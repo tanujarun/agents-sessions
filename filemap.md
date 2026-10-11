@@ -7,15 +7,20 @@
 - `bin/agent-sessions` — launcher script; no logic
 - `install.sh` — symlink the launcher into `~/.local/bin`
 - `Makefile` — `test`, `lint`
+- `src/agent_sessions/__init__.py` — package marker, `__version__`
 - `src/agent_sessions/model.py` — Session and Store dataclasses, session key
 - `src/agent_sessions/mounts.py` — list real mounted filesystems (platform layer)
 - `src/agent_sessions/discover.py` — find stores on mounts; prune list
 - `src/agent_sessions/pathmap.py` — foreign path to local path
 - `src/agent_sessions/index.py` — cache of stores and parsed sessions
 - `src/agent_sessions/providers/` — one adapter per provider, plus the registry
+- `src/agent_sessions/providers/__init__.py` — registry: `register`, `all_providers`, `get`
+- `src/agent_sessions/providers/base.py` — `Provider` base class, `NotSupported`
 - `src/agent_sessions/importer.py` — copy a foreign session into the native store
 - `src/agent_sessions/launch.py` — build and run the resume command (platform layer)
 - `src/agent_sessions/cli.py` — argparse entry, all subcommands
 - `menu/` — Menu.qml provider snippet, JSONC rows, `apply.sh`
 - `tests/` — unittest suites
+- `tests/__init__.py` — puts `src` on `sys.path`
+- `tests/test_smoke.py` — imports, CLI skeleton, `make_key`
 - `tests/fixtures/<provider>/` — sanitised real session files

@@ -176,7 +176,7 @@ native copy is launchable.
 agent-sessions scan [--deep] [--json]          refresh index; print summary
 agent-sessions list [--provider P] [--json]    sessions, newest first
 agent-sessions menu <provider>                 TSV rows for the menu (below)
-agent-sessions open <key>                      native: resume. foreign: chooser
+agent-sessions open <key> [--dry-run]          native: resume. foreign: chooser. --dry-run prints the command
 agent-sessions import <key> [--open]           import; optionally resume after
 agent-sessions show <key>                      plain-text transcript to stdout
 agent-sessions status                          mounts, stores, counts per provider,

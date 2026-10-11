@@ -2,7 +2,7 @@
 
 Status key: `[ ]` open, `[~]` delegated, `[x]` accepted. Spec: `docs/SPEC.md`.
 
-## 1. Scaffold — Light — after: none — [ ]
+## 1. Scaffold — Light — after: none — [x]
 
 Create the layout in SPEC "Architecture": `src/agent_sessions/` package with
 empty-but-importable modules and the `Provider` base class + registry,
@@ -14,7 +14,7 @@ CLI with every subcommand from SPEC "CLI contract" stubbed (exit 1,
 `lint` (`python3 -m compileall -q src tests`). Stdlib only.
 Verify: `make test`, `make lint`, `bin/agent-sessions --help`.
 
-## 2. Format investigation — Heavy — after: 1 — [ ]
+## 2. Format investigation — Heavy — after: 1 — [~]
 
 Read-only study of the five providers' stores on Linux and on the Windows
 profile. Produce `docs/FORMATS.md`: per provider the store signature, the file
