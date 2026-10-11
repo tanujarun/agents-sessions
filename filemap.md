@@ -43,6 +43,7 @@
 - `tests/test_discover.py` — fast, deep and brute pass, prune list, the five store signatures on the fixtures
 - `tests/test_pathmap.py` — normalisation, letters by evidence, overrides, MSIX redirect
 - `tests/test_index.py` — parse cache, scan policy, vanished mounts, derived fields, order, `verify`
+- `tests/test_claude.py`, `tests/test_codex.py`, `tests/test_grok.py`, `tests/test_antigravity.py`, `tests/test_gemini.py` — one suite per adapter, on the fixtures
 - `tests/test_cli.py` — `scan`, `list`, `status`, `verify` through `cli.main`
 - `tests/fixtures/README.md` — what each fixture is, expected parsed values and counts, leak check
 - `tests/fixtures/<provider>/<native|windows>/` — sanitised real stores, laid out like a home directory

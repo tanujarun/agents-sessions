@@ -394,6 +394,8 @@ class SkeletonSignatureTest(unittest.TestCase):
                                  expect[p.name])
                 for method, args in (("candidates", (None,)), ("parse", (None, None)),
                                      ("resume_argv", (None,)), ("import_session", (None, None))):
+                    if method != "import_session":
+                        continue   # readers implemented: tests/test_<provider>.py
                     with self.assertRaises(NotImplementedError):
                         getattr(p, method)(*args)
 

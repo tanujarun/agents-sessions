@@ -895,6 +895,32 @@ the parsed count on both stores.)
 
 ---
 
+## Reader notes (found while implementing, 2026-10-12)
+
+- **Claude**: of the 3 Windows "superseded parent" files one is an empty session, so 2 listed
+  sessions carry the `continued in` note. `tests/fixtures/README.md` counts the sub-agent
+  transcript among the `claude/native` candidates; by §3 it is not one (8 candidates, 6 listed).
+- **Codex tool turns** (for `transcript`): `response_item` records whose `payload.type` ends in
+  `_call` and that carry a string `name` (only `custom_tool_call` / `exec` occurs in the data).
+- **Grok**: `<user_query>` is not always at the start of the text (it can follow an
+  `<image_files>` block or an interrupt notice). One compaction survivor has the wrapper but no
+  `prompt_index`: not counted as a prompt, shown in the transcript. `chat_history.jsonl` has no
+  timestamps. Sub-agent children are recognised by a tolerant match on the parent's
+  `subagents/*/meta.json` (no instance exists; unverified).
+- **Antigravity**: `USER_INPUT` content is `<USER_REQUEST>…</USER_REQUEST>` followed by metadata
+  blocks. `steps.step_payload`: `19.2` user text, `20.1` reply, `20.7.2` tool name (matched
+  `transcript.jsonl` on all 13 user and 19 planner steps). Title chain used: summaries `title` →
+  `annotations/<id>.pbtxt` → `preview` → first user input → `id[:8]`. The fixture README shows one
+  cwd with back-slashes; the reader returns the URI form `F:/Proj/My Site`.
+- **Gemini** (0.54.0 bundle): a message with a known id replaces it in place; `messages` inside a
+  metadata record adds; sub-agent chats live in `chats/<parent id>/`; a legacy `.json` chat is one
+  JSON object with `sessionId` and `messages`, and a resumed `.json` gets a `.jsonl` twin
+  (duplicate rule: newest `lastUpdated` wins).
+- **Path map**: `D:` stays unresolved from listed sessions (the only listed session on it points
+  at a folder that is gone); no listed session is affected.
+
+---
+
 ## Open questions / needs live test
 
 Each needs one supervised resume by the user; none can be answered from the files.

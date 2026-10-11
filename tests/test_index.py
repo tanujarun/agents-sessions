@@ -182,7 +182,11 @@ class ParseCacheTest(IndexCase):
 
 class NotImplementedReaderTest(unittest.TestCase):
     def test_skeleton_adapter_lists_the_store_with_one_warning(self):
-        box = Sandbox(self, {"claude": Claude})
+        class Skeleton(Claude):   # an adapter whose reader is not written yet
+            def candidates(self, store):
+                raise NotImplementedError
+
+        box = Sandbox(self, {"claude": Skeleton})
         disk = box.mount("Win")
         for base in (box.home, disk / "Users" / "a", disk / "Users" / "b"):
             (base / ".claude" / "projects" / "x").mkdir(parents=True)
