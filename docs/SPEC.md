@@ -70,6 +70,7 @@ src/agent_sessions/
   providers/      one adapter per provider + registry
   importer.py     copy a foreign session into the native store
   launch.py       build and run the resume command (platform layer)
+  api.py          the facade the CLI and the TUI call
   cli.py          argparse entry
   tui/            the Textual front end (app.py, view.py, app.tcss); the only
                   package that imports textual
@@ -115,17 +116,33 @@ class Provider:
     label: str           # "Claude"
     binary: str          # executable to resume with
     app_id: str          # omarchy-launch-tui --app-id value
+    resumable: bool      # False when no usable binary exists (Gemini today)
     dir_names: set[str]  # directory names that may be a store root, for discovery
     def native_store(self) -> Path | None
-    def is_store(self, path: Path) -> bool            # cheap signature check
-    def list_sessions(self, store: Store) -> list[Session]
-    def resume_argv(self, s: Session) -> list[str]    # for native sessions
-    def import_session(self, s: Session, pathmap) -> Session   # may raise NotSupported(reason)
+    def is_store(self, path: Path) -> bool                    # cheap signature check
+    def candidates(self, store: Store) -> list[Candidate]     # cheap: names and stats only
+    def parse(self, store: Store, c: Candidate) -> Session | None   # None = not a listed session
+    def resume_argv(self, s: Session) -> list[str]            # for native sessions
+    def import_session(self, s: Session, pathmap) -> Session  # may raise NotSupported(reason)
 ```
 
-Adapters never raise on a malformed file: they skip it and record a warning
-that `scan` reports. Adapter details per provider live in `docs/FORMATS.md`
-(written by task 2); adapters implement what that file says and nothing guessed.
+`Candidate` = `(id_hint, paths)`: `paths` are the files/dirs whose
+`(path, mtime_ns, size)` decide whether a cached parse is still valid (for a
+Codex thread: its rollout files and `session_index.jsonl`). The index calls
+`candidates` on every scan and `parse` only for candidates whose signature
+changed, so the live native Claude store (hundreds of MB) is not re-read each
+time. `parse` fills the conversation fields (`id`, `title`, `cwd`, `started`,
+`updated`, `messages`, `files`, `note`); the index fills the rest (`key`,
+`store`, `origin`, `mount`, `mount_label`, `cwd_local`, `cwd_exists`,
+`launchable`, `imported_as`).
+
+Adapters never raise on a malformed file: `parse` skips it and records a
+warning that `scan` reports. Adapter details per provider live in
+`docs/FORMATS.md`; adapters implement what that file says and nothing guessed.
+
+The CLI and the TUI both go through `api.py` (load index, scan, list, status,
+verify, and later open / import / transcript); neither reaches into the
+modules behind it.
 
 ### Discovery (the "all mounted drives, consistently" requirement)
 
@@ -154,10 +171,12 @@ that `scan` reports. Adapter details per provider live in `docs/FORMATS.md`
 4. Unreadable directories are counted and reported, never fatal.
 5. Results are deterministic: sorted, same input gives byte-identical `list --json`.
 
-The deep pass is the slow part. It runs on `scan --deep`, when the set of
-mounts changed since the last deep pass, or when the last one is older than
-24 h (then in the background, detached). `scan` without `--deep` does steps
-1-2 and re-parses only files whose mtime/size changed. A mount that vanished
+The deep pass costs a few seconds warm (FORMATS.md "Walk cost"), more cold.
+It runs on `scan --deep`, and `scan` chooses it by itself when the set of
+mounts changed since the last deep pass or the last one is older than 24 h.
+It runs inline (the TUI calls it from a worker and can cancel it); nothing is
+detached. `scan` without a deep pass does steps 1-2 and re-parses only
+candidates whose signature changed. A mount that vanished
 keeps its sessions out of the listing but its stores stay remembered.
 
 ### Read-only rule
@@ -174,7 +193,9 @@ platform has it (fall back silently), so a scan does not update access times.
 Foreign cwd -> local path. Drive letters are resolved by evidence, not
 hard-coded: the Windows system volume is the mount holding `Users/` and
 `Windows/`; other letters are matched by testing which mount contains the
-recorded path (case-insensitive segment match). Unresolved or ambiguous
+recorded path (case-insensitive segment match). Letters are
+resolved per source mount (the mount the foreign store is on), since two
+Windows installs can assign letters differently. Unresolved or ambiguous
 letters stay unmapped (`cwd_local = null`), and `status` lists them. A manual
 override file `~/.config/agent-sessions/pathmap.json` (`{"F:": "/run/media/…"}`)
 wins over evidence. Normalise before matching: strip a `\\?\` prefix, accept

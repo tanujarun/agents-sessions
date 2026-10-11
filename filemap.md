@@ -19,6 +19,7 @@
 - `src/agent_sessions/providers/base.py` — `Provider` base class, `NotSupported`
 - `src/agent_sessions/importer.py` — copy a foreign session into the native store
 - `src/agent_sessions/launch.py` — build and run the resume command (platform layer)
+- `src/agent_sessions/api.py` — facade used by the CLI and the TUI
 - `src/agent_sessions/cli.py` — argparse entry, all subcommands
 - `src/agent_sessions/tui/` — Textual front end: `app.py`, `view.py` (pure view logic), `app.tcss` (all styling)
 - `share/agent-sessions.desktop` — desktop launcher for the TUI
