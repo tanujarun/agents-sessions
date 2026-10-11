@@ -12,7 +12,8 @@ from .. import importer
 from ..fsutil import home, listdir_ro, open_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
-from .base import NotSupported, Provider, Turn, clean_title, iter_jsonl, parse_ts, warn
+from .base import (NotSupported, Provider, Turn, clean_title, iter_jsonl, parse_ts,
+                   unreadable, warn)
 
 _TRANSCRIPT = re.compile(
     r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
@@ -194,7 +195,7 @@ def _scan(path) -> _Scan:
                 scan.assistant_ids.add(ident)
             else:
                 scan.assistant_anonymous += 1
-        elif kind in _TITLE_FIELD:
+        elif isinstance(kind, str) and kind in _TITLE_FIELD:
             value = record.get(_TITLE_FIELD[kind])
             if isinstance(value, str):
                 scan.titles[kind] = value
@@ -256,13 +257,15 @@ class Claude(Provider):
         projects = os.path.join(store.root, "projects")
         try:
             dirs = subdirs(projects)
-        except (FileNotFoundError, NotADirectoryError):
+        except OSError as exc:
+            unreadable(projects, exc)
             return []
         found: dict[str, list[str]] = {}
         for name in dirs:
             try:
                 entries = listdir_ro(os.path.join(projects, name))
-            except OSError:
+            except OSError as exc:
+                unreadable(os.path.join(projects, name), exc)
                 continue
             for entry in entries:
                 match = _TRANSCRIPT.match(entry)

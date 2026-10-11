@@ -84,7 +84,7 @@ three times and diff; simulate a missing mount and a corrupt file. Report
 every mismatch with paths.
 Verify: orchestrator reruns the script.
 
-## 8. Audit fixes — Medium — after: 5, 7 — [~]
+## 8. Audit fixes — Medium — after: 5, 7 — [x]
 
 Defects found by task 7: a wrong-typed record field drops a whole Claude or
 Codex session; an unreadable directory inside a store drops its sessions

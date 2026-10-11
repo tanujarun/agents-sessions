@@ -25,7 +25,7 @@ from ..model import Candidate, Session, Store
 __all__ = [
     "Candidate", "NotSupported", "Provider", "Session", "Store", "Warnings",
     "clean_title", "collect_warnings", "iter_jsonl", "open_ro",
-    "open_sqlite_ro", "parse_ts", "warn",
+    "open_sqlite_ro", "parse_ts", "unreadable", "warn",
 ]
 
 TITLE_MAX = 80
@@ -148,6 +148,13 @@ def warn(message: str, path=None) -> None:
     stack = getattr(_active, "stack", None)
     if stack:
         stack[-1].add(message, path)
+
+
+def unreadable(path, exc=None) -> None:
+    """Report a directory ``candidates`` could not list. One that is not
+    there (any more) is not reported: nothing in it can be missed."""
+    if not isinstance(exc, (FileNotFoundError, NotADirectoryError)):
+        warn("unreadable; its sessions are not listed", path)
 
 
 @contextlib.contextmanager

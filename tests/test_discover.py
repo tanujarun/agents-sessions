@@ -419,6 +419,81 @@ class SkeletonSignatureTest(unittest.TestCase):
         self.assertEqual({s.reason for s in found.skipped}, {"test fixtures"})
         self.assertEqual(found.stores, [])
 
+    def test_stores_inside_this_project_are_skipped(self):
+        """A fake home left under the project's own tree (scratch/…) is
+        found, counted and not listed, by all three passes."""
+        box = Sandbox(self)
+        mount = box.mount("Disk")
+        project = mount / "Projects" / "agent-sessions"
+        inside = box.store(project / "scratch" / "fake-home")
+        direct = box.store(project)
+        fixture = box.store(project / "tests" / "fixtures" / "sample")
+        sibling = box.store(mount / "Projects" / "agent-sessions-old")
+        outside = box.store(mount / "elsewhere")
+        remembered = [("fake", str(p)) for p in (inside, direct, fixture, sibling, outside)]
+        passes = {
+            "fast": lambda: fast_pass(list_mounts(), providers.all_providers(), remembered),
+            "deep": lambda: deep_pass(list_mounts(), providers.all_providers()),
+            "brute": lambda: brute_pass(list_mounts(), providers.all_providers()),
+        }
+        with unittest.mock.patch.object(discover, "PROJECT_ROOT", str(project)):
+            for name, run in passes.items():
+                with self.subTest(run=name):
+                    found = run()
+                    self.assertEqual(roots(found), sorted([str(sibling), str(outside)]))
+                    self.assertEqual(
+                        sorted((s.root, s.reason, s.mount) for s in found.skipped),
+                        sorted([(str(inside), discover.IN_PROJECT, str(mount)),
+                                (str(direct), discover.IN_PROJECT, str(mount)),
+                                (str(fixture), "test fixtures", str(mount))]))
+        # An installed copy has no project around it: nothing is skipped by this rule.
+        with unittest.mock.patch.object(discover, "PROJECT_ROOT", None):
+            for name, run in passes.items():
+                with self.subTest(run=name, installed=True):
+                    found = run()
+                    self.assertEqual(roots(found), sorted(
+                        str(p) for p in (inside, direct, sibling, outside)))
+                    self.assertEqual([s.reason for s in found.skipped], ["test fixtures"])
+
+    def test_the_project_root_is_this_checkout(self):
+        repo = Path(__file__).resolve().parent.parent
+        self.assertEqual(discover.PROJECT_ROOT, str(repo))
+        self.assertEqual(discover.IN_PROJECT, "inside the agent-sessions project")
+        # Not a source tree (no tests/fixtures beside src/, or no src/ at all).
+        tmp = Sandbox(self).root
+        for layout in ("copy/src/agent_sessions", "site-packages/agent_sessions"):
+            package = tmp / layout
+            package.mkdir(parents=True)
+            with unittest.mock.patch.object(discover, "__file__", str(package / "discover.py")):
+                self.assertIsNone(discover._project_root(), layout)
+        (tmp / "copy" / "tests" / "fixtures").mkdir(parents=True)
+        with unittest.mock.patch.object(
+                discover, "__file__", str(tmp / "copy/src/agent_sessions/discover.py")):
+            self.assertEqual(discover._project_root(), str(tmp / "copy"))
+
+    def test_scan_and_verify_agree_on_stores_inside_the_project(self):
+        from agent_sessions import api
+        box = Sandbox(self)
+        mount = box.mount("Disk")
+        project = mount / "Projects" / "agent-sessions"
+        inside = box.store(project / "scratch" / "fake-home")
+        box.session(inside, "leftover")
+        outside = box.store(mount / "elsewhere")
+        box.session(outside, "real")
+        with unittest.mock.patch("agent_sessions.index.shutil.which", return_value=None):
+            api.scan(deep=True)                      # before the rule: both are listed
+            with unittest.mock.patch.object(discover, "PROJECT_ROOT", None):
+                api.scan(deep=True)
+                self.assertEqual(sorted(s.id for s in api.list_sessions()), ["leftover", "real"])
+            with unittest.mock.patch.object(discover, "PROJECT_ROOT", str(project)):
+                summary = api.scan()                 # a quick scan drops the remembered store
+                self.assertEqual((summary["stores"], summary["skipped_stores"]), (1, 1))
+                self.assertEqual([s.id for s in api.list_sessions()], ["real"])
+                self.assertEqual([(s["root"], s["reason"]) for s in api.status()["skipped_stores"]],
+                                 [(str(inside), discover.IN_PROJECT)])
+                result = api.verify()
+                self.assertEqual((result["ok"], result["differences"]), (True, []))
+
     def test_same_tree_elsewhere_is_listed(self):
         box = Sandbox(self, REAL)
         mount = box.mount("Copy")

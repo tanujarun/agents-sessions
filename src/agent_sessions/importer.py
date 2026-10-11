@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import time
@@ -46,6 +47,9 @@ HEADROOM = 10            # per cent of the copy size that must stay free on top
 PROVENANCE = "imports.json"
 PROVENANCE_VERSION = 1
 STAGING_PREFIX = ".agent-sessions-import-"
+# What ``execute`` names its staging directory: prefix, pid, hex time.
+_STAGING_NAME = re.compile(re.escape(STAGING_PREFIX) + r"([0-9]+)-[0-9a-f]+")
+STAGING_MAX_AGE = 3600   # seconds; a younger staging directory is never swept
 FILE_MODE = 0o600        # sessions are private; never wider than the tools write
 DIR_MODE = 0o700
 
@@ -446,6 +450,56 @@ def _record(plan: ImportPlan) -> dict:
     return record
 
 
+def _pid_alive(pid: int) -> bool:
+    """Whether a process with this id exists. Where that cannot be asked
+    without side effects (signal 0 is not a probe on Windows) the answer is
+    yes, so nothing is swept there."""
+    if os.name != "posix":
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OverflowError:      # not a process id on this system
+        return False
+    except OSError:            # it exists and belongs to someone else
+        return True
+    return True
+
+
+def sweep_staging(native_root) -> list[str]:
+    """Remove the staging directories an import that died left at the root
+    of a native store; returns the paths it removed.
+
+    Only a real directory whose name is exactly what ``execute`` gives its
+    staging directory, whose process is gone and which was last changed over
+    an hour ago. Anything that cannot be listed or removed is left alone."""
+    native_root = os.fspath(native_root)
+    removed = []
+    try:
+        names = sorted(os.listdir(native_root))
+    except OSError:
+        return removed
+    now = time.time()
+    for name in names:
+        match = _STAGING_NAME.fullmatch(name)
+        if not match:
+            continue
+        path = os.path.join(native_root, name)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(st.st_mode) or now - st.st_mtime <= STAGING_MAX_AGE:
+            continue
+        if _pid_alive(int(match.group(1))):
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.lexists(path):
+            removed.append(path)
+    return removed
+
+
 def execute(plan: ImportPlan, progress=None) -> dict:
     """Carry out a plan and return its provenance record.
 
@@ -453,6 +507,7 @@ def execute(plan: ImportPlan, progress=None) -> dict:
     Raises ``Exists`` or ``ImportFailed``; after a failure nothing of this
     import is left in the native store.
     """
+    sweep_staging(plan.native_root)
     check(plan)
     records = read_provenance()    # read again below the checks: this is what gets extended
     total = plan.total_bytes
@@ -533,4 +588,5 @@ def execute(plan: ImportPlan, progress=None) -> dict:
 
 __all__ = ["Append", "Exists", "FileCopy", "ImportFailed", "ImportPlan", "Rewrite", "Unit",
            "check", "describe", "execute", "file_copy", "free_space", "human_size",
-           "only_changed", "provenance_file", "read_provenance", "start_plan", "tree"]
+           "only_changed", "provenance_file", "read_provenance", "start_plan", "sweep_staging",
+           "tree"]

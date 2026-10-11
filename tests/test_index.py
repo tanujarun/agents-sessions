@@ -505,6 +505,44 @@ class DerivedFieldsTest(IndexCase):
         self.assertEqual((rows[str(mirror)]["listed"], rows[str(mirror)]["duplicates"]), (1, 1))
         self.assertEqual(rows[str(self.foreign)]["duplicates"], 0)
 
+    def test_of_two_copies_the_newest_is_listed(self):
+        """The same session id in two foreign stores: the copy with the
+        newest ``updated`` is the one listed, wherever its store sorts."""
+        later = self.box.mount("Zed Disk")
+        second = self.box.store(later / "Users" / "arun")
+        self.assertLess(str(self.foreign), str(second))
+        self.box.session(self.foreign, "s1", title="stale", updated="2026-10-01T10:00:00Z")
+        self.box.session(second, "s1", title="current", updated="2026-10-05T10:00:00Z")
+        # the other way round, a tie, and a copy with no date at all
+        self.box.session(self.foreign, "s2", title="current", updated="2026-10-06T10:00:00Z")
+        self.box.session(second, "s2", title="stale", updated="2026-10-02T10:00:00Z")
+        self.box.session(self.foreign, "s3", title="first", updated="2026-10-03T10:00:00Z")
+        self.box.session(second, "s3", title="second", updated="2026-10-03T10:00:00Z")
+        self.box.session(self.foreign, "s4", title="undated", updated=None)
+        self.box.session(second, "s4", title="dated", updated="2020-01-01T00:00:00Z")
+        self.box.session(self.foreign, "s5", title="undated a", updated=None)
+        self.box.session(second, "s5", title="undated b", updated=None)
+        summary = api.scan(deep=True)
+        self.assertEqual((summary["candidates"], summary["sessions"]), (10, 5))
+        got = {s.id: (s.title, s.store) for s in api.list_sessions()}
+        self.assertEqual(got, {
+            "s1": ("current", str(second)),
+            "s2": ("current", str(self.foreign)),
+            "s3": ("first", str(self.foreign)),       # tie: the smaller store key
+            "s4": ("dated", str(second)),             # no date sorts oldest
+            "s5": ("undated a", str(self.foreign)),
+        })
+        rows = {r["root"]: r for r in api.status()["stores"]}
+        self.assertEqual((rows[str(self.foreign)]["listed"], rows[str(self.foreign)]["duplicates"]),
+                         (3, 2))
+        self.assertEqual((rows[str(second)]["listed"], rows[str(second)]["duplicates"]), (2, 3))
+        for row in rows.values():
+            self.assertEqual(row["listed"] + row["duplicates"] + row["skipped"],
+                             row["candidates"])
+        first = listing()
+        api.scan(deep=True)
+        self.assertEqual(listing(), first)
+
     def test_drive_letters_reach_the_sessions(self):
         (self.disk / "Windows").mkdir()
         target = self.disk / "Users" / "arun" / "Site Work"

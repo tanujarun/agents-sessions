@@ -105,6 +105,9 @@ class Index:
         self.deep_mounts: list[str] = []     # mount paths of the last deep pass
         self.walk: dict[str, dict] = {}      # mount path -> stats of that pass
         self.parsed: dict[str, dict] = {}    # store key -> parse cache
+        # set by load(), not persisted: why the cache gave nothing
+        # ("missing", "unreadable: <reason>"), None when it was read
+        self.load_error: str | None = None
         # derived by finalise()
         self.sessions: list[Session] = []
         self.store_rows: list[dict] = []
@@ -117,14 +120,19 @@ class Index:
     @classmethod
     def load(cls, path=None) -> "Index":
         """Read the cache; a missing, corrupt or old-version file gives an
-        empty index."""
+        empty index, and ``load_error`` says which it was."""
         index = cls(path if path is not None else cache_file())
         try:
             with open(index.path, encoding="utf-8") as fh:
                 index._adopt(json.load(fh))
-        except (OSError, ValueError, TypeError, KeyError, AttributeError,
-                RecursionError):
+        except FileNotFoundError:
             index.__init__(index.path)
+            index.load_error = "missing"
+        except (OSError, ValueError, TypeError, KeyError, AttributeError,
+                RecursionError) as exc:
+            index.__init__(index.path)
+            reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+            index.load_error = f"unreadable: {reason or type(exc).__name__}"
         return index
 
     def _adopt(self, data) -> None:
@@ -314,15 +322,19 @@ class Index:
             entry = {"reader": reader, "implemented": True, "warnings": [], "candidates": {}}
             out[key] = entry
             reusable = old["candidates"] if old and old["reader"] == reader else {}
-            try:
-                candidates = sorted(provider.candidates(store), key=lambda c: c.id_hint)
-            except NotImplementedError:
-                entry["implemented"] = False
-                continue
-            except Exception as exc:  # an adapter must not break the scan
-                entry["warnings"].append(
-                    f"{store.root}: cannot list sessions: {type(exc).__name__}: {exc}")
-                continue
+            with base.collect_warnings() as listing:
+                try:
+                    candidates = sorted(provider.candidates(store), key=lambda c: c.id_hint)
+                except NotImplementedError:
+                    entry["implemented"] = False
+                    continue
+                except Exception as exc:  # an adapter must not break the scan
+                    entry["warnings"].append(
+                        f"{store.root}: cannot list sessions: {type(exc).__name__}: {exc}")
+                    continue
+            # Directories the adapter could not list: kept with the store,
+            # and gone again on the scan after they become readable.
+            entry["warnings"] += sorted(set(listing.items))
             for position, candidate in enumerate(candidates):
                 hint = candidate.id_hint
                 if hint in entry["candidates"]:
@@ -374,7 +386,8 @@ class Index:
         sessions: list[Session] = []
         rows = []
         warnings: set[str] = set()
-        listed: set[tuple[str, str, str]] = set()   # (origin, provider, id)
+        found = []                         # (row, store, conversation), in order
+        best: dict[tuple[str, str, str], tuple[str, int]] = {}   # (origin, provider, id)
         for store in sorted(self.stores, key=_store_key):
             entry = self.parsed.get(_store_key(store)) or {}
             cached = entry.get("candidates", {})
@@ -396,14 +409,21 @@ class Index:
                 if conversation is None:
                     row["skipped"] += 1
                     continue
+                # Of several copies of one session (a hard-linked mirror, a
+                # copied profile) the newest is listed; on a tie the one
+                # met first, which is the smaller store key.
                 ident = (store.origin, store.provider, conversation["id"])
-                if ident in listed:
-                    # Hard-linked mirror of a store already listed.
-                    row["duplicates"] += 1
-                    continue
-                listed.add(ident)
-                row["listed"] += 1
-                sessions.append(Session.for_store(store, **conversation))
+                updated = conversation["updated"] or ""
+                if ident not in best or updated > best[ident][0]:
+                    best[ident] = (updated, len(found))
+                found.append((row, store, conversation))
+        for position, (row, store, conversation) in enumerate(found):
+            ident = (store.origin, store.provider, conversation["id"])
+            if best[ident][1] != position:
+                row["duplicates"] += 1
+                continue
+            row["listed"] += 1
+            sessions.append(Session.for_store(store, **conversation))
         self.pathmap = PathMap.build(mounts, [(s.cwd, s.mount) for s in sessions if s.cwd])
         warnings.update(self.pathmap.warnings)
         native = {(s.provider, s.id): s.key for s in sessions if s.origin == "native"}

@@ -30,6 +30,7 @@ REDIRECTS = (
 )
 # Directories that mark the Windows system volume.
 SYSTEM_VOLUME_DIRS = ("users", "windows")
+SYSTEM_LETTER = "C:"   # what Windows calls the volume it runs from
 
 _DRIVE = re.compile(r"^([A-Za-z]):(?:[\\/]+(.*))?$", re.S)
 _SPLIT_ANY = re.compile(r"[\\/]+")
@@ -239,6 +240,10 @@ class PathMap:
             self._roots[key] = (source, "system volume", len(paths))
         elif shared:
             self._unsettled(key, "ambiguous", shared, paths)
+        elif root == SYSTEM_LETTER and self._is_system_volume(source):
+            # None of the recorded folders exists any more, on any mount: a
+            # Windows install still calls its own system volume C:.
+            self._roots[key] = (source, "system volume", len(paths))
         else:
             self._unsettled(key, "no evidence", (), paths)
 

@@ -15,7 +15,8 @@
 - `src/agent_sessions/mounts.py` — platform layer: `Mount`, `list_mounts`, `mount_points`, `find_mount`,
   `parse_mountinfo`; the real-filesystem list `REAL_FSTYPES`; `AGENT_SESSIONS_MOUNTS` override
 - `src/agent_sessions/discover.py` — `fast_pass`, `deep_pass`, `brute_pass` (the walk `verify` uses), the prune
-  list `PRUNE`, `ALWAYS_DESCEND`, `SKIP_RULES` (stores found but not listed)
+  list `PRUNE`, `ALWAYS_DESCEND`, `SKIP_RULES` (stores found but not listed), `PROJECT_ROOT` (stores inside this
+  checkout are skipped too)
 - `src/agent_sessions/pathmap.py` — `normalise`, `PathMap` (drive letters by evidence per source mount,
   `REDIRECTS`, override file `~/.config/agent-sessions/pathmap.json`)
 - `src/agent_sessions/index.py` — `Index`: cache file, scan (parse cache by signature), `finalise` (derived
@@ -45,6 +46,10 @@
 - `tests/test_index.py` — parse cache, scan policy, vanished mounts, derived fields, order, `verify`
 - `tests/test_claude.py`, `tests/test_codex.py`, `tests/test_grok.py`, `tests/test_antigravity.py`, `tests/test_gemini.py` — one suite per adapter, on the fixtures
 - `tests/test_cli.py` — `scan`, `list`, `status`, `verify` through `cli.main`
+- `tests/test_wrong_types.py` — all five adapters against records, JSON values and SQLite column values of
+  the wrong type, on temp copies of every fixture store
+- `tests/test_unreadable.py` — a directory inside a store at mode 000: the warning per adapter and through
+  the index
 - `tests/fixtures/README.md` — what each fixture is, expected parsed values and counts, leak check
 - `tests/fixtures/<provider>/<native|windows>/` — sanitised real stores, laid out like a home directory
   (`claude/`, `codex/`, `grok/`, `antigravity/`, `gemini/`; SQLite fixtures are WAL-mode, open immutable)
@@ -56,3 +61,23 @@
 - `tests/test_launch.py` — launch plans per provider, folder gone, foreign refused, `--here`, hooks
 - `tests/test_importer.py` — imports per provider (bytes, rewrites, idempotence, collisions, roll back, free
   space, provenance, source times), `encode_cwd`, refusals
+- `src/agent_sessions/tui/__init__.py` — package marker; imports no Textual; `run()`, the "run ./install.sh" hint
+- `src/agent_sessions/tui/__main__.py` — `python -m agent_sessions.tui`: run the app, exit 1 with the hint when
+  Textual is missing
+- `src/agent_sessions/tui/engine.py` — `Engine`: the object the app calls the engine through (forwards to
+  `agent_sessions.api`, looked up at call time), `EngineError`; tests pass a fake in its place
+- `src/agent_sessions/tui/view.py` — pure view logic, no Textual: rows, ages, display width and clipping,
+  column fitting, filter, tabs, selection by key, small-terminal layout, status and prompt texts, key table
+  (`KEYMAPS`), help, transcript wrapping
+- `src/agent_sessions/tui/app.py` — `SessionsApp`, `MainScreen` (workers for load, scan, import, open,
+  `can_import`), `SessionList` and `TranscriptView` (line-drawn, virtual), `TabLabel`, `HelpScreen`,
+  `TranscriptScreen` (the pager)
+- `src/agent_sessions/tui/app.tcss` — every colour, border and spacing value; the widget tree it styles is
+  listed at its top
+- `requirements-tui.txt` — the pinned Textual version `install.sh` installs into `.venv`
+- `tests/tui_support.py` — `FakeEngine` (records calls, never launches or imports), fake sessions,
+  `screen_text`, `settle`
+- `tests/test_tui_view.py` — every function of `tui/view.py`, `tui/engine.py`, the launcher and import rules;
+  runs on the system Python
+- `tests/test_tui_app.py` — the app under Textual's pilot with the fake engine (`make test-tui`; skips itself
+  without Textual)

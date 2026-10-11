@@ -15,7 +15,7 @@ from ..fsutil import home, listdir_ro
 from ..model import Candidate, Session, Store
 from . import register
 from .base import (NotSupported, Provider, Turn, clean_title, iter_jsonl, open_ro,
-                   open_sqlite_ro, parse_ts, warn)
+                   open_sqlite_ro, parse_ts, unreadable, warn)
 
 IDE_NOTE = "Antigravity IDE conversation: list only"
 # The verdict of FORMATS section 6, shown to the user as it is.
@@ -237,7 +237,12 @@ class Antigravity(Provider):
         ``parse`` can say so. Directory listing only."""
         root = Path(store.root)
         out = []
-        for name in sorted(listdir_ro(root / "conversations")):
+        try:
+            names = sorted(listdir_ro(root / "conversations"))
+        except OSError as exc:
+            unreadable(root / "conversations", exc)
+            names = []
+        for name in names:
             if name.startswith(".") or name.endswith(_SIDECARS):
                 continue
             entry = str(root / "conversations" / name)

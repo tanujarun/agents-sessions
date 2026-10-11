@@ -13,6 +13,7 @@ import os
 import shutil
 import stat
 import sys
+import time
 import unittest
 import urllib.parse
 from pathlib import Path
@@ -942,6 +943,87 @@ class NotSupportedTest(ImportCase):
         with self.assertRaises(api.NotFound):
             api.import_session("claude:nope")
         self.assertEqual(api.can_import("claude:nope")[0], False)
+
+
+def dead_pid() -> int:
+    """A process id nothing has: above what this system gives out."""
+    try:
+        limit = int(Path("/proc/sys/kernel/pid_max").read_text())
+    except (OSError, ValueError):
+        limit = 2 ** 22
+    return limit + 1
+
+
+class StagingSweepTest(ImportCase):
+    foreign = ("claude",)
+    HOUR = 3600
+
+    def make(self, name, age, is_dir=True) -> Path:
+        path = self.home / ".claude" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if is_dir:
+            (path / "0").mkdir(parents=True)
+            (path / "0" / "part.jsonl").write_text("half", encoding="utf-8")
+        else:
+            path.write_text("x", encoding="utf-8")
+        then = time.time() - age
+        os.utime(path, (then, then))
+        return path
+
+    def leftovers(self):
+        prefix = importer.STAGING_PREFIX
+        dead, live = dead_pid(), os.getpid()
+        self.assertFalse(importer._pid_alive(dead))
+        self.assertTrue(importer._pid_alive(live))
+        stale = [self.make(f"{prefix}{dead}-18a3f0", 2 * self.HOUR),
+                 self.make(f"{prefix}{dead}-0", 30 * 24 * self.HOUR)]
+        kept = [
+            self.make(f"{prefix}{dead}-18a3f1", self.HOUR - 120),           # fresh
+            self.make(f"{prefix}{live}-18a3f2", 2 * self.HOUR),             # its process lives
+            self.make(f"{prefix}{dead}-18a3f3", 2 * self.HOUR, is_dir=False),   # a file
+            self.make(f"{prefix}{dead}", 2 * self.HOUR),                    # not the pattern
+            self.make(f"{prefix}{dead}-18A3F4", 2 * self.HOUR),
+            self.make(f"{prefix}{dead}-18a3f5.bak", 2 * self.HOUR),
+            self.make(f"{prefix}abc-18a3f6", 2 * self.HOUR),
+            self.make(f"x{prefix}{dead}-18a3f7", 2 * self.HOUR),
+            self.make(f"{prefix[1:]}{dead}-18a3f8", 2 * self.HOUR),
+            self.make("projects", 2 * self.HOUR),
+            self.make("sessions", 2 * self.HOUR),
+        ]
+        link = self.home / ".claude" / f"{prefix}{dead}-18a3f9"       # a link to a directory
+        os.symlink(kept[-1], link)
+        return stale, kept + [link]
+
+    def test_sweep_removes_only_dead_old_staging_directories(self):
+        stale, kept = self.leftovers()
+        removed = importer.sweep_staging(self.home / ".claude")
+        self.assertEqual(removed, sorted(str(p) for p in stale))
+        self.assertEqual([p for p in stale if os.path.lexists(p)], [])
+        self.assertEqual([p for p in kept if not os.path.lexists(p)], [])
+        self.assertEqual(importer.sweep_staging(self.home / ".claude"), [])
+        self.assertEqual(importer.sweep_staging(self.home / "no such store"), [])
+
+    def test_an_import_sweeps_and_a_dry_run_does_not(self):
+        stale, kept = self.leftovers()
+        api.import_plan(CLAUDE_WIN, index=self.index)           # `import --dry-run`
+        self.assertEqual(api.can_import(CLAUDE_WIN, index=self.index), (True, ""))
+        self.assertEqual([p for p in stale + kept if not os.path.lexists(p)], [])
+        copy = api.import_session(CLAUDE_WIN, index=self.index)
+        self.assertEqual(copy.origin, "native")
+        self.assertEqual([p for p in stale if os.path.lexists(p)], [])
+        self.assertEqual([p for p in kept if not os.path.lexists(p)], [])
+
+    @unittest.skipIf(os.geteuid() == 0, "root can remove everything")
+    def test_a_staging_directory_that_cannot_be_removed_is_ignored(self):
+        stuck = self.make(f"{importer.STAGING_PREFIX}{dead_pid()}-1", 2 * self.HOUR)
+        os.chmod(stuck / "0", 0o500)
+        self.addCleanup(os.chmod, stuck / "0", 0o700)
+        then = time.time() - 2 * self.HOUR
+        os.utime(stuck, (then, then))
+        self.assertEqual(importer.sweep_staging(self.home / ".claude"), [])
+        copy = api.import_session(CLAUDE_WIN, index=self.index)     # and the import goes on
+        self.assertEqual(copy.origin, "native")
+        self.assertTrue(stuck.exists())
 
 
 class HelpersTest(unittest.TestCase):

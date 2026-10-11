@@ -675,6 +675,10 @@ order:
 - `{"$rewindTo": "<message id>"}`: removes that message and every later one (all of them if the
   id is unknown).
 
+Reader rule (ours, not the tool's): when metadata keys are merged, a `sessionId`, `projectHash`,
+`kind` or `summary` that is not a string and a `startTime` or `lastUpdated` that is not a time
+are left out, so a damaged record cannot replace a good value.
+
 | field | source | fallback |
 |---|---|---|
 | `id` | metadata `sessionId` | — (skip the file) |

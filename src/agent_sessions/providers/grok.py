@@ -14,7 +14,7 @@ from ..fsutil import home, listdir_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
 from .base import (NotSupported, Provider, Turn, clean_title, iter_jsonl, open_ro, parse_ts,
-                   warn)
+                   unreadable, warn)
 
 _SUMMARY = "summary.json"
 _CHAT = "chat_history.jsonl"
@@ -207,16 +207,23 @@ class Grok(Provider):
         sessions = Path(store.root) / "sessions"
         found: list[tuple[str, str, Path]] = []      # (group, name, dir)
         metas: list[tuple[Path, str]] = []           # (owning session dir, meta path)
-        for group in sorted(subdirs(sessions)):
+        try:
+            groups = sorted(subdirs(sessions))
+        except OSError as exc:
+            unreadable(sessions, exc)
+            groups = []
+        for group in groups:
             try:
                 names = sorted(subdirs(sessions / group))
-            except OSError:
+            except OSError as exc:
+                unreadable(sessions / group, exc)
                 continue
             for name in names:
                 session_dir = sessions / group / name
                 try:
                     entries = set(listdir_ro(session_dir))
-                except OSError:
+                except OSError as exc:
+                    unreadable(session_dir, exc)
                     continue
                 if _SUMMARY not in entries:
                     continue
@@ -225,7 +232,8 @@ class Grok(Provider):
                     continue
                 try:
                     children = sorted(subdirs(session_dir / _SUBAGENTS))
-                except OSError:
+                except OSError as exc:
+                    unreadable(session_dir / _SUBAGENTS, exc)
                     continue
                 metas += [(session_dir, str(session_dir / _SUBAGENTS / child / _META))
                           for child in children]

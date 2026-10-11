@@ -66,6 +66,24 @@ SKIP_RULES = (
     (None, ("tests", "fixtures"), "test fixtures"),
 )
 
+IN_PROJECT = "inside the agent-sessions project"
+
+
+def _project_root() -> str | None:
+    """The agent-sessions source tree this module runs from: the directory
+    that holds ``src/agent_sessions``, when it also holds ``tests/fixtures``.
+    None for an installed copy, which then skips nothing by this rule."""
+    package = Path(__file__).resolve().parent
+    if package.parent.name != "src":
+        return None
+    root = package.parent.parent
+    return str(root) if (root / "tests" / "fixtures").is_dir() else None
+
+
+# Stores below this directory are found and counted but not listed: fake
+# homes and copied fixtures left by the project's own tests and experiments.
+PROJECT_ROOT = _project_root()
+
 # Directories whose children are home directories, relative to a mount.
 HOME_PARENTS = ("Users", "home")
 
@@ -158,6 +176,8 @@ def _skip_reason(provider_name: str, root: str) -> str | None:
         if name in (None, provider_name) and any(
                 tuple(segments[i:i + len(run)]) == run for i in range(len(segments))):
             return reason
+    if PROJECT_ROOT and (root == PROJECT_ROOT or root.startswith(PROJECT_ROOT + os.sep)):
+        return IN_PROJECT
     return None
 
 

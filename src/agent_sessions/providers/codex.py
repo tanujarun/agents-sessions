@@ -12,7 +12,8 @@ from .. import importer
 from ..fsutil import home, listdir_ro, open_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
-from .base import NotSupported, Provider, Turn, clean_title, iter_jsonl, parse_ts, warn
+from .base import (NotSupported, Provider, Turn, clean_title, iter_jsonl, parse_ts,
+                   unreadable, warn)
 
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 # Groups: local time, thread id, segment id (or None), ".zst" (or None).
@@ -38,7 +39,8 @@ _CWD_KEYS = {
 def _subdirs(path) -> list[str]:
     try:
         return sorted(subdirs(path))
-    except OSError:
+    except OSError as exc:
+        unreadable(path, exc)
         return []
 
 
@@ -110,7 +112,8 @@ def _read(path: str, tools: bool = False) -> _Rollout:
             if payload.get("type") != "item_completed":
                 continue
             item = payload.get("item")
-            role = _ROLES.get(item.get("type")) if isinstance(item, dict) else None
+            role = item.get("type") if isinstance(item, dict) else None
+            role = _ROLES.get(role) if isinstance(role, str) else None
             if role == "user":
                 rollout.turns.append((ordinal, Turn(role, _item_text(item, " "), moment)))
             elif role == "assistant":
@@ -308,7 +311,8 @@ class Codex(Provider):
                     folder = os.path.join(sessions, year, month, day)
                     try:
                         names = listdir_ro(folder)
-                    except OSError:
+                    except OSError as exc:
+                        unreadable(folder, exc)
                         continue
                     for name in names:
                         match = _ROLLOUT.match(name)

@@ -178,6 +178,12 @@ def _scan(args) -> int:
 
 def _list(args) -> int:
     index = api.load_index()
+    if index.load_error is not None:
+        # No cache, or one that cannot be used: an empty listing would look
+        # like "no sessions". stdout stays the listing alone.
+        print(f"{PROG}: no usable cache; scanning…", file=sys.stderr)
+        api.scan()
+        index = api.load_index()
     sessions = api.list_sessions(args.provider, index=index)
     if args.json:
         _json([s.to_dict() for s in sessions])

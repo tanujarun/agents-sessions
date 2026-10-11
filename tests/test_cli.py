@@ -21,6 +21,7 @@ from support import Sandbox  # noqa: E402
 
 from agent_sessions import api, cli, launch  # noqa: E402
 from agent_sessions.fsutil import cache_file  # noqa: E402
+from agent_sessions.index import Index  # noqa: E402
 from agent_sessions.model import make_key  # noqa: E402
 
 
@@ -111,12 +112,45 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("invalid choice", err)
 
-    def test_list_without_an_index(self):
-        code, out, err = run("list")
-        self.assertEqual((code, out), (0, ""))
-        self.assertIn("no index yet", err)
-        self.assertEqual(run("list", "--json"), (0, "[]\n", ""))
+    NOTICE = "agent-sessions: no usable cache; scanning…\n"
+
+    def test_list_without_a_cache_scans_first(self):
+        """No cache file: `list` scans by itself and says so on stderr;
+        stdout is the listing a scan followed by `list` gives."""
         self.assertFalse(cache_file().exists())
+        self.assertEqual(Index.load().load_error, "missing")
+        self.assertEqual(api.load_index().sessions, [])     # the API itself does not scan
+        self.assertFalse(cache_file().exists())
+        code, out, err = run("list")
+        self.assertEqual((code, err), (0, self.NOTICE))
+        self.assertEqual([line.split()[0] for line in out.splitlines()], ["3h", "2d", "5w", "5w"])
+        self.assertTrue(cache_file().exists())
+        self.assertIsNone(Index.load().load_error)
+        self.assertEqual(run("list"), (0, out, ""))         # the cache is there now
+
+        cache_file().unlink()
+        code, as_json, err = run("list", "--json")
+        self.assertEqual((code, err), (0, self.NOTICE))
+        self.assertEqual([r["id"] for r in json.loads(as_json)], ["f1", "n1", "n2", "n2"])
+        self.assertEqual(run("list", "--json"), (0, as_json, ""))
+        self.assertNotIn("load_error", json.loads(cache_file().read_text(encoding="utf-8")))
+
+    def test_list_with_a_corrupt_cache_scans_first(self):
+        run("scan")
+        want = run("list")
+        want_json = run("list", "--json")
+        self.assertEqual((want[2], want_json[2]), ("", ""))
+        good = cache_file().read_text(encoding="utf-8")
+        for damage in ("{not json", "", "[]", good.replace('"version":1', '"version":0'),
+                       good[:len(good) // 2]):
+            for argv, expected in ((("list",), want), (("list", "--json"), want_json)):
+                with self.subTest(damage=damage[:20], argv=argv):
+                    cache_file().write_text(damage, encoding="utf-8")
+                    self.assertRegex(Index.load().load_error, r"^unreadable: .+")
+                    self.assertEqual(api.load_index().sessions, [])
+                    self.assertEqual(run(*argv), (0, expected[1], self.NOTICE))
+                    self.assertIsNone(Index.load().load_error)
+                    self.assertEqual(run(*argv), expected)
 
     def test_scan_json(self):
         code, out, err = run("scan", "--deep", "--json")
@@ -246,7 +280,7 @@ class SessionCommandsTest(unittest.TestCase):
     def test_open_foreign_fails_with_the_reason(self):
         for extra in ((), ("--dry-run",)):
             self.assertEqual(run("open", self.foreign_key, *extra), (
-                1, "", "agent-sessions: this session is on WinC; import it first\n"))
+                1, "", "agent-sessions: this session is on C:; import it first\n"))
         self.assertEqual(self.w.started, [])
         self.assertEqual(len(self.w.notified), 1)       # the real attempt only
 
@@ -331,7 +365,7 @@ class SessionCommandsTest(unittest.TestCase):
                 0, f"already imported: {native.key}\ndry run: nothing was written\n", ""))
         code, out, _ = run("list", "--keys")
         row = next(line for line in out.splitlines() if line.endswith(self.foreign_key))
-        self.assertRegex(row, r"^\S+\s+WinC · imported\s+claude\s+title-69\s+My Site\s+claude:")
+        self.assertRegex(row, r"^\S+\s+C: · imported\s+claude\s+title-69\s+My Site\s+claude:")
         self.assertEqual(run("open", self.foreign_key, "--dry-run"),
                          (0, self.command(CLAUDE_WIN, self.w.site), ""))
 
@@ -372,12 +406,12 @@ class SessionCommandsTest(unittest.TestCase):
                               "user:\ntext-25\n\nassistant:\ntext-26\n\n[tool: exec]\n\n"
                               "user:\ntext-146\n\nassistant:\ntext-151\n"),
             GROK_NATIVE: ("Grok", "Linux", None),
-            AGY_WIN: ("Antigravity", "WinC",
+            AGY_WIN: ("Antigravity", "C:",
                       "user:\ntext-3\n\n[tool: list_dir]\n\nassistant:\ntext-9\n\n"
                       "user:\ntext-11\n\nassistant:\ntext-12\n\n"
                       "user:\ntext-13\n\nassistant:\ntext-14\n"),
-            GEMINI_WIN: ("Gemini", "WinC", "user:\ntext-prompt-1\n\nassistant:\ntext-reply-1\n"),
-            CLAUDE_WIN: ("Claude", "WinC", "user:\ntext-65\n"),
+            GEMINI_WIN: ("Gemini", "C:", "user:\ntext-prompt-1\n\nassistant:\ntext-reply-1\n"),
+            CLAUDE_WIN: ("Claude", "C:", "user:\ntext-65\n"),
         }
         for session_id, (label, where, turns) in cases.items():
             with self.subTest(provider=label, where=where):

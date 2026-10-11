@@ -131,6 +131,70 @@ class PathMapTest(unittest.TestCase):
         self.assertEqual(pm.to_local(None, str(self.sys)), (None, False))
         self.assertEqual(pm.to_local("relative", str(self.sys)), (None, False))
 
+    def test_c_on_a_system_volume_with_no_evidence(self):
+        """Every folder recorded under C: is gone: a store on a Windows
+        system volume still means that volume."""
+        gone = [(r"C:\Users\arun\AppData\Local\Temp\gone", self.sys), ("C:\\", self.sys),
+                (r"c:\Old\Project", self.sys)]
+        pm = self.build(gone)
+        self.assertEqual(pm.letters(), [{
+            "letter": "C:", "source_mount": str(self.sys), "mount": str(self.sys),
+            "how": "system volume", "paths": 3}])
+        self.assertEqual(pm.unresolved(), [])
+        self.assertEqual(pm.letter_for_mount(str(self.sys)), "C:")
+        self.assertEqual(pm.letter_for_mount(self.mounts[0], str(self.sys)), "C:")
+        self.assertIsNone(pm.letter_for_mount(str(self.data)))
+        # a folder that is gone stays unmapped; one that exists maps
+        self.assertEqual(pm.to_local(r"C:\Old\Project", str(self.sys)), (None, False))
+        self.assertEqual(pm.to_local(r"C:\Users\arun", str(self.sys)),
+                         (str(self.sys / "Users" / "arun"), True))
+
+    def test_c_with_no_evidence_elsewhere_stays_unresolved(self):
+        gone = r"C:\Old\Project"
+        # the store is not on a system volume
+        for source in (self.data, self.empty):
+            pm = self.build([(gone, source)])
+            self.assertEqual(pm.letters(), [])
+            self.assertEqual(pm.unresolved(), [{
+                "letter": "C:", "source_mount": str(source), "reason": "no evidence",
+                "candidates": [], "paths": 1}])
+            self.assertIsNone(pm.letter_for_mount(str(source)))
+        # only C:
+        for letter in ("D", "E", "Z"):
+            pm = self.build([(gone.replace("C", letter, 1), self.sys)])
+            self.assertEqual((pm.letters(), [u["reason"] for u in pm.unresolved()]),
+                             ([], ["no evidence"]))
+        # Users/ without Windows/ is not a system volume
+        (self.data / "Users").mkdir()
+        pm = self.build([(gone, self.data)])
+        self.assertEqual([u["reason"] for u in pm.unresolved()], ["no evidence"])
+
+    def test_c_with_ambiguous_or_other_evidence_is_left_alone(self):
+        # evidence that points at two mounts: ambiguous, as before
+        (self.empty / "Only Here").mkdir()
+        (self.data / "Only There").mkdir()
+        pm = self.build([(r"C:\Only Here", self.sys), (r"C:\Only There", self.sys)])
+        self.assertEqual([(u["letter"], u["reason"], u["candidates"]) for u in pm.unresolved()],
+                         [("C:", "ambiguous", sorted([str(self.data), str(self.empty)]))])
+        self.assertEqual(pm.letters(), [])
+        self.assertIsNone(pm.letter_for_mount(str(self.sys)))
+        # a folder two other mounts share: ambiguous too
+        (self.empty / "Shared").mkdir()
+        (self.data / "Shared").mkdir()
+        pm = self.build([(r"C:\Shared", self.sys), (r"C:\gone", self.sys)])
+        self.assertEqual([(u["reason"], u["candidates"]) for u in pm.unresolved()],
+                         [("ambiguous", sorted([str(self.data), str(self.empty)]))])
+        # evidence that points elsewhere wins over the rule
+        pm = self.build([(r"C:\AI Projects", self.sys), (r"C:\gone", self.sys)])
+        self.assertEqual([(r["letter"], r["mount"], r["how"]) for r in pm.letters()],
+                         [("C:", str(self.data), "evidence")])
+        # and so does an override
+        pm = self.build([(r"C:\gone", self.sys)], overrides={"C:": str(self.empty)})
+        self.assertEqual([(r["letter"], r["mount"], r["how"]) for r in pm.letters()],
+                         [("C:", str(self.empty), "override")])
+        self.assertEqual(pm.letter_for_mount(str(self.empty)), "C:")
+        self.assertIsNone(pm.letter_for_mount(str(self.sys)))
+
     def test_ambiguous_letter_stays_unmapped(self):
         (self.empty / "Shared" / "Proj").mkdir(parents=True)
         (self.data / "Shared" / "Proj").mkdir(parents=True)

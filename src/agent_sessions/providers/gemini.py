@@ -12,7 +12,7 @@ from ..fsutil import home, listdir_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
 from .base import (NotSupported, Provider, Turn, clean_title, iter_jsonl, open_ro,
-                   parse_ts, warn)
+                   parse_ts, unreadable, warn)
 
 # The verdict of FORMATS section 6, shown to the user as it is.
 IMPORT_UNSAFE = ("Gemini CLI is not installed on this machine, and no resumable Gemini "
@@ -86,6 +86,19 @@ def _is_resumable(message: dict) -> bool:
     return False
 
 
+# Metadata keys this reader uses. A value of another type than text (or one
+# that is not a time, for the two times) is left out of a merge, so it cannot
+# replace a good one.
+_META_TEXT = ("sessionId", "projectHash", "kind", "summary")
+_META_TIME = ("startTime", "lastUpdated")
+
+
+def _usable_meta(patch: dict) -> dict:
+    return {key: value for key, value in patch.items()
+            if (key not in _META_TEXT or isinstance(value, str))
+            and (key not in _META_TIME or parse_ts(value) is not None)}
+
+
 def _is_message(record) -> bool:
     return isinstance(record, dict) and isinstance(record.get("id"), str)
 
@@ -120,10 +133,10 @@ def apply_records(records) -> tuple[dict, list[dict]]:
             if isinstance(patch.get("messages"), list):
                 messages.clear()
                 messages.update((m["id"], m) for m in patch["messages"] if _is_message(m))
-            meta.update(patch)
+            meta.update(_usable_meta(patch))
         elif (isinstance(record.get("sessionId"), str)
               and isinstance(record.get("projectHash"), str)):
-            meta.update(record)
+            meta.update(_usable_meta(record))
             if isinstance(record.get("messages"), list):
                 messages.update((m["id"], m) for m in record["messages"] if _is_message(m))
     return meta, list(messages.values())
@@ -208,11 +221,17 @@ class Gemini(Provider):
         """
         root = Path(store.root)
         out = []
-        for slug in sorted(subdirs(root / "tmp")):
+        try:
+            slugs = sorted(subdirs(root / "tmp"))
+        except OSError as exc:
+            unreadable(root / "tmp", exc)
+            slugs = []
+        for slug in slugs:
             chats = root / "tmp" / slug / "chats"
             try:
                 names = sorted(n for n in listdir_ro(chats) if _CHAT_NAME.match(n))
-            except OSError:
+            except OSError as exc:
+                unreadable(chats, exc)
                 continue
             groups: dict[str, list[str]] = {}
             for name in names:
