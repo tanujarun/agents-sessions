@@ -19,7 +19,8 @@
 - `src/agent_sessions/importer.py` — copy a foreign session into the native store
 - `src/agent_sessions/launch.py` — build and run the resume command (platform layer)
 - `src/agent_sessions/cli.py` — argparse entry, all subcommands
-- `menu/` — Menu.qml provider snippet, JSONC rows, `apply.sh`
+- `src/agent_sessions/tui.py` — curses front end; view logic in pure functions
+- `share/agent-sessions.desktop` — desktop launcher for the TUI
 - `tests/` — unittest suites
 - `tests/__init__.py` — puts `src` on `sys.path`
 - `tests/test_smoke.py` — imports, CLI skeleton, `make_key`

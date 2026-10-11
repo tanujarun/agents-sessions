@@ -29,7 +29,7 @@ Verify: orchestrator spot-checks claims against the real files.
 ## 3. Core: mounts, discovery, path map, index, CLI — Careful — after: 2 — [ ]
 
 Implement `model`, `mounts`, `discover`, `pathmap`, `index`, and the CLI
-commands `scan`, `list`, `status`, `verify`, `menu` against the adapter
+commands `scan`, `list`, `status`, `verify` against the adapter
 contract (adapters may still be stubs; use a fake provider in tests). All of
 SPEC "Discovery", "Read-only rule", "Path map" and the determinism rule.
 Verify: unit tests with temp-dir fake mounts (spaces in names, unreadable dir,
@@ -54,26 +54,27 @@ Verify: counts against the real stores; no `-wal`/`-shm` created on any drive.
 
 `launch.py`, `importer.py`, `import_session` in each adapter, CLI `open`,
 `import`, `show`. All SPEC "Launch" and "Import" rules; `NotSupported` with a
-reason where FORMATS.md says import is unsafe. No model calls and no
+reason where FORMATS.md says import is unsafe. Remove the stubbed `menu` subcommand. No model calls and no
 interactive tool launches during the task: verify by the scanner listing the
 imported copy as native and launchable, and by dry-run printing of the launch
 command (`open --dry-run`). Imports during testing go to a temp native store
 (env override), never the real one.
 Verify: tests for idempotence, no-overwrite, atomic write, provenance.
 
-## 6. Menu integration — Careful — after: 4a, 4b (parallel with 5) — [ ]
+## 6. TUI front end — Careful — after: 5 — [ ]
 
-SPEC "Menu surface": JSONC rows in `~/.config/omarchy/extensions/omarchy-menu.jsonc`,
-provider specs + optional description/icon columns in
-`~/.config/omarchy/plugins/tanuj.menu/Menu.qml` (back both up first), the
-foreign-row chooser. Sources kept in `menu/` with an `apply.sh`. Shell restart
-only through `~/.claude/skills/qswidget-des/scripts/guarded-restart.sh`. No
-synthetic input into the user's session; test by summoning the route and
-screenshotting.
-Verify: existing providers (fonts, webapps, power-profiles) unchanged; the
-five session submenus fill.
+`tui.py` per SPEC "TUI": layout, keys, foreign-row prompt, built-in transcript
+pager, background scan thread, resize handling, terminal always restored.
+`agent-sessions` with no subcommand on a tty opens it. `share/agent-sessions.desktop`
+plus the install step. The TUI calls engine functions only. Keep the view
+logic (row formatting, column fitting, filtering, selection-by-key) in pure
+functions that are unit-tested without curses.
+Verify: unit tests for the pure functions; a scripted run inside a `pty` at
+several sizes (120x40, 80x24, 40x10) that sends keys and asserts on the
+screen text, including an empty index and a resize; no real launch (the
+launcher is injected and recorded).
 
-## 7. Ground-truth audit — Medium — after: 5, 6 — [ ]
+## 7. Ground-truth audit — Medium — after: 5 — [ ]
 
 An independent check that does not import the package: a throwaway script
 that brute-force walks every mount and counts session files per provider by

@@ -4,7 +4,8 @@
 
 One place that finds every saved AI coding-agent session on this machine, on
 every mounted drive, lists them per provider, and resumes one in a terminal.
-Entry point is the Omarchy SAO menu (`tanuj.menu`). Function first; looks later.
+The interface is a full-screen terminal app (TUI) in the manner of btop or the
+agent CLIs themselves. Function first; looks later.
 
 Definition of "session": one resumable conversation saved on disk by an agent
 CLI (a Claude Code transcript, a Codex rollout, a Grok session folder, an
@@ -12,7 +13,8 @@ Antigravity conversation, a Gemini CLI chat).
 
 ## Non-goals (this phase)
 
-- Visual design of the menu rows beyond readable text.
+- Visual polish of the TUI beyond a clear, readable layout.
+- Any change to the Omarchy shell or the SAO menu (`tanuj.menu`).
 - Readers for opencode, cursor-agent, copilot, crush: installed, but no session
   exists on any drive to test against. `status` reports them as "no reader".
 - Resuming a session in place inside a store on another drive.
@@ -22,8 +24,7 @@ Antigravity conversation, a Gemini CLI chat).
 ## Stack
 
 Python 3 (system is 3.14; code must run on 3.11+), **standard library only**.
-Tests with `unittest`. Menu glue is QML/JS inside the existing `tanuj.menu`
-plugin plus one JSONC entry. No daemon.
+Tests with `unittest`. The TUI uses stdlib `curses` and nothing else. No daemon.
 
 ## Facts already established (2026-10-12)
 
@@ -64,8 +65,9 @@ src/agent_sessions/
   importer.py     copy a foreign session into the native store
   launch.py       build and run the resume command (platform layer)
   cli.py          argparse entry
+  tui.py          the curses front end; the only module that imports curses
 bin/agent-sessions   thin launcher (symlinked to ~/.local/bin by install.sh)
-menu/                the Menu.qml provider snippet + JSONC rows + apply script
+share/               agent-sessions.desktop (installed by install.sh)
 tests/               unittest; fixtures are sanitised real files
 ```
 
@@ -166,17 +168,17 @@ tool needs it to resume. Rules: never overwrite an existing native session;
 idempotent (a second import reports the existing copy); source untouched;
 provenance appended to `~/.local/state/agent-sessions/imports.json`; the copy
 is written to a temp name and renamed into place. A provider whose format
-cannot be imported safely raises `NotSupported` with the reason, and the menu
+cannot be imported safely raises `NotSupported` with the reason, and the TUI
 shows that reason. After import the foreign row shows as imported and the
 native copy is launchable.
 
 ### CLI contract
 
 ```
+agent-sessions [tui]                           open the TUI (default when run with no subcommand on a terminal)
 agent-sessions scan [--deep] [--json]          refresh index; print summary
 agent-sessions list [--provider P] [--json]    sessions, newest first
-agent-sessions menu <provider>                 TSV rows for the menu (below)
-agent-sessions open <key> [--dry-run]          native: resume. foreign: chooser. --dry-run prints the command
+agent-sessions open <key> [--dry-run]          native: resume. foreign: exit 1 with "import first". --dry-run prints the command
 agent-sessions import <key> [--open]           import; optionally resume after
 agent-sessions show <key>                      plain-text transcript to stdout
 agent-sessions status                          mounts, stores, counts per provider,
@@ -184,46 +186,86 @@ agent-sessions status                          mounts, stores, counts per provid
 agent-sessions verify                          compare index against a brute-force walk; exit 1 on mismatch
 ```
 
-`menu <provider>` prints one row per session, tab separated:
-`label \t key \t "" \t description \t icon`. It must return in under 300 ms
-from the cache and start a background `scan` when the cache is stale. Exit
-codes: 0 ok, 1 failure, 2 usage.
+Exit codes: 0 ok, 1 failure, 2 usage. The engine functions behind these
+commands are importable; the TUI calls them directly, not through a subprocess.
 
-## Menu surface (function-first)
+## TUI (function-first)
+
+Started by `agent-sessions` with no arguments, or from the desktop launcher
+(`share/agent-sessions.desktop`, which runs
+`omarchy-launch-tui --app-id=org.omarchy.sessions agent-sessions`).
 
 ```
-Menu root
-└─ Sessions                      (extensions/omarchy-menu.jsonc: "sessions")
-   ├─ Claude        ▸  provider "sessions-claude"
-   ├─ Codex         ▸  provider "sessions-codex"
-   ├─ Grok          ▸  provider "sessions-grok"
-   ├─ Antigravity   ▸  provider "sessions-antigravity"
-   ├─ Gemini        ▸  provider "sessions-gemini"
-   └─ Rescan drives     action: agent-sessions scan --deep (notifies when done)
+ agent-sessions                         5 drives · 63 sessions · scanned 2m ago
+ 1 Claude 41 │ 2 Codex 5 │ 3 Grok 22 │ 4 Antigravity 3 │ 5 Gemini 4 │ 0 All
+────────────────────────────────────────────────────────────────────────────────
+ TITLE                                   PROJECT          AGE   WHERE
+▸Fix the first-open lag in the menu      tanuj            2d    Linux
+ Portfolio landing page hero             Website Works    5d    Linux
+ Pill content site copy pass             Pill Content     3w    C: (Windows)
+ Lead generation scraper                 Lead Generation  2mo   C: · imported
+ …
+────────────────────────────────────────────────────────────────────────────────
+ id       0c7e…                      messages 214     updated 2026-10-10 17:58
+ cwd      F:\AI Projects\Website Works
+ local    /run/media/tanuj/Zephyro/AI Projects/Website Works   (exists)
+ store    /run/media/tanuj/22EEA841EEA80F5B/Users/arunt/.claude
+────────────────────────────────────────────────────────────────────────────────
+ ↑↓ move  ←→ provider  Enter resume  o resume, keep open  i import  v view
+ / filter  r rescan  R full rescan  ? help  q quit
 ```
 
-Row inside a provider: label `<title>  ·  <project folder>  ·  <age>`;
-description (shown while searching) `<full cwd>  ·  <drive label or "Linux">`.
-Native rows use the provider glyph; foreign rows use a drive glyph and end with
-`  ·  <drive label>`; imported foreign rows end with `  ·  imported`.
-Order: newest first, native and foreign mixed. Empty provider: one inert row
-`No sessions found`.
+Regions, top to bottom: status line; provider tabs with counts (`0` = all
+providers); column header; session list (scrolls, selection bar); detail pane
+for the selected row; key hints. Below 80 columns the PROJECT column goes
+first, then the detail pane; never crash on a small or resized terminal.
 
-Activating a native row resumes it. Activating a foreign row opens a chooser
-(Omarchy's own picker) with: `Import to Linux and resume`, `Import to Linux`,
-`View transcript`. `View transcript` opens `agent-sessions show` in a terminal
-pager.
+Rows: newest first, native and foreign mixed. WHERE is `Linux` for native
+sessions, the drive (letter when known, else mount label) for foreign ones,
+plus `· imported` once imported. Foreign rows are dimmed. Empty provider: one
+centred line `No sessions found`.
 
-Menu.qml change is limited to: the five provider specs, and letting provider
-rows carry the optional 4th (description) and 5th (icon) TSV columns. Existing
-providers must behave exactly as before.
+Keys:
+
+| Key | Action |
+|---|---|
+| `↑` `↓` `k` `j`, PgUp/PgDn, Home/End, `g`/`G` | move selection |
+| `←` `→` `h` `l`, Tab/Shift-Tab, `1`-`5`, `0` | switch provider |
+| Enter | native: resume in a new terminal window with the tool's own app-id, in the session's directory, then quit the TUI. Foreign: open the prompt below |
+| `o` | same as Enter but the TUI stays open |
+| `i` | foreign: import to Linux (asks `y/n` first); status line reports the result |
+| `v` | view the transcript in a built-in scrolling pager (`q`/Esc returns) |
+| `/` | filter the current list by substring over title, project and cwd; Esc clears |
+| `r` | quick rescan (known stores); `R` full rescan of every drive |
+| `?` | key help overlay |
+| `q`, Ctrl-C | quit |
+
+Foreign-row prompt (one line over the key hints):
+`On <drive>: [i] import and resume  [I] import only  [v] view  [Esc] cancel`.
+A foreign session already imported resumes its native copy on Enter.
+
+Behaviour:
+
+- Start shows the cached index at once, then runs a quick scan in a background
+  thread and refreshes the list in place, keeping the selection on the same
+  session key. A full rescan shows progress in the status line (`scanning
+  Zephyro… 41k dirs`) and can be cancelled with Esc.
+- No blocking work on the UI thread; the input loop polls with a timeout.
+- Errors (cwd gone, tool not installed, import refused) appear in the status
+  line in plain words; the TUI never exits on an error.
+- The terminal is always restored on exit, including on an exception.
+
+The TUI holds no logic of its own: lists, filters, import and launch are
+engine calls, so another front end can replace it.
 
 ## Portability (Windows variant later)
 
 Core modules (`model`, `discover`, `pathmap`, `index`, `providers`, `importer`,
 `cli`) use `pathlib`/`os` only, no POSIX-only calls, no shelling out. Everything
 platform-specific sits behind `mounts.py` and `launch.py`, each a small
-interface with a Linux implementation. Path mapping is written direction-neutral
+interface with a Linux implementation. `tui.py` is the only curses user and no
+engine module imports it (Windows needs the `windows-curses` package or a
+different front end). Path mapping is written direction-neutral
 (foreign <-> local), so Windows can map `/home/tanuj/...` the other way.
 
 ## Definition of done (this phase)
@@ -231,10 +273,10 @@ interface with a Linux implementation. Path mapping is written direction-neutral
 1. `agent-sessions scan --deep` finds every store on every mounted drive;
    `verify` passes; two consecutive scans give identical `list --json`.
 2. Counts match an independent brute-force count for each provider.
-3. Every native session of the five providers resumes from the menu in its
+3. Every native session of the five providers resumes from the TUI in its
    project directory.
 4. A foreign Claude and a foreign Codex session import and then resume on
    Linux; other providers import or state exactly why not.
 5. Unmounting a drive, an unreadable folder or a corrupt session file does not
    break listing.
-6. Unit tests pass; the menu's existing entries work as before.
+6. Unit tests pass; the TUI survives resize, an empty index and a missing drive.
