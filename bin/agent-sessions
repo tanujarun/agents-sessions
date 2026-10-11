@@ -1,12 +1,43 @@
 #!/usr/bin/env python3
-"""Launcher: put <repo>/src on sys.path and run the CLI. No logic here."""
+"""Launcher: put <repo>/src on sys.path and run the CLI. No logic here.
 
+The TUI (no arguments on a terminal, or `tui` first) needs Textual, which
+lives in <repo>/.venv: for that case only, re-execute under the venv's
+Python. Every other subcommand stays on the system Python.
+"""
+
+import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+REPO = Path(__file__).resolve().parent.parent
+SRC = str(REPO / "src")
 
-from agent_sessions.cli import main  # noqa: E402
+
+def wants_tui(argv) -> bool:
+    if argv:
+        return argv[0] == "tui"
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def run_tui(argv) -> int:
+    for python in (REPO / ".venv" / "bin" / "python", REPO / ".venv" / "Scripts" / "python.exe"):
+        if python.is_file():
+            env = dict(os.environ)
+            env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC, env.get("PYTHONPATH")]))
+            command = [str(python), "-m", "agent_sessions.tui", *argv]
+            os.execve(command[0], command, env)
+    # No venv: this Python will do if it has Textual; if not, the TUI says
+    # how to install it and exits 1.
+    sys.path.insert(0, SRC)
+    from agent_sessions.tui.__main__ import main
+    return main(argv)
+
 
 if __name__ == "__main__":
+    args = sys.argv[1:]
+    if wants_tui(args):
+        sys.exit(run_tui(args[1:]))
+    sys.path.insert(0, SRC)
+    from agent_sessions.cli import main
     sys.exit(main())

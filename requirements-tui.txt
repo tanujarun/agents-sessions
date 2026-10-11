@@ -1,0 +1,2 @@
+# The TUI's only dependency, pinned. install.sh installs it into ./.venv.
+textual==8.2.8

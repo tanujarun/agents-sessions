@@ -9,7 +9,9 @@ Textual, from the project `.venv` (`./install.sh` creates it).
   need `.venv/bin/python` and skip themselves when Textual is absent
 - Lint: `make lint` (`python3 -m compileall -q src tests`)
 - Run: `bin/agent-sessions` (TUI) or `bin/agent-sessions <scan|list|open|import|show|status|verify>`
-- Install: `./install.sh` (symlinks into `~/.local/bin`)
+- TUI tests: `make test-tui` (needs `.venv`; about 80 s)
+- Install: `./install.sh` (creates `.venv` with Textual, symlinks into
+  `~/.local/bin`, installs the desktop launcher)
 
 ## Rules
 

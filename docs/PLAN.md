@@ -61,7 +61,7 @@ command (`open --dry-run`). Imports during testing go to a temp native store
 (env override), never the real one.
 Verify: tests for idempotence, no-overwrite, atomic write, provenance.
 
-## 6. TUI front end — Careful — after: 4a, 4b — [~]
+## 6. TUI front end — Careful — after: 4a, 4b — [x]
 
 `tui/` (Textual) per SPEC "TUI" and "Stack": layout, keys, foreign-row prompt,
 built-in transcript pager, scans in workers, resize handling, all styling in

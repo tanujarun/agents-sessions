@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Agent Sessions
+Comment=Find and resume saved AI coding-agent sessions
+Exec=omarchy-launch-tui --app-id=org.omarchy.sessions agent-sessions
+Terminal=false
+Icon=utilities-terminal
+Categories=Utility;

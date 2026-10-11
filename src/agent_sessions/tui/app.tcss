@@ -1,0 +1,305 @@
+/* agent-sessions: every colour, border and spacing value of the TUI.
+ *
+ * Function-first: plain and readable, nothing decorative. Restyle here; the
+ * Python side holds no style and reads the spacing it needs for fitting
+ * (cell padding, tab padding, gutters) back from these rules.
+ *
+ * Colours are the terminal's own: `ansi_default` and the sixteen `ansi_*`
+ * names, with `dim`, `bold` and `reverse`. No hex values.
+ *
+ * Widget tree:
+ *   MainScreen#main                (.-narrow below 80 columns, .-compact when
+ *                                   the detail pane is dropped)
+ *     #statusbar > #status-message (.-info | .-error), #status-summary (.-busy)
+ *     #tabs > TabLabel.tab#tab-<provider> (.-active), #tab-all
+ *     #header                      column headings
+ *     SessionList#list             component classes below
+ *     #detail > .detail-row > .detail-label, .detail-value#detail-<field>
+ *     #prompt                      foreign-row prompt, import y/n
+ *     #filterbar > #filter-label, Input#filter
+ *     #hints
+ *   HelpScreen > #help > #help-title, #help-text, #help-hint
+ *   TranscriptScreen#pager > #pager-title, TranscriptView#pager-body,
+ *                            #pager-footer > #pager-hints, #pager-status (.-error)
+ */
+
+Screen {
+    background: ansi_default;
+    color: ansi_default;
+}
+
+/* --- status line --------------------------------------------------------- */
+
+#statusbar {
+    height: 1;
+}
+
+#status-message {
+    width: 1fr;
+    height: 1;
+    padding: 0 1;
+    text-style: bold;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+#status-message.-info {
+    text-style: none;
+}
+
+#status-message.-error {
+    color: ansi_red;
+    text-style: none;
+}
+
+#status-summary {
+    width: auto;
+    height: 1;
+    padding: 0 1;
+    text-wrap: nowrap;
+}
+
+/* --- provider tabs --------------------------------------------------------- */
+
+#tabs {
+    height: 1;
+}
+
+.tab {
+    width: auto;
+    height: 1;
+    padding: 0 1;
+    text-wrap: nowrap;
+}
+
+.tab.-active {
+    text-style: bold reverse;
+}
+
+/* --- list ------------------------------------------------------------------- */
+
+#header {
+    height: 2;
+    text-style: bold;
+    text-wrap: nowrap;
+    border-top: solid ansi_default;
+}
+
+#list {
+    height: 1fr;
+    overflow-x: hidden;
+    scrollbar-size-vertical: 1;
+    scrollbar-color: ansi_default;
+    scrollbar-color-hover: ansi_default;
+    scrollbar-color-active: ansi_default;
+    scrollbar-background: ansi_default;
+    scrollbar-background-hover: ansi_default;
+    scrollbar-background-active: ansi_default;
+}
+
+/* Padding of every cell: left + right of neighbours is the column spacing. */
+#list > .session-list--cell {
+    padding: 0 1;
+}
+
+#list > .session-list--foreign {
+    text-style: dim;
+}
+
+#list > .session-list--cursor {
+    text-style: reverse;
+}
+
+#list > .session-list--empty {
+    text-style: dim;
+}
+
+/* --- detail pane -------------------------------------------------------------- */
+
+#detail {
+    height: auto;
+    border-top: solid ansi_default;
+}
+
+.detail-row {
+    height: 1;
+}
+
+.detail-label {
+    width: 10;
+    height: 1;
+    padding: 0 1;
+    text-style: dim;
+}
+
+.detail-value {
+    width: 1fr;
+    height: 1;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+#detail-row-main > .detail-value {
+    width: auto;
+    padding: 0 3 0 0;
+}
+
+/* The id gives way (with an ellipsis) so messages and updated always fit. */
+#detail-row-main > #detail-id {
+    width: 1fr;
+    min-width: 6;
+}
+
+/* --- prompt, filter, hints ------------------------------------------------------- */
+
+#prompt {
+    height: 1;
+    padding: 0 1;
+    text-style: bold;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+#filterbar {
+    height: 1;
+}
+
+#filter-label {
+    width: auto;
+    height: 1;
+    padding: 0 0 0 1;
+    text-style: bold;
+}
+
+#filter {
+    width: 1fr;
+    height: 1;
+    border: none;
+    padding: 0 1;
+    background: ansi_default;
+    color: ansi_default;
+}
+
+#filter:focus {
+    border: none;
+}
+
+#hints {
+    height: auto;
+    padding: 0 1;
+    text-style: dim;
+    text-wrap: nowrap;
+    border-top: solid ansi_default;
+}
+
+/* A short terminal keeps its rows for the list. */
+#main.-compact #header,
+#main.-compact #hints {
+    border-top: none;
+}
+
+#main.-compact #header {
+    height: 1;
+}
+
+/* --- help overlay ------------------------------------------------------------------ */
+
+HelpScreen {
+    background: ansi_default;
+    align: center middle;
+}
+
+#help {
+    width: auto;
+    max-width: 100%;
+    height: auto;
+    max-height: 100%;
+    padding: 0 1;
+    border: solid ansi_default;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-size-vertical: 1;
+    scrollbar-color: ansi_default;
+    scrollbar-color-hover: ansi_default;
+    scrollbar-color-active: ansi_default;
+    scrollbar-background: ansi_default;
+    scrollbar-background-hover: ansi_default;
+    scrollbar-background-active: ansi_default;
+}
+
+#help-title, #help-text, #help-hint {
+    width: auto;
+}
+
+#help-title {
+    text-style: bold;
+    margin: 0 0 1 0;
+}
+
+#help-hint {
+    text-style: dim;
+    margin: 1 0 0 0;
+}
+
+/* --- transcript pager ---------------------------------------------------------------- */
+
+#pager-title {
+    height: 1;
+    padding: 0 1;
+    text-style: bold;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+#pager-body {
+    height: 1fr;
+    padding: 0 1;
+    scrollbar-gutter: stable;   /* no re-wrap when the scrollbar appears */
+    border-top: solid ansi_default;
+    border-bottom: solid ansi_default;
+    overflow-x: hidden;
+    scrollbar-size-vertical: 1;
+    scrollbar-color: ansi_default;
+    scrollbar-color-hover: ansi_default;
+    scrollbar-color-active: ansi_default;
+    scrollbar-background: ansi_default;
+    scrollbar-background-hover: ansi_default;
+    scrollbar-background-active: ansi_default;
+}
+
+#pager-body > .transcript--role-user {
+    text-style: bold reverse;
+}
+
+#pager-body > .transcript--role-assistant {
+    text-style: bold;
+}
+
+#pager-body > .transcript--role-tool,
+#pager-body > .transcript--note {
+    text-style: dim;
+}
+
+#pager-footer {
+    height: 1;
+}
+
+#pager-hints {
+    width: 1fr;
+    height: 1;
+    padding: 0 1;
+    text-style: dim;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+#pager-status {
+    width: auto;
+    height: 1;
+    padding: 0 1;
+    text-wrap: nowrap;
+}
+
+#pager-status.-error {
+    color: ansi_red;
+}
