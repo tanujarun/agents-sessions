@@ -1,7 +1,7 @@
 # File map
 
 - `CLAUDE.md` — rules and commands for every agent working here
-- `docs/SPEC.md` — goals, architecture, CLI contract, menu surface
+- `docs/SPEC.md` — goals, architecture, CLI contract, TUI
 - `docs/PLAN.md` — task list and status
 - `docs/FORMATS.md` — per-provider on-disk formats and resume commands (task 2)
 - `bin/agent-sessions` — launcher script; no logic
@@ -19,7 +19,7 @@
 - `src/agent_sessions/importer.py` — copy a foreign session into the native store
 - `src/agent_sessions/launch.py` — build and run the resume command (platform layer)
 - `src/agent_sessions/cli.py` — argparse entry, all subcommands
-- `src/agent_sessions/tui.py` — curses front end; view logic in pure functions
+- `src/agent_sessions/tui/` — Textual front end: `app.py`, `view.py` (pure view logic), `app.tcss` (all styling)
 - `share/agent-sessions.desktop` — desktop launcher for the TUI
 - `tests/` — unittest suites
 - `tests/__init__.py` — puts `src` on `sys.path`

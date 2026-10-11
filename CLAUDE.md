@@ -1,10 +1,12 @@
 # agent-sessions
 
-Python 3.11+, standard library only. No third-party imports, no pip.
+Python 3.11+. Engine: standard library only. TUI (`src/agent_sessions/tui/`):
+Textual, from the project `.venv` (`./install.sh` creates it).
 
 ## Commands
 
-- Test: `make test` (`python3 -m unittest discover -s tests -v`)
+- Test: `make test` (`python3 -m unittest discover -s tests -v`); TUI tests
+  need `.venv/bin/python` and skip themselves when Textual is absent
 - Lint: `make lint` (`python3 -m compileall -q src tests`)
 - Run: `bin/agent-sessions` (TUI) or `bin/agent-sessions <scan|list|open|import|show|status|verify>`
 - Install: `./install.sh` (symlinks into `~/.local/bin`)
@@ -23,8 +25,8 @@ Python 3.11+, standard library only. No third-party imports, no pip.
   `claude -p`, `codex exec`, …). `--help` and `--version` are fine.
 - Do not send keyboard or mouse input to the desktop session.
 - Platform-specific code only in `mounts.py` and `launch.py`; everything else
-  must also run on Windows later (pathlib, no shelling out). `curses` is
-  imported only in `tui.py`, and no engine module imports `tui`.
+  must also run on Windows later (pathlib, no shelling out). `textual` is
+  imported only under `tui/`, and no engine module imports `tui`.
 - Formats come from `docs/FORMATS.md`. If the files disagree with it, fix the
   doc in the same change; never guess a field.
 - Output order is deterministic: sort everything you emit.

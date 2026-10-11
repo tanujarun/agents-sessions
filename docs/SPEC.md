@@ -23,8 +23,12 @@ Antigravity conversation, a Gemini CLI chat).
 
 ## Stack
 
-Python 3 (system is 3.14; code must run on 3.11+), **standard library only**.
-Tests with `unittest`. The TUI uses stdlib `curses` and nothing else. No daemon.
+Python 3 (system is 3.14; code must run on 3.11+). The engine (everything but
+`tui/`) is **standard library only** and runs on the system Python. The TUI
+uses **Textual** (cross-platform, styleable, so the later look-and-feel work
+and the Windows variant build on it), installed by `install.sh` into a
+project-local `.venv`; nothing is installed system-wide. Tests with `unittest`
+(TUI tests use Textual's headless `run_test()` pilot). No daemon.
 
 ## Facts already established (2026-10-12)
 
@@ -65,7 +69,8 @@ src/agent_sessions/
   importer.py     copy a foreign session into the native store
   launch.py       build and run the resume command (platform layer)
   cli.py          argparse entry
-  tui.py          the curses front end; the only module that imports curses
+  tui/            the Textual front end (app.py, view.py, app.tcss); the only
+                  package that imports textual
 bin/agent-sessions   thin launcher (symlinked to ~/.local/bin by install.sh)
 share/               agent-sessions.desktop (installed by install.sh)
 tests/               unittest; fixtures are sanitised real files
@@ -194,6 +199,9 @@ commands are importable; the TUI calls them directly, not through a subprocess.
 Started by `agent-sessions` with no arguments, or from the desktop launcher
 (`share/agent-sessions.desktop`, which runs
 `omarchy-launch-tui --app-id=org.omarchy.sessions agent-sessions`).
+`bin/agent-sessions` re-executes itself under `.venv/bin/python` for the TUI
+when the venv exists; if Textual is missing it says how to install it and
+exits 1. Every other subcommand runs on the system Python with no venv.
 
 ```
  agent-sessions                         5 drives · 63 sessions · scanned 2m ago
@@ -250,22 +258,25 @@ Behaviour:
   thread and refreshes the list in place, keeping the selection on the same
   session key. A full rescan shows progress in the status line (`scanning
   Zephyro… 41k dirs`) and can be cancelled with Esc.
-- No blocking work on the UI thread; the input loop polls with a timeout.
+- No blocking work on the UI thread; scans, imports and transcript loads run
+  in Textual workers.
 - Errors (cwd gone, tool not installed, import refused) appear in the status
   line in plain words; the TUI never exits on an error.
 - The terminal is always restored on exit, including on an exception.
 
 The TUI holds no logic of its own: lists, filters, import and launch are
-engine calls, so another front end can replace it.
+engine calls, so another front end can replace it. All colours, borders and
+spacing live in `tui/app.tcss`, none in Python, so the look can be reworked
+later without touching behaviour. Mouse works too: click a tab or row, wheel
+scrolls, double-click resumes.
 
 ## Portability (Windows variant later)
 
 Core modules (`model`, `discover`, `pathmap`, `index`, `providers`, `importer`,
 `cli`) use `pathlib`/`os` only, no POSIX-only calls, no shelling out. Everything
 platform-specific sits behind `mounts.py` and `launch.py`, each a small
-interface with a Linux implementation. `tui.py` is the only curses user and no
-engine module imports it (Windows needs the `windows-curses` package or a
-different front end). Path mapping is written direction-neutral
+interface with a Linux implementation. `tui/` is the only Textual user and no
+engine module imports it. Textual runs on Windows unchanged. Path mapping is written direction-neutral
 (foreign <-> local), so Windows can map `/home/tanuj/...` the other way.
 
 ## Definition of done (this phase)

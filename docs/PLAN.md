@@ -63,16 +63,17 @@ Verify: tests for idempotence, no-overwrite, atomic write, provenance.
 
 ## 6. TUI front end — Careful — after: 5 — [ ]
 
-`tui.py` per SPEC "TUI": layout, keys, foreign-row prompt, built-in transcript
-pager, background scan thread, resize handling, terminal always restored.
+`tui/` (Textual) per SPEC "TUI" and "Stack": layout, keys, foreign-row prompt,
+built-in transcript pager, scans in workers, resize handling, all styling in
+`app.tcss`. `install.sh` creates `.venv` and installs a pinned Textual.
 `agent-sessions` with no subcommand on a tty opens it. `share/agent-sessions.desktop`
 plus the install step. The TUI calls engine functions only. Keep the view
 logic (row formatting, column fitting, filtering, selection-by-key) in pure
-functions that are unit-tested without curses.
-Verify: unit tests for the pure functions; a scripted run inside a `pty` at
-several sizes (120x40, 80x24, 40x10) that sends keys and asserts on the
-screen text, including an empty index and a resize; no real launch (the
-launcher is injected and recorded).
+functions in `tui/view.py` that are unit-tested without Textual.
+Verify: unit tests for the pure functions; headless `run_test()` pilot tests
+at 120x40, 80x24 and 40x10 that press keys and assert on the screen,
+including an empty index and a resize; no real launch (the launcher is
+injected and recorded).
 
 ## 7. Ground-truth audit — Medium — after: 5 — [ ]
 
