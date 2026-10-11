@@ -126,7 +126,7 @@ class StartTest(TuiCase):
             self.assertIn("Already imported", text)
             self.assertIn("claude session 0", text)
             self.assertIn("scanning", text.splitlines()[0])
-            self.assertEqual(self.engine.called("scan"), [False])    # quick, and running
+            self.assertEqual(self.engine.called("scan"), [None])     # the engine picks the depth; running
             self.assertIsNotNone(self.main._scan)
             self.assertEqual(len(self.rows.rows), 20)
             # Now the scan ends, having found a new session.
@@ -585,7 +585,7 @@ class ForeignTest(TuiCase):
             await pilot.press("j", "q", "enter", "o", "r", "2", "y")
             self.assertEqual(self.main.mode, "foreign")
             self.assertEqual(self.selected(), FOREIGN)
-            self.assertEqual(self.engine.called("scan"), [False])
+            self.assertEqual(self.engine.called("scan"), [None])
             self.assertFalse(self.exited())
 
     async def test_escape_cancels(self):
@@ -624,7 +624,7 @@ class ForeignTest(TuiCase):
             row = next(row for row in self.rows.rows if row.key == FOREIGN)
             self.assertEqual(row.where, "C: · imported")
             self.assertEqual(self.main.mode, "list")
-            self.assertEqual(self.engine.called("scan"), [False])   # the engine indexes the copy
+            self.assertEqual(self.engine.called("scan"), [None])   # the engine indexes the copy
             self.assertGreaterEqual(len(self.engine.called("load_index")), 3)   # and is re-read
 
     async def test_v_views(self):
@@ -749,7 +749,7 @@ class ImportKeyTest(TuiCase):
             self.assertNotEqual(self.selected(), FOREIGN)
             await pilot.press("r")
             await self.message("an import is running")
-            self.assertEqual(self.engine.called("scan"), [False])
+            self.assertEqual(self.engine.called("scan"), [None])
             gate.set()
             await self.message("imported claude session 12")
             self.assertNotIn("importing", self.status())
@@ -977,13 +977,13 @@ class ScanTest(TuiCase):
     async def test_r_is_quick_and_capital_r_is_deep(self):
         async with self.started() as pilot:
             await settle(pilot)
-            self.assertEqual(self.engine.called("scan"), [False])
+            self.assertEqual(self.engine.called("scan"), [None])
             await pilot.press("r")
             await self.message("rescan: 34 sessions, 0.2 s")
-            self.assertEqual(self.engine.called("scan"), [False, False])
+            self.assertEqual(self.engine.called("scan"), [None, False])
             await pilot.press("R")
             await self.message("full rescan: 34 sessions")
-            self.assertEqual(self.engine.called("scan"), [False, False, True])
+            self.assertEqual(self.engine.called("scan"), [None, False, True])
             self.assertFalse(self.exited())
 
     async def test_progress_then_escape_cancels(self):
@@ -1020,7 +1020,7 @@ class ScanTest(TuiCase):
             await self.message("a scan is already running")
             await pilot.press("r")
             await self.message("a scan is already running")
-            self.assertEqual(self.engine.called("scan"), [False, False])
+            self.assertEqual(self.engine.called("scan"), [None, False])
             # An import waits for the scan as well.
             await pilot.press("i", "y")
             await self.message("a scan is running")
@@ -1341,7 +1341,7 @@ class HelpAndQuitTest(TuiCase):
                 self.assertIn(fragment, text)
             await pilot.press("o", "i", "r", "1")          # no meaning here
             self.assertIsInstance(self.app.screen, HelpScreen)
-            self.assertEqual(self.engine.called("scan"), [False])
+            self.assertEqual(self.engine.called("scan"), [None])
             await pilot.press("escape")
             await settle(pilot)
             self.assertIs(self.app.screen, self.main)
