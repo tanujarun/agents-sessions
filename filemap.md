@@ -1,0 +1,21 @@
+# File map
+
+- `CLAUDE.md` — rules and commands for every agent working here
+- `docs/SPEC.md` — goals, architecture, CLI contract, menu surface
+- `docs/PLAN.md` — task list and status
+- `docs/FORMATS.md` — per-provider on-disk formats and resume commands (task 2)
+- `bin/agent-sessions` — launcher script; no logic
+- `install.sh` — symlink the launcher into `~/.local/bin`
+- `Makefile` — `test`, `lint`
+- `src/agent_sessions/model.py` — Session and Store dataclasses, session key
+- `src/agent_sessions/mounts.py` — list real mounted filesystems (platform layer)
+- `src/agent_sessions/discover.py` — find stores on mounts; prune list
+- `src/agent_sessions/pathmap.py` — foreign path to local path
+- `src/agent_sessions/index.py` — cache of stores and parsed sessions
+- `src/agent_sessions/providers/` — one adapter per provider, plus the registry
+- `src/agent_sessions/importer.py` — copy a foreign session into the native store
+- `src/agent_sessions/launch.py` — build and run the resume command (platform layer)
+- `src/agent_sessions/cli.py` — argparse entry, all subcommands
+- `menu/` — Menu.qml provider snippet, JSONC rows, `apply.sh`
+- `tests/` — unittest suites
+- `tests/fixtures/<provider>/` — sanitised real session files

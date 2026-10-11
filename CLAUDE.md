@@ -1,0 +1,35 @@
+# agent-sessions
+
+Python 3.11+, standard library only. No third-party imports, no pip.
+
+## Commands
+
+- Test: `make test` (`python3 -m unittest discover -s tests -v`)
+- Lint: `make lint` (`python3 -m compileall -q src tests`)
+- Run: `bin/agent-sessions <scan|list|menu|open|import|show|status|verify>`
+- Install: `./install.sh` (symlinks into `~/.local/bin`)
+
+## Rules
+
+- Read-only outside the native stores, `~/.cache/agent-sessions/` and
+  `~/.local/state/agent-sessions/`. Never write to a store on another drive,
+  including the Windows profile under `/run/media/tanuj/`.
+- Open every SQLite file `mode=ro`; foreign ones also `immutable=1`. A scan
+  must not leave `-wal`/`-shm` files behind.
+- Tests never touch the real stores for writing. Use temp dirs and the env
+  overrides `AGENT_SESSIONS_HOME` (fake home), `AGENT_SESSIONS_CACHE`,
+  `AGENT_SESSIONS_STATE`, `AGENT_SESSIONS_MOUNTS` (fake mount list).
+- Do not start an agent CLI interactively or make a model call (no
+  `claude -p`, `codex exec`, …). `--help` and `--version` are fine.
+- Do not send keyboard or mouse input to the desktop session.
+- Platform-specific code only in `mounts.py` and `launch.py`; everything else
+  must also run on Windows later (pathlib, no shelling out).
+- Formats come from `docs/FORMATS.md`. If the files disagree with it, fix the
+  doc in the same change; never guess a field.
+- Output order is deterministic: sort everything you emit.
+- Update `filemap.md` when you add or move a file.
+
+## Docs
+
+`docs/SPEC.md` (what and why), `docs/PLAN.md` (tasks), `docs/FORMATS.md`
+(per-provider on-disk formats), `filemap.md` (where things are).
