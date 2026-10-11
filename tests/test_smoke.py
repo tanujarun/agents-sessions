@@ -31,21 +31,32 @@ class SmokeTest(unittest.TestCase):
         import importlib
 
         for name in ("mounts", "discover", "pathmap", "index", "importer",
-                     "launch", "providers.base"):
+                     "launch", "api", "fsutil", "providers.base"):
             importlib.import_module(f"agent_sessions.{name}")
         self.assertEqual(agent_sessions.__version__, "0.1.0")
 
-    def test_registry_starts_empty(self):
-        self.assertEqual(providers.all_providers(), [])
+    def test_registry_holds_the_five_adapters(self):
+        self.assertEqual([p.name for p in providers.all_providers()],
+                         ["antigravity", "claude", "codex", "gemini", "grok"])
+        self.assertEqual(providers.get("claude").label, "Claude")
         with self.assertRaises(KeyError):
-            providers.get("claude")
+            providers.get("nope")
+
+    def test_engine_does_not_import_textual(self):
+        import importlib
+
+        for name in ("api", "cli", "index", "discover", "pathmap", "mounts", "fsutil"):
+            importlib.import_module(f"agent_sessions.{name}")
+        self.assertNotIn("textual", sys.modules)
 
     def test_help_exits_zero(self):
         code, out, _ = run(["--help"])
         self.assertEqual(code, 0)
-        for cmd in ("scan", "list", "menu", "open", "import", "show",
+        for cmd in ("tui", "scan", "list", "open", "import", "show",
                     "status", "verify"):
             self.assertIn(cmd, out)
+        self.assertNotIn("menu", out)
+        self.assertEqual(run(["menu", "claude"])[0], 2)
 
     def test_version(self):
         code, out, _ = run(["--version"])
@@ -53,10 +64,12 @@ class SmokeTest(unittest.TestCase):
         self.assertIn("0.1.0", out)
 
     def test_stub_returns_one(self):
-        code, _, err = run(["scan"])
+        code, _, err = run(["show", "k"])
         self.assertEqual(code, 1)
-        self.assertEqual(err, "agent-sessions: scan: not implemented\n")
+        self.assertEqual(err, "agent-sessions: show: not implemented\n")
         self.assertEqual(run(["open", "k", "--dry-run"])[0], 1)
+        self.assertEqual(run(["import", "k", "--open"])[0], 1)
+        self.assertEqual(run(["tui"]), (1, "", "agent-sessions: tui: not implemented\n"))
 
     def test_no_subcommand_returns_two(self):
         code, out, _ = run([])

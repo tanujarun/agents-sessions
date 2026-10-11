@@ -123,6 +123,7 @@ class Provider:
     def candidates(self, store: Store) -> list[Candidate]     # cheap: names and stats only
     def parse(self, store: Store, c: Candidate) -> Session | None   # None = not a listed session
     def resume_argv(self, s: Session) -> list[str]            # for native sessions
+    def transcript(self, s: Session) -> Iterator[Turn]       # (role, text, ts); user, assistant, tool-name turns
     def import_session(self, s: Session, pathmap) -> Session  # may raise NotSupported(reason)
 ```
 

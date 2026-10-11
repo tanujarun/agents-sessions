@@ -26,7 +26,7 @@ letter evidence for the path map, deep-walk timing per mount, and sanitised
 fixtures under `tests/fixtures/<provider>/`.
 Verify: orchestrator spot-checks claims against the real files.
 
-## 3. Core: mounts, discovery, path map, index, CLI — Careful — after: 2 — [~]
+## 3. Core: mounts, discovery, path map, index, CLI — Careful — after: 2 — [x]
 
 Implement `model`, `mounts`, `discover`, `pathmap`, `index`, and the CLI
 commands `scan`, `list`, `status`, `verify` against the adapter
@@ -36,7 +36,7 @@ Verify: unit tests with temp-dir fake mounts (spaces in names, unreadable dir,
 vanished mount, nested store, symlink loop); `scan --deep` on the real machine
 finishes and reports timing.
 
-## 4a. Adapters: Claude, Codex — Careful — after: 3 — [ ]
+## 4a. Adapters: Claude, Codex — Careful — after: 3 — [~]
 
 `providers/claude.py`, `providers/codex.py` per FORMATS.md: `is_store`,
 `list_sessions`, `resume_argv`. Tests on the fixtures, including a truncated
@@ -44,7 +44,7 @@ file and a non-UTF-8 line.
 Verify: `list --provider claude --json` and `codex` counts equal a `find`
 count on the real stores; titles sane.
 
-## 4b. Adapters: Grok, Antigravity, Gemini — Careful — after: 3 — [ ]
+## 4b. Adapters: Grok, Antigravity, Gemini — Careful — after: 3 — [~]
 
 Same as 4a for `providers/grok.py`, `providers/antigravity.py`,
 `providers/gemini.py`. SQLite opened read-only/immutable as SPEC requires.

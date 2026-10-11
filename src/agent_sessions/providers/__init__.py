@@ -26,3 +26,7 @@ def all_providers() -> list[Provider]:
 def get(name: str) -> Provider:
     """Instance of the provider called ``name``; KeyError if unknown."""
     return _REGISTRY[name]()
+
+
+# Importing an adapter module registers it.
+from . import antigravity, claude, codex, gemini, grok  # noqa: E402,F401
