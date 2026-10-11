@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -142,6 +143,132 @@ class SqliteTest(TempCase):
         self.assertEqual(con.execute("select count(*) from threads").fetchone(), (2,))
         con.close()
         self.assertEqual(sorted(p.name for p in path.parent.iterdir()), before)
+
+    # --- loaded into memory (the file itself is never opened by SQLite) ------
+
+    def in_memory(self, con) -> bool:
+        """True for an in-memory connection: its main database has no file."""
+        return con.execute("pragma database_list").fetchall()[0][2] == ""
+
+    def test_wal_file_is_loaded_into_memory_and_left_alone(self):
+        path = self.make_wal_db()
+        os.utime(path, ns=(1_000_000_000, os.stat(path).st_mtime_ns))
+        before = os.stat(path)
+        raw = path.read_bytes()
+        os.utime(path, ns=(1_000_000_000, before.st_mtime_ns))
+        self.assertEqual(raw[18:20], b"\x02\x02")
+        con = open_sqlite_ro(path)
+        self.assertTrue(self.in_memory(con))
+        self.assertEqual(con.execute("select v from t").fetchall(), [("row",)])
+        self.assertEqual(con.execute("select count(*) from sqlite_master").fetchone(), (1,))
+        # The journal mode of the copy is not WAL: nothing to look for on disk.
+        self.assertNotEqual(con.execute("pragma journal_mode").fetchone()[0], "wal")
+        con.close()
+        after = os.stat(path)
+        self.assertEqual(self.siblings(path), [path.name])
+        self.assertEqual((after.st_mtime_ns, after.st_size), (before.st_mtime_ns, before.st_size))
+        self.assertEqual(path.read_bytes(), raw)             # the file keeps its WAL header
+        if getattr(os, "O_NOATIME", 0):
+            os.utime(path, ns=(1_000_000_000, before.st_mtime_ns))
+            open_sqlite_ro(path).execute("select v from t").fetchall()
+            self.assertEqual(os.stat(path).st_atime_ns, 1_000_000_000)
+
+    def test_in_memory_copy_refuses_writes_of_every_kind(self):
+        con = open_sqlite_ro(self.make_wal_db())
+        self.assertTrue(self.in_memory(con))
+        for sql in ("insert into t values ('x')", "update t set v = 'y'", "delete from t",
+                    "create table u (v)", "drop table t"):
+            with self.assertRaises(sqlite3.OperationalError):
+                con.execute(sql)
+        self.assertEqual(con.execute("select v from t").fetchall(), [("row",)])
+        con.close()
+
+    def test_rollback_journal_file_loads_too(self):
+        path = self.tmp / "plain.sqlite"
+        con = sqlite3.connect(path)
+        con.execute("create table t (v text)")
+        con.execute("insert into t values ('caf\u00e9')")
+        con.commit()
+        con.close()
+        self.assertEqual(path.read_bytes()[18:20], b"\x01\x01")
+        con = open_sqlite_ro(path)
+        self.assertTrue(self.in_memory(con))
+        self.assertEqual(con.execute("select v from t").fetchone(), ("caf\u00e9",))
+        con.close()
+
+    def test_large_file_falls_back_to_the_immutable_open(self):
+        path = self.make_wal_db()
+        with mock.patch.object(base, "SQLITE_MEMORY_MAX", 1024):      # the file is larger
+            con = open_sqlite_ro(path)
+        self.assertFalse(self.in_memory(con))
+        self.assertEqual(con.execute("select v from t").fetchall(), [("row",)])
+        with self.assertRaises(sqlite3.OperationalError):
+            con.execute("insert into t values ('x')")
+        con.close()
+        self.assertEqual(self.siblings(path), [path.name])
+
+    def test_failed_load_falls_back_to_the_immutable_open(self):
+        path = self.make_wal_db()
+
+        class NoDeserialize(sqlite3.Connection):
+            def deserialize(self, *args, **kwargs):
+                raise sqlite3.OperationalError("deserialize is not available")
+
+        real = sqlite3.connect
+        with mock.patch.object(
+                base.sqlite3, "connect",
+                lambda target, *a, **k: real(target, *a, **dict(
+                    k, **({"factory": NoDeserialize} if target == ":memory:" else {})))):
+            con = open_sqlite_ro(path)
+        self.assertFalse(self.in_memory(con))
+        self.assertEqual(con.execute("select v from t").fetchall(), [("row",)])
+        con.close()
+        self.assertEqual(self.siblings(path), [path.name])
+
+    def test_files_that_are_not_databases(self):
+        for name, content in (("empty.db", b""), ("short.db", b"SQLite format 3\x00"),
+                              ("text.db", b"not a database " * 40),
+                              ("cut.db", self.make_wal_db().read_bytes()[:600])):
+            path = self.tmp / name
+            path.write_bytes(content)
+            with self.subTest(name=name):
+                try:
+                    con = open_sqlite_ro(path)
+                    rows = con.execute("select name from sqlite_master").fetchall()
+                    con.close()
+                except sqlite3.Error:
+                    rows = None         # as before: the error comes on open or first query
+                self.assertIn(rows, (None, []))
+                self.assertEqual(path.read_bytes(), content)
+                self.assertFalse((self.tmp / (name + "-wal")).exists())
+                self.assertFalse((self.tmp / (name + "-shm")).exists())
+
+    def test_every_fixture_database_reads_the_same_both_ways(self):
+        """The in-memory copy and the immutable open see the same rows."""
+        checked = 0
+        for path in sorted(FIXTURES.rglob("*")):
+            if path.suffix not in (".db", ".sqlite") or not path.is_file():
+                continue
+            before = sorted(p.name for p in path.parent.iterdir())
+            uri = "file:" + base.urllib.parse.quote(str(path)) + "?mode=ro&immutable=1"
+            dumps = []
+            for con in (open_sqlite_ro(path), sqlite3.connect(uri, uri=True)):
+                tables = [row[0] for row in con.execute(
+                    "select name from sqlite_master where type = 'table' order by name")]
+                # FTS shadow tables need their module; plain tables are compared in full.
+                dump = {}
+                for table in tables:
+                    try:
+                        dump[table] = con.execute(f'select * from "{table}"').fetchall()
+                    except sqlite3.Error as exc:
+                        dump[table] = type(exc).__name__
+                dumps.append(dump)
+                con.close()
+            self.assertEqual(dumps[0], dumps[1], path)
+            self.assertTrue(dumps[0], path)
+            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), before)
+            checked += 1
+        self.assertGreaterEqual(checked, 8)
 
 
 class ParseTsTest(unittest.TestCase):

@@ -50,3 +50,9 @@
   (`claude/`, `codex/`, `grok/`, `antigravity/`, `gemini/`; SQLite fixtures are WAL-mode, open immutable)
 - `tests/fixtures/claude/not-a-store/`, `tests/fixtures/gemini/native-no-chats/` — negative cases for `is_store`
 - `scratch/` — throwaway investigation scripts (git-ignored): `walk.py`, `*_count.py`, `drives.py`, `build_fixtures.py`
+- `src/agent_sessions/errors.py` — `ApiError`, `NotFound`, `LaunchFailed`, `ImportFailed` (re-exported by `api`)
+- `tests/fixture_world.py` — `World`: fake home plus two fake drives built from the fixtures, launches and
+  notifications recorded; `tree_state`, `age_access_times`, `files_below`
+- `tests/test_launch.py` — launch plans per provider, folder gone, foreign refused, `--here`, hooks
+- `tests/test_importer.py` — imports per provider (bytes, rewrites, idempotence, collisions, roll back, free
+  space, provenance, source times), `encode_cwd`, refusals

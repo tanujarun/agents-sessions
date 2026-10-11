@@ -11,7 +11,12 @@ from typing import Iterator
 from ..fsutil import home, listdir_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
-from .base import Provider, Turn, clean_title, iter_jsonl, open_ro, parse_ts, warn
+from .base import (NotSupported, Provider, Turn, clean_title, iter_jsonl, open_ro,
+                   parse_ts, warn)
+
+# The verdict of FORMATS section 6, shown to the user as it is.
+IMPORT_UNSAFE = ("Gemini CLI is not installed on this machine, and no resumable Gemini "
+                 "session exists to import")
 
 _CHAT_NAME = re.compile(r"^session-.*\.jsonl?$")
 # The tool names a chat file ``session-<time>-<first 8 of the session id>``.
@@ -180,6 +185,8 @@ class Gemini(Provider):
     app_id = "org.omarchy.gemini"
     # No usable gemini binary exists here (FORMATS "Gemini CLI" section 0).
     resumable = False
+    # Resume searches only the chats of the process cwd's project (section 5).
+    resume_needs_cwd = True
     dir_names = {".gemini"}
 
     def native_store(self) -> Path | None:
@@ -332,5 +339,5 @@ class Gemini(Provider):
                     if isinstance(name, str) and name:
                         yield Turn("tool", name, parse_ts(call.get("timestamp")) or ts)
 
-    def import_session(self, s: Session, pathmap) -> Session:
-        raise NotImplementedError
+    def import_plan(self, s: Session, pathmap):
+        raise NotSupported(IMPORT_UNSAFE)

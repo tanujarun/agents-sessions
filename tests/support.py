@@ -87,6 +87,7 @@ class Sandbox:
             "AGENT_SESSIONS_HOME": str(self.home),
             "AGENT_SESSIONS_CACHE": str(self.cache),
             "AGENT_SESSIONS_STATE": str(self.root / "state"),
+            "AGENT_SESSIONS_NOTIFY": "0",   # a failed launch must not notify the desktop
         })
         env.start()
         case.addCleanup(env.stop)

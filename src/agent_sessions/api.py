@@ -1,18 +1,26 @@
-"""The facade the CLI and the TUI call: load, scan, list, status, verify."""
+"""The facade the CLI and the TUI call: load, scan, list, status, verify,
+find, open, import, transcript."""
 
 from __future__ import annotations
 
 import shutil
 import time
+from dataclasses import dataclass, field
+from typing import Iterator
 
 from . import discover
+from . import importer
 from . import index as index_mod
+from . import launch
+from . import providers as registry
+from .errors import ApiError, ImportFailed, LaunchFailed, NotFound
 from .fsutil import cache_file
 from .index import Index
+from .launch import LaunchPlan
 from .model import Session, make_key
-from .mounts import list_mounts
+from .mounts import NATIVE_LABEL, list_mounts
 from .providers import all_providers
-from .providers.base import parse_ts
+from .providers.base import NotSupported, Turn, parse_ts
 
 # Agent CLIs that may be installed but have no adapter (SPEC non-goals).
 NO_READER_TOOLS = ("copilot", "crush", "cursor-agent", "opencode")
@@ -203,5 +211,206 @@ def verify(progress=None, cancel=None) -> dict:
     return result
 
 
-__all__ = ["NO_READER_TOOLS", "cache_file", "list_sessions", "load_index", "scan",
-           "status", "verify"]
+# --- one session: find, show, open, import -----------------------------------
+
+MATCHES_SHOWN = 8   # keys named in an "ambiguous" message
+
+
+def find_session(ref, index=None) -> Session:
+    """The session ``ref`` names: a full key, a key prefix that only one
+    session has, or a bare session id. A ``Session`` is returned as it is.
+
+    A foreign session and its imported copy share an id; a bare id then means
+    the native copy. Raises ``NotFound`` when nothing matches, and when
+    several sessions do (the reason names them).
+    """
+    if isinstance(ref, Session):
+        return ref
+    text = ref.strip() if isinstance(ref, str) else ""
+    if not text:
+        raise NotFound("no session key given")
+    index = index if index is not None else load_index()
+    for session in index.sessions:
+        if session.key == text:
+            return session
+    matches = [s for s in index.sessions if s.key.startswith(text) or s.id == text]
+    if len(matches) > 1:
+        native = [s for s in matches if s.origin == "native"]
+        if len(native) == 1 and all(s is native[0] or s.imported_as == native[0].key
+                                    for s in matches):
+            return native[0]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise NotFound(f"no session matches {text!r}; `list --keys` shows the keys")
+    keys = sorted(s.key for s in matches)
+    shown = ", ".join(keys[:MATCHES_SHOWN])
+    more = f", and {len(keys) - MATCHES_SHOWN} more" if len(keys) > MATCHES_SHOWN else ""
+    raise NotFound(f"{text!r} matches {len(keys)} sessions: {shown}{more}")
+
+
+def _provider(session: Session):
+    try:
+        return registry.get(session.provider)
+    except KeyError:
+        raise NotFound(f"no reader for provider {session.provider!r}") from None
+
+
+def _native_copy(session: Session, index) -> Session | None:
+    """The native session with the same provider and id, as the index has it.
+
+    For a foreign session that is its imported copy. A native session is its
+    own copy only when a foreign session of that id is listed too: then it
+    was imported (a bare id names the native side of such a pair)."""
+    wanted = "native" if session.origin != "native" else "foreign"
+    found = None
+    for other in index.sessions:
+        if other.provider == session.provider and other.id == session.id:
+            if other.origin == "native":
+                found = other
+            if other.origin == wanted:
+                wanted = None
+    return found if wanted is None else None
+
+
+def transcript(ref, index=None) -> Iterator[Turn]:
+    """The conversation as ``Turn(role, text, ts)``, oldest first: ``user``
+    and ``assistant`` text, and one ``tool`` turn per tool call whose text is
+    the tool's name. Read lazily. Raises ``NotFound``."""
+    session = find_session(ref, index)
+    return iter(_provider(session).transcript(session))
+
+
+def open_session(ref, here=False, dry_run=False, index=None) -> LaunchPlan:
+    """Resume a session in a new terminal window, in its project directory.
+
+    A foreign session that was imported resumes its native copy; any other
+    foreign session is refused. ``here=True`` starts the tool in this process
+    instead (``chdir`` then ``exec``: the call does not return).
+    ``dry_run=True`` only returns the plan. Raises ``LaunchFailed`` with the
+    reason (a real failure also sends a desktop notification) or ``NotFound``.
+    The window is opened by ``launch.starter``, which a caller may replace.
+    """
+    session = find_session(ref, index)
+    where = None
+    if session.origin != "native":
+        index = index if index is not None else load_index()
+        copy = _native_copy(session, index)    # imported: resume that one
+        if copy is not None:
+            session = copy
+        else:
+            where = index.where(session)
+            if where == NATIVE_LABEL:   # another store on this machine's own disks
+                where = session.store
+    return launch.launch(session, _provider(session), where=where, here=here,
+                         dry_run=dry_run)
+
+
+@dataclass
+class ImportReport:
+    session: Session                 # the native copy, as indexed
+    created: bool                    # False: it was already there, nothing was copied
+    files: list[str] = field(default_factory=list)   # what this import put in place
+    bytes: int = 0
+
+
+def _plan(session: Session, index) -> importer.ImportPlan:
+    """The import plan for a foreign session. Raises ``ImportFailed``."""
+    if session.origin == "native":
+        raise ImportFailed(f"this session is already on {NATIVE_LABEL}")
+    try:
+        return _provider(session).import_plan(session, index.pathmap)
+    except NotSupported as exc:
+        raise ImportFailed(exc.reason) from None
+    except NotFound as exc:
+        raise ImportFailed(exc.reason) from None
+
+
+def can_import(session, index=None) -> tuple[bool, str]:
+    """``(True, "")`` when ``import_session`` would copy this session, else
+    ``(False, reason)``: it is native, already imported, its provider cannot
+    be imported, its project folder is not on any mounted drive, its id is
+    already in the native store, or there is too little free space. Reads
+    only; writes nothing."""
+    try:
+        index = index if index is not None else load_index()
+        session = find_session(session, index)
+        if _native_copy(session, index) is not None:
+            return False, "already imported"
+        importer.check(_plan(session, index))
+    except ApiError as exc:
+        return False, exc.reason
+    return True, ""
+
+
+def import_plan(ref, index=None) -> dict:
+    """What ``import_session`` would do, as plain data, for a dry run:
+    ``already`` (the native key when it is imported already, else None),
+    ``copies``, ``rewrites`` (with the changes each would make), ``appends``,
+    ``bytes``, ``needed``, ``free``. Writes nothing. Raises ``ImportFailed``
+    for everything the import itself would refuse."""
+    index = index if index is not None else load_index()
+    session = find_session(ref, index)
+    copy = _native_copy(session, index)
+    if copy is not None:
+        return {"provider": session.provider, "id": session.id, "source_key": session.key,
+                "native_key": copy.key, "already": copy.key, "copies": [], "rewrites": [],
+                "appends": [], "bytes": 0}
+    plan = _plan(session, index)
+    importer.check(plan)
+    return dict(importer.describe(plan), already=None)
+
+
+def import_report(ref, progress=None, index=None) -> ImportReport:
+    """``import_session`` with the details: whether anything was copied (a
+    session imported before is returned with ``created=False``) and which
+    files were put in place."""
+    index = index if index is not None else load_index()
+    session = find_session(ref, index)
+    copy = _native_copy(session, index)
+    if copy is not None:
+        return ImportReport(copy, False)
+    if session.origin == "native":
+        raise ImportFailed(f"this session is already on {NATIVE_LABEL}")
+    provider = _provider(session)
+    collision = None
+    files: list[str] = []
+    size = 0
+    try:
+        plan = provider.import_plan(session, index.pathmap)
+        files, size = plan.destinations, plan.total_bytes
+        provider.import_session(session, index.pathmap, progress)
+    except importer.Exists as exc:
+        collision = exc     # in the store but not in this index: look again below
+    except NotSupported as exc:
+        raise ImportFailed(exc.reason) from None
+    fresh = Index.load()
+    fresh.scan(all_providers(), list_mounts(), deep=False)
+    copy = _native_copy(session, fresh)
+    if collision is not None:
+        if copy is None:
+            raise collision
+        return ImportReport(copy, False)
+    if copy is None:
+        raise ImportFailed("the files were copied but the copy is not listed as a session: "
+                           + ", ".join(files))
+    return ImportReport(copy, True, files, size)
+
+
+def import_session(ref, progress=None, index=None) -> Session:
+    """Copy a foreign session into the native store and return the native
+    copy, indexed and launchable. A session that was imported before is
+    returned as it is; nothing is copied twice and nothing is overwritten.
+
+    ``progress(done_bytes, total_bytes)`` is called while copying. Raises
+    ``ImportFailed`` with the reason, also when the provider cannot be
+    imported. A quick scan runs afterwards; an ``index`` passed in is not
+    refreshed, load it again.
+    """
+    return import_report(ref, progress, index).session
+
+
+__all__ = ["ApiError", "ImportFailed", "ImportReport", "LaunchFailed", "LaunchPlan",
+           "NO_READER_TOOLS", "NotFound", "Turn", "cache_file", "can_import", "find_session",
+           "import_plan", "import_report", "import_session", "list_sessions", "load_index",
+           "open_session", "scan", "status", "transcript", "verify"]

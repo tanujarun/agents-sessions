@@ -392,12 +392,8 @@ class SkeletonSignatureTest(unittest.TestCase):
             with self.subTest(provider=p.name):
                 self.assertEqual((p.label, p.binary, p.app_id, p.resumable, p.dir_names),
                                  expect[p.name])
-                for method, args in (("candidates", (None,)), ("parse", (None, None)),
-                                     ("resume_argv", (None,)), ("import_session", (None, None))):
-                    if method != "import_session":
-                        continue   # readers implemented: tests/test_<provider>.py
-                    with self.assertRaises(NotImplementedError):
-                        getattr(p, method)(*args)
+                # Readers: tests/test_<provider>.py. Import: tests/test_importer.py.
+                self.assertEqual(p.resume_needs_cwd, p.name == "gemini")
 
     def test_native_stores_follow_the_home_override(self):
         box = Sandbox(self, REAL)

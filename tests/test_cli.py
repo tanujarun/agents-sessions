@@ -1,8 +1,11 @@
-"""cli.py: scan, list, status, verify through main()."""
+"""cli.py: every subcommand but tui, through main()."""
 
 import contextlib
 import io
 import json
+import os
+import shlex
+import shutil
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -11,9 +14,12 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from fixture_world import (  # noqa: E402
+    AGY_WIN, CLAUDE_NATIVE, CLAUDE_WIN, CODEX_SEGMENTED, CODEX_WIN, GEMINI_WIN, GROK_NATIVE,
+    GROK_WIN, World, files_below)
 from support import Sandbox  # noqa: E402
 
-from agent_sessions import cli  # noqa: E402
+from agent_sessions import api, cli, launch  # noqa: E402
 from agent_sessions.fsutil import cache_file  # noqa: E402
 from agent_sessions.model import make_key  # noqa: E402
 
@@ -195,6 +201,291 @@ class CliTest(unittest.TestCase):
             cli._out("caf\xe9 \udcff")
         text.flush()
         self.assertEqual(text.buffer.getvalue(), b"caf\\xe9 \\udcff\n")
+
+
+class SessionCommandsTest(unittest.TestCase):
+    """open, import, show and ``list --keys`` on the fixture machine."""
+
+    def setUp(self):
+        self.w = World(self, native=("claude", "codex", "grok"))
+        self.home = self.w.home
+        self.index = self.w.scan()
+        self.native_key = self.w.session(CLAUDE_NATIVE, "native", self.index).key
+        self.foreign_key = self.w.session(CLAUDE_WIN, "foreign", self.index).key
+
+    def command(self, session_id, cwd, app="claude", verb="--resume") -> str:
+        return (f"cd {shlex.quote(str(cwd))} && omarchy-launch-tui "
+                f"--app-id=org.omarchy.{app} {app} {verb} {session_id}\n")
+
+    # --- open ---------------------------------------------------------------
+
+    def test_open_dry_run_prints_the_command_and_starts_nothing(self):
+        expected = self.command(CLAUDE_NATIVE, self.home / "My Proj")
+        self.assertIn("'", expected)                    # the space is quoted for a shell
+        for ref in (self.native_key, CLAUDE_NATIVE, self.native_key[:20]):
+            self.assertEqual(run("open", ref, "--dry-run"), (0, expected, ""))
+        self.assertEqual(run("open", CODEX_SEGMENTED, "--dry-run"),
+                         (0, self.command(CODEX_SEGMENTED, self.home, "codex", "resume"), ""))
+        self.assertEqual((self.w.started, self.w.notified), ([], []))
+
+    def test_open_launches_and_prints_the_plan(self):
+        code, out, err = run("open", GROK_NATIVE)
+        self.assertEqual((code, out, err),
+                         (0, self.command(GROK_NATIVE, self.home / "proj", "grok"), ""))
+        self.assertEqual(self.w.started, [(
+            ["omarchy-launch-tui", "--app-id=org.omarchy.grok", "grok", "--resume",
+             GROK_NATIVE], str(self.home / "proj"))])
+
+    def test_open_prints_the_note_when_the_folder_is_gone(self):
+        shutil.rmtree(self.home / "My Proj")
+        code, out, err = run("open", CLAUDE_NATIVE, "--dry-run")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out, self.command(CLAUDE_NATIVE, self.home)
+                         + "note: project folder is gone; starting in the home directory\n")
+
+    def test_open_foreign_fails_with_the_reason(self):
+        for extra in ((), ("--dry-run",)):
+            self.assertEqual(run("open", self.foreign_key, *extra), (
+                1, "", "agent-sessions: this session is on WinC; import it first\n"))
+        self.assertEqual(self.w.started, [])
+        self.assertEqual(len(self.w.notified), 1)       # the real attempt only
+
+    def test_open_here_prints_first_then_execs(self):
+        calls = []
+        out = io.StringIO()
+        with mock.patch.object(launch.os, "chdir", lambda path: calls.append(("chdir", path))), \
+                mock.patch.object(launch.os, "execvp", lambda file, argv: calls.append(
+                    ("execvp", argv, out.getvalue()))), \
+                contextlib.redirect_stdout(out):
+            code = cli.main(["open", GROK_NATIVE, "--here"])
+        printed = f"cd {self.home / 'proj'} && grok --resume {GROK_NATIVE}\n"
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [("chdir", str(self.home / "proj")),
+                                 ("execvp", ["grok", "--resume", GROK_NATIVE], printed)])
+        self.assertEqual(out.getvalue(), printed)
+        self.assertEqual(run("open", GROK_NATIVE, "--here", "--dry-run"), (0, printed, ""))
+        self.assertEqual(self.w.started, [])
+
+    def test_unknown_and_ambiguous_keys(self):
+        for command in ("open", "show", "import"):
+            code, out, err = run(command, "claude:nope")
+            self.assertEqual((code, out), (1, ""))
+            self.assertEqual(err, "agent-sessions: no session matches 'claude:nope'; "
+                                  "`list --keys` shows the keys\n")
+            code, out, err = run(command, "claude:")
+            self.assertEqual((code, out), (1, ""))
+            self.assertIn("'claude:' matches 8 sessions: claude:", err)
+            self.assertIn(self.native_key, err)
+            self.assertIn(self.foreign_key, err)
+        code, _, err = run("show", "c")
+        self.assertRegex(err, r"'c' matches 11 sessions: (\S+, ){8}and 3 more\n$")
+        self.assertEqual(run("open", "", "--dry-run")[2], "agent-sessions: no session key given\n")
+        self.assertEqual((self.w.started, self.w.notified), ([], []))
+
+    # --- import -------------------------------------------------------------
+
+    def test_import_dry_run_says_what_would_happen_and_writes_nothing(self):
+        code, out, err = run("import", self.foreign_key, "--dry-run")
+        self.assertEqual((code, err), (0, ""))
+        lines = out.splitlines()
+        source = self.w.profile / ".claude" / "projects" / "F--Proj-My-Site"
+        target = [line.split(" -> ")[1] for line in lines if line.startswith("copy ")]
+        self.assertEqual(lines[0], f"import {self.foreign_key} -> "
+                                   f"{api.import_plan(self.foreign_key)['native_key']}")
+        self.assertEqual(lines[1], f"project folder: F:\\Proj\\My Site -> {self.w.site}")
+        self.assertTrue(lines[2].startswith(f"copy {source / CLAUDE_WIN}/ -> "))
+        self.assertTrue(lines[2].endswith(f"{CLAUDE_WIN}/ (1 file, 28 B)"), lines[2])
+        self.assertTrue(lines[3].startswith(f"copy {source / CLAUDE_WIN}.jsonl -> "))
+        self.assertRegex(lines[3], r"\.jsonl \(4\.9 kB\)$")
+        self.assertTrue(all(str(self.home / ".claude" / "projects") in t for t in target))
+        self.assertRegex(lines[4], r"^free space on .*: [0-9.]+ [kMG]?B; 5\.5 kB needed$")
+        self.assertEqual(lines[5:], ["dry run: nothing was written"])
+
+        code, out, err = run("import", CODEX_WIN, "--dry-run")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("\nrewrite ", out)
+        self.assertIn(": working directories in session_meta and turn_context records\n", out)
+        self.assertIn(f"\n  session_meta payload.cwd: F:\\Proj\\My Site -> {self.w.site}\n", out)
+        self.assertIn("\n  turn_context payload.workspace_roots[]: F:\\Proj\\My Site -> ", out)
+
+        code, out, err = run("import", GROK_WIN, "--dry-run")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("Grok's directory encoding of '-', '.', '_', '~' is unverified", err)
+
+        # Nothing was written anywhere: the stores are as the fixtures were.
+        self.assertFalse(os.path.exists(os.environ["AGENT_SESSIONS_STATE"]))
+        self.assertNotIn(CLAUDE_WIN, " ".join(files_below(self.home / ".claude")))
+        self.assertNotIn(CODEX_WIN, " ".join(files_below(self.home / ".codex")))
+
+    def test_import_prints_the_native_key_and_is_idempotent(self):
+        code, out, err = run("import", self.foreign_key)
+        native = self.w.session(CLAUDE_WIN, "native")
+        self.assertEqual((code, out), (0, native.key + "\n"))
+        self.assertEqual(err, f"agent-sessions: imported 2 items (5.0 kB) into "
+                              f"{self.home / '.claude'}\n")
+        self.assertTrue(native.launchable)
+        for ref in (self.foreign_key, CLAUDE_WIN):
+            self.assertEqual(run("import", ref), (
+                0, native.key + "\n", "agent-sessions: already imported; nothing was copied\n"))
+            self.assertEqual(run("import", ref, "--dry-run"), (
+                0, f"already imported: {native.key}\ndry run: nothing was written\n", ""))
+        code, out, _ = run("list", "--keys")
+        row = next(line for line in out.splitlines() if line.endswith(self.foreign_key))
+        self.assertRegex(row, r"^\S+\s+WinC · imported\s+claude\s+title-69\s+My Site\s+claude:")
+        self.assertEqual(run("open", self.foreign_key, "--dry-run"),
+                         (0, self.command(CLAUDE_WIN, self.w.site), ""))
+
+    def test_import_open_resumes_the_copy(self):
+        code, out, err = run("import", CODEX_WIN, "--open")
+        native = self.w.session(CODEX_WIN, "native")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, native.key + "\n"
+                         + self.command(CODEX_WIN, self.w.site, "codex", "resume"))
+        self.assertIn("imported 1 item (9.6 kB)", err)
+        self.assertEqual(self.w.started, [(
+            ["omarchy-launch-tui", "--app-id=org.omarchy.codex", "codex", "resume", CODEX_WIN],
+            str(self.w.site))])
+
+    def test_import_refusals_exit_one_with_the_reason(self):
+        for ref, needle in ((AGY_WIN, "Antigravity keeps conversations in SQLite files"),
+                            (GEMINI_WIN, "Gemini CLI is not installed on this machine"),
+                            (GROK_WIN, "Grok's directory encoding"),
+                            (CLAUDE_NATIVE, "this session is already on Linux")):
+            code, out, err = run("import", ref, "--open")
+            self.assertEqual((code, out), (1, ""), ref)
+            self.assertTrue(err.startswith("agent-sessions: "), err)
+            self.assertIn(needle, err)
+        shutil.rmtree(self.w.site)
+        self.w.scan()
+        self.assertEqual(run("import", self.foreign_key), (
+            1, "", "agent-sessions: the project folder F:\\Proj\\My Site was not found on any "
+                   "mounted drive\n"))
+        self.assertEqual(self.w.started, [])
+        self.assertFalse(os.path.exists(os.environ["AGENT_SESSIONS_STATE"]))
+
+    # --- show ---------------------------------------------------------------
+
+    def test_show_on_each_providers_fixture(self):
+        cases = {   # id: (provider label, where, turns as printed)
+            CLAUDE_NATIVE: ("Claude", "Linux", "user:\ntext-5\n"),
+            CODEX_SEGMENTED: ("Codex", "Linux",
+                              "user:\ntext-25\n\nassistant:\ntext-26\n\n[tool: exec]\n\n"
+                              "user:\ntext-146\n\nassistant:\ntext-151\n"),
+            GROK_NATIVE: ("Grok", "Linux", None),
+            AGY_WIN: ("Antigravity", "WinC",
+                      "user:\ntext-3\n\n[tool: list_dir]\n\nassistant:\ntext-9\n\n"
+                      "user:\ntext-11\n\nassistant:\ntext-12\n\n"
+                      "user:\ntext-13\n\nassistant:\ntext-14\n"),
+            GEMINI_WIN: ("Gemini", "WinC", "user:\ntext-prompt-1\n\nassistant:\ntext-reply-1\n"),
+            CLAUDE_WIN: ("Claude", "WinC", "user:\ntext-65\n"),
+        }
+        for session_id, (label, where, turns) in cases.items():
+            with self.subTest(provider=label, where=where):
+                session = api.find_session(session_id, self.index)
+                code, out, err = run("show", session.key)
+                self.assertEqual((code, err), (0, ""))
+                header, _, body = out.partition("\n\n")
+                rows = dict(line.split(None, 1) for line in header.splitlines())
+                self.assertEqual(list(rows)[:4], ["title", "provider", "where", "cwd"])
+                self.assertEqual(list(rows)[-4:], ["started", "updated", "messages", "key"])
+                self.assertEqual(
+                    (rows["title"], rows["provider"], rows["where"], rows["cwd"],
+                     rows["started"], rows["updated"], rows["messages"], rows["key"]),
+                    (session.title, label, where, session.cwd, session.started,
+                     session.updated, str(session.messages), session.key))
+                self.assertEqual(rows.get("local"), session.cwd_local)
+                if turns is not None:
+                    self.assertEqual(body, turns)
+                self.assertRegex(body, r"^user:\n")
+                self.assertEqual(run("show", session_id)[1], out)
+        grok = run("show", GROK_NATIVE)[1]
+        self.assertIn("\n\nassistant:\ntext-55\n\n[tool: name-56]\n\nassistant:\ntext-62\n", grok)
+
+    def test_show_groups_tool_calls_and_keeps_text_lines(self):
+        turns = [api.Turn("user", "one\ntwo", None), api.Turn("tool", "Bash", None),
+                 api.Turn("tool", "Read", None), api.Turn("assistant", "done", None),
+                 api.Turn("tool", "Edit", None)]
+        with mock.patch.object(api, "transcript", return_value=iter(turns)):
+            out = run("show", CLAUDE_NATIVE)[1]
+        self.assertEqual(out.partition("\n\n")[2],
+                         "user:\none\ntwo\n\n[tool: Bash]\n[tool: Read]\n\n"
+                         "assistant:\ndone\n\n[tool: Edit]\n")
+
+    def test_show_stops_quietly_when_the_reader_goes_away(self):
+        real, count = cli._out, []
+
+        def closing(text):
+            count.append(text)
+            if len(count) > 3:
+                raise BrokenPipeError(32, "Broken pipe")
+            real(text)
+
+        with mock.patch.object(cli, "_out", closing):
+            code, out, err = run("show", CODEX_SEGMENTED)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(len(out.splitlines()), 3)
+
+    # --- list --keys --------------------------------------------------------
+
+    def test_list_keys_adds_a_last_column(self):
+        plain = run("list")[1].splitlines()
+        keyed = run("list", "--keys")[1].splitlines()
+        keys = [s.key for s in api.list_sessions(index=self.index)]
+        self.assertEqual(len(plain), len(keys))
+        self.assertEqual([line.split()[-1] for line in keyed], keys)
+        for short, long, key in zip(plain, keyed, keys):
+            self.assertNotIn(key, short)
+            self.assertTrue(long.startswith(short.rstrip()[:10]))
+            self.assertEqual(" ".join(long.split()[:-1]), " ".join(short.split()))
+
+
+class FindSessionTest(unittest.TestCase):
+    def setUp(self):
+        self.box = Sandbox(self)
+        native = self.box.store(self.box.home)
+        disk = self.box.mount("Disk")
+        foreign = self.box.store(disk / "Users" / "u")
+        self.box.session(native, "aaa-1")
+        self.box.session(native, "both")
+        self.box.session(foreign, "aaa-2")
+        self.box.session(foreign, "both")
+        api.scan(deep=True)
+        self.index = api.load_index()
+        self.native_key = make_key("fake", native, "both")
+        self.foreign_key = make_key("fake", foreign, "both")
+
+    def test_full_key_prefix_and_bare_id(self):
+        find = lambda ref: api.find_session(ref, self.index)   # noqa: E731
+        both = find(self.native_key)
+        self.assertEqual((both.origin, both.id), ("native", "both"))
+        self.assertEqual(find(self.foreign_key).origin, "foreign")
+        self.assertIs(find(both), both)                        # a Session passes through
+        self.assertEqual(find(self.native_key[:-2]), both)      # unique prefix
+        self.assertEqual(find("aaa-1").id, "aaa-1")
+        self.assertEqual(find("  aaa-2\n").id, "aaa-2")
+        self.assertEqual(api.find_session("aaa-1").id, "aaa-1")   # loads the index itself
+        # An id listed natively and on a drive: the native copy.
+        self.assertEqual(find("both"), both)
+
+    def test_not_found(self):
+        for ref, needle in (("zzz", "no session matches 'zzz'"), ("", "no session key given"),
+                            (None, "no session key given"), ("aaa", "no session matches 'aaa'"),
+                            ("fake:", "'fake:' matches 4 sessions: fake:"),
+                            (self.native_key[:10], "matches 2 sessions")):
+            with self.assertRaises(api.NotFound) as caught:
+                api.find_session(ref, self.index)
+            self.assertIn(needle, caught.exception.reason)
+            self.assertIsInstance(caught.exception, api.ApiError)
+        with self.assertRaises(api.NotFound) as caught:
+            api.find_session(self.native_key[:10], self.index)
+        self.assertIn(self.native_key, caught.exception.reason)
+        with self.assertRaises(api.NotFound):
+            list(api.transcript("zzz", self.index))
+
+    def test_transcript_goes_through_the_adapter(self):
+        turns = [api.Turn("user", "hello", None)]
+        with mock.patch("support.FakeProvider.transcript", return_value=turns, create=True):
+            self.assertEqual(list(api.transcript("aaa-1", self.index)), turns)
 
 
 class AgeTest(unittest.TestCase):

@@ -919,6 +919,42 @@ the parsed count on both stores.)
 - **Path map**: `D:` stays unresolved from listed sessions (the only listed session on it points
   at a folder that is gone); no listed session is affected.
 
+### Import and launch notes (task 5, 2026-10-12)
+
+- **Claude `<enc-cwd>`** (correction to §2): the tool's regex has no `u` flag, so the
+  replacement is per UTF-16 code unit. A character outside the BMP (an emoji) becomes **two**
+  `-`; "each become one `-`" holds for BMP characters only. `encode_cwd` was checked against the
+  tool's own functions (`k`, `Mse`, `Le`, `OO`, copied from the 2.1.296 binary and run under
+  node) on nine paths, four of them over 200 characters. The hash has no Bun-specific branch.
+  Three real Windows sessions map to a folder whose encoding is over 200 characters (the MSIX
+  scratch workspaces), so the hash rule is used by real imports.
+- **Codex rewrite**: `json.dumps(record, ensure_ascii=False, separators=(",", ":"))` reproduces
+  the original bytes of every `session_meta` and `turn_context` line of the real Windows rollout
+  and of the fixtures, so a rewritten line differs from the source in the mapped values only. A
+  path that does not map to an existing folder is left as recorded. The thread name is taken from
+  the store's `session_index.jsonl`, else from the Orca mirror's (`<profile>/AppData/Roaming/orca/…/home`
+  or `<profile>/.config/orca/…/home`); the source line is appended as it is, unless the native
+  index already names the thread. The Windows thread has two name lines in the mirror only.
+- **Grok `summary.json`** (correction to §6.4): all 15 real summaries (14 native, 1 Windows) are
+  pretty-printed with a two-space indent and no final newline, and `json.dumps(…, indent=2,
+  ensure_ascii=False)` reproduces each byte for byte. The import keeps that layout when the
+  source has it (then only the two values differ) and writes compact JSON otherwise. Keys that
+  are absent are not added.
+- **Grok group directory**: besides the `[A-Za-z0-9/ ]` rule, an encoded name over 255 bytes is
+  refused (the slug-and-hash naming is documented but was never seen). Sub-agent child sessions
+  of an imported session are not copied (none exists).
+- **Every import**: files are staged in `<native store>/.agent-sessions-import-<pid>-<n>/` and
+  renamed into place; a hard kill can leave that directory behind (it is inert). Copies keep the
+  source's modification time, are created `0600` (directories `0700`), and symbolic links and
+  special files in a session directory are left out.
+- **SQLite**: a database up to 64 MB is now read through `open_ro` and loaded into an in-memory
+  connection with `Connection.deserialize` (header bytes 18 and 19 set from 2 to 1 in the copy,
+  `PRAGMA query_only`), so SQLite never opens the file and its access time cannot move. Larger
+  files, and any file that does not load that way, are opened with `mode=ro&immutable=1` as
+  before. Both ways give the same rows on every fixture database and on the real ones.
+- **Launch**: `resume_needs_cwd` is true for Gemini only (§5 of each provider). The other four
+  start in the home directory with a note when the recorded folder is gone or unknown.
+
 ---
 
 ## Open questions / needs live test

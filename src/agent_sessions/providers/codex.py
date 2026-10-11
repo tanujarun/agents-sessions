@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
 from typing import Iterator
 
-from ..fsutil import home, listdir_ro, subdirs
+from .. import importer
+from ..fsutil import home, listdir_ro, open_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
-from .base import Provider, Turn, clean_title, iter_jsonl, parse_ts, warn
+from .base import NotSupported, Provider, Turn, clean_title, iter_jsonl, parse_ts, warn
 
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 # Groups: local time, thread id, segment id (or None), ".zst" (or None).
@@ -19,6 +21,18 @@ _ROLLOUT = re.compile(
     r"\.jsonl(\.zst)?$")
 _INDEX = "session_index.jsonl"
 _ROLES = {"UserMessage": "user", "AgentMessage": "assistant"}
+# Where the Orca app keeps its own CODEX_HOME, relative to the profile that
+# holds ``.codex`` (FORMATS section 1, "Mirror stores"). Its thread-name index
+# can exist when the store's own does not.
+_MIRROR_HOMES = (
+    ("AppData", "Roaming", "orca", "codex-runtime-home", "home"),
+    (".config", "orca", "codex-runtime-home", "home"),
+)
+# record type -> the payload keys an import maps to local paths (section 6).
+_CWD_KEYS = {
+    "session_meta": ("cwd", "runtime_workspace_roots"),
+    "turn_context": ("cwd", "workspace_roots"),
+}
 
 
 def _subdirs(path) -> list[str]:
@@ -144,6 +158,112 @@ def _index_title(path: str, thread_id: str) -> str:
     return clean_title(name)
 
 
+def _index_line(path: str, thread_id: str) -> bytes | None:
+    """The last index line that names the thread, as it is in the file."""
+    if not os.path.exists(path):
+        return None
+    found = None
+    try:
+        with open_ro(path) as fh:
+            for raw in fh:
+                line = raw.rstrip(b"\r\n")
+                try:
+                    record = json.loads(line.decode("utf-8", "replace"))
+                except (ValueError, RecursionError):
+                    continue
+                if (isinstance(record, dict) and record.get("id") == thread_id
+                        and isinstance(record.get("thread_name"), str)):
+                    found = line
+    except OSError:
+        return None
+    return found
+
+
+def _source_name_line(store_root: str, thread_id: str) -> bytes | None:
+    """The thread's name line from the store's index, else from the Orca
+    mirror's beside it."""
+    homes = [store_root] + [os.path.join(os.path.dirname(store_root), *parts)
+                            for parts in _MIRROR_HOMES]
+    for directory in homes:
+        line = _index_line(os.path.join(directory, _INDEX), thread_id)
+        if line is not None:
+            return line
+    return None
+
+
+class _CwdRewrite(importer.Rewrite):
+    """Maps the recorded working directories of a rollout to local paths.
+
+    Only ``session_meta`` and ``turn_context`` lines are touched, and of
+    those only ``payload.cwd`` and the workspace-root lists; a path that does
+    not map to an existing folder is left as it is. A changed line is
+    serialised again the way the tool writes it (compact, non-ASCII as it
+    is) and parsed back to confirm that nothing else moved. Every other line
+    goes through byte for byte.
+    """
+
+    label = "working directories in session_meta and turn_context records"
+
+    def __init__(self, pathmap, mount):
+        super().__init__()
+        self._pathmap = pathmap
+        self._mount = mount
+        self._seen: dict[tuple[str, str, str, str], int] = {}
+
+    def _local(self, value):
+        if not isinstance(value, str) or not value:
+            return value
+        local, exists = self._pathmap.to_local(value, self._mount)
+        return local if exists and local else value
+
+    def _line(self, raw: bytes) -> bytes:
+        body = raw.rstrip(b"\r\n")
+        if b'"session_meta"' not in body and b'"turn_context"' not in body:
+            return raw
+        try:
+            text = body.decode("utf-8")
+            record, original = json.loads(text), json.loads(text)
+        except (ValueError, RecursionError):
+            return raw
+        kind = record.get("type") if isinstance(record, dict) else None
+        payload = record.get("payload") if isinstance(record, dict) else None
+        if kind not in _CWD_KEYS or not isinstance(payload, dict):
+            return raw
+        changed = []
+        for key in _CWD_KEYS[kind]:
+            value = payload.get(key)
+            if isinstance(value, str):
+                mapped = self._local(value)
+                if mapped != value:
+                    payload[key] = mapped
+                    changed.append((kind, f"payload.{key}", value, mapped))
+            elif isinstance(value, list):
+                mapped = [self._local(item) for item in value]
+                for old, new in zip(value, mapped):
+                    if old != new:
+                        changed.append((kind, f"payload.{key}[]", old, new))
+                payload[key] = mapped
+        if not changed:
+            return raw
+        out = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+        allowed = [("payload", key) for key in _CWD_KEYS[kind]]
+        if not importer.only_changed(original, json.loads(out), allowed):
+            raise importer.ImportFailed(
+                "a rollout line did not survive rewriting unchanged; nothing was imported")
+        for change in changed:
+            self._seen[change] = self._seen.get(change, 0) + 1
+        return out.encode("utf-8") + raw[len(body):]
+
+    def apply(self, reader) -> Iterator[bytes]:
+        self._seen = {}
+        self.changes = []
+        for raw in reader:
+            yield self._line(raw)
+        self.changes = [
+            f"{kind} {field}: {old} -> {new}" + (f" ({count} records)" if count > 1 else "")
+            for (kind, field, old, new), count in sorted(self._seen.items())]
+
+
 def _is_subagent(meta: dict) -> bool:
     if "source" in meta and not isinstance(meta["source"], str):
         return True
@@ -258,5 +378,49 @@ class Codex(Provider):
                 rollouts.append(_read(path, tools=True))
         yield from _surviving(_ordered(rollouts))
 
-    def import_session(self, s: Session, pathmap) -> Session:
-        raise NotImplementedError
+    def import_plan(self, s: Session, pathmap) -> importer.ImportPlan:
+        """Every rollout of the thread to the same ``YYYY/MM/DD/<name>``
+        (FORMATS section 6). A thread in one file has its working directories
+        rewritten; a thread with segments keeps the base file (and any middle
+        segment) byte for byte, because a segment's ``history_base`` holds a
+        byte offset into the base, and only its last segment is rewritten.
+        The thread's name line, when the source has one, is appended to the
+        native ``session_index.jsonl`` after the files are in place."""
+        files = [f for f in s.files if _ROLLOUT.match(os.path.basename(f))]
+        if not files:
+            raise NotSupported("this thread has no rollout file to copy")
+        plan = importer.start_plan(s, self.native_store(), pathmap)
+        native = Store(self.name, plan.native_root, "native")
+        for candidate in self.candidates(native):
+            if candidate.id_hint == s.id:
+                plan.existing = [p for p in candidate.paths
+                                 if _ROLLOUT.match(os.path.basename(p))]
+        source_sessions = os.path.join(s.store, "sessions")
+        for position, path in enumerate(files):
+            parts = os.path.relpath(path, source_sessions).split(os.sep)
+            if len(parts) != 4 or parts[0] == os.pardir:
+                raise NotSupported(f"a rollout is not under sessions/YYYY/MM/DD: {path}")
+            rewrite = None
+            if position == len(files) - 1:
+                rewrite = _CwdRewrite(pathmap, s.mount)
+            plan.units.append(importer.Unit(
+                os.path.join(plan.native_root, "sessions", *parts), path,
+                [importer.file_copy(path, rewrite=rewrite)]))
+        index = os.path.join(plan.native_root, _INDEX)
+        line = _source_name_line(s.store, s.id)
+        if line is not None and _index_line(index, s.id) is None:
+            plan.appends.append(importer.Append(index, line + b"\n", "the thread's name"))
+        meta = _read_meta(files[0])
+        if isinstance(meta.get("cli_version"), str):
+            plan.info["source_tool_version"] = meta["cli_version"]
+        return plan
+
+
+def _read_meta(path: str) -> dict:
+    """The ``session_meta`` payload of a rollout's first line, or ``{}``."""
+    for record in iter_jsonl(path):
+        payload = record.get("payload")
+        if record.get("type") == "session_meta" and isinstance(payload, dict):
+            return payload
+        break
+    return {}

@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
 from typing import Iterator
 
-from ..fsutil import home, listdir_ro, subdirs
+from .. import importer
+from ..fsutil import home, listdir_ro, open_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
-from .base import Provider, Turn, clean_title, iter_jsonl, parse_ts, warn
+from .base import NotSupported, Provider, Turn, clean_title, iter_jsonl, parse_ts, warn
 
 _TRANSCRIPT = re.compile(
     r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
@@ -30,6 +32,58 @@ _TITLE_FIELDS = (
     ("summary", "summary"),
 )
 _TITLE_FIELD = dict(_TITLE_FIELDS)
+
+ENCODED_MAX = 200           # longer directory names are cut and get a hash
+_HEAD = 65536               # the tool itself reads this much for cheap fields
+_BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def encode_cwd(cwd: str) -> str:
+    """The project directory name the tool gives a working directory
+    (FORMATS "Claude Code" section 2; the tool's functions ``OO``, ``Mse``).
+
+    Every UTF-16 code unit that is not an ASCII letter or digit becomes
+    ``-``. A result over 200 characters is cut to 200 and gets ``-`` plus the
+    base-36 absolute value of the 32-bit string hash ``h = h * 31 + unit``
+    over the original text.
+    """
+    raw = cwd.encode("utf-16-le", "surrogatepass")
+    units = [int.from_bytes(raw[i:i + 2], "little") for i in range(0, len(raw), 2)]
+    encoded = "".join(
+        chr(unit) if unit < 128 and chr(unit).isalnum() else "-" for unit in units)
+    if len(encoded) <= ENCODED_MAX:
+        return encoded
+    total = 0
+    for unit in units:
+        total = (total * 31 + unit) & 0xFFFFFFFF
+    if total >= 0x80000000:
+        total -= 0x100000000
+    total = abs(total)
+    digits = ""
+    while True:
+        total, digit = divmod(total, 36)
+        digits = _BASE36[digit] + digits
+        if not total:
+            break
+    return f"{encoded[:ENCODED_MAX]}-{digits}"
+
+
+def _recorded_version(path) -> str | None:
+    """The tool version of the first record that names one, looking only at
+    the head of the transcript."""
+    try:
+        with open_ro(path) as fh:
+            head = fh.read(_HEAD)
+    except OSError:
+        return None
+    for line in head.split(b"\n")[:-1]:
+        try:
+            record = json.loads(line.decode("utf-8", "replace"))
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(record, dict) and isinstance(record.get("version"), str):
+            return record["version"]
+    return None
 
 
 def _prompts(record: dict) -> tuple[list[str], str | None]:
@@ -278,5 +332,31 @@ class Claude(Provider):
                         if isinstance(tool, str) and tool:
                             yield Turn("tool", tool, moment)
 
-    def import_session(self, s: Session, pathmap) -> Session:
-        raise NotImplementedError
+    def import_plan(self, s: Session, pathmap) -> importer.ImportPlan:
+        """Copy only (FORMATS section 6): the ``<id>/`` side directory first,
+        the transcript last, into ``projects/<encoded mapped cwd>/``. Nothing
+        is rewritten and nothing else is copied."""
+        transcript = next((f for f in s.files if _TRANSCRIPT.match(os.path.basename(f))), None)
+        if transcript is None:
+            raise NotSupported("this session has no transcript file to copy")
+        plan = importer.start_plan(s, self.native_store(), pathmap)
+        name = os.path.basename(transcript)
+        projects = os.path.join(plan.native_root, "projects")
+        try:
+            dirs = sorted(subdirs(projects))
+        except OSError:
+            dirs = []
+        plan.existing = [path for path in (os.path.join(projects, d, name) for d in dirs)
+                         if os.path.lexists(path)]
+        target = os.path.join(projects, encode_cwd(plan.cwd_local))
+        side = transcript[:-len(".jsonl")]
+        if os.path.isdir(side) and not os.path.islink(side):
+            sub, files = importer.tree(side)
+            plan.units.append(importer.Unit(
+                os.path.join(target, os.path.basename(side)), side, files, True, sub))
+        plan.units.append(importer.Unit(
+            os.path.join(target, name), transcript, [importer.file_copy(transcript)]))
+        version = _recorded_version(transcript)
+        if version:
+            plan.info["source_tool_version"] = version
+        return plan

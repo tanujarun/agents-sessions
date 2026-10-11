@@ -9,10 +9,12 @@ import urllib.parse
 from pathlib import Path
 from typing import Iterator
 
+from .. import importer
 from ..fsutil import home, listdir_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
-from .base import Provider, Turn, clean_title, iter_jsonl, open_ro, parse_ts, warn
+from .base import (NotSupported, Provider, Turn, clean_title, iter_jsonl, open_ro, parse_ts,
+                   warn)
 
 _SUMMARY = "summary.json"
 _CHAT = "chat_history.jsonl"
@@ -23,6 +25,11 @@ _FIXED_PATHS = 3            # summary.json, chat_history.jsonl, <group>/.cwd
 _SMALL_FILE = 16 * 1024 * 1024
 _QUERY = re.compile(r"<user_query>(.*?)</user_query>", re.S)
 _INJECTED = ("<user_info>", "<system-reminder>")
+# Import (FORMATS section 6): the only cwd shape whose group directory name
+# is known for certain, and the reason given for every other one.
+_PLAIN_CWD = re.compile(r"[A-Za-z0-9/ ]+")
+_GROUP_NAME_MAX = 255       # bytes; longer names get a slug and a hash [docs]
+ENCODING_UNVERIFIED = "Grok's directory encoding of '-', '.', '_', '~' is unverified"
 
 
 def _load_json(path):
@@ -43,6 +50,53 @@ def _load_json(path):
         return json.loads(raw.decode("utf-8-sig", "replace")), None
     except (ValueError, RecursionError):
         return None, "not valid JSON"
+
+
+class _SummaryRewrite(importer.Rewrite):
+    """Sets ``info.cwd`` and ``grok_home`` in ``summary.json``; every other
+    key keeps its value. The file is written in the source's own layout when
+    that is one the tool is known to write (two-space indent, as every real
+    summary is), else as compact JSON."""
+
+    label = "info.cwd and grok_home in summary.json"
+
+    def __init__(self, cwd: str, grok_home: str):
+        super().__init__()
+        self._cwd = cwd
+        self._home = grok_home
+
+    @staticmethod
+    def _dump(value, pretty: bool) -> bytes:
+        if pretty:
+            return json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+    def apply(self, reader) -> Iterator[bytes]:
+        self.changes = []
+        raw = reader.read(_SMALL_FILE + 1)
+        try:
+            if len(raw) > _SMALL_FILE:
+                raise ValueError("too large")
+            text = raw.decode("utf-8")
+            data, original = json.loads(text), json.loads(text)
+        except (ValueError, RecursionError) as exc:
+            raise importer.ImportFailed(f"summary.json cannot be rewritten: {exc}") from exc
+        if not isinstance(data, dict):
+            raise importer.ImportFailed("summary.json cannot be rewritten: not a JSON object")
+        pretty = self._dump(original, True) == raw
+        info = data.get("info")
+        if isinstance(info, dict) and "cwd" in info and info["cwd"] != self._cwd:
+            self.changes.append(f"info.cwd: {info['cwd']} -> {self._cwd}")
+            info["cwd"] = self._cwd
+        if "grok_home" in data and data["grok_home"] != self._home:
+            self.changes.append(f"grok_home: {data['grok_home']} -> {self._home}")
+            data["grok_home"] = self._home
+        out = self._dump(data, pretty)
+        if not importer.only_changed(original, json.loads(out.decode("utf-8")),
+                                     [("info", "cwd"), ("grok_home",)]):
+            raise importer.ImportFailed(
+                "summary.json did not survive rewriting unchanged; nothing was imported")
+        yield out
 
 
 def _mtime(path) -> str | None:
@@ -310,5 +364,40 @@ class Grok(Provider):
                 if isinstance(name, str) and name:
                     yield Turn("tool", name, None)
 
-    def import_session(self, s: Session, pathmap) -> Session:
-        raise NotImplementedError
+    def import_plan(self, s: Session, pathmap) -> importer.ImportPlan:
+        """The session directory without ``*.lock``, into the group directory
+        of the mapped cwd, with ``summary.json`` rewritten (FORMATS section
+        6). Allowed only when the group directory name is certain: a native
+        group already decodes to the mapped cwd, or the cwd is made of
+        letters, digits, ``/`` and spaces."""
+        if not s.files:
+            raise NotSupported("this session has no directory to copy")
+        source = s.files[0]
+        plan = importer.start_plan(s, self.native_store(), pathmap)
+        sessions = os.path.join(plan.native_root, "sessions")
+        try:
+            groups = sorted(subdirs(sessions))
+        except OSError:
+            groups = []
+        group = next((g for g in groups if urllib.parse.unquote(g) == plan.cwd_local), None)
+        if group is None:
+            if not _PLAIN_CWD.fullmatch(plan.cwd_local):
+                raise NotSupported(f"{ENCODING_UNVERIFIED} (project folder {plan.cwd_local})")
+            group = urllib.parse.quote(plan.cwd_local, safe="")
+            if len(group.encode("utf-8")) > _GROUP_NAME_MAX:
+                raise NotSupported(
+                    "Grok shortens directory names over 255 bytes in a way that is "
+                    f"unverified (project folder {plan.cwd_local})")
+        name = os.path.basename(os.path.normpath(source))
+        plan.existing = sorted({
+            path for path in (os.path.join(sessions, g, n) for g in groups
+                              for n in {name, s.id})
+            if os.path.lexists(path)})
+        dirs, files = importer.tree(source, skip=lambda entry: entry.endswith(".lock"))
+        for item in files:
+            if item.rel == _SUMMARY:
+                item.rewrite = _SummaryRewrite(plan.cwd_local, plan.native_root)
+        files.sort(key=lambda item: (item.rel == _SUMMARY, item.rel))   # summary.json last
+        plan.units.append(importer.Unit(
+            os.path.join(sessions, group, name), source, files, True, dirs))
+        return plan

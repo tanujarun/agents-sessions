@@ -184,9 +184,14 @@ class FixtureParseTest(GeminiCase):
     def test_a_gemini_dir_without_tmp_is_not_a_store(self):
         self.assertFalse(self.provider.is_store(NOT_A_STORE))
 
-    def test_import_is_a_later_task(self):
-        with self.assertRaises(NotImplementedError):
-            self.provider.import_session(None, None)
+    def test_import_is_refused_with_the_documented_reason(self):
+        """FORMATS section 6. More in tests/test_importer.py."""
+        from agent_sessions.providers import gemini as module
+        from agent_sessions.providers.base import NotSupported
+        for call in (self.provider.import_plan, self.provider.import_session):
+            with self.assertRaises(NotSupported) as caught:
+                call(None, None)
+            self.assertEqual(caught.exception.reason, module.IMPORT_UNSAFE)
 
 
 class RecordModelTest(GeminiCase):

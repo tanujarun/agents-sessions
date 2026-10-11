@@ -50,7 +50,7 @@ Same as 4a for `providers/grok.py`, `providers/antigravity.py`,
 `providers/gemini.py`. SQLite opened read-only/immutable as SPEC requires.
 Verify: counts against the real stores; no `-wal`/`-shm` created on any drive.
 
-## 5. Launch and import — Careful — after: 4a, 4b — [~]
+## 5. Launch and import — Careful — after: 4a, 4b — [x]
 
 `launch.py`, `importer.py`, `import_session` in each adapter, CLI `open`,
 `import`, `show`. All SPEC "Launch" and "Import" rules; `NotSupported` with a
@@ -61,7 +61,7 @@ command (`open --dry-run`). Imports during testing go to a temp native store
 (env override), never the real one.
 Verify: tests for idempotence, no-overwrite, atomic write, provenance.
 
-## 6. TUI front end — Careful — after: 5 — [ ]
+## 6. TUI front end — Careful — after: 4a, 4b — [~]
 
 `tui/` (Textual) per SPEC "TUI" and "Stack": layout, keys, foreign-row prompt,
 built-in transcript pager, scans in workers, resize handling, all styling in
@@ -75,7 +75,7 @@ at 120x40, 80x24 and 40x10 that press keys and assert on the screen,
 including an empty index and a resize; no real launch (the launcher is
 injected and recorded).
 
-## 7. Ground-truth audit — Medium — after: 5 — [ ]
+## 7. Ground-truth audit — Medium — after: 4a, 4b — [x]
 
 An independent check that does not import the package: a throwaway script
 that brute-force walks every mount and counts session files per provider by
@@ -83,3 +83,14 @@ the signatures in FORMATS.md, then compares with `list --json`; run `scan`
 three times and diff; simulate a missing mount and a corrupt file. Report
 every mismatch with paths.
 Verify: orchestrator reruns the script.
+
+## 8. Audit fixes — Medium — after: 5, 7 — [~]
+
+Defects found by task 7: a wrong-typed record field drops a whole Claude or
+Codex session; an unreadable directory inside a store drops its sessions
+without a warning; of two copies of one session the path-first one is listed,
+not the newest; a corrupt or missing cache makes `list` print nothing without
+saying why; stores inside this project's own tree get listed by a real scan;
+`C:` stays unresolved on a system volume with no path evidence; import staging
+directories are never swept.
+Verify: a regression test per defect; real scan still 135 sessions, `verify` passes.

@@ -14,10 +14,14 @@ from typing import Iterator
 from ..fsutil import home, listdir_ro
 from ..model import Candidate, Session, Store
 from . import register
-from .base import (Provider, Turn, clean_title, iter_jsonl, open_ro, open_sqlite_ro,
-                   parse_ts, warn)
+from .base import (NotSupported, Provider, Turn, clean_title, iter_jsonl, open_ro,
+                   open_sqlite_ro, parse_ts, warn)
 
 IDE_NOTE = "Antigravity IDE conversation: list only"
+# The verdict of FORMATS section 6, shown to the user as it is.
+IMPORT_UNSAFE = ("Antigravity keeps conversations in SQLite files with protobuf columns; "
+                 "registering one needs a row in conversation_summaries.db and the "
+                 "workspace path is inside protobuf blobs")
 
 _SUMMARIES = "conversation_summaries.db"
 _SIDECARS = ("-wal", "-shm", "-journal")
@@ -465,5 +469,5 @@ class Antigravity(Provider):
                     if name:
                         yield Turn("tool", name, ts)
 
-    def import_session(self, s: Session, pathmap) -> Session:
-        raise NotImplementedError
+    def import_plan(self, s: Session, pathmap):
+        raise NotSupported(IMPORT_UNSAFE)

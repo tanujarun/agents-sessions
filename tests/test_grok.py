@@ -236,9 +236,14 @@ class FixtureParseTest(GrokCase):
         self.assertEqual(self.provider.resume_argv(s), ["grok", "--resume", TITLED])
         self.assertTrue(self.provider.resumable)
 
-    def test_import_is_a_later_task(self):
-        with self.assertRaises(NotImplementedError):
-            self.provider.import_session(None, None)
+    def test_import_needs_the_session_files(self):
+        """The import itself: tests/test_importer.py."""
+        from agent_sessions.providers.base import NotSupported
+        store = Store("grok", "/nowhere/store", "foreign", "/nowhere", "x")
+        session = Session.for_store(store, id="00000000-0000-4000-8000-000000000000")
+        with self.assertRaises(NotSupported) as caught:
+            self.provider.import_plan(session, None)
+        self.assertIn("no directory", caught.exception.reason)
 
 
 class RulesTest(GrokCase):

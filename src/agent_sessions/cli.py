@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shlex
 import sys
 from datetime import datetime, timezone
 
@@ -33,17 +35,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--provider", metavar="P", help="only this provider",
                    choices=[provider.name for provider in all_providers()])
     p.add_argument("--json", action="store_true", help="JSON output")
+    p.add_argument("--keys", action="store_true", help="add the session key as a last column")
 
+    key_help = "a session key (`list --keys`), a unique start of one, or a session id"
     p = sub.add_parser("open", help="native: resume. foreign: import first")
-    p.add_argument("key")
+    p.add_argument("key", help=key_help)
     p.add_argument("--dry-run", action="store_true", help="print the command, do not run it")
+    p.add_argument("--here", action="store_true",
+                   help="resume in this terminal instead of a new window")
 
     p = sub.add_parser("import", help="import; optionally resume after")
-    p.add_argument("key")
+    p.add_argument("key", help=key_help)
     p.add_argument("--open", action="store_true", help="resume after import")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print what would be copied and rewritten, write nothing")
 
     p = sub.add_parser("show", help="plain-text transcript to stdout")
-    p.add_argument("key")
+    p.add_argument("key", help=key_help)
 
     p = sub.add_parser("status", help="mounts, stores, counts per provider, warnings")
     p.add_argument("--json", action="store_true", help="JSON output")
@@ -80,6 +88,16 @@ def _table(rows, indent: str = "") -> None:
 
 def _count(n: int, word: str, plural: str | None = None) -> str:
     return f"{n:,} {word if n == 1 else (plural or word + 's')}"
+
+
+def _size(count: int) -> str:
+    """A byte count in decimal units: ``812 B``, ``116.7 kB``, ``123.7 MB``."""
+    size = float(count)
+    for unit in ("B", "kB", "MB"):
+        if size < 1000:
+            return f"{int(size)} B" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1000
+    return f"{size:.1f} GB"
 
 
 def _age(stamp: str | None, now: datetime) -> str:
@@ -168,7 +186,8 @@ def _list(args) -> int:
         print(f"{PROG}: no index yet; run `{PROG} scan`", file=sys.stderr)
     now = datetime.now(timezone.utc)
     _table([[_age(s.updated or s.started, now), index.where(s), s.provider,
-             s.title or "-", _project(s.cwd)] for s in sessions])
+             s.title or "-", _project(s.cwd)] + ([s.key] if args.keys else [])
+            for s in sessions])
     return 0
 
 
@@ -281,12 +300,127 @@ def _verify(args) -> int:
     return 0
 
 
+def _print_plan(plan) -> None:
+    """A launch plan as a line a shell could run, and its note."""
+    _out(f"cd {shlex.quote(plan.cwd)} && {shlex.join(plan.command)}")
+    if plan.note:
+        _out(f"note: {plan.note}")
+
+
+def _resume(ref, here: bool, dry_run: bool, index=None) -> int:
+    if here and not dry_run:
+        # exec replaces this process: say what runs before it does.
+        try:
+            _print_plan(api.open_session(ref, here=True, dry_run=True, index=index))
+            sys.stdout.flush()
+        except api.LaunchFailed:
+            pass   # the real call below fails the same way, and notifies
+    plan = api.open_session(ref, here=here, dry_run=dry_run, index=index)
+    if not here or dry_run:
+        _print_plan(plan)
+    return 0
+
+
+def _open(args) -> int:
+    return _resume(args.key, args.here, args.dry_run)
+
+
+def _import(args) -> int:
+    index = api.load_index()
+    if args.dry_run:
+        plan = api.import_plan(args.key, index=index)
+        if plan["already"]:
+            _out(f"already imported: {plan['already']}")
+            _out("dry run: nothing was written")
+            return 0
+        _out(f"import {plan['source_key']} -> {plan['native_key']}")
+        _out(f"project folder: {plan['cwd']} -> {plan['cwd_local']}")
+        for copy in plan["copies"]:
+            size = _size(copy["bytes"])
+            if copy["dir"]:
+                _out(f"copy {copy['from']}{os.sep} -> {copy['to']}{os.sep} "
+                     f"({_count(copy['files'], 'file')}, {size})")
+            else:
+                _out(f"copy {copy['from']} -> {copy['to']} ({size})")
+        for rewrite in plan["rewrites"]:
+            _out(f"rewrite {rewrite['file']}: {rewrite['what']}")
+            for change in rewrite["changes"] or ["nothing to change"]:
+                _out(f"  {change}")
+        for append in plan["appends"]:
+            _out(f"append to {append['file']}: {append['what']}")
+        _out(f"free space on {plan['free_on']}: {_size(plan['free'])}; "
+             f"{_size(plan['needed'])} needed")
+        _out("dry run: nothing was written")
+        return 0
+    progress = None
+    if sys.stderr.isatty():
+        def progress(done, total):
+            share = 100 * done // total if total else 100
+            sys.stderr.write(f"\r\033[Kcopying… {share}% of "
+                             f"{_size(total)}")
+            sys.stderr.flush()
+    try:
+        report = api.import_report(args.key, progress=progress, index=index)
+    finally:
+        if progress is not None:
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+    if report.created:
+        print(f"{PROG}: imported {_count(len(report.files), 'item')} "
+              f"({_size(report.bytes)}) into {report.session.store}",
+              file=sys.stderr)
+    else:
+        print(f"{PROG}: already imported; nothing was copied", file=sys.stderr)
+    _out(report.session.key)
+    if args.open:
+        return _resume(report.session, False, False)
+    return 0
+
+
+def _show(args) -> int:
+    index = api.load_index()
+    session = api.find_session(args.key, index=index)
+    label = next((p.label for p in all_providers() if p.name == session.provider),
+                 session.provider)
+    rows = [["title", session.title or "-"], ["provider", label],
+            ["where", index.where(session)], ["cwd", session.cwd or "-"]]
+    if session.cwd_local and session.cwd_local != session.cwd:
+        rows.append(["local", session.cwd_local])
+    rows += [["started", session.started or "-"], ["updated", session.updated or "-"],
+             ["messages", "-" if session.messages is None else session.messages],
+             ["key", session.key]]
+    _table(rows)
+    last = None
+    for turn in api.transcript(session):
+        if turn.role == "tool":
+            if last != "tool":
+                _out("")
+            _out(f"[tool: {turn.text}]")
+        else:
+            _out("")
+            _out(f"{turn.role}:")
+            _out(turn.text)
+        last = turn.role
+    return 0
+
+
 def _not_implemented(args: argparse.Namespace) -> int:
     print(f"{PROG}: {args.command}: not implemented", file=sys.stderr)
     return 1
 
 
-_COMMANDS = {"scan": _scan, "list": _list, "status": _status, "verify": _verify}
+def _quiet_stdout() -> None:
+    """After a broken pipe: point stdout at nothing, so the flush at exit
+    does not raise again."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+_COMMANDS = {"scan": _scan, "list": _list, "status": _status, "verify": _verify,
+             "open": _open, "import": _import, "show": _show}
 
 
 def main(argv=None) -> int:
@@ -296,7 +430,15 @@ def main(argv=None) -> int:
         parser.print_help()
         return 2
     try:
-        return _COMMANDS.get(args.command, _not_implemented)(args)
+        code = _COMMANDS.get(args.command, _not_implemented)(args)
+        sys.stdout.flush()
+        return code
+    except BrokenPipeError:
+        _quiet_stdout()   # the reader (head, less) went away: not an error
+        return 0
+    except api.ApiError as exc:
+        print(f"{PROG}: {exc.reason}", file=sys.stderr)
+        return 1
     except MountsError as exc:
         print(f"{PROG}: {exc}", file=sys.stderr)
         return 1

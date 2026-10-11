@@ -675,10 +675,16 @@ class RegistryTest(unittest.TestCase):
         p = Provider()
         for call in (p.native_store, lambda: p.is_store(Path("/")), lambda: p.candidates(None),
                      lambda: p.parse(None, None), lambda: p.resume_argv(None),
-                     lambda: p.import_session(None, None), lambda: p.list_sessions(None)):
+                     lambda: p.list_sessions(None)):
             with self.assertRaises(NotImplementedError):
                 call()
+        # A provider that says nothing about importing refuses, with a reason.
+        for call in (p.import_plan, p.import_session):
+            with self.assertRaises(providers.NotSupported) as caught:
+                call(None, None)
+            self.assertIn("cannot be imported", caught.exception.reason)
         self.assertTrue(Provider.resumable)
+        self.assertFalse(Provider.resume_needs_cwd)
 
     def test_list_sessions_convenience(self):
         box = Sandbox(self)

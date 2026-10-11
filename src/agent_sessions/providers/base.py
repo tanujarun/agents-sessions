@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, NamedTuple
 
+from .. import importer
 from ..fsutil import open_ro
 from ..model import Candidate, Session, Store
 
@@ -50,6 +51,7 @@ class Provider:
     binary: str = ""          # executable to resume with
     app_id: str = ""          # omarchy-launch-tui --app-id value
     resumable: bool = True    # False when no usable binary exists
+    resume_needs_cwd: bool = False  # True when the tool finds a session only from its project directory
     dir_names: set[str] = set()  # directory names that may be a store root
 
     def native_store(self) -> Path | None:
@@ -93,9 +95,33 @@ class Provider:
         """
         raise NotImplementedError
 
-    def import_session(self, s: Session, pathmap) -> Session:
-        """May raise NotSupported(reason)."""
-        raise NotImplementedError
+    def import_plan(self, s: Session, pathmap) -> "importer.ImportPlan":
+        """What importing foreign session ``s`` into the native store would
+        copy, rewrite and append, as an ``importer.ImportPlan``. Reads the
+        source only, writes nothing. Raises ``NotSupported(reason)`` when the
+        format cannot be imported safely, ``ImportFailed`` when this session
+        cannot be (its project folder is not on any mounted drive)."""
+        raise NotSupported(f"{self.label or self.name} sessions cannot be imported")
+
+    def import_session(self, s: Session, pathmap, progress=None) -> Session:
+        """Copy foreign session ``s`` into the native store and return the
+        native copy as ``parse`` reads it (the index fills the other fields).
+
+        ``progress(done_bytes, total_bytes)`` is called while copying. May
+        raise ``NotSupported(reason)``, ``ImportFailed``, or
+        ``importer.Exists`` when the id is already in the native store.
+        """
+        plan = self.import_plan(s, pathmap)
+        importer.execute(plan, progress)
+        store = Store(self.name, plan.native_root, "native")
+        for candidate in self.candidates(store):
+            if candidate.id_hint == plan.session_id:
+                copy = self.parse(store, candidate)
+                if copy is not None:
+                    return copy
+        raise importer.ImportFailed(
+            "the files were copied but the copy does not read as a session: "
+            + ", ".join(plan.destinations))
 
 
 # --- warnings ---------------------------------------------------------------
@@ -180,13 +206,67 @@ def iter_jsonl(path):
                 yield record
 
 
-def open_sqlite_ro(path) -> sqlite3.Connection:
-    """Open a SQLite file read-only and immutable.
+SQLITE_MEMORY_MAX = 64 * 1024 * 1024   # larger files are opened in place
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+_SQLITE_HEADER = 100
 
-    Plain ``mode=ro`` creates or rewrites ``-shm``/``-wal`` next to a WAL
-    database; ``immutable=1`` does not. Rows still in a hot ``-wal`` are not
-    visible. Raises ``sqlite3.Error`` when the file cannot be opened.
+
+def _sqlite_in_memory(path) -> sqlite3.Connection | None:
+    """A read-only in-memory copy of a SQLite file, or None when the file is
+    missing, too large, not a database, or this Python cannot load one.
+
+    The bytes are read through ``open_ro``, so SQLite itself never opens the
+    file and its access time stays where it was. Header bytes 18 and 19 (file
+    format write and read version) say 2 for a WAL database; the copy gets 1,
+    because a WAL database in memory would look for a journal it cannot have.
     """
+    if not hasattr(sqlite3.Connection, "deserialize"):
+        return None
+    try:
+        if os.stat(path).st_size > SQLITE_MEMORY_MAX:
+            return None
+        with open_ro(path) as fh:
+            data = fh.read(SQLITE_MEMORY_MAX + 1)
+    except OSError:
+        return None
+    if (len(data) > SQLITE_MEMORY_MAX or len(data) < _SQLITE_HEADER
+            or not data.startswith(_SQLITE_MAGIC)):
+        return None
+    if data[18] == 2 or data[19] == 2:
+        patched = bytearray(data)
+        for offset in (18, 19):
+            if patched[offset] == 2:
+                patched[offset] = 1
+        data = bytes(patched)
+    con = None
+    try:
+        con = sqlite3.connect(":memory:")
+        con.deserialize(data)
+        con.execute("select count(*) from sqlite_master").fetchone()
+        con.execute("pragma query_only = 1")
+        return con
+    except (sqlite3.Error, OverflowError, ValueError):
+        if con is not None:
+            con.close()
+        return None
+
+
+def open_sqlite_ro(path) -> sqlite3.Connection:
+    """Open a SQLite file for reading without leaving a trace.
+
+    Files up to 64 MB are read through ``open_ro`` and loaded into an
+    in-memory connection (see ``_sqlite_in_memory``). Anything else, and any
+    file that does not load that way, is opened in place with
+    ``mode=ro&immutable=1``: plain ``mode=ro`` creates or rewrites
+    ``-shm``/``-wal`` next to a WAL database, ``immutable=1`` does not.
+
+    Either way the connection refuses writes, and rows still in a hot
+    ``-wal`` are not visible. Raises ``sqlite3.Error`` when the file cannot
+    be opened (a missing file: on the first query).
+    """
+    con = _sqlite_in_memory(path)
+    if con is not None:
+        return con
     uri = "file:" + urllib.parse.quote(os.fspath(path)) + "?mode=ro&immutable=1"
     return sqlite3.connect(uri, uri=True)
 

@@ -64,12 +64,26 @@ class SmokeTest(unittest.TestCase):
         self.assertIn("0.1.0", out)
 
     def test_stub_returns_one(self):
-        code, _, err = run(["show", "k"])
-        self.assertEqual(code, 1)
-        self.assertEqual(err, "agent-sessions: show: not implemented\n")
-        self.assertEqual(run(["open", "k", "--dry-run"])[0], 1)
-        self.assertEqual(run(["import", "k", "--open"])[0], 1)
         self.assertEqual(run(["tui"]), (1, "", "agent-sessions: tui: not implemented\n"))
+
+    def test_unknown_key_returns_one(self):
+        """With an empty index (a temp home, no mounts) no key matches."""
+        import os
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {
+                "AGENT_SESSIONS_HOME": os.path.join(tmp, "home"),
+                "AGENT_SESSIONS_CACHE": os.path.join(tmp, "cache"),
+                "AGENT_SESSIONS_STATE": os.path.join(tmp, "state"),
+                "AGENT_SESSIONS_MOUNTS": "[]", "AGENT_SESSIONS_NOTIFY": "0"}):
+            code, out, err = run(["show", "k"])
+            self.assertEqual((code, out), (1, ""))
+            self.assertIn("no session matches 'k'", err)
+            self.assertEqual(run(["open", "k", "--dry-run"])[0], 1)
+            self.assertEqual(run(["open", "k"])[0], 1)
+            self.assertEqual(run(["import", "k", "--open"])[0], 1)
+            self.assertEqual(os.listdir(tmp), [])   # nothing was written
 
     def test_no_subcommand_returns_two(self):
         code, out, _ = run([])
