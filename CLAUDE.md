@@ -16,8 +16,9 @@ Textual, from the project `.venv` (`./install.sh` creates it).
 - Read-only outside the native stores, `~/.cache/agent-sessions/` and
   `~/.local/state/agent-sessions/`. Never write to a store on another drive,
   including the Windows profile under `/run/media/tanuj/`.
-- Open every SQLite file `mode=ro`; foreign ones also `immutable=1`. A scan
-  must not leave `-wal`/`-shm` files behind.
+- Open every SQLite file, native ones too, with
+  `file:<quoted path>?mode=ro&immutable=1`. A scan must not create or touch
+  `-wal`/`-shm` files.
 - Tests never touch the real stores for writing. Use temp dirs and the env
   overrides `AGENT_SESSIONS_HOME` (fake home), `AGENT_SESSIONS_CACHE`,
   `AGENT_SESSIONS_STATE`, `AGENT_SESSIONS_MOUNTS` (fake mount list).

@@ -1,0 +1,10 @@
+{"type":"system","content":"text-48"}
+{"type":"user","content":[{"type":"text","text":"<user_info>text-49</user_info>"}]}
+{"type":"user","content":[{"type":"text","text":"<system-reminder>text-50</system-reminder>"}],"synthetic_reason":"system_reminder"}
+{"type":"user","content":[{"type":"text","text":"<image_files>text-51</image_files>"},{"type":"image","url":"text-52"}],"prompt_index":0}
+{"type":"reasoning","id":"rs_X442484ad4a3bd27558b904e","summary":[{"type":"summary_text","text":"text-53"}],"encrypted_content":"text-54","status":"completed"}
+{"type":"assistant","content":"text-55","tool_calls":[{"id":"call-X3afd43f69d7a4849329a282","name":"name-56","arguments":"text-57"}],"model_id":"grok-4.7-build","model_fingerprint":"text-13","reasoning_effort":"high"}
+{"type":"tool_result","tool_call_id":"call-X3afd43f69d7a4849329a282","content":"text-58"}
+{"type":"user","content":[{"type":"text","text":"<system-reminder>text-59</system-reminder>"}],"synthetic_reason":"task_completed","prompt_index":1}
+{"type":"reasoning","id":"rs_Xcfe710da23638706e97b413","summary":[{"type":"summary_text","text":"text-60"}],"encrypted_content":"text-61","status":"completed"}
+{"type":"assistant","content":"text-62","model_id":"grok-4.7-build","model_fingerprint":"text-13","reasoning_effort":"high"}

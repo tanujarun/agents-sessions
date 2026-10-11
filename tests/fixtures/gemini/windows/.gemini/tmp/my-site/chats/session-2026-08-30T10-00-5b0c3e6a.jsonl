@@ -1,0 +1,7 @@
+{"sessionId":"5b0c3e6a-1f2d-4c7b-9a8e-0d1c2b3a4f5e","projectHash":"cc88ac2f7b1a6e9e68d6a6c2c0fcae7f1edff2538b1aebc8e2cf8dfc1b8617e1","startTime":"2026-08-30T10:00:00.000Z","lastUpdated":"2026-08-30T10:00:00.000Z","kind":"main"}
+{"id":"m1","timestamp":"2026-08-30T10:00:01.000Z","type":"user","content":[{"text":"<session_context>text-ctx</session_context>"}]}
+{"id":"m2","timestamp":"2026-08-30T10:00:02.000Z","type":"user","content":[{"text":"text-prompt-1"}]}
+{"id":"m3","timestamp":"2026-08-30T10:00:05.000Z","type":"gemini","content":"text-reply-1"}
+{"id":"m4","timestamp":"2026-08-30T10:00:09.000Z","type":"user","content":[{"text":"text-prompt-2"}]}
+{"$rewindTo":"m4"}
+{"$set":{"lastUpdated":"2026-08-30T10:00:10.000Z","summary":"title-synthetic"}}

@@ -3,7 +3,8 @@
 - `CLAUDE.md` — rules and commands for every agent working here
 - `docs/SPEC.md` — goals, architecture, CLI contract, TUI
 - `docs/PLAN.md` — task list and status
-- `docs/FORMATS.md` — per-provider on-disk formats and resume commands (task 2)
+- `docs/FORMATS.md` — per-provider on-disk formats, resume commands, import recipes, store discovery,
+  drive letters, ground-truth counts, open questions
 - `bin/agent-sessions` — launcher script; no logic
 - `install.sh` — symlink the launcher into `~/.local/bin`
 - `Makefile` — `test`, `lint`
@@ -24,4 +25,8 @@
 - `tests/` — unittest suites
 - `tests/__init__.py` — puts `src` on `sys.path`
 - `tests/test_smoke.py` — imports, CLI skeleton, `make_key`
-- `tests/fixtures/<provider>/` — sanitised real session files
+- `tests/fixtures/README.md` — what each fixture is, expected parsed values and counts, leak check
+- `tests/fixtures/<provider>/<native|windows>/` — sanitised real stores, laid out like a home directory
+  (`claude/`, `codex/`, `grok/`, `antigravity/`, `gemini/`; SQLite fixtures are WAL-mode, open immutable)
+- `tests/fixtures/claude/not-a-store/`, `tests/fixtures/gemini/native-no-chats/` — negative cases for `is_store`
+- `scratch/` — throwaway investigation scripts (git-ignored): `walk.py`, `*_count.py`, `drives.py`, `build_fixtures.py`

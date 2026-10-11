@@ -1,0 +1,2 @@
+{"type":"system","content":"text-72"}
+{"type":"user","content":[{"type":"text","text":"<system-reminder>text-123</system-reminder>"}],"synthetic_reason":"system_reminder"}

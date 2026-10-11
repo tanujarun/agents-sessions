@@ -1,0 +1,4 @@
+{"ts":"2026-09-29T07:20:40.560Z","type":"turn_started","session_id":"01a0ec08-671b-72e4-b2fb-47b426cf36e6","turn_number":0,"model_id":"grok-4.7","yolo_mode":true,"conversation_message_count":3,"session_relationship":"text-44","schema_version":"text-45"}
+{"ts":"2026-09-29T07:20:40.630Z","type":"loop_started","loop_index":0}
+{"ts":"2026-09-29T07:20:40.636Z","type":"phase_changed","phase":"waiting_for_model"}
+{"ts":"2026-09-29T07:39:10.801Z","type":"turn_ended","outcome":"text-23"}

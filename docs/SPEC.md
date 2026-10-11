@@ -36,25 +36,27 @@ Mounted data filesystems: `/` + `/home` (btrfs), and four NTFS volumes under
 `/run/media/tanuj/`: `22EEA841EEA80F5B` (the Windows system drive, `C:`),
 `No Other Way`, `Folded`, `Zephyro`.
 
-Stores found so far:
+Stores, formats, counts, drive letters and resume commands are in
+`docs/FORMATS.md` (task 2, accepted). Where this spec and FORMATS.md disagree
+on a format detail, FORMATS.md wins. Summary: native stores `~/.claude`,
+`~/.codex`, `~/.grok`, `~/.gemini/antigravity-cli`; foreign stores of all five
+providers under `/run/media/tanuj/22EEA841EEA80F5B/Users/arunt/`; none on the
+other three volumes today. Drive letters `C:` = `22EEA841EEA80F5B`, `D:` =
+`No Other Way`, `F:` = `Zephyro`.
 
-| Provider | Linux store (native) | Other drives |
-|---|---|---|
-| Claude Code | `~/.claude/projects/<enc-cwd>/<uuid>.jsonl` (4 project dirs) | `…/Users/arunt/.claude/projects` (13 project dirs, 37 transcripts, Windows cwd such as `F:\AI Projects\Website Works`) |
-| Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (3), names in `~/.codex/session_index.jsonl` | `…/Users/arunt/.codex/sessions` (2) |
-| Grok | `~/.grok/sessions/<urlencoded-cwd>/<id>/` (~20) | `…/Users/arunt/.grok/sessions/F%3A%5CAI%20Projects%5CWebsite%20Works/…` |
-| Antigravity | `~/.gemini/antigravity-cli/conversations/<uuid>.db` (+ `brain/`, `conversation_summaries.db`) | `…/Users/arunt/.gemini/antigravity-cli`, `…/antigravity-ide` |
-| Gemini CLI | none yet | `…/Users/arunt/.gemini/tmp/<project>/…`, `…/.gemini/history` |
+Provider capabilities that follow from FORMATS.md:
 
-Project-level `.claude` folders exist on several drives (settings, not
-sessions). A copied profile may sit anywhere (for example
-`Zephyro/AI Projects/Website Works/Archive/07 Alt device snapshot/Alt Device Files/.claude`),
-so discovery must not assume profile locations only.
+| Provider | List | Resume (native) | Import |
+|---|---|---|---|
+| Claude | yes | `claude --resume <id>` | copy-only |
+| Codex | yes | `codex resume <id>` | copy + rewrite cwd in two record types |
+| Grok | yes | `grok --resume <id>` | only when the mapped cwd is `[A-Za-z0-9/ ]`, else NotSupported |
+| Antigravity | yes | `agy --conversation <id>` | NotSupported |
+| Gemini | yes | not launchable: the real CLI is not installed | NotSupported |
 
 Existing launch convention (bar launchers):
 `cd <dir> && omarchy-launch-tui --app-id=org.omarchy.<tool> <tool> <args>` with
-`<tool>` in `claude`, `codex`, `grok`, `agy`. Resume flags per tool are **not
-yet verified**; task 2 verifies them from each tool's `--help`.
+`<tool>` in `claude`, `codex`, `grok`, `agy`.
 
 ## Architecture
 
@@ -96,6 +98,15 @@ launchable, etc.).
 Title rule: the tool's own title/summary when it has one, else the first real
 user prompt, one line, whitespace collapsed, capped at 80 chars.
 
+A **listed session** is a top-level conversation with at least one real user
+prompt or one assistant message (FORMATS.md "Rules common to all providers").
+Sub-agent transcripts, empty sessions, bookkeeping files and non-interactive
+runs are not sessions and are skipped silently; `status` counts them.
+
+`imported_as` is derived, not stored: a foreign session is "imported" when a
+session with the same provider and id exists in the native store.
+`imports.json` is provenance only.
+
 ### Provider adapter contract
 
 ```python
@@ -122,15 +133,24 @@ that `scan` reports. Adapter details per provider live in `docs/FORMATS.md`
    portals, `/boot`, and btrfs subvolumes of an already-listed device that are
    not `/` or `/home`). Paths with spaces and escaped mountinfo (`\040`) handled.
 2. Fast pass: check the known store locations (native stores, `<mount>/Users/*/`,
-   `/home/*/`, plus every store remembered in the index).
+   `/home/*/`, including `.gemini/antigravity-cli` and `.gemini/antigravity-ide`
+   under each, plus every store remembered in the index).
 3. Deep pass: walk each mount completely with `os.scandir`, not following
    symlinks or crossing mounts, looking for directories whose name is in the
    union of `dir_names`, then confirming with `is_store`. Prune list (never
    descended): `Windows`, `Program Files*`, `ProgramData`, `$RECYCLE.BIN`,
    `System Volume Information`, `node_modules`, `.git`, `site-packages`,
-   `SteamLibrary`, `XboxGames`, `/proc`, `/sys`, `/dev`, `/run` (except the
+   `SteamLibrary`, `XboxGames`, `_cacache`, `npm-cache`, `.cargo`, `.rustup`,
+   `.pnpm-store`, `.npm`, `__pycache__`, `.venv`, `miniforge`, the path
+   `AppData/Local/Temp` (never a bare `Temp`; never `AppData` or `Packages`), `/proc`, `/sys`, `/dev`, `/run` (except the
    mounts under `/run/media`), `/tmp`, `/var`, `/usr`, `/nix`, caches. The prune
-   list is data, in one place. A store is never searched for nested stores.
+   list is data, in one place. A confirmed store is not descended, with one
+   exception: a `.gemini` directory is always descended (it holds the
+   Antigravity stores), store or not. A Claude store whose path has a segment
+   `local-agent-mode-sessions` (Claude Desktop history) is skipped and counted
+   in `status`. Two stores that resolve to the same files (hard-linked
+   mirrors) must not double-list: drop a session whose provider and id are
+   already listed from a store of the same origin.
 4. Unreadable directories are counted and reported, never fatal.
 5. Results are deterministic: sorted, same input gives byte-identical `list --json`.
 
@@ -143,9 +163,11 @@ keeps its sessions out of the listing but its stores stay remembered.
 ### Read-only rule
 
 Nothing outside the native stores, `~/.cache/agent-sessions/` and
-`~/.local/state/agent-sessions/` is ever written. SQLite files in foreign
-stores are opened with `file:…?mode=ro&immutable=1` so no `-wal`/`-shm` is
-created on the drive. Native SQLite files are opened `mode=ro` too.
+`~/.local/state/agent-sessions/` is ever written. **Every** SQLite file,
+native ones too, is opened with `file:<urllib-quoted path>?mode=ro&immutable=1`:
+plain `mode=ro` creates or rewrites `-shm`/`-wal` on these WAL databases.
+Session files on other drives are opened with `os.O_NOATIME` where the
+platform has it (fall back silently), so a scan does not update access times.
 
 ### Path map
 
@@ -155,7 +177,12 @@ hard-coded: the Windows system volume is the mount holding `Users/` and
 recorded path (case-insensitive segment match). Unresolved or ambiguous
 letters stay unmapped (`cwd_local = null`), and `status` lists them. A manual
 override file `~/.config/agent-sessions/pathmap.json` (`{"F:": "/run/media/…"}`)
-wins over evidence.
+wins over evidence. Normalise before matching: strip a `\\?\` prefix, accept
+`/` and `\`, decode `file://` URIs (drop the slash before a drive letter),
+compare the letter and every segment case-insensitively and return the
+on-disk spelling, and apply the MSIX redirect for `AppData\Roaming\Claude`
+(FORMATS.md "Drive letters"). A path whose folder is gone maps to `null`
+with `cwd_exists = false`; never substitute a parent that looks close.
 
 ### Launch
 
@@ -284,10 +311,11 @@ engine module imports it. Textual runs on Windows unchanged. Path mapping is wri
 1. `agent-sessions scan --deep` finds every store on every mounted drive;
    `verify` passes; two consecutive scans give identical `list --json`.
 2. Counts match an independent brute-force count for each provider.
-3. Every native session of the five providers resumes from the TUI in its
-   project directory.
+3. Every native session of a provider whose tool is installed (Claude, Codex,
+   Grok, Antigravity) resumes from the TUI in its project directory.
 4. A foreign Claude and a foreign Codex session import and then resume on
-   Linux; other providers import or state exactly why not.
+   Linux (a supervised live test by the user; FORMATS.md "Open questions");
+   other providers import or state exactly why not.
 5. Unmounting a drive, an unreadable folder or a corrupt session file does not
    break listing.
 6. Unit tests pass; the TUI survives resize, an empty index and a missing drive.

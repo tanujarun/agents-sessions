@@ -14,7 +14,7 @@ CLI with every subcommand from SPEC "CLI contract" stubbed (exit 1,
 `lint` (`python3 -m compileall -q src tests`). Stdlib only.
 Verify: `make test`, `make lint`, `bin/agent-sessions --help`.
 
-## 2. Format investigation — Heavy — after: 1 — [~]
+## 2. Format investigation — Heavy — after: 1 — [x]
 
 Read-only study of the five providers' stores on Linux and on the Windows
 profile. Produce `docs/FORMATS.md`: per provider the store signature, the file
@@ -26,7 +26,7 @@ letter evidence for the path map, deep-walk timing per mount, and sanitised
 fixtures under `tests/fixtures/<provider>/`.
 Verify: orchestrator spot-checks claims against the real files.
 
-## 3. Core: mounts, discovery, path map, index, CLI — Careful — after: 2 — [ ]
+## 3. Core: mounts, discovery, path map, index, CLI — Careful — after: 2 — [~]
 
 Implement `model`, `mounts`, `discover`, `pathmap`, `index`, and the CLI
 commands `scan`, `list`, `status`, `verify` against the adapter

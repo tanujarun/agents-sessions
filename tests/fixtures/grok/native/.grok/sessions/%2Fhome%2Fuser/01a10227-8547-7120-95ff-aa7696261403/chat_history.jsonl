@@ -1,0 +1,5 @@
+{"type":"system","content":"text-40"}
+{"type":"user","content":[{"type":"text","text":"<user_info>text-41</user_info>"}]}
+{"type":"user","content":[{"type":"text","text":"<system-reminder>text-6</system-reminder>"}],"synthetic_reason":"system_reminder"}
+{"type":"user","content":[{"type":"text","text":"<user_query>\ntext-42\n</user_query>"}],"prompt_index":0}
+{"type":"user","content":[{"type":"text","text":"<system-reminder>text-43</system-reminder>"}],"synthetic_reason":"system_reminder"}

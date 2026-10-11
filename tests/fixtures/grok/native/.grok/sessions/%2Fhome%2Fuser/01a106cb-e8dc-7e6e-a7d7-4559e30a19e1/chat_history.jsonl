@@ -1,0 +1,9 @@
+{"type":"system","content":"text-4"}
+{"type":"user","content":[{"type":"text","text":"<user_info>text-5</user_info>"}]}
+{"type":"user","content":[{"type":"text","text":"<system-reminder>text-6</system-reminder>"}],"synthetic_reason":"system_reminder"}
+{"type":"user","content":[{"type":"text","text":"<user_query>\ntext-7\n</user_query>"}],"prompt_index":0}
+{"type":"reasoning","id":"rs_Xa5babf190c7e7927b018b53","summary":[{"type":"summary_text","text":"text-8"}],"encrypted_content":"text-9","status":"completed"}
+{"type":"assistant","content":"text-10","tool_calls":[{"id":"call-Xb6b68d1415fd9606fe5c847","name":"name-11","arguments":"text-12"}],"model_id":"grok-4.7-build","model_fingerprint":"text-13","reasoning_effort":"high"}
+{"type":"tool_result","tool_call_id":"call-Xb6b68d1415fd9606fe5c847","content":"text-14"}
+{"type":"reasoning","id":"rs_X07beb44265bd0bc86bdbb20","summary":[],"encrypted_content":"text-15","status":"completed"}
+{"type":"assistant","content":"text-16","model_id":"grok-4.7-build","model_fingerprint":"text-13","reasoning_effort":"high"}

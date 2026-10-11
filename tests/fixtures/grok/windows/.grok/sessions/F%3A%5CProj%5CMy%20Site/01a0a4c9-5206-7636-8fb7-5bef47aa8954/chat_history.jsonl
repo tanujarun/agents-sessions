@@ -1,0 +1,9 @@
+{"type":"system","content":"text-72"}
+{"type":"user","content":[{"type":"text","text":"<user_info>text-73</user_info>"}]}
+{"type":"user","content":[{"type":"text","text":"<system-reminder>text-74</system-reminder>"}],"synthetic_reason":"system_reminder"}
+{"type":"user","content":[{"type":"text","text":"<user_query>\ntext-75\n</user_query>"}],"prompt_index":0}
+{"type":"reasoning","id":"rs_Xa783dcf85de30093d84998e","summary":[{"type":"summary_text","text":"text-76"}],"encrypted_content":"text-77","status":"completed"}
+{"type":"assistant","content":"text-78","tool_calls":[{"id":"call-X2711cc3a31a3ea1fc9e3091","name":"name-56","arguments":"text-79"},{"id":"call-X6b8454adef35fbb999e9df1","name":"name-56","arguments":"text-80"},{"id":"call-Xb817e293ad6d5000c011863","name":"list_dir","arguments":"text-81"},{"id":"call-X2f1d163d350a8e9ed5900b4","name":"name-82","arguments":"text-83"}],"model_id":"grok-4.6-build","model_fingerprint":"text-84","reasoning_effort":"high"}
+{"type":"tool_result","tool_call_id":"call-X2f1d163d350a8e9ed5900b4","content":"text-85"}
+{"type":"tool_result","tool_call_id":"call-Xf2ff5b3c3287be45e5f54fb","content":"text-86","images":[{"type":"image","url":"text-87"}]}
+{"type":"tool_result","tool_call_id":"call-X5cb00befeaa9cd4cc2fc790","content":"text-88","images":[{"type":"image","url":"text-89"}]}

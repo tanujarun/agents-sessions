@@ -1,0 +1,4 @@
+{"ts":"2026-10-03T14:25:07.051Z","type":"mcp_config_resolved","servers":[{"name":"name-17","transport":"text-18","source":"local"}],"disabled":[]}
+{"ts":"2026-10-03T14:25:07.071Z","type":"mcp_server_starting","server_name":"text-19","transport":"text-18","target":"text-20","timeout_sec":30}
+{"ts":"2026-10-03T14:25:07.204Z","type":"turn_started","session_id":"01a10227-8547-7120-95ff-aa7696261403","turn_number":0,"model_id":"grok-4.7","yolo_mode":true,"conversation_message_count":3,"session_relationship":"text-44","schema_version":"text-45"}
+{"ts":"2026-10-03T14:25:07.662Z","type":"mcp_init_completed","total_servers":1,"succeeded":0,"failed":1,"auth_required":1,"total_tools":0,"duration_ms":590,"is_reinit":false,"failed_servers":["text-19"]}
