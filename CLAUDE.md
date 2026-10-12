@@ -10,20 +10,21 @@ Textual, from the project `.venv` (`./install.sh` creates it).
 - Lint: `make lint` (`ruff check`, `ruff format --check`, `compileall`); `make format` applies the
   formatter; `make typecheck` runs `mypy`; `make coverage`; `make check` runs lint, typecheck and
   both suites. These need the tools in `.venv`: `make dev` (installs `.[tui,dev]` editable)
-- Run: `bin/agent-sessions` (TUI) or `bin/agent-sessions <scan|list|open|import|show|status|verify>`
+- Run: `bin/agent-sessions` (TUI) or `bin/agent-sessions <scan|list|open|import|show|status|verify|mount|forget|map>`
 - TUI tests: `make test-tui` (needs `.venv`; about 80 s)
 - Install: `./install.sh` (creates `.venv` with Textual, symlinks into
   `~/.local/bin`, installs the desktop launcher)
 
 ## Rules
 
-- Read-only outside the native stores, `~/.cache/agent-sessions/` and
-  `~/.local/state/agent-sessions/`. Never write to a store on another drive,
+- Read-only outside the native stores, `~/.cache/agent-sessions/`,
+  `~/.local/state/agent-sessions/` and `~/.config/agent-sessions/pathmap.json` (`map` only). Never write to a store on another drive,
   including the Windows profile under `/run/media/tanuj/`.
 - Open SQLite files only through `providers.base.open_sqlite_ro` (in-memory
   copy; never a plain `sqlite3.connect`). A scan must not create or touch
   `-wal`/`-shm` files or move access times on another drive.
-- `subprocess` only in `launch.py`. Read files on other drives through
+- `subprocess` only in `launch.py`, and in `mounts.py` for `udisksctl mount`. Tests never mount or
+  unmount anything (replace `mounts.starter`). Read files on other drives through
   `fsutil.open_ro`, never `shutil.copy` or a plain `open`.
 - A store that is not the native one is hostile: a session id must `fullmatch` `Provider.id_pattern`,
   and an import writes only below the native root (`importer.contained`).
