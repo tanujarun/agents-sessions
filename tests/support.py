@@ -17,7 +17,11 @@ from agent_sessions import providers  # noqa: E402
 from agent_sessions.fsutil import home  # noqa: E402
 from agent_sessions.model import Candidate, Session  # noqa: E402
 from agent_sessions.providers.base import (  # noqa: E402
-    Provider, clean_title, parse_ts, warn)
+    Provider,
+    clean_title,
+    parse_ts,
+    warn,
+)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -32,7 +36,7 @@ class FakeProvider(Provider):
     app_id = "org.test.fake"
     resumable = True
     dir_names = {".fake"}
-    parsed: list = []   # id hints, in call order; reset by Sandbox
+    parsed: list = []  # id hints, in call order; reset by Sandbox
 
     def native_store(self):
         return home() / ".fake"
@@ -56,10 +60,16 @@ class FakeProvider(Provider):
         if not data.get("listed", True):
             return None
         return Session.for_store(
-            store, id=data.get("id", c.id_hint), title=clean_title(data.get("title")),
-            cwd=data.get("cwd"), started=parse_ts(data.get("started")),
-            updated=parse_ts(data.get("updated")), messages=data.get("messages"),
-            files=list(c.paths), note=data.get("note"))
+            store,
+            id=data.get("id", c.id_hint),
+            title=clean_title(data.get("title")),
+            cwd=data.get("cwd"),
+            started=parse_ts(data.get("started")),
+            updated=parse_ts(data.get("updated")),
+            messages=data.get("messages"),
+            files=list(c.paths),
+            note=data.get("note"),
+        )
 
 
 class OtherProvider(FakeProvider):
@@ -83,12 +93,15 @@ class Sandbox:
         self.home = self.root / "home" / "user"
         self.home.mkdir(parents=True)
         self.cache = self.root / "cache"
-        env = mock.patch.dict(os.environ, {
-            "AGENT_SESSIONS_HOME": str(self.home),
-            "AGENT_SESSIONS_CACHE": str(self.cache),
-            "AGENT_SESSIONS_STATE": str(self.root / "state"),
-            "AGENT_SESSIONS_NOTIFY": "0",   # a failed launch must not notify the desktop
-        })
+        env = mock.patch.dict(
+            os.environ,
+            {
+                "AGENT_SESSIONS_HOME": str(self.home),
+                "AGENT_SESSIONS_CACHE": str(self.cache),
+                "AGENT_SESSIONS_STATE": str(self.root / "state"),
+                "AGENT_SESSIONS_NOTIFY": "0",  # a failed launch must not notify the desktop
+            },
+        )
         env.start()
         case.addCleanup(env.stop)
         if registry is None:

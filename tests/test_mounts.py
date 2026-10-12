@@ -47,12 +47,17 @@ class ParseMountinfoTest(unittest.TestCase):
         self.by_path = {m.path: m for m in self.mounts}
 
     def test_real_filesystems_only_sorted(self):
-        self.assertEqual([m.path for m in self.mounts], [
-            "/", "/home", "/mnt/data",
-            "/run/media/user/22EEA841EEA80F5B",
-            "/run/media/user/No Other Way",
-            "/run/media/user/Tab\tand\\slash",
-        ])
+        self.assertEqual(
+            [m.path for m in self.mounts],
+            [
+                "/",
+                "/home",
+                "/mnt/data",
+                "/run/media/user/22EEA841EEA80F5B",
+                "/run/media/user/No Other Way",
+                "/run/media/user/Tab\tand\\slash",
+            ],
+        )
 
     def test_escapes_are_decoded(self):
         self.assertIn("/run/media/user/No Other Way", self.by_path)
@@ -62,8 +67,7 @@ class ParseMountinfoTest(unittest.TestCase):
         self.assertEqual(self.by_path["/"].label, "Linux")
         self.assertEqual(self.by_path["/home"].label, "Linux")
         self.assertEqual(self.by_path["/mnt/data"].label, "data")
-        self.assertEqual(self.by_path["/run/media/user/22EEA841EEA80F5B"].label,
-                         "22EEA841EEA80F5B")
+        self.assertEqual(self.by_path["/run/media/user/22EEA841EEA80F5B"].label, "22EEA841EEA80F5B")
 
     def test_fstype_and_device(self):
         m = self.by_path["/run/media/user/22EEA841EEA80F5B"]
@@ -71,22 +75,30 @@ class ParseMountinfoTest(unittest.TestCase):
         self.assertEqual(self.by_path["/home"].fstype, "btrfs")
 
     def test_filtered(self):
-        for path in ("/proc", "/sys", "/dev", "/run", "/tmp", "/run/user/1000",
-                     "/run/user/1000/gvfs", "/run/user/1000/doc",   # pseudo, FUSE portals
-                     "/var/lib/docker/overlay2/abc/merged",          # overlay
-                     "/var/lib/snapd/snap/core/1",                   # squashfs
-                     "/boot", "/boot/efi",                           # boot partitions
-                     "/var/log", "/var/cache/pacman/pkg",            # other btrfs subvolumes
-                     "/mnt/data-bind",                               # second mount of a device
-                     "/mnt/nas"):                                    # network share
+        for path in (
+            "/proc",
+            "/sys",
+            "/dev",
+            "/run",
+            "/tmp",
+            "/run/user/1000",
+            "/run/user/1000/gvfs",
+            "/run/user/1000/doc",  # pseudo, FUSE portals
+            "/var/lib/docker/overlay2/abc/merged",  # overlay
+            "/var/lib/snapd/snap/core/1",  # squashfs
+            "/boot",
+            "/boot/efi",  # boot partitions
+            "/var/log",
+            "/var/cache/pacman/pkg",  # other btrfs subvolumes
+            "/mnt/data-bind",  # second mount of a device
+            "/mnt/nas",
+        ):  # network share
             with self.subTest(path=path):
                 self.assertNotIn(path, self.by_path)
 
     def test_later_mount_on_the_same_point_wins(self):
-        text = ("1 0 0:1 / /mnt/x rw - tmpfs tmpfs rw\n"
-                "2 0 8:1 / /mnt/x rw - ext4 /dev/sda1 rw\n")
-        self.assertEqual([(m.path, m.fstype) for m in parse_mountinfo(text)],
-                         [("/mnt/x", "ext4")])
+        text = "1 0 0:1 / /mnt/x rw - tmpfs tmpfs rw\n2 0 8:1 / /mnt/x rw - ext4 /dev/sda1 rw\n"
+        self.assertEqual([(m.path, m.fstype) for m in parse_mountinfo(text)], [("/mnt/x", "ext4")])
         self.assertEqual(parse_mountinfo("\n".join(reversed(text.splitlines()))), [])
 
     def test_garbage_lines_are_ignored(self):

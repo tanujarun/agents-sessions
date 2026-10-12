@@ -59,24 +59,41 @@ class Session:
     note: str | None = None
 
     @classmethod
-    def for_store(cls, store: Store, *, id: str, title: str = "",
-                  cwd: str | None = None, started: str | None = None,
-                  updated: str | None = None, messages: int | None = None,
-                  files: list[str] | None = None,
-                  note: str | None = None) -> "Session":
+    def for_store(
+        cls,
+        store: Store,
+        *,
+        id: str,
+        title: str = "",
+        cwd: str | None = None,
+        started: str | None = None,
+        updated: str | None = None,
+        messages: int | None = None,
+        files: list[str] | None = None,
+        note: str | None = None,
+    ) -> "Session":
         """Build a session from the conversation fields an adapter knows.
 
         The fields the index owns (``cwd_local``, ``cwd_exists``,
         ``launchable``, ``imported_as``) start at their defaults.
         """
         return cls(
-            provider=store.provider, id=id,
+            provider=store.provider,
+            id=id,
             key=make_key(store.provider, store.root, id),
-            title=title, cwd=cwd, cwd_local=None, cwd_exists=False,
-            started=started, updated=updated, messages=messages,
-            store=store.root, origin=store.origin, mount=store.mount,
+            title=title,
+            cwd=cwd,
+            cwd_local=None,
+            cwd_exists=False,
+            started=started,
+            updated=updated,
+            messages=messages,
+            store=store.root,
+            origin=store.origin,
+            mount=store.mount,
             mount_label=store.mount_label,
-            files=list(files) if files else [], note=note,
+            files=list(files) if files else [],
+            note=note,
         )
 
     @classmethod

@@ -12,14 +12,14 @@ from .. import importer
 from ..fsutil import home, listdir_ro, open_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
-from .base import (NotSupported, Provider, Turn, clean_title, iter_jsonl, parse_ts,
-                   unreadable, warn)
+from .base import NotSupported, Provider, Turn, clean_title, iter_jsonl, parse_ts, unreadable, warn
 
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 # Groups: local time, thread id, segment id (or None), ".zst" (or None).
 _ROLLOUT = re.compile(
     rf"^rollout-(\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}-\d{{2}}-\d{{2}})-({_UUID})(?:_({_UUID}))?"
-    r"\.jsonl(\.zst)?$")
+    r"\.jsonl(\.zst)?$"
+)
 _INDEX = "session_index.jsonl"
 _ROLES = {"UserMessage": "user", "AgentMessage": "assistant"}
 # Where the Orca app keeps its own CODEX_HOME, relative to the profile that
@@ -48,8 +48,11 @@ def _item_text(item: dict, joiner: str) -> str:
     content = item.get("content")
     if not isinstance(content, list):
         return ""
-    texts = [block["text"] for block in content
-             if isinstance(block, dict) and isinstance(block.get("text"), str)]
+    texts = [
+        block["text"]
+        for block in content
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    ]
     return joiner.join(texts)
 
 
@@ -59,12 +62,12 @@ class _Rollout:
     def __init__(self, path: str):
         self.path = path
         self.records = 0
-        self.meta: dict | None = None        # session_meta payload of the first line
+        self.meta: dict | None = None  # session_meta payload of the first line
         self.first_ordinal: int | None = None
-        self.first_ts: str | None = None     # timestamp of the first line
-        self.last_ts: str | None = None      # last timestamp in the file
-        self.turn_cwd: str | None = None     # first turn_context cwd
-        self.turns: list[tuple[int | None, Turn]] = []   # (ordinal, turn)
+        self.first_ts: str | None = None  # timestamp of the first line
+        self.last_ts: str | None = None  # last timestamp in the file
+        self.turn_cwd: str | None = None  # first turn_context cwd
+        self.turns: list[tuple[int | None, Turn]] = []  # (ordinal, turn)
 
     @property
     def thread_id(self) -> str | None:
@@ -125,8 +128,7 @@ def _read(path: str, tools: bool = False) -> _Rollout:
                     rollout.turn_cwd = cwd
         elif kind == "response_item" and tools:
             call, tool = payload.get("type"), payload.get("name")
-            if (isinstance(call, str) and call.endswith("_call")
-                    and isinstance(tool, str) and tool):
+            if isinstance(call, str) and call.endswith("_call") and isinstance(tool, str) and tool:
                 rollout.turns.append((ordinal, Turn("tool", tool, moment)))
     return rollout
 
@@ -141,8 +143,7 @@ def _surviving(ordered: list[_Rollout]) -> Iterator[Turn]:
     superseded: those with ``ordinal >= history_base.end_ordinal_exclusive``
     of any segment that follows their file."""
     for position, rollout in enumerate(ordered):
-        ends = [later.base_end for later in ordered[position + 1:]
-                if later.base_end is not None]
+        ends = [later.base_end for later in ordered[position + 1 :] if later.base_end is not None]
         cutoff = min(ends) if ends else None
         for ordinal, turn in rollout.turns:
             if cutoff is not None and ordinal is not None and ordinal >= cutoff:
@@ -152,7 +153,7 @@ def _surviving(ordered: list[_Rollout]) -> Iterator[Turn]:
 
 def _index_title(path: str, thread_id: str) -> str:
     """``thread_name`` of the last index line for the thread; renames append."""
-    if not os.path.exists(path):   # the file is optional
+    if not os.path.exists(path):  # the file is optional
         return ""
     name = None
     for record in iter_jsonl(path):
@@ -174,8 +175,11 @@ def _index_line(path: str, thread_id: str) -> bytes | None:
                     record = json.loads(line.decode("utf-8", "replace"))
                 except (ValueError, RecursionError):
                     continue
-                if (isinstance(record, dict) and record.get("id") == thread_id
-                        and isinstance(record.get("thread_name"), str)):
+                if (
+                    isinstance(record, dict)
+                    and record.get("id") == thread_id
+                    and isinstance(record.get("thread_name"), str)
+                ):
                     found = line
     except OSError:
         return None
@@ -185,8 +189,9 @@ def _index_line(path: str, thread_id: str) -> bytes | None:
 def _source_name_line(store_root: str, thread_id: str) -> bytes | None:
     """The thread's name line from the store's index, else from the Orca
     mirror's beside it."""
-    homes = [store_root] + [os.path.join(os.path.dirname(store_root), *parts)
-                            for parts in _MIRROR_HOMES]
+    homes = [store_root] + [
+        os.path.join(os.path.dirname(store_root), *parts) for parts in _MIRROR_HOMES
+    ]
     for directory in homes:
         line = _index_line(os.path.join(directory, _INDEX), thread_id)
         if line is not None:
@@ -252,10 +257,11 @@ class _CwdRewrite(importer.Rewrite):
         allowed = [("payload", key) for key in _CWD_KEYS[kind]]
         if not importer.only_changed(original, json.loads(out), allowed):
             raise importer.ImportFailed(
-                "a rollout line did not survive rewriting unchanged; nothing was imported")
+                "a rollout line did not survive rewriting unchanged; nothing was imported"
+            )
         for change in changed:
             self._seen[change] = self._seen.get(change, 0) + 1
-        return out.encode("utf-8") + raw[len(body):]
+        return out.encode("utf-8") + raw[len(body) :]
 
     def apply(self, reader) -> Iterator[bytes]:
         self._seen = {}
@@ -264,7 +270,8 @@ class _CwdRewrite(importer.Rewrite):
             yield self._line(raw)
         self.changes = [
             f"{kind} {field}: {old} -> {new}" + (f" ({count} records)" if count > 1 else "")
-            for (kind, field, old, new), count in sorted(self._seen.items())]
+            for (kind, field, old, new), count in sorted(self._seen.items())
+        ]
 
 
 def _is_subagent(meta: dict) -> bool:
@@ -318,17 +325,19 @@ class Codex(Provider):
                         match = _ROLLOUT.match(name)
                         if match:
                             threads.setdefault(match.group(2), []).append(
-                                os.path.join(folder, name))
+                                os.path.join(folder, name)
+                            )
         index = os.path.join(store.root, _INDEX)
-        return [Candidate(thread, sorted(paths) + [index])
-                for thread, paths in sorted(threads.items())]
+        return [
+            Candidate(thread, sorted(paths) + [index]) for thread, paths in sorted(threads.items())
+        ]
 
     def parse(self, store: Store, c: Candidate) -> Session | None:
         rollouts = []
         for path in sorted(set(c.paths)):
             match = _ROLLOUT.match(os.path.basename(path))
             if not match:
-                continue   # the index
+                continue  # the index
             if match.group(4):
                 warn("compressed rollout (.jsonl.zst) is not supported; skipped", path)
                 continue
@@ -346,17 +355,18 @@ class Codex(Provider):
         kept = []
         for rollout in ordered:
             if rollout.thread_id not in (None, thread_id):
-                warn(f"belongs to thread {rollout.thread_id}, not {thread_id}; skipped",
-                     rollout.path)
+                warn(
+                    f"belongs to thread {rollout.thread_id}, not {thread_id}; skipped", rollout.path
+                )
             else:
                 kept.append(rollout)
         ordered = kept
         meta = base.meta or {}
         if meta.get("source") == "exec" or _is_subagent(meta):
-            return None   # non-interactive run, or a sub-agent thread
+            return None  # non-interactive run, or a sub-agent thread
         turns = list(_surviving(ordered))
         if not turns:
-            return None   # empty thread
+            return None  # empty thread
         title = _index_title(os.path.join(store.root, _INDEX), thread_id)
         if not title:
             first = next((t.text for t in turns if t.role == "user"), None)
@@ -366,10 +376,15 @@ class Codex(Provider):
             cwd = base.turn_cwd or next((r.turn_cwd for r in ordered if r.turn_cwd), None)
         last = ordered[-1]
         return Session.for_store(
-            store, id=thread_id, title=title, cwd=cwd,
+            store,
+            id=thread_id,
+            title=title,
+            cwd=cwd,
             started=parse_ts(meta.get("timestamp")) or base.first_ts,
             updated=last.last_ts or _mtime(last.path),
-            messages=len(turns), files=[r.path for r in ordered])
+            messages=len(turns),
+            files=[r.path for r in ordered],
+        )
 
     def resume_argv(self, s: Session) -> list[str]:
         return [self.binary, "resume", s.id]
@@ -397,8 +412,7 @@ class Codex(Provider):
         native = Store(self.name, plan.native_root, "native")
         for candidate in self.candidates(native):
             if candidate.id_hint == s.id:
-                plan.existing = [p for p in candidate.paths
-                                 if _ROLLOUT.match(os.path.basename(p))]
+                plan.existing = [p for p in candidate.paths if _ROLLOUT.match(os.path.basename(p))]
         source_sessions = os.path.join(s.store, "sessions")
         for position, path in enumerate(files):
             parts = os.path.relpath(path, source_sessions).split(os.sep)
@@ -407,9 +421,13 @@ class Codex(Provider):
             rewrite = None
             if position == len(files) - 1:
                 rewrite = _CwdRewrite(pathmap, s.mount)
-            plan.units.append(importer.Unit(
-                os.path.join(plan.native_root, "sessions", *parts), path,
-                [importer.file_copy(path, rewrite=rewrite)]))
+            plan.units.append(
+                importer.Unit(
+                    os.path.join(plan.native_root, "sessions", *parts),
+                    path,
+                    [importer.file_copy(path, rewrite=rewrite)],
+                )
+            )
         index = os.path.join(plan.native_root, _INDEX)
         line = _source_name_line(s.store, s.id)
         if line is not None and _index_line(index, s.id) is None:

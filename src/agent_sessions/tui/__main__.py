@@ -21,6 +21,7 @@ def main(argv=None, engine=None) -> int:
         if (exc.name or "").split(".")[0] not in ("textual", "rich"):
             raise
         from . import INSTALL_HINT
+
         print(INSTALL_HINT.format(repo=_repo()), file=sys.stderr)
         return 1
     app = SessionsApp(engine=engine)

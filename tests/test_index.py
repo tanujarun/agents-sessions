@@ -27,7 +27,7 @@ def listing() -> str:
 def bump(path: Path, seconds: int = 5) -> None:
     """Move a file's mtime without changing its size."""
     st = os.stat(path)
-    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + seconds * 10 ** 9))
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + seconds * 10**9))
 
 
 class IndexCase(unittest.TestCase):
@@ -36,8 +36,9 @@ class IndexCase(unittest.TestCase):
         self.native = self.box.store(self.box.home)
         self.disk = self.box.mount("Win Disk")
         self.foreign = self.box.store(self.disk / "Users" / "arun")
-        which = mock.patch("agent_sessions.index.shutil.which",
-                           side_effect=lambda name: f"/usr/bin/{name}")
+        which = mock.patch(
+            "agent_sessions.index.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"
+        )
         which.start()
         self.addCleanup(which.stop)
 
@@ -59,18 +60,18 @@ class ParseCacheTest(IndexCase):
         self.assertEqual(len(FakeProvider.parsed), 2)
         api.list_sessions()
         api.status()
-        self.assertEqual(len(FakeProvider.parsed), 2)   # listing never parses
+        self.assertEqual(len(FakeProvider.parsed), 2)  # listing never parses
 
     def test_changed_mtime_or_size_reparses_only_that_candidate(self):
         a = self.box.session(self.native, "a", title="one")
         self.box.session(self.native, "b")
         api.scan()
         FakeProvider.parsed.clear()
-        bump(a)                                               # mtime only
+        bump(a)  # mtime only
         self.assertEqual(api.scan()["parsed"], 1)
         st = os.stat(a)
         a.write_text(json.dumps({"title": "one, longer", "updated": "2026-10-01T10:00:00Z"}))
-        os.utime(a, ns=(st.st_atime_ns, st.st_mtime_ns))      # size only
+        os.utime(a, ns=(st.st_atime_ns, st.st_mtime_ns))  # size only
         summary = api.scan()
         self.assertEqual((summary["parsed"], summary["cached"]), (1, 1))
         self.assertEqual(FakeProvider.parsed, ["a", "a"])
@@ -101,11 +102,16 @@ class ParseCacheTest(IndexCase):
     def test_candidate_with_several_paths(self):
         """A session directory: its own stat does not move when a file in it
         grows, so the adapter lists the files."""
+
         class DirProvider(FakeProvider):
             def candidates(self, store):
-                return [index_mod.Candidate(d.name, [str(d), str(d / "chat.jsonl"),
-                                                     str(d / "missing.json")])
-                        for d in Path(store.root, "sessions").iterdir() if d.is_dir()]
+                return [
+                    index_mod.Candidate(
+                        d.name, [str(d), str(d / "chat.jsonl"), str(d / "missing.json")]
+                    )
+                    for d in Path(store.root, "sessions").iterdir()
+                    if d.is_dir()
+                ]
 
             def parse(self, store, c):
                 type(self).parsed.append(c.id_hint)
@@ -139,7 +145,7 @@ class ParseCacheTest(IndexCase):
         self.assertEqual(first["warnings"], [f"{bad}: not JSON"])
         self.assertEqual(first["sessions"], 0)
         FakeProvider.parsed.clear()
-        self.assertEqual(api.scan()["warnings"], [f"{bad}: not JSON"])   # from the cache
+        self.assertEqual(api.scan()["warnings"], [f"{bad}: not JSON"])  # from the cache
         self.assertEqual(FakeProvider.parsed, [])
         self.assertEqual(api.status()["warnings"], [f"{bad}: not JSON"])
 
@@ -148,8 +154,9 @@ class ParseCacheTest(IndexCase):
         self.box.session(self.native, "fine")
         first = api.scan()
         self.assertEqual(first["sessions"], 1)
-        self.assertEqual(first["warnings"],
-                         [f"{self.native}: boom: parse failed: RuntimeError: boom"])
+        self.assertEqual(
+            first["warnings"], [f"{self.native}: boom: parse failed: RuntimeError: boom"]
+        )
         FakeProvider.parsed.clear()
         api.scan()
         self.assertEqual(FakeProvider.parsed, ["boom"])
@@ -164,8 +171,7 @@ class ParseCacheTest(IndexCase):
         self.box.session(store, "a")
         summary = api.scan()
         self.assertEqual(summary["sessions"], 0)
-        self.assertEqual(summary["warnings"],
-                         [f"{store}: a: adapter returned an unusable session"])
+        self.assertEqual(summary["warnings"], [f"{store}: a: adapter returned an unusable session"])
 
     def test_candidates_failure_is_a_warning(self):
         class Broken(FakeProvider):
@@ -175,14 +181,15 @@ class ParseCacheTest(IndexCase):
         self.box = Sandbox(self, {"fake": Broken})
         store = self.box.store(self.box.home)
         summary = api.scan()
-        self.assertEqual(summary["warnings"],
-                         [f"{store}: cannot list sessions: OSError: disk went away"])
+        self.assertEqual(
+            summary["warnings"], [f"{store}: cannot list sessions: OSError: disk went away"]
+        )
         self.assertEqual((summary["stores"], summary["sessions"]), (1, 0))
 
 
 class NotImplementedReaderTest(unittest.TestCase):
     def test_skeleton_adapter_lists_the_store_with_one_warning(self):
-        class Skeleton(Claude):   # an adapter whose reader is not written yet
+        class Skeleton(Claude):  # an adapter whose reader is not written yet
             def candidates(self, store):
                 raise NotImplementedError
 
@@ -194,11 +201,14 @@ class NotImplementedReaderTest(unittest.TestCase):
         self.assertEqual((summary["stores"], summary["sessions"]), (3, 0))
         self.assertEqual(summary["warnings"], ["claude: reader not implemented"])
         status = api.status()
-        self.assertEqual([(s["root"], s["reader"], s["listed"], s["candidates"])
-                          for s in status["stores"]],
-                         [(str(box.home / ".claude"), False, 0, 0),
-                          (str(disk / "Users/a/.claude"), False, 0, 0),
-                          (str(disk / "Users/b/.claude"), False, 0, 0)])
+        self.assertEqual(
+            [(s["root"], s["reader"], s["listed"], s["candidates"]) for s in status["stores"]],
+            [
+                (str(box.home / ".claude"), False, 0, 0),
+                (str(disk / "Users/a/.claude"), False, 0, 0),
+                (str(disk / "Users/b/.claude"), False, 0, 0),
+            ],
+        )
         self.assertEqual(status["providers"][0]["reader"], False)
         self.assertEqual(api.list_sessions(), [])
         self.assertTrue(api.verify()["ok"])
@@ -225,8 +235,9 @@ class CacheFileTest(IndexCase):
         self.assertEqual(sorted(p.name for p in self.box.cache.iterdir()), ["index.json"])
         data = json.loads(cache_file().read_text())
         self.assertEqual(data["version"], index_mod.CACHE_VERSION)
-        self.assertEqual([s["root"] for s in data["stores"]],
-                         sorted([str(self.native), str(self.foreign)]))
+        self.assertEqual(
+            [s["root"] for s in data["stores"]], sorted([str(self.native), str(self.foreign)])
+        )
 
     def test_cache_env_may_name_the_file(self):
         target = self.box.root / "elsewhere" / "my-index.json"
@@ -239,15 +250,30 @@ class CacheFileTest(IndexCase):
         api.scan()
         good = cache_file().read_text()
         broken = [
-            "", "{", "[]", "null", '"text"', good[: len(good) // 2],
+            "",
+            "{",
+            "[]",
+            "null",
+            '"text"',
+            good[: len(good) // 2],
             json.dumps({"version": index_mod.CACHE_VERSION}),
             json.dumps(dict(json.loads(good), version=index_mod.CACHE_VERSION + 1)),
             json.dumps(dict(json.loads(good), stores=[{"provider": 1}])),
             json.dumps(dict(json.loads(good), stores="x")),
             json.dumps(dict(json.loads(good), parsed={"k": {"candidates": []}})),
-            json.dumps(dict(json.loads(good), parsed={"fake:x": {
-                "reader": "r", "implemented": True, "warnings": [],
-                "candidates": {"a": {"sig": [], "warnings": [], "session": {"id": 5}}}}})),
+            json.dumps(
+                dict(
+                    json.loads(good),
+                    parsed={
+                        "fake:x": {
+                            "reader": "r",
+                            "implemented": True,
+                            "warnings": [],
+                            "candidates": {"a": {"sig": [], "warnings": [], "session": {"id": 5}}},
+                        }
+                    },
+                )
+            ),
             json.dumps(dict(json.loads(good), last_deep="soon")),
             json.dumps(dict(json.loads(good), walk={"/": {"dirs": "many"}})),
         ]
@@ -266,9 +292,10 @@ class CacheFileTest(IndexCase):
     def test_missing_cache(self):
         self.assertEqual(api.list_sessions(), [])
         status = api.status()
-        self.assertEqual((status["last_quick"], status["last_deep"], status["stores"]),
-                         (None, None, []))
-        self.assertFalse(self.box.cache.exists())   # reading creates nothing
+        self.assertEqual(
+            (status["last_quick"], status["last_deep"], status["stores"]), (None, None, [])
+        )
+        self.assertFalse(self.box.cache.exists())  # reading creates nothing
 
     def test_unwritable_cache_is_a_warning(self):
         self.box.session(self.native, "a")
@@ -281,15 +308,15 @@ class CacheFileTest(IndexCase):
 
 class ScanPolicyTest(IndexCase):
     def test_deep_runs_when_due(self):
-        self.assertEqual(api.scan()["mode"], "deep")            # never walked
+        self.assertEqual(api.scan()["mode"], "deep")  # never walked
         self.assertEqual(api.scan()["mode"], "quick")
-        self.assertEqual(api.scan(deep=True)["mode"], "deep")   # asked for
+        self.assertEqual(api.scan(deep=True)["mode"], "deep")  # asked for
         self.assertEqual(api.scan(deep=False)["mode"], "quick")
         other = self.box.mount("Second")
-        self.assertEqual(api.scan()["mode"], "deep")            # mount added
+        self.assertEqual(api.scan()["mode"], "deep")  # mount added
         self.assertEqual(api.scan()["mode"], "quick")
         self.box.unmount(other)
-        self.assertEqual(api.scan()["mode"], "deep")            # mount removed
+        self.assertEqual(api.scan()["mode"], "deep")  # mount removed
         self.assertEqual(api.scan()["mode"], "quick")
 
     def test_deep_pass_older_than_a_day_is_repeated(self):
@@ -307,7 +334,7 @@ class ScanPolicyTest(IndexCase):
         api.scan(deep=False)
         self.assertEqual(api.list_sessions(), [])
         self.assertEqual(api.scan(deep=True)["sessions"], 1)
-        self.assertEqual(api.scan(deep=False)["sessions"], 1)   # remembered now
+        self.assertEqual(api.scan(deep=False)["sessions"], 1)  # remembered now
 
     def test_deleted_store_is_forgotten(self):
         tucked = self.box.store(self.disk / "Projects" / "old")
@@ -330,11 +357,13 @@ class ScanPolicyTest(IndexCase):
         summary = api.scan(deep=True, cancel=cancel)
         self.assertTrue(summary["cancelled"])
         after = json.loads(cache_file().read_text())
-        self.assertEqual((after["last_deep"], after["deep_mounts"], after["last_quick"]),
-                         (before["last_deep"], before["deep_mounts"], before["last_quick"]))
+        self.assertEqual(
+            (after["last_deep"], after["deep_mounts"], after["last_quick"]),
+            (before["last_deep"], before["deep_mounts"], before["last_quick"]),
+        )
         self.assertEqual(after["parsed"], before["parsed"])
         self.assertEqual(len(api.list_sessions()), 1)
-        self.assertEqual(api.scan()["mode"], "deep")   # still due
+        self.assertEqual(api.scan()["mode"], "deep")  # still due
 
     def test_cancel_while_parsing_keeps_what_was_done(self):
         for hint in ("a", "b", "c"):
@@ -369,20 +398,22 @@ class VanishedMountTest(IndexCase):
         FakeProvider.parsed.clear()
 
         self.box.unmount(self.disk)
-        self.assertEqual(sorted(self.by_id()), ["n"])     # before any rescan
+        self.assertEqual(sorted(self.by_id()), ["n"])  # before any rescan
         summary = api.scan()
-        self.assertEqual((summary["stores"], summary["stores_not_mounted"], summary["sessions"]),
-                         (1, 1, 1))
+        self.assertEqual(
+            (summary["stores"], summary["stores_not_mounted"], summary["sessions"]), (1, 1, 1)
+        )
         self.assertEqual(sorted(self.by_id()), ["n"])
         rows = {r["root"]: r for r in api.status()["stores"]}
-        self.assertEqual((rows[str(self.foreign)]["present"], rows[str(self.native)]["present"]),
-                         (False, True))
+        self.assertEqual(
+            (rows[str(self.foreign)]["present"], rows[str(self.native)]["present"]), (False, True)
+        )
         gone = [m for m in api.status()["mounts"] if not m["mounted"]]
         self.assertEqual([(m["path"], m["label"]) for m in gone], [(str(self.disk), "Win Disk")])
         api.scan(deep=True)
         self.assertIn(str(self.foreign), [s["root"] for s in api.status()["stores"]])
 
-        self.box.set_mounts((self.disk, "Win Disk"))      # plugged back in
+        self.box.set_mounts((self.disk, "Win Disk"))  # plugged back in
         self.assertEqual(sorted(self.by_id()), ["f", "n"])
         summary = api.scan(deep=False)
         self.assertEqual((summary["sessions"], summary["parsed"], summary["cached"]), (2, 0, 2))
@@ -403,12 +434,16 @@ class VanishedMountTest(IndexCase):
         desktop = disk / "AppData" / "local-agent-mode-sessions" / "x" / ".claude"
         (desktop / "projects").mkdir(parents=True)
         api.scan(deep=True)
-        self.assertEqual([(s["root"], s["mounted"]) for s in api.status()["skipped_stores"]],
-                         [(str(desktop), True)])
+        self.assertEqual(
+            [(s["root"], s["mounted"]) for s in api.status()["skipped_stores"]],
+            [(str(desktop), True)],
+        )
         box.unmount(disk)
         api.scan(deep=True)
-        self.assertEqual([(s["root"], s["mounted"]) for s in api.status()["skipped_stores"]],
-                         [(str(desktop), False)])
+        self.assertEqual(
+            [(s["root"], s["mounted"]) for s in api.status()["skipped_stores"]],
+            [(str(desktop), False)],
+        )
         box.set_mounts((disk, "Win"))
         (desktop / "projects").rmdir()
         api.scan(deep=False)
@@ -419,21 +454,32 @@ class DerivedFieldsTest(IndexCase):
     def test_index_owned_fields(self):
         project = self.box.home / "My Proj"
         project.mkdir()
-        self.box.session(self.native, "n", cwd=str(project), messages=4,
-                         started="2026-09-30T08:00:00Z")
+        self.box.session(
+            self.native, "n", cwd=str(project), messages=4, started="2026-09-30T08:00:00Z"
+        )
         self.box.session(self.foreign, "f", cwd="/nowhere/at/all")
         api.scan()
         got = self.by_id()
         n, f = got["n"], got["f"]
         self.assertEqual(n.key, make_key("fake", self.native, "n"))
-        self.assertEqual((n.provider, n.store, n.origin, n.mount, n.mount_label),
-                         ("fake", str(self.native), "native", str(self.box.root / "home"), "Linux"))
+        self.assertEqual(
+            (n.provider, n.store, n.origin, n.mount, n.mount_label),
+            ("fake", str(self.native), "native", str(self.box.root / "home"), "Linux"),
+        )
         self.assertEqual((n.cwd, n.cwd_local, n.cwd_exists), (str(project), str(project), True))
-        self.assertEqual((n.messages, n.started, n.updated, n.files),
-                         (4, "2026-09-30T08:00:00.000000Z", "2026-10-01T10:00:00.000000Z",
-                          [str(self.native / "sessions" / "n.json")]))
-        self.assertEqual((f.origin, f.mount, f.mount_label, f.store),
-                         ("foreign", str(self.disk), "Win Disk", str(self.foreign)))
+        self.assertEqual(
+            (n.messages, n.started, n.updated, n.files),
+            (
+                4,
+                "2026-09-30T08:00:00.000000Z",
+                "2026-10-01T10:00:00.000000Z",
+                [str(self.native / "sessions" / "n.json")],
+            ),
+        )
+        self.assertEqual(
+            (f.origin, f.mount, f.mount_label, f.store),
+            ("foreign", str(self.disk), "Win Disk", str(self.foreign)),
+        )
         self.assertEqual((f.cwd_local, f.cwd_exists, f.launchable), (None, False, False))
 
     def test_launchable_rules(self):
@@ -442,11 +488,11 @@ class DerivedFieldsTest(IndexCase):
         api.scan()
         got = self.by_id()
         self.assertEqual((got["n"].launchable, got["n"].note), (True, None))
-        self.assertEqual((got["f"].launchable, got["f"].note), (False, None))   # foreign: never
+        self.assertEqual((got["f"].launchable, got["f"].note), (False, None))  # foreign: never
         with mock.patch("agent_sessions.index.shutil.which", return_value=None):
-            n = self.by_id()["n"]                                               # binary missing
+            n = self.by_id()["n"]  # binary missing
             self.assertEqual((n.launchable, n.note), (False, "Fake CLI is not installed"))
-        with mock.patch.object(FakeProvider, "resumable", False):               # not resumable
+        with mock.patch.object(FakeProvider, "resumable", False):  # not resumable
             n = self.by_id()["n"]
             self.assertEqual((n.launchable, n.note), (False, "Fake CLI is not installed"))
 
@@ -492,15 +538,18 @@ class DerivedFieldsTest(IndexCase):
         real = self.box.session(self.foreign, "t1", title="thread")
         os.link(real, mirror / "sessions" / "t1.json")
         self.box.session(mirror, "only-in-mirror")
-        self.box.session(self.native, "t1")           # another origin: not a duplicate
+        self.box.session(self.native, "t1")  # another origin: not a duplicate
         summary = api.scan(deep=True)
         self.assertEqual(summary["candidates"], 4)
         got = [(s.origin, s.id, s.store) for s in api.list_sessions()]
-        self.assertEqual(sorted(got), [
-            ("foreign", "only-in-mirror", str(mirror)),
-            ("foreign", "t1", str(self.foreign)),     # first store in path order wins
-            ("native", "t1", str(self.native)),
-        ])
+        self.assertEqual(
+            sorted(got),
+            [
+                ("foreign", "only-in-mirror", str(mirror)),
+                ("foreign", "t1", str(self.foreign)),  # first store in path order wins
+                ("native", "t1", str(self.native)),
+            ],
+        )
         rows = {r["root"]: r for r in api.status()["stores"]}
         self.assertEqual((rows[str(mirror)]["listed"], rows[str(mirror)]["duplicates"]), (1, 1))
         self.assertEqual(rows[str(self.foreign)]["duplicates"], 0)
@@ -525,20 +574,23 @@ class DerivedFieldsTest(IndexCase):
         summary = api.scan(deep=True)
         self.assertEqual((summary["candidates"], summary["sessions"]), (10, 5))
         got = {s.id: (s.title, s.store) for s in api.list_sessions()}
-        self.assertEqual(got, {
-            "s1": ("current", str(second)),
-            "s2": ("current", str(self.foreign)),
-            "s3": ("first", str(self.foreign)),       # tie: the smaller store key
-            "s4": ("dated", str(second)),             # no date sorts oldest
-            "s5": ("undated a", str(self.foreign)),
-        })
+        self.assertEqual(
+            got,
+            {
+                "s1": ("current", str(second)),
+                "s2": ("current", str(self.foreign)),
+                "s3": ("first", str(self.foreign)),  # tie: the smaller store key
+                "s4": ("dated", str(second)),  # no date sorts oldest
+                "s5": ("undated a", str(self.foreign)),
+            },
+        )
         rows = {r["root"]: r for r in api.status()["stores"]}
-        self.assertEqual((rows[str(self.foreign)]["listed"], rows[str(self.foreign)]["duplicates"]),
-                         (3, 2))
+        self.assertEqual(
+            (rows[str(self.foreign)]["listed"], rows[str(self.foreign)]["duplicates"]), (3, 2)
+        )
         self.assertEqual((rows[str(second)]["listed"], rows[str(second)]["duplicates"]), (2, 3))
         for row in rows.values():
-            self.assertEqual(row["listed"] + row["duplicates"] + row["skipped"],
-                             row["candidates"])
+            self.assertEqual(row["listed"] + row["duplicates"] + row["skipped"], row["candidates"])
         first = listing()
         api.scan(deep=True)
         self.assertEqual(listing(), first)
@@ -557,13 +609,18 @@ class DerivedFieldsTest(IndexCase):
         index = api.load_index()
         self.assertEqual(index.where(got["w"]), "C:")
         status = api.status()
-        self.assertEqual([(r["letter"], r["mount"]) for r in status["letters"]],
-                         [("C:", str(self.disk))])
-        self.assertEqual([(r["letter"], r["reason"]) for r in status["unresolved_letters"]],
-                         [("E:", "no evidence")])
-        self.assertEqual({m["path"]: m["letter"] for m in status["mounts"]},
-                         {str(self.box.root / "home"): None, str(self.disk): "C:"})
-        target.rmdir()                                   # folder deleted after the scan
+        self.assertEqual(
+            [(r["letter"], r["mount"]) for r in status["letters"]], [("C:", str(self.disk))]
+        )
+        self.assertEqual(
+            [(r["letter"], r["reason"]) for r in status["unresolved_letters"]],
+            [("E:", "no evidence")],
+        )
+        self.assertEqual(
+            {m["path"]: m["letter"] for m in status["mounts"]},
+            {str(self.box.root / "home"): None, str(self.disk): "C:"},
+        )
+        target.rmdir()  # folder deleted after the scan
         self.assertEqual(self.by_id()["w"].cwd_exists, False)
 
 
@@ -577,14 +634,25 @@ class OrderTest(IndexCase):
         api.scan()
         got = api.list_sessions()
         ties = sorted(s.key for s in got if s.id.startswith("tie"))
-        self.assertEqual([s.key for s in got], [
-            make_key("fake", self.native, "new"), ties[0], ties[1],
-            make_key("fake", self.native, "old"), make_key("fake", self.native, "undated")])
+        self.assertEqual(
+            [s.key for s in got],
+            [
+                make_key("fake", self.native, "new"),
+                ties[0],
+                ties[1],
+                make_key("fake", self.native, "old"),
+                make_key("fake", self.native, "undated"),
+            ],
+        )
 
     def test_two_scans_give_byte_identical_json(self):
         for i in range(12):
-            self.box.session(self.native if i % 2 else self.foreign, f"s{i:02}",
-                             cwd=str(self.box.home), updated=f"2026-10-{i % 3 + 1:02}T00:00:00Z")
+            self.box.session(
+                self.native if i % 2 else self.foreign,
+                f"s{i:02}",
+                cwd=str(self.box.home),
+                updated=f"2026-10-{i % 3 + 1:02}T00:00:00Z",
+            )
         api.scan(deep=True)
         first = listing()
         self.assertEqual(listing(), first)
@@ -592,7 +660,7 @@ class OrderTest(IndexCase):
         self.assertEqual(listing(), first)
         api.scan(deep=False)
         self.assertEqual(listing(), first)
-        cache_file().unlink()                 # from scratch: same again
+        cache_file().unlink()  # from scratch: same again
         api.scan()
         self.assertEqual(listing(), first)
         self.assertEqual(len(json.loads(first)), 12)
@@ -600,7 +668,7 @@ class OrderTest(IndexCase):
     def test_status_is_stable(self):
         self.box.session(self.native, "a")
         api.scan(deep=True)
-        dump = lambda: json.dumps(api.status(), sort_keys=True)   # noqa: E731
+        dump = lambda: json.dumps(api.status(), sort_keys=True)  # noqa: E731
         self.assertEqual(dump(), dump())
         stores = api.status()["stores"]
         self.assertEqual(stores, sorted(stores, key=lambda r: (r["provider"], r["root"])))
@@ -617,14 +685,15 @@ class VerifyTest(IndexCase):
         result = api.verify()
         self.assertEqual((result["ok"], result["differences"], result["stale"]), (True, [], []))
         self.assertEqual((result["stores"], result["sessions"]), (2, 2))
-        self.assertEqual(sorted(result["walk"]), sorted([str(self.box.root / "home"),
-                                                         str(self.disk)]))
+        self.assertEqual(
+            sorted(result["walk"]), sorted([str(self.box.root / "home"), str(self.disk)])
+        )
 
     def test_does_not_use_or_write_the_cache(self):
         before = cache_file().read_bytes()
         FakeProvider.parsed.clear()
         api.verify()
-        self.assertEqual(sorted(FakeProvider.parsed), ["f", "n"])   # parsed afresh
+        self.assertEqual(sorted(FakeProvider.parsed), ["f", "n"])  # parsed afresh
         self.assertEqual(cache_file().read_bytes(), before)
 
     def test_store_the_prune_list_hides(self):
@@ -632,8 +701,9 @@ class VerifyTest(IndexCase):
         api.scan(deep=True)
         result = api.verify()
         self.assertFalse(result["ok"])
-        self.assertEqual(result["differences"],
-                         [f"store on disk but not in the index: fake {hidden}"])
+        self.assertEqual(
+            result["differences"], [f"store on disk but not in the index: fake {hidden}"]
+        )
 
     def test_store_inside_a_store_is_a_note(self):
         inner = self.box.store(self.foreign / "plugins")
@@ -647,10 +717,12 @@ class VerifyTest(IndexCase):
         cache_file().write_text(json.dumps(data))
         result = api.verify()
         self.assertFalse(result["ok"])
-        self.assertEqual(result["differences"][0],
-                         f"{self.native}: n: cached parse differs from a fresh parse")
-        self.assertIn("title is 'tampered' in the index, 'title n' on disk",
-                      result["differences"][1])
+        self.assertEqual(
+            result["differences"][0], f"{self.native}: n: cached parse differs from a fresh parse"
+        )
+        self.assertIn(
+            "title is 'tampered' in the index, 'title n' on disk", result["differences"][1]
+        )
 
     def test_store_missing_from_the_index(self):
         data = json.loads(cache_file().read_text())
@@ -658,10 +730,13 @@ class VerifyTest(IndexCase):
         cache_file().write_text(json.dumps(data))
         result = api.verify()
         self.assertFalse(result["ok"])
-        self.assertIn(f"store on disk but not in the index: fake {self.foreign}",
-                      result["differences"])
-        self.assertIn(f"session on disk but not listed: {make_key('fake', self.foreign, 'f')}",
-                      result["differences"])
+        self.assertIn(
+            f"store on disk but not in the index: fake {self.foreign}", result["differences"]
+        )
+        self.assertIn(
+            f"session on disk but not listed: {make_key('fake', self.foreign, 'f')}",
+            result["differences"],
+        )
 
     def test_candidate_missing_from_the_index(self):
         data = json.loads(cache_file().read_text())
@@ -669,23 +744,31 @@ class VerifyTest(IndexCase):
         data["last_quick"] = "2999-01-01T00:00:00Z"
         cache_file().write_text(json.dumps(data))
         result = api.verify()
-        self.assertEqual(result["differences"], [
-            f"{self.foreign}: f: candidate on disk but not in the index",
-            f"session on disk but not listed: {make_key('fake', self.foreign, 'f')}"])
+        self.assertEqual(
+            result["differences"],
+            [
+                f"{self.foreign}: f: candidate on disk but not in the index",
+                f"session on disk but not listed: {make_key('fake', self.foreign, 'f')}",
+            ],
+        )
 
     def test_changes_after_the_scan_are_stale_not_wrong(self):
-        self.box.session(self.native, "n", title="grew")            # changed
-        (self.foreign / "sessions" / "f.json").unlink()             # gone
+        self.box.session(self.native, "n", title="grew")  # changed
+        (self.foreign / "sessions" / "f.json").unlink()  # gone
         data = json.loads(cache_file().read_text())
         data["last_quick"] = "2020-01-01T00:00:00Z"
         cache_file().write_text(json.dumps(data))
-        self.box.session(self.foreign, "late")                      # new
+        self.box.session(self.foreign, "late")  # new
         result = api.verify()
         self.assertEqual((result["ok"], result["differences"]), (True, []))
-        self.assertEqual(result["stale"], [
-            f"{self.native}: n: changed since the last scan",
-            f"{self.foreign}: f: gone since the last scan",
-            f"{self.foreign}: late: new since the last scan"])
+        self.assertEqual(
+            result["stale"],
+            [
+                f"{self.native}: n: changed since the last scan",
+                f"{self.foreign}: f: gone since the last scan",
+                f"{self.foreign}: late: new since the last scan",
+            ],
+        )
         api.scan()
         result = api.verify()
         self.assertEqual((result["ok"], result["stale"]), (True, []))
@@ -706,14 +789,20 @@ class RegistryTest(unittest.TestCase):
         with mock.patch.dict(providers._REGISTRY, {"fake": FakeProvider}, clear=True):
             self.assertEqual(api.list_sessions(), [])
             status = api.status()
-            self.assertEqual([(s["provider"], s["reader"]) for s in status["stores"]],
-                             [("other", False)])
+            self.assertEqual(
+                [(s["provider"], s["reader"]) for s in status["stores"]], [("other", False)]
+            )
 
     def test_base_provider_contract(self):
         p = Provider()
-        for call in (p.native_store, lambda: p.is_store(Path("/")), lambda: p.candidates(None),
-                     lambda: p.parse(None, None), lambda: p.resume_argv(None),
-                     lambda: p.list_sessions(None)):
+        for call in (
+            p.native_store,
+            lambda: p.is_store(Path("/")),
+            lambda: p.candidates(None),
+            lambda: p.parse(None, None),
+            lambda: p.resume_argv(None),
+            lambda: p.list_sessions(None),
+        ):
             with self.assertRaises(NotImplementedError):
                 call()
         # A provider that says nothing about importing refuses, with a reason.
@@ -740,20 +829,24 @@ class IndexObjectTest(IndexCase):
         api.scan(deep=True)
         index = Index.load()
         again = Index.load()
-        self.assertEqual((index.stores, index.parsed, index.walk, index.deep_mounts),
-                         (again.stores, again.parsed, again.walk, again.deep_mounts))
+        self.assertEqual(
+            (index.stores, index.parsed, index.walk, index.deep_mounts),
+            (again.stores, again.parsed, again.walk, again.deep_mounts),
+        )
         before = cache_file().read_bytes()
         index.save()
         self.assertEqual(cache_file().read_bytes(), before)
         self.assertEqual(Index.load(self.box.root / "no such file.json").stores, [])
-        self.assertEqual(Index.load(self.box.root).stores, [])   # a directory
+        self.assertEqual(Index.load(self.box.root).stores, [])  # a directory
 
     def test_signature(self):
         a = self.box.session(self.native, "a")
         st = os.stat(a)
         missing = str(self.native / "nope")
-        self.assertEqual(index_mod.signature([str(a), missing, str(a)]),
-                         [[missing, None, None], [str(a), st.st_mtime_ns, st.st_size]])
+        self.assertEqual(
+            index_mod.signature([str(a), missing, str(a)]),
+            [[missing, None, None], [str(a), st.st_mtime_ns, st.st_size]],
+        )
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ PAGER_MAX_TURN_CHARS = 20000
 
 # --- display width ----------------------------------------------------------
 
+
 def char_width(ch: str) -> int:
     """Terminal cells one character takes: 0 for combining marks, joiners and
     control characters, 2 for wide (CJK, most emoji), else 1."""
@@ -69,7 +70,7 @@ def clean(text) -> str:
 def _take(text: str, width: int) -> str:
     """The longest prefix of ``text`` that fits in ``width`` cells."""
     if text.isascii():
-        return text[:max(width, 0)]
+        return text[: max(width, 0)]
     used = 0
     for position, ch in enumerate(text):
         used += char_width(ch)
@@ -96,6 +97,7 @@ def pad(text: str, width: int, align: str = "left") -> str:
 
 
 # --- time -------------------------------------------------------------------
+
 
 def parse_stamp(stamp) -> datetime | None:
     """An ISO 8601 time as an aware datetime; None when absent or malformed."""
@@ -144,6 +146,7 @@ def local_time(stamp, tz=None) -> str:
 
 # --- rows -------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class Row:
     """What the list shows of one session."""
@@ -152,11 +155,11 @@ class Row:
     provider: str
     title: str
     project: str
-    stamp: str | None   # the time AGE is counted from
+    stamp: str | None  # the time AGE is counted from
     where: str
     foreign: bool
     imported: bool
-    haystack: str       # casefolded title, project and cwd, for the filter
+    haystack: str  # casefolded title, project and cwd, for the filter
 
 
 def project_name(cwd) -> str:
@@ -172,10 +175,16 @@ def make_row(session, where: str) -> Row:
     project = project_name(session.cwd)
     haystack = "\n".join((title, project, session.cwd or "")).casefold()
     return Row(
-        key=session.key, provider=session.provider, title=title, project=project,
-        stamp=session.updated or session.started, where=clean(where),
-        foreign=session.origin != "native", imported=bool(session.imported_as),
-        haystack=haystack)
+        key=session.key,
+        provider=session.provider,
+        title=title,
+        project=project,
+        stamp=session.updated or session.started,
+        where=clean(where),
+        foreign=session.origin != "native",
+        imported=bool(session.imported_as),
+        haystack=haystack,
+    )
 
 
 def matches(row: Row, needle: str) -> bool:
@@ -188,8 +197,7 @@ def filter_rows(rows, provider=None, needle: str = "") -> list[Row]:
     """The rows of one provider (``None`` or ``ALL``: every provider) that
     match the filter, in the order given."""
     everyone = provider is None or provider == ALL
-    return [row for row in rows
-            if (everyone or row.provider == provider) and matches(row, needle)]
+    return [row for row in rows if (everyone or row.provider == provider) and matches(row, needle)]
 
 
 def select_index(rows, key, previous: int = 0) -> int:
@@ -211,8 +219,14 @@ def move_index(index: int, count: int, move: str, page: int = 1) -> int:
     if count <= 0:
         return -1
     page = max(page, 1)
-    target = {"up": index - 1, "down": index + 1, "pageup": index - page,
-              "pagedown": index + page, "home": 0, "end": count - 1}.get(move, index)
+    target = {
+        "up": index - 1,
+        "down": index + 1,
+        "pageup": index - page,
+        "pagedown": index + page,
+        "home": 0,
+        "end": count - 1,
+    }.get(move, index)
     return min(max(target, 0), count - 1)
 
 
@@ -229,12 +243,13 @@ def scroll_for(index: int, top: int, height: int, count: int) -> int:
 
 # --- provider tabs ----------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class Tab:
-    name: str    # provider name, or ALL
+    name: str  # provider name, or ALL
     label: str
     count: int
-    digit: str   # the key that selects it; "" when there is none
+    digit: str  # the key that selects it; "" when there is none
 
 
 def build_tabs(providers, rows) -> list[Tab]:
@@ -249,8 +264,10 @@ def build_tabs(providers, rows) -> list[Tab]:
         labels.setdefault(name, label or name)
     ordered = [name for name in PROVIDER_ORDER if name in labels]
     ordered += [name for name in labels if name not in PROVIDER_ORDER]
-    tabs = [Tab(name, labels[name], counts.get(name, 0), str(n) if n <= 9 else "")
-            for n, name in enumerate(ordered, 1)]
+    tabs = [
+        Tab(name, labels[name], counts.get(name, 0), str(n) if n <= 9 else "")
+        for n, name in enumerate(ordered, 1)
+    ]
     tabs.append(Tab(ALL, "All", len(rows), "0"))
     return tabs
 
@@ -288,8 +305,7 @@ def fit_tab_labels(tabs, active: int, available: int, extra: int = 0) -> list[st
     with the active tab in full; last, the active tab loses its count too."""
     labels: list[str] = []
     for level in range(5):
-        labels = [_tab_label(tab, level, index == active)
-                  for index, tab in enumerate(tabs)]
+        labels = [_tab_label(tab, level, index == active) for index, tab in enumerate(tabs)]
         if sum(text_width(label) + extra for label in labels) <= available:
             break
     return labels
@@ -297,19 +313,25 @@ def fit_tab_labels(tabs, active: int, available: int, extra: int = 0) -> list[st
 
 # --- columns ----------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class Column:
-    name: str    # "title" | "provider" | "project" | "age" | "where"
+    name: str  # "title" | "provider" | "project" | "age" | "where"
     title: str
     width: int
 
 
-AGE_WIDTH = 4            # "11mo"
+AGE_WIDTH = 4  # "11mo"
 MIN_TITLE_WIDTH = 16
-MAX_SIDE_WIDTH = 24      # cap on PROJECT, WHERE and PROVIDER
+MAX_SIDE_WIDTH = 24  # cap on PROJECT, WHERE and PROVIDER
 
-_HEADINGS = {"title": "TITLE", "provider": "PROVIDER", "project": "PROJECT",
-             "age": "AGE", "where": "WHERE"}
+_HEADINGS = {
+    "title": "TITLE",
+    "provider": "PROVIDER",
+    "project": "PROJECT",
+    "age": "AGE",
+    "where": "WHERE",
+}
 _ORDER = ("title", "provider", "project", "age", "where")
 _DROP_ORDER = ("project", "where", "provider", "age")
 
@@ -326,24 +348,32 @@ def column_widths(rows, provider_labels=None) -> dict[str, int]:
     return {
         "project": widest({row.project for row in rows}, _HEADINGS["project"]),
         "where": widest({row.where for row in rows}, _HEADINGS["where"]),
-        "provider": widest({provider_labels.get(row.provider, row.provider)
-                            for row in rows}, _HEADINGS["provider"]),
+        "provider": widest(
+            {provider_labels.get(row.provider, row.provider) for row in rows}, _HEADINGS["provider"]
+        ),
     }
 
 
-def fit_columns(width: int, widths=None, *, show_provider: bool = False,
-                show_project: bool = True, cell_pad: int = 0) -> list[Column]:
+def fit_columns(
+    width: int,
+    widths=None,
+    *,
+    show_provider: bool = False,
+    show_project: bool = True,
+    cell_pad: int = 0,
+) -> list[Column]:
     """The columns that fit in ``width`` cells, left to right, TITLE taking
     what the others leave. ``cell_pad`` is the padding every cell carries
     (left plus right). When TITLE would get less than ``MIN_TITLE_WIDTH``,
     columns go in this order: PROJECT, WHERE, PROVIDER, AGE. TITLE is never
     dropped, however narrow."""
     widths = widths or {}
-    sides = {"age": AGE_WIDTH,
-             "where": widths.get("where", len(_HEADINGS["where"]))}
+    sides = {"age": AGE_WIDTH, "where": widths.get("where", len(_HEADINGS["where"]))}
     if show_project:
-        sides["project"] = min(widths.get("project", len(_HEADINGS["project"])),
-                               max(width // 4, len(_HEADINGS["project"])))
+        sides["project"] = min(
+            widths.get("project", len(_HEADINGS["project"])),
+            max(width // 4, len(_HEADINGS["project"])),
+        )
     if show_provider:
         sides["provider"] = widths.get("provider", len(_HEADINGS["provider"]))
 
@@ -359,28 +389,35 @@ def fit_columns(width: int, widths=None, *, show_provider: bool = False,
 
 
 def _cells(values, columns, pad_left: int, pad_right: int) -> str:
-    return "".join(" " * pad_left + pad(values.get(column.name, ""), column.width)
-                   + " " * pad_right for column in columns)
+    return "".join(
+        " " * pad_left + pad(values.get(column.name, ""), column.width) + " " * pad_right
+        for column in columns
+    )
 
 
 def format_header(columns, pad_left: int = 0, pad_right: int = 0) -> str:
     """The column header line."""
-    return _cells({column.name: column.title for column in columns},
-                  columns, pad_left, pad_right)
+    return _cells({column.name: column.title for column in columns}, columns, pad_left, pad_right)
 
 
-def format_row(row: Row, columns, now: datetime, provider_labels=None,
-               pad_left: int = 0, pad_right: int = 0) -> str:
+def format_row(
+    row: Row, columns, now: datetime, provider_labels=None, pad_left: int = 0, pad_right: int = 0
+) -> str:
     """One list line: every cell clipped with an ellipsis and padded to its
     column, by display width."""
     provider_labels = provider_labels or {}
-    values = {"title": row.title, "project": row.project,
-              "provider": provider_labels.get(row.provider, row.provider),
-              "age": age_text(row.stamp, now), "where": row.where}
+    values = {
+        "title": row.title,
+        "project": row.project,
+        "provider": provider_labels.get(row.provider, row.provider),
+        "age": age_text(row.stamp, now),
+        "where": row.where,
+    }
     return _cells(values, columns, pad_left, pad_right)
 
 
 # --- layout for small terminals ---------------------------------------------
+
 
 @dataclass(frozen=True)
 class Layout:
@@ -418,11 +455,15 @@ def layout_for(width: int, height: int, hint_gutter: int = 0) -> Layout:
     goes first, then the detail pane). ``hint_gutter`` is the padding round
     the hint text."""
     show_detail = width >= DETAIL_MIN_WIDTH and height >= DETAIL_MIN_HEIGHT
-    return Layout(show_project=width >= NARROW_WIDTH, show_detail=show_detail,
-                  hints=hint_lines(width - hint_gutter, roomy=show_detail))
+    return Layout(
+        show_project=width >= NARROW_WIDTH,
+        show_detail=show_detail,
+        hints=hint_lines(width - hint_gutter, roomy=show_detail),
+    )
 
 
 # --- status line ------------------------------------------------------------
+
 
 def plural(count: int, word: str) -> str:
     return f"{count:,} {word}" if count == 1 else f"{count:,} {word}s"
@@ -453,8 +494,13 @@ def bytes_text(count) -> str:
 def drive_count(mounts) -> int:
     """Drives in a status report: mounted entries, one per label (``/`` and
     ``/home`` are both ``Linux``)."""
-    return len({mount.get("label") or mount.get("path")
-                for mount in mounts or () if mount.get("mounted", True)})
+    return len(
+        {
+            mount.get("label") or mount.get("path")
+            for mount in mounts or ()
+            if mount.get("mounted", True)
+        }
+    )
 
 
 def summary_variants(drives: int, sessions: int, last_scan, now: datetime) -> list[str]:
@@ -469,8 +515,9 @@ def summary_variants(drives: int, sessions: int, last_scan, now: datetime) -> li
     return [f"{plural(drives, 'drive')} · {count} · {scanned}", f"{count} · {scanned}", count]
 
 
-def status_parts(left: str, variants, width: int, gap: int = 2,
-                 keep_left: bool = False) -> tuple[str, str]:
+def status_parts(
+    left: str, variants, width: int, gap: int = 2, keep_left: bool = False
+) -> tuple[str, str]:
     """Share the status line between the left text (the app name, or a
     message) and the longest right text that still fits beside it. When none
     fits, a message wins the whole line (``keep_left``); otherwise the
@@ -537,7 +584,7 @@ def verdict_text(session, verdict) -> str:
         return f"checking{ELLIPSIS}"
     possible, reason = verdict
     reason = clean(reason or "").strip()
-    if possible is None:    # the question itself failed
+    if possible is None:  # the question itself failed
         return f"unknown: {reason}" if reason else "unknown"
     if possible:
         return f"possible · {reason}" if reason else "possible"
@@ -565,6 +612,7 @@ def detail_fields(session, verdict=None, tz=None) -> dict[str, str]:
 
 # --- prompts ----------------------------------------------------------------
 
+
 def drive_of(where: str) -> str:
     """The drive part of a WHERE text (``C: · imported`` -> ``C:``)."""
     return where.split(" · ")[0].strip() or "another drive"
@@ -587,34 +635,58 @@ def foreign_prompt(where: str, width: int | None = None) -> str:
     choice is cut off."""
     drive = drive_of(where)
     lead = drive if drive.endswith(":") else f"{drive}:"
-    return fit_first((
-        f"On {lead} [i] import and resume  [I] import only  [v] view  [Esc] cancel",
-        f"On {lead} [i] import+resume  [I] import  [v] view  [Esc]",
-        "[i] resume [I] import [v] view [Esc]",
-        "[i] [I] [v] [Esc]",
-    ), width)
+    return fit_first(
+        (
+            f"On {lead} [i] import and resume  [I] import only  [v] view  [Esc] cancel",
+            f"On {lead} [i] import+resume  [I] import  [v] view  [Esc]",
+            "[i] resume [I] import [v] view [Esc]",
+            "[i] [I] [v] [Esc]",
+        ),
+        width,
+    )
 
 
 def confirm_prompt(title: str, where: str, width: int | None = None) -> str:
     drive = drive_of(where)
-    return fit_first((
-        f"Import \"{clip(title, 40)}\" from {drive} to Linux?  [y] yes  [n] no",
-        f"Import from {drive} to Linux?  [y] yes  [n] no",
-        "Import?  [y] yes  [n] no",
-        "Import? [y] [n]",
-    ), width)
+    return fit_first(
+        (
+            f'Import "{clip(title, 40)}" from {drive} to Linux?  [y] yes  [n] no',
+            f"Import from {drive} to Linux?  [y] yes  [n] no",
+            "Import?  [y] yes  [n] no",
+            "Import? [y] [n]",
+        ),
+        width,
+    )
 
 
 # --- keys -------------------------------------------------------------------
 
 _LIST_KEYS = {
-    "up": "cursor_up", "k": "cursor_up", "down": "cursor_down", "j": "cursor_down",
-    "pageup": "cursor_pageup", "pagedown": "cursor_pagedown",
-    "home": "cursor_home", "g": "cursor_home", "end": "cursor_end", "G": "cursor_end",
-    "left": "tab_prev", "h": "tab_prev", "shift+tab": "tab_prev",
-    "right": "tab_next", "l": "tab_next", "tab": "tab_next",
-    "enter": "resume", "o": "resume_stay", "i": "import", "v": "view",
-    "/": "filter", "r": "rescan", "R": "full_rescan", "?": "help", "q": "quit",
+    "up": "cursor_up",
+    "k": "cursor_up",
+    "down": "cursor_down",
+    "j": "cursor_down",
+    "pageup": "cursor_pageup",
+    "pagedown": "cursor_pagedown",
+    "home": "cursor_home",
+    "g": "cursor_home",
+    "end": "cursor_end",
+    "G": "cursor_end",
+    "left": "tab_prev",
+    "h": "tab_prev",
+    "shift+tab": "tab_prev",
+    "right": "tab_next",
+    "l": "tab_next",
+    "tab": "tab_next",
+    "enter": "resume",
+    "o": "resume_stay",
+    "i": "import",
+    "v": "view",
+    "/": "filter",
+    "r": "rescan",
+    "R": "full_rescan",
+    "?": "help",
+    "q": "quit",
     "escape": "escape",
 }
 _LIST_KEYS.update({str(digit): "tab_digit" for digit in range(10)})
@@ -622,20 +694,56 @@ _LIST_KEYS.update({str(digit): "tab_digit" for digit in range(10)})
 KEYMAPS = {
     "list": _LIST_KEYS,
     # The foreign-row prompt and the import confirmation take over the keys.
-    "foreign": {"i": "prompt_import_resume", "I": "prompt_import_only",
-                "v": "prompt_view", "escape": "prompt_cancel"},
-    "confirm": {"y": "confirm_yes", "Y": "confirm_yes", "n": "confirm_no",
-                "N": "confirm_no", "escape": "confirm_no"},
+    "foreign": {
+        "i": "prompt_import_resume",
+        "I": "prompt_import_only",
+        "v": "prompt_view",
+        "escape": "prompt_cancel",
+    },
+    "confirm": {
+        "y": "confirm_yes",
+        "Y": "confirm_yes",
+        "n": "confirm_no",
+        "N": "confirm_no",
+        "escape": "confirm_no",
+    },
     # While the filter box has the keyboard it takes every printable key.
-    "filter": {"escape": "filter_clear", "enter": "filter_accept", "tab": "filter_accept",
-               "up": "cursor_up", "down": "cursor_down",
-               "pageup": "cursor_pageup", "pagedown": "cursor_pagedown"},
-    "help": {"escape": "close", "enter": "close", "q": "close", "?": "close",
-             "up": "up", "k": "up", "down": "down", "j": "down",
-             "pageup": "pageup", "pagedown": "pagedown"},
-    "pager": {"q": "close", "escape": "close", "up": "up", "k": "up", "down": "down",
-              "j": "down", "pageup": "pageup", "pagedown": "pagedown", "space": "pagedown",
-              "home": "home", "g": "home", "end": "end", "G": "end"},
+    "filter": {
+        "escape": "filter_clear",
+        "enter": "filter_accept",
+        "tab": "filter_accept",
+        "up": "cursor_up",
+        "down": "cursor_down",
+        "pageup": "cursor_pageup",
+        "pagedown": "cursor_pagedown",
+    },
+    "help": {
+        "escape": "close",
+        "enter": "close",
+        "q": "close",
+        "?": "close",
+        "up": "up",
+        "k": "up",
+        "down": "down",
+        "j": "down",
+        "pageup": "pageup",
+        "pagedown": "pagedown",
+    },
+    "pager": {
+        "q": "close",
+        "escape": "close",
+        "up": "up",
+        "k": "up",
+        "down": "down",
+        "j": "down",
+        "pageup": "pageup",
+        "pagedown": "pagedown",
+        "space": "pagedown",
+        "home": "home",
+        "g": "home",
+        "end": "end",
+        "G": "end",
+    },
 }
 
 MODAL_MODES = ("foreign", "confirm")
@@ -658,8 +766,7 @@ HELP = (
     ("PgUp PgDn Home End g G", "move by page, to the top, to the end"),
     ("← → h l Tab Shift-Tab", "switch provider"),
     ("1-9, 0", "provider by number; 0 is All"),
-    ("Enter", "resume in a new terminal window and quit; a session on another "
-              "drive asks first"),
+    ("Enter", "resume in a new terminal window and quit; a session on another drive asks first"),
     ("o", "the same, and stay here"),
     ("i", "import a session from another drive to Linux (asks y/n)"),
     ("v", "view the transcript (q or Esc returns)"),
@@ -702,7 +809,7 @@ def _split_wide(word: str, width: int) -> tuple[str, str]:
     """Cut a word that is wider than a line: (what fits, the rest). Always
     takes at least one character so wrapping ends."""
     head = _take(word, width) or word[:1]
-    return head, word[len(head):]
+    return head, word[len(head) :]
 
 
 def wrap_line(line: str, width: int) -> list[str]:
@@ -726,7 +833,7 @@ def wrap_line(line: str, width: int) -> list[str]:
             out.append(current.rstrip())
             current, used = "", 0
         elif used + 1 > width:
-            current, used = "", 0   # indentation as wide as the line: drop it
+            current, used = "", 0  # indentation as wide as the line: drop it
         while used + text_width(token) > width:
             head, token = _split_wide(token, width - used)
             out.append(current + head)
@@ -745,8 +852,9 @@ def wrap_text(text: str, width: int) -> list[str]:
     return lines
 
 
-def transcript_lines(role, text, ts, width: int, tz=None,
-                     max_chars: int = PAGER_MAX_TURN_CHARS) -> list[tuple[str, str]]:
+def transcript_lines(
+    role, text, ts, width: int, tz=None, max_chars: int = PAGER_MAX_TURN_CHARS
+) -> list[tuple[str, str]]:
     """One turn as pager lines, each ``(kind, text)``: a ``role-<role>``
     heading, wrapped ``text`` lines, a closing ``blank``. A tool turn is its
     heading alone (the tool's name)."""

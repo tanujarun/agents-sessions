@@ -24,15 +24,15 @@ from .fsutil import home
 
 LAUNCHER = "omarchy-launch-tui"
 NOTIFIER = "notify-send"
-NOTIFY_ENV = "AGENT_SESSIONS_NOTIFY"   # "0" switches desktop notifications off
+NOTIFY_ENV = "AGENT_SESSIONS_NOTIFY"  # "0" switches desktop notifications off
 NOTIFY_TITLE = "Cannot resume session"
 
 
 @dataclass
 class LaunchPlan:
-    cwd: str             # directory the tool starts in
-    argv: list[str]      # the tool's resume command
-    command: list[str]   # what is actually executed
+    cwd: str  # directory the tool starts in
+    argv: list[str]  # the tool's resume command
+    command: list[str]  # what is actually executed
     note: str | None = None
 
 
@@ -40,8 +40,13 @@ def _detached(command, cwd=None) -> None:
     """Start ``command`` in its own session with no terminal attached, and
     collect its exit status in the background so no zombie is left."""
     proc = subprocess.Popen(
-        command, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL, start_new_session=True)
+        command,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
     threading.Thread(target=proc.wait, daemon=True).start()
 
 
@@ -58,8 +63,8 @@ def _notify(reason: str) -> None:
         _detached([tool, "--app-name=agent-sessions", NOTIFY_TITLE, reason])
 
 
-starter = _spawn      # starter(command, cwd): open the terminal window
-notifier = _notify    # notifier(reason): tell the desktop about a failure
+starter = _spawn  # starter(command, cwd): open the terminal window
+notifier = _notify  # notifier(reason): tell the desktop about a failure
 
 
 def _tell(reason: str) -> None:
@@ -100,7 +105,8 @@ def plan(session, provider, where: str | None = None, here: bool = False) -> Lau
         raise LaunchFailed(f"this session is on {place}; import it first")
     if not provider.resumable:
         raise LaunchFailed(
-            f"{label} sessions cannot be resumed here: the {label} CLI is not installed")
+            f"{label} sessions cannot be resumed here: the {label} CLI is not installed"
+        )
     argv = [str(arg) for arg in provider.resume_argv(session)]
     if not argv or not shutil.which(argv[0]):
         tool = argv[0] if argv else provider.binary
@@ -113,8 +119,9 @@ def plan(session, provider, where: str | None = None, here: bool = False) -> Lau
     return LaunchPlan(cwd, argv, [LAUNCHER, f"--app-id={provider.app_id}", *argv], note)
 
 
-def launch(session, provider, where: str | None = None, here: bool = False,
-           dry_run: bool = False) -> LaunchPlan:
+def launch(
+    session, provider, where: str | None = None, here: bool = False, dry_run: bool = False
+) -> LaunchPlan:
     """Resume ``session``: in a new terminal window, or with ``here`` in this
     process (``chdir`` then ``exec``; it does not return). ``dry_run`` only
     builds the plan. A real failure also sends a desktop notification."""
@@ -134,7 +141,7 @@ def launch(session, provider, where: str | None = None, here: bool = False,
                 if before is not None:
                     os.chdir(before)
                 raise
-            return made   # reached only when exec is replaced (tests)
+            return made  # reached only when exec is replaced (tests)
         starter(made.command, made.cwd)
         return made
     except LaunchFailed as exc:
@@ -143,7 +150,8 @@ def launch(session, provider, where: str | None = None, here: bool = False,
         raise
     except OSError as exc:
         failure = LaunchFailed(
-            f"could not start {exc.filename or provider.binary}: {exc.strerror or exc}")
+            f"could not start {exc.filename or provider.binary}: {exc.strerror or exc}"
+        )
         _tell(failure.reason)
         raise failure from exc
 

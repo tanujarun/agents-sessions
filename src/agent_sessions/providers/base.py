@@ -23,9 +23,20 @@ from ..fsutil import open_ro
 from ..model import Candidate, Session, Store
 
 __all__ = [
-    "Candidate", "NotSupported", "Provider", "Session", "Store", "Warnings",
-    "clean_title", "collect_warnings", "iter_jsonl", "open_ro",
-    "open_sqlite_ro", "parse_ts", "unreadable", "warn",
+    "Candidate",
+    "NotSupported",
+    "Provider",
+    "Session",
+    "Store",
+    "Warnings",
+    "clean_title",
+    "collect_warnings",
+    "iter_jsonl",
+    "open_ro",
+    "open_sqlite_ro",
+    "parse_ts",
+    "unreadable",
+    "warn",
 ]
 
 TITLE_MAX = 80
@@ -40,18 +51,20 @@ class NotSupported(Exception):
 
 
 class Turn(NamedTuple):
-    role: str          # "user" | "assistant" | "tool"
+    role: str  # "user" | "assistant" | "tool"
     text: str
-    ts: str | None     # ISO 8601 UTC, as parse_ts returns it
+    ts: str | None  # ISO 8601 UTC, as parse_ts returns it
 
 
 class Provider:
-    name: str = ""            # "claude"
-    label: str = ""           # "Claude"
-    binary: str = ""          # executable to resume with
-    app_id: str = ""          # omarchy-launch-tui --app-id value
-    resumable: bool = True    # False when no usable binary exists
-    resume_needs_cwd: bool = False  # True when the tool finds a session only from its project directory
+    name: str = ""  # "claude"
+    label: str = ""  # "Claude"
+    binary: str = ""  # executable to resume with
+    app_id: str = ""  # omarchy-launch-tui --app-id value
+    resumable: bool = True  # False when no usable binary exists
+    resume_needs_cwd: bool = (
+        False  # True when the tool finds a session only from its project directory
+    )
     dir_names: set[str] = set()  # directory names that may be a store root
 
     def native_store(self) -> Path | None:
@@ -121,10 +134,12 @@ class Provider:
                     return copy
         raise importer.ImportFailed(
             "the files were copied but the copy does not read as a session: "
-            + ", ".join(plan.destinations))
+            + ", ".join(plan.destinations)
+        )
 
 
 # --- warnings ---------------------------------------------------------------
+
 
 class Warnings:
     """Messages recorded while one candidate (or one scan step) is read."""
@@ -201,7 +216,7 @@ def iter_jsonl(path):
             if first:
                 first = False
                 if raw.startswith(_BOM):
-                    raw = raw[len(_BOM):]
+                    raw = raw[len(_BOM) :]
             line = raw.rstrip(b"\n").rstrip(b"\r")
             if not line.strip():
                 continue
@@ -213,7 +228,7 @@ def iter_jsonl(path):
                 yield record
 
 
-SQLITE_MEMORY_MAX = 64 * 1024 * 1024   # larger files are opened in place
+SQLITE_MEMORY_MAX = 64 * 1024 * 1024  # larger files are opened in place
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 _SQLITE_HEADER = 100
 
@@ -236,8 +251,11 @@ def _sqlite_in_memory(path) -> sqlite3.Connection | None:
             data = fh.read(SQLITE_MEMORY_MAX + 1)
     except OSError:
         return None
-    if (len(data) > SQLITE_MEMORY_MAX or len(data) < _SQLITE_HEADER
-            or not data.startswith(_SQLITE_MAGIC)):
+    if (
+        len(data) > SQLITE_MEMORY_MAX
+        or len(data) < _SQLITE_HEADER
+        or not data.startswith(_SQLITE_MAGIC)
+    ):
         return None
     if data[18] == 2 or data[19] == 2:
         patched = bytearray(data)
@@ -336,8 +354,12 @@ def parse_ts(value) -> str | None:
         if len(value) != 2:
             return None
         seconds, nanos = value[0], value[1] or 0
-        if (isinstance(seconds, bool) or not isinstance(seconds, int)
-                or isinstance(nanos, bool) or not isinstance(nanos, int)):
+        if (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, int)
+            or isinstance(nanos, bool)
+            or not isinstance(nanos, int)
+        ):
             return None
         return _from_epoch(seconds, nanos // 1000)
     if not isinstance(value, str):
@@ -351,8 +373,7 @@ def parse_ts(value) -> str | None:
     year, month, day, hour, minute, second = (int(g) for g in m.groups()[:6])
     micros = int((m.group(7) or "0")[:6].ljust(6, "0"))
     try:
-        moment = datetime(year, month, day, hour, minute, second, micros,
-                          tzinfo=timezone.utc)
+        moment = datetime(year, month, day, hour, minute, second, micros, tzinfo=timezone.utc)
         if m.group(9):
             offset = timedelta(hours=int(m.group(10)), minutes=int(m.group(11)))
             moment = moment - offset if m.group(9) == "+" else moment + offset

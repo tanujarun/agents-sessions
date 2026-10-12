@@ -16,7 +16,14 @@ from support import FIXTURES  # noqa: E402
 from agent_sessions.model import Candidate, Session, Store, make_key  # noqa: E402
 from agent_sessions.providers import base  # noqa: E402
 from agent_sessions.providers.base import (  # noqa: E402
-    clean_title, collect_warnings, iter_jsonl, open_ro, open_sqlite_ro, parse_ts, warn)
+    clean_title,
+    collect_warnings,
+    iter_jsonl,
+    open_ro,
+    open_sqlite_ro,
+    parse_ts,
+    warn,
+)
 
 
 class TempCase(unittest.TestCase):
@@ -73,7 +80,7 @@ class IterJsonlTest(TempCase):
             self.assertEqual(list(iter_jsonl(missing)), [])
         self.assertEqual(len(got.items), 1)
         self.assertTrue(got.items[0].startswith(f"{missing}: cannot read"))
-        self.assertEqual(list(iter_jsonl(missing)), [])   # no collector: still quiet
+        self.assertEqual(list(iter_jsonl(missing)), [])  # no collector: still quiet
 
     def test_reading_leaves_the_access_time_alone(self):
         path = self.write(b'{"a": 1}\n')
@@ -94,7 +101,7 @@ class SqliteTest(TempCase):
         con.execute("create table t (v text)")
         con.execute("insert into t values ('row')")
         con.commit()
-        con.close()   # checkpoints and removes the sidecars
+        con.close()  # checkpoints and removes the sidecars
         with open(path, "rb") as fh:
             self.assertEqual(fh.read(20)[18], 2, "fixture must be a WAL-mode file")
         return path
@@ -167,7 +174,7 @@ class SqliteTest(TempCase):
         after = os.stat(path)
         self.assertEqual(self.siblings(path), [path.name])
         self.assertEqual((after.st_mtime_ns, after.st_size), (before.st_mtime_ns, before.st_size))
-        self.assertEqual(path.read_bytes(), raw)             # the file keeps its WAL header
+        self.assertEqual(path.read_bytes(), raw)  # the file keeps its WAL header
         if getattr(os, "O_NOATIME", 0):
             os.utime(path, ns=(1_000_000_000, before.st_mtime_ns))
             open_sqlite_ro(path).execute("select v from t").fetchall()
@@ -176,8 +183,13 @@ class SqliteTest(TempCase):
     def test_in_memory_copy_refuses_writes_of_every_kind(self):
         con = open_sqlite_ro(self.make_wal_db())
         self.assertTrue(self.in_memory(con))
-        for sql in ("insert into t values ('x')", "update t set v = 'y'", "delete from t",
-                    "create table u (v)", "drop table t"):
+        for sql in (
+            "insert into t values ('x')",
+            "update t set v = 'y'",
+            "delete from t",
+            "create table u (v)",
+            "drop table t",
+        ):
             with self.assertRaises(sqlite3.OperationalError):
                 con.execute(sql)
         self.assertEqual(con.execute("select v from t").fetchall(), [("row",)])
@@ -198,7 +210,7 @@ class SqliteTest(TempCase):
 
     def test_large_file_falls_back_to_the_immutable_open(self):
         path = self.make_wal_db()
-        with mock.patch.object(base, "SQLITE_MEMORY_MAX", 1024):      # the file is larger
+        with mock.patch.object(base, "SQLITE_MEMORY_MAX", 1024):  # the file is larger
             con = open_sqlite_ro(path)
         self.assertFalse(self.in_memory(con))
         self.assertEqual(con.execute("select v from t").fetchall(), [("row",)])
@@ -216,9 +228,14 @@ class SqliteTest(TempCase):
 
         real = sqlite3.connect
         with mock.patch.object(
-                base.sqlite3, "connect",
-                lambda target, *a, **k: real(target, *a, **dict(
-                    k, **({"factory": NoDeserialize} if target == ":memory:" else {})))):
+            base.sqlite3,
+            "connect",
+            lambda target, *a, **k: real(
+                target,
+                *a,
+                **dict(k, **({"factory": NoDeserialize} if target == ":memory:" else {})),
+            ),
+        ):
             con = open_sqlite_ro(path)
         self.assertFalse(self.in_memory(con))
         self.assertEqual(con.execute("select v from t").fetchall(), [("row",)])
@@ -226,9 +243,12 @@ class SqliteTest(TempCase):
         self.assertEqual(self.siblings(path), [path.name])
 
     def test_files_that_are_not_databases(self):
-        for name, content in (("empty.db", b""), ("short.db", b"SQLite format 3\x00"),
-                              ("text.db", b"not a database " * 40),
-                              ("cut.db", self.make_wal_db().read_bytes()[:600])):
+        for name, content in (
+            ("empty.db", b""),
+            ("short.db", b"SQLite format 3\x00"),
+            ("text.db", b"not a database " * 40),
+            ("cut.db", self.make_wal_db().read_bytes()[:600]),
+        ):
             path = self.tmp / name
             path.write_bytes(content)
             with self.subTest(name=name):
@@ -237,7 +257,7 @@ class SqliteTest(TempCase):
                     rows = con.execute("select name from sqlite_master").fetchall()
                     con.close()
                 except sqlite3.Error:
-                    rows = None         # as before: the error comes on open or first query
+                    rows = None  # as before: the error comes on open or first query
                 self.assertIn(rows, (None, []))
                 self.assertEqual(path.read_bytes(), content)
                 self.assertFalse((self.tmp / (name + "-wal")).exists())
@@ -253,8 +273,12 @@ class SqliteTest(TempCase):
             uri = "file:" + base.urllib.parse.quote(str(path)) + "?mode=ro&immutable=1"
             dumps = []
             for con in (open_sqlite_ro(path), sqlite3.connect(uri, uri=True)):
-                tables = [row[0] for row in con.execute(
-                    "select name from sqlite_master where type = 'table' order by name")]
+                tables = [
+                    row[0]
+                    for row in con.execute(
+                        "select name from sqlite_master where type = 'table' order by name"
+                    )
+                ]
                 # FTS shadow tables need their module; plain tables are compared in full.
                 dump = {}
                 for table in tables:
@@ -274,13 +298,13 @@ class SqliteTest(TempCase):
 class ParseTsTest(unittest.TestCase):
     def test_every_recorded_form(self):
         cases = {
-            "2026-10-03T14:25:33.100Z": "2026-10-03T14:25:33.100000Z",           # ms
-            "2026-09-27T23:35:21.831252584Z": "2026-09-27T23:35:21.831252Z",     # ns
-            "2026-08-29T08:31:15.3316788Z": "2026-08-29T08:31:15.331678Z",       # 100 ns
+            "2026-10-03T14:25:33.100Z": "2026-10-03T14:25:33.100000Z",  # ms
+            "2026-09-27T23:35:21.831252584Z": "2026-09-27T23:35:21.831252Z",  # ns
+            "2026-08-29T08:31:15.3316788Z": "2026-08-29T08:31:15.331678Z",  # 100 ns
             "2026-08-29 09:11:11.2289146+00:00": "2026-08-29T09:11:11.228914Z",  # SQLite, 7
-            "2026-08-29 09:11:11.228914+00:00": "2026-08-29T09:11:11.228914Z",   # SQLite, 6
+            "2026-08-29 09:11:11.228914+00:00": "2026-08-29T09:11:11.228914Z",  # SQLite, 6
             "2026-10-03T14:25:33Z": "2026-10-03T14:25:33.000000Z",
-            "2026-10-03T14:25:33": "2026-10-03T14:25:33.000000Z",                # no zone = UTC
+            "2026-10-03T14:25:33": "2026-10-03T14:25:33.000000Z",  # no zone = UTC
             "2026-10-03T16:25:33.5+02:00": "2026-10-03T14:25:33.500000Z",
             "2026-10-03T09:55:33-0430": "2026-10-03T14:25:33.000000Z",
             " 2026-10-03T14:25:33.100Z\n": "2026-10-03T14:25:33.100000Z",
@@ -290,11 +314,11 @@ class ParseTsTest(unittest.TestCase):
                 self.assertEqual(parse_ts(value), expected)
 
     def test_epoch_numbers(self):
-        self.assertEqual(parse_ts(1790000000), "2026-09-21T14:13:20.000000Z")         # s
-        self.assertEqual(parse_ts(1790000000123), "2026-09-21T14:13:20.123000Z")      # ms
+        self.assertEqual(parse_ts(1790000000), "2026-09-21T14:13:20.000000Z")  # s
+        self.assertEqual(parse_ts(1790000000123), "2026-09-21T14:13:20.123000Z")  # ms
         self.assertEqual(parse_ts(1790000000.25), "2026-09-21T14:13:20.250000Z")
         self.assertEqual(parse_ts("1790000000"), "2026-09-21T14:13:20.000000Z")
-        self.assertEqual(parse_ts(1790000000123456), "2026-09-21T14:13:20.123456Z")   # us
+        self.assertEqual(parse_ts(1790000000123456), "2026-09-21T14:13:20.123456Z")  # us
         self.assertEqual(parse_ts(1790000000123456789), "2026-09-21T14:13:20.123456Z")  # ns
         self.assertEqual(parse_ts(0), "1970-01-01T00:00:00.000000Z")
 
@@ -304,14 +328,32 @@ class ParseTsTest(unittest.TestCase):
         self.assertEqual(parse_ts((1790000000, 5000)), "2026-09-21T14:13:20.000005Z")
 
     def test_rejects_everything_else(self):
-        for value in (None, True, "", "yesterday", "2026-13-40T00:00:00Z", "2026-10-03",
-                      [], {}, {2: 5}, (1, 2, 3), float("nan"), float("inf"), 10 ** 30, b"1"):
+        for value in (
+            None,
+            True,
+            "",
+            "yesterday",
+            "2026-13-40T00:00:00Z",
+            "2026-10-03",
+            [],
+            {},
+            {2: 5},
+            (1, 2, 3),
+            float("nan"),
+            float("inf"),
+            10**30,
+            b"1",
+        ):
             with self.subTest(value=value):
                 self.assertIsNone(parse_ts(value))
 
     def test_output_sorts_in_time_order(self):
-        stamps = ["2026-10-03T14:25:33Z", "2026-10-03T14:25:33.100Z",
-                  "2026-10-03 14:25:33.0500000+00:00", 1790000000]
+        stamps = [
+            "2026-10-03T14:25:33Z",
+            "2026-10-03T14:25:33.100Z",
+            "2026-10-03 14:25:33.0500000+00:00",
+            1790000000,
+        ]
         got = [parse_ts(s) for s in stamps]
         self.assertEqual(len({len(g) for g in got}), 1)
         self.assertEqual(sorted(got), [got[3], got[0], got[2], got[1]])
@@ -323,7 +365,7 @@ class CleanTitleTest(unittest.TestCase):
 
     def test_caps_at_80(self):
         self.assertEqual(clean_title("x" * 200), "x" * 80)
-        self.assertEqual(len(clean_title("word " * 40)), 79)   # no trailing space
+        self.assertEqual(len(clean_title("word " * 40)), 79)  # no trailing space
         self.assertEqual(clean_title("y" * 80), "y" * 80)
 
     def test_none_empty_and_control_characters(self):
@@ -369,21 +411,33 @@ class WarningsTest(unittest.TestCase):
 class ModelTest(unittest.TestCase):
     def test_for_store_fills_conversation_fields_and_defaults(self):
         store = Store("claude", "/home/u/.claude", "native", "/home", "Linux")
-        s = Session.for_store(store, id="abc", title="T", cwd="/home/u/p",
-                              started="2026-10-01T00:00:00.000000Z",
-                              updated="2026-10-02T00:00:00.000000Z", messages=3,
-                              files=["/home/u/.claude/projects/x/abc.jsonl"], note="n")
+        s = Session.for_store(
+            store,
+            id="abc",
+            title="T",
+            cwd="/home/u/p",
+            started="2026-10-01T00:00:00.000000Z",
+            updated="2026-10-02T00:00:00.000000Z",
+            messages=3,
+            files=["/home/u/.claude/projects/x/abc.jsonl"],
+            note="n",
+        )
         self.assertEqual(s.key, make_key("claude", "/home/u/.claude", "abc"))
-        self.assertEqual((s.provider, s.store, s.origin, s.mount, s.mount_label),
-                         ("claude", "/home/u/.claude", "native", "/home", "Linux"))
-        self.assertEqual((s.cwd_local, s.cwd_exists, s.launchable, s.imported_as),
-                         (None, False, False, None))
+        self.assertEqual(
+            (s.provider, s.store, s.origin, s.mount, s.mount_label),
+            ("claude", "/home/u/.claude", "native", "/home", "Linux"),
+        )
+        self.assertEqual(
+            (s.cwd_local, s.cwd_exists, s.launchable, s.imported_as), (None, False, False, None)
+        )
         self.assertEqual((s.title, s.cwd, s.messages, s.note), ("T", "/home/u/p", 3, "n"))
 
     def test_for_store_minimal(self):
         s = Session.for_store(Store("grok", "/x/.grok"), id="i")
-        self.assertEqual((s.title, s.cwd, s.started, s.updated, s.messages, s.files, s.note),
-                         ("", None, None, None, None, [], None))
+        self.assertEqual(
+            (s.title, s.cwd, s.started, s.updated, s.messages, s.files, s.note),
+            ("", None, None, None, None, [], None),
+        )
         self.assertEqual(s.origin, "foreign")
 
     def test_from_dict_round_trip(self):

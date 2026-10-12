@@ -14,14 +14,26 @@ from typing import Iterator
 from ..fsutil import home, listdir_ro
 from ..model import Candidate, Session, Store
 from . import register
-from .base import (NotSupported, Provider, Turn, clean_title, iter_jsonl, open_ro,
-                   open_sqlite_ro, parse_ts, unreadable, warn)
+from .base import (
+    NotSupported,
+    Provider,
+    Turn,
+    clean_title,
+    iter_jsonl,
+    open_ro,
+    open_sqlite_ro,
+    parse_ts,
+    unreadable,
+    warn,
+)
 
 IDE_NOTE = "Antigravity IDE conversation: list only"
 # The verdict of FORMATS section 6, shown to the user as it is.
-IMPORT_UNSAFE = ("Antigravity keeps conversations in SQLite files with protobuf columns; "
-                 "registering one needs a row in conversation_summaries.db and the "
-                 "workspace path is inside protobuf blobs")
+IMPORT_UNSAFE = (
+    "Antigravity keeps conversations in SQLite files with protobuf columns; "
+    "registering one needs a row in conversation_summaries.db and the "
+    "workspace path is inside protobuf blobs"
+)
 
 _SUMMARIES = "conversation_summaries.db"
 _SIDECARS = ("-wal", "-shm", "-journal")
@@ -30,11 +42,19 @@ _STEP_USER, _STEP_PLANNER = 14, 15
 _USER_REQUEST = re.compile(r"<USER_REQUEST>(.*?)</USER_REQUEST>", re.S)
 _PBTXT_TITLE = re.compile(rb'^\s*title\s*:\s*"((?:[^"\\]|\\.)*)"', re.M | re.S)
 _PBTXT_ESCAPE = re.compile(rb"\\(x[0-9a-fA-F]{1,2}|[0-7]{1,3}|.)", re.S)
-_PBTXT_SIMPLE = {b"n": b"\n", b"t": b"\t", b"r": b"\r", b"a": b"\a", b"b": b"\b",
-                 b"f": b"\f", b"v": b"\v"}
+_PBTXT_SIMPLE = {
+    b"n": b"\n",
+    b"t": b"\t",
+    b"r": b"\r",
+    b"a": b"\a",
+    b"b": b"\b",
+    b"f": b"\f",
+    b"v": b"\v",
+}
 
 
 # --- protobuf without a schema ----------------------------------------------
+
 
 def _varint(data: bytes, pos: int):
     """``(value, next position)``; value is None when the bytes run out or
@@ -80,13 +100,13 @@ def pb_fields(data) -> list[tuple[int, int, object]]:
             width = 8 if wire == 1 else 4
             if pos + width > size:
                 break
-            value = data[pos:pos + width]
+            value = data[pos : pos + width]
             pos += width
         elif wire == 2:
             length, pos = _varint(data, pos)
             if length is None or pos + length > size:
                 break
-            value = data[pos:pos + length]
+            value = data[pos : pos + length]
             pos += length
         else:
             break
@@ -99,8 +119,12 @@ def pb_all(data, *path) -> list:
     repeated fields are followed at each level."""
     values = [data]
     for number in path:
-        values = [value for message in values
-                  for found, _wire, value in pb_fields(message) if found == number]
+        values = [
+            value
+            for message in values
+            for found, _wire, value in pb_fields(message)
+            if found == number
+        ]
     return values
 
 
@@ -130,6 +154,7 @@ def pb_timestamp(value) -> tuple[int, int] | None:
 
 
 # --- small values -----------------------------------------------------------
+
 
 def uri_to_path(uri) -> str | None:
     """A ``file://`` URI as the path it names; a Windows drive keeps its
@@ -250,13 +275,18 @@ class Antigravity(Provider):
                 out.append(Candidate("unknown:" + name, [entry]))
                 continue
             cid = name[:-3]
-            out.append(Candidate(cid, [
-                entry,
-                str(root / _SUMMARIES),
-                str(root / "annotations" / f"{cid}.pbtxt"),
-                str(root / "cache" / "last_conversations.json"),
-                str(self._log(root, cid)),
-            ]))
+            out.append(
+                Candidate(
+                    cid,
+                    [
+                        entry,
+                        str(root / _SUMMARIES),
+                        str(root / "annotations" / f"{cid}.pbtxt"),
+                        str(root / "cache" / "last_conversations.json"),
+                        str(self._log(root, cid)),
+                    ],
+                )
+            )
         return out
 
     @staticmethod
@@ -320,18 +350,32 @@ class Antigravity(Provider):
         if not cwd:
             cwd, cwd_source = None, "none"
 
-        started = (parse_ts(pb_timestamp(pb_first(conv["blob"], 2)))
-                   or parse_ts(pb_timestamp(pb_first(conv["first"], 1))) or _mtime(db))
+        started = (
+            parse_ts(pb_timestamp(pb_first(conv["blob"], 2)))
+            or parse_ts(pb_timestamp(pb_first(conv["first"], 1)))
+            or _mtime(db)
+        )
         modified = _text(row.get("last_modified_time"))
-        updated = ((parse_ts(modified) if not modified.startswith("0001-") else None)
-                   or parse_ts(pb_timestamp(pb_first(conv["last"], 1))) or _mtime(db))
+        updated = (
+            (parse_ts(modified) if not modified.startswith("0001-") else None)
+            or parse_ts(pb_timestamp(pb_first(conv["last"], 1)))
+            or _mtime(db)
+        )
 
         files = [str(db)]
         files += [str(p) for p in (root / "brain" / cid, annotation) if os.path.exists(p)]
         note = IDE_NOTE if root.name == "antigravity-ide" else None
-        return {"id": cid, "title": title, "cwd": cwd, "started": started, "updated": updated,
-                "messages": messages, "files": files, "note": note,
-                "sources": {"title": title_source, "cwd": cwd_source}}
+        return {
+            "id": cid,
+            "title": title,
+            "cwd": cwd,
+            "started": started,
+            "updated": updated,
+            "messages": messages,
+            "files": files,
+            "note": note,
+            "sources": {"title": title_source, "cwd": cwd_source},
+        }
 
     @staticmethod
     def _conversation(db: Path) -> dict | None:
@@ -342,21 +386,27 @@ class Antigravity(Provider):
                 steps = con.execute("SELECT count(*) FROM steps").fetchone()[0]
                 messages = con.execute(
                     "SELECT count(*) FROM steps WHERE step_type IN (?, ?)",
-                    (_STEP_USER, _STEP_PLANNER)).fetchone()[0]
+                    (_STEP_USER, _STEP_PLANNER),
+                ).fetchone()[0]
                 first = con.execute(
-                    "SELECT metadata FROM steps ORDER BY idx ASC LIMIT 1").fetchone()
+                    "SELECT metadata FROM steps ORDER BY idx ASC LIMIT 1"
+                ).fetchone()
                 last = con.execute(
-                    "SELECT metadata FROM steps ORDER BY idx DESC LIMIT 1").fetchone()
-                blob = _optional(
-                    con, "SELECT data FROM trajectory_metadata_blob WHERE id = 'main'")
+                    "SELECT metadata FROM steps ORDER BY idx DESC LIMIT 1"
+                ).fetchone()
+                blob = _optional(con, "SELECT data FROM trajectory_metadata_blob WHERE id = 'main'")
                 parents = _optional(con, "SELECT count(*) FROM parent_references")
         except sqlite3.Error as exc:
             warn(f"conversation database not readable: {exc}", db)
             return None
-        return {"steps": _count(steps), "messages": _count(messages),
-                "first": first[0] if first else None, "last": last[0] if last else None,
-                "blob": blob[0] if blob else None,
-                "parents": _count(parents[0]) if parents else 0}
+        return {
+            "steps": _count(steps),
+            "messages": _count(messages),
+            "first": first[0] if first else None,
+            "last": last[0] if last else None,
+            "blob": blob[0] if blob else None,
+            "parents": _count(parents[0]) if parents else 0,
+        }
 
     @staticmethod
     def _summary_row(path: Path, cid: str) -> dict:
@@ -367,7 +417,8 @@ class Antigravity(Provider):
         try:
             with contextlib.closing(_connect(path)) as con:
                 cursor = con.execute(
-                    "SELECT * FROM conversation_summaries WHERE conversation_id = ?", (cid,))
+                    "SELECT * FROM conversation_summaries WHERE conversation_id = ?", (cid,)
+                )
                 row = cursor.fetchone()
                 if row is None:
                     return {}
@@ -456,7 +507,8 @@ class Antigravity(Provider):
         try:
             with contextlib.closing(_connect(db)) as con:
                 rows = con.execute(
-                    "SELECT step_type, metadata, step_payload FROM steps ORDER BY idx").fetchall()
+                    "SELECT step_type, metadata, step_payload FROM steps ORDER BY idx"
+                ).fetchall()
         except sqlite3.Error:
             return
         for step_type, metadata, payload in rows:

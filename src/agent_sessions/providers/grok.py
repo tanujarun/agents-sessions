@@ -13,22 +13,31 @@ from .. import importer
 from ..fsutil import home, listdir_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
-from .base import (NotSupported, Provider, Turn, clean_title, iter_jsonl, open_ro, parse_ts,
-                   unreadable, warn)
+from .base import (
+    NotSupported,
+    Provider,
+    Turn,
+    clean_title,
+    iter_jsonl,
+    open_ro,
+    parse_ts,
+    unreadable,
+    warn,
+)
 
 _SUMMARY = "summary.json"
 _CHAT = "chat_history.jsonl"
 _CWD = ".cwd"
 _SUBAGENTS = "subagents"
 _META = "meta.json"
-_FIXED_PATHS = 3            # summary.json, chat_history.jsonl, <group>/.cwd
+_FIXED_PATHS = 3  # summary.json, chat_history.jsonl, <group>/.cwd
 _SMALL_FILE = 16 * 1024 * 1024
 _QUERY = re.compile(r"<user_query>(.*?)</user_query>", re.S)
 _INJECTED = ("<user_info>", "<system-reminder>")
 # Import (FORMATS section 6): the only cwd shape whose group directory name
 # is known for certain, and the reason given for every other one.
 _PLAIN_CWD = re.compile(r"[A-Za-z0-9/ ]+")
-_GROUP_NAME_MAX = 255       # bytes; longer names get a slug and a hash [docs]
+_GROUP_NAME_MAX = 255  # bytes; longer names get a slug and a hash [docs]
 ENCODING_UNVERIFIED = "Grok's directory encoding of '-', '.', '_', '~' is unverified"
 
 
@@ -92,10 +101,12 @@ class _SummaryRewrite(importer.Rewrite):
             self.changes.append(f"grok_home: {data['grok_home']} -> {self._home}")
             data["grok_home"] = self._home
         out = self._dump(data, pretty)
-        if not importer.only_changed(original, json.loads(out.decode("utf-8")),
-                                     [("info", "cwd"), ("grok_home",)]):
+        if not importer.only_changed(
+            original, json.loads(out.decode("utf-8")), [("info", "cwd"), ("grok_home",)]
+        ):
             raise importer.ImportFailed(
-                "summary.json did not survive rewriting unchanged; nothing was imported")
+                "summary.json did not survive rewriting unchanged; nothing was imported"
+            )
         yield out
 
 
@@ -112,17 +123,24 @@ def _text(content) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "\n".join(part["text"] for part in content
-                         if isinstance(part, dict) and part.get("type") == "text"
-                         and isinstance(part.get("text"), str))
+        return "\n".join(
+            part["text"]
+            for part in content
+            if isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        )
     return ""
 
 
 def _is_prompt(record) -> bool:
     """A real user prompt: a user record that has ``prompt_index`` and no
     ``synthetic_reason`` (FORMATS section 4)."""
-    return (record.get("type") == "user" and record.get("prompt_index") is not None
-            and not record.get("synthetic_reason"))
+    return (
+        record.get("type") == "user"
+        and record.get("prompt_index") is not None
+        and not record.get("synthetic_reason")
+    )
 
 
 def _prompt_text(record) -> str | None:
@@ -165,7 +183,7 @@ def _is_child(session_id, session_dir, meta_paths) -> bool:
     for path in meta_paths:
         meta = Path(path)
         if meta.parent.parent.parent == session_dir:
-            continue            # a session is not its own sub-agent
+            continue  # a session is not its own sub-agent
         if meta.parent.name == session_id:
             return True
         data, error = _load_json(meta)
@@ -205,8 +223,8 @@ class Grok(Provider):
         parsed in, and a new or changed ``meta.json`` invalidates the cache.
         """
         sessions = Path(store.root) / "sessions"
-        found: list[tuple[str, str, Path]] = []      # (group, name, dir)
-        metas: list[tuple[Path, str]] = []           # (owning session dir, meta path)
+        found: list[tuple[str, str, Path]] = []  # (group, name, dir)
+        metas: list[tuple[Path, str]] = []  # (owning session dir, meta path)
         try:
             groups = sorted(subdirs(sessions))
         except OSError as exc:
@@ -235,8 +253,10 @@ class Grok(Provider):
                 except OSError as exc:
                     unreadable(session_dir / _SUBAGENTS, exc)
                     continue
-                metas += [(session_dir, str(session_dir / _SUBAGENTS / child / _META))
-                          for child in children]
+                metas += [
+                    (session_dir, str(session_dir / _SUBAGENTS / child / _META))
+                    for child in children
+                ]
         seen: dict[str, int] = {}
         for _group, name, _dir in found:
             seen[name] = seen.get(name, 0) + 1
@@ -245,8 +265,11 @@ class Grok(Provider):
             # The directory name is the session id; the same id under two
             # groups needs the group to stay unique.
             hint = name if seen[name] == 1 else f"{group}/{name}"
-            paths = [str(session_dir / _SUMMARY), str(session_dir / _CHAT),
-                     str(session_dir.parent / _CWD)]
+            paths = [
+                str(session_dir / _SUMMARY),
+                str(session_dir / _CHAT),
+                str(session_dir.parent / _CWD),
+            ]
             paths += [meta for owner, meta in metas if owner != session_dir]
             out.append(Candidate(hint, paths))
         return out
@@ -273,8 +296,11 @@ class Grok(Provider):
             warn("summary.json skipped: not a JSON object", summary_path)
             return None
         info = summary.get("info") if isinstance(summary.get("info"), dict) else {}
-        session_id = info.get("id") if isinstance(info.get("id"), str) and info.get("id") \
+        session_id = (
+            info.get("id")
+            if isinstance(info.get("id"), str) and info.get("id")
             else session_dir.name
+        )
         if _is_child(session_id, session_dir, c.paths[_FIXED_PATHS:]):
             return None
 
@@ -300,15 +326,14 @@ class Grok(Provider):
                     if not first_prompt:
                         first_prompt = clean_title(_prompt_text(record))
             if prompts + replies == 0:
-                return None             # empty session
+                return None  # empty session
             messages = prompts + replies
         else:
             # No chat file: an untitled session is an empty one; a titled one
             # was a conversation whose history is gone.
             if not own_title:
                 return None
-            warn("chat_history.jsonl is missing; message count taken from summary.json",
-                 chat_path)
+            warn("chat_history.jsonl is missing; message count taken from summary.json", chat_path)
             count = summary.get("num_chat_messages")
             messages = count if isinstance(count, int) and not isinstance(count, bool) else None
 
@@ -324,11 +349,22 @@ class Grok(Provider):
             cwd, cwd_source = self._group_cwd(session_dir.parent)
 
         started = parse_ts(summary.get("created_at")) or _mtime(session_dir)
-        updated = (parse_ts(summary.get("updated_at")) or parse_ts(summary.get("last_active_at"))
-                   or _mtime(summary_path))
-        return {"id": session_id, "title": title, "cwd": cwd, "started": started,
-                "updated": updated, "messages": messages, "files": [str(session_dir)],
-                "note": None, "sources": {"title": title_source, "cwd": cwd_source}}
+        updated = (
+            parse_ts(summary.get("updated_at"))
+            or parse_ts(summary.get("last_active_at"))
+            or _mtime(summary_path)
+        )
+        return {
+            "id": session_id,
+            "title": title,
+            "cwd": cwd,
+            "started": started,
+            "updated": updated,
+            "messages": messages,
+            "files": [str(session_dir)],
+            "note": None,
+            "sources": {"title": title_source, "cwd": cwd_source},
+        }
 
     @staticmethod
     def _group_cwd(group_dir: Path) -> tuple[str | None, str]:
@@ -395,17 +431,22 @@ class Grok(Provider):
             if len(group.encode("utf-8")) > _GROUP_NAME_MAX:
                 raise NotSupported(
                     "Grok shortens directory names over 255 bytes in a way that is "
-                    f"unverified (project folder {plan.cwd_local})")
+                    f"unverified (project folder {plan.cwd_local})"
+                )
         name = os.path.basename(os.path.normpath(source))
-        plan.existing = sorted({
-            path for path in (os.path.join(sessions, g, n) for g in groups
-                              for n in {name, s.id})
-            if os.path.lexists(path)})
+        plan.existing = sorted(
+            {
+                path
+                for path in (os.path.join(sessions, g, n) for g in groups for n in {name, s.id})
+                if os.path.lexists(path)
+            }
+        )
         dirs, files = importer.tree(source, skip=lambda entry: entry.endswith(".lock"))
         for item in files:
             if item.rel == _SUMMARY:
                 item.rewrite = _SummaryRewrite(plan.cwd_local, plan.native_root)
-        files.sort(key=lambda item: (item.rel == _SUMMARY, item.rel))   # summary.json last
-        plan.units.append(importer.Unit(
-            os.path.join(sessions, group, name), source, files, True, dirs))
+        files.sort(key=lambda item: (item.rel == _SUMMARY, item.rel))  # summary.json last
+        plan.units.append(
+            importer.Unit(os.path.join(sessions, group, name), source, files, True, dirs)
+        )
         return plan

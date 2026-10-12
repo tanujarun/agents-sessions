@@ -59,26 +59,47 @@ def status(index=None) -> dict:
     no reader, warnings. Every list is sorted."""
     index = index if index is not None else load_index()
     present = {m.path for m in index.current_mounts}
-    mounts = [{"path": m.path, "label": m.label, "fstype": m.fstype, "device": m.device,
-               "mounted": True, "letter": index.pathmap.letter_for_mount(m.path),
-               "walk": index.walk.get(m.path)}
-              for m in index.current_mounts]
-    gone = {(row["mount"], row["mount_label"]) for row in index.store_rows
-            if not row["present"]}
-    mounts += [{"path": path, "label": label, "fstype": "", "device": "",
-                "mounted": False, "letter": None, "walk": None}
-               for path, label in sorted(gone) if path not in present]
+    mounts = [
+        {
+            "path": m.path,
+            "label": m.label,
+            "fstype": m.fstype,
+            "device": m.device,
+            "mounted": True,
+            "letter": index.pathmap.letter_for_mount(m.path),
+            "walk": index.walk.get(m.path),
+        }
+        for m in index.current_mounts
+    ]
+    gone = {(row["mount"], row["mount_label"]) for row in index.store_rows if not row["present"]}
+    mounts += [
+        {
+            "path": path,
+            "label": label,
+            "fstype": "",
+            "device": "",
+            "mounted": False,
+            "letter": None,
+            "walk": None,
+        }
+        for path, label in sorted(gone)
+        if path not in present
+    ]
     providers = []
     for p in all_providers():
         rows = [r for r in index.store_rows if r["provider"] == p.name and r["present"]]
-        providers.append({
-            "name": p.name, "label": p.label, "binary": p.binary,
-            "installed": shutil.which(p.binary) if p.binary else None,
-            "resumable": bool(p.resumable),
-            "reader": all(r["reader"] for r in rows),
-            "stores": len(rows),
-            "sessions": sum(r["listed"] for r in rows),
-        })
+        providers.append(
+            {
+                "name": p.name,
+                "label": p.label,
+                "binary": p.binary,
+                "installed": shutil.which(p.binary) if p.binary else None,
+                "resumable": bool(p.resumable),
+                "reader": all(r["reader"] for r in rows),
+                "stores": len(rows),
+                "sessions": sum(r["listed"] for r in rows),
+            }
+        )
     tools = [{"tool": name, "path": shutil.which(name)} for name in NO_READER_TOOLS]
     return {
         "cache": str(index.path),
@@ -87,9 +108,15 @@ def status(index=None) -> dict:
         "mounts": mounts,
         "providers": providers,
         "stores": index.store_rows,
-        "skipped_stores": [{"provider": s.provider, "root": s.root, "reason": s.reason,
-                            "mounted": s.mount in present}
-                           for s in index.skipped],
+        "skipped_stores": [
+            {
+                "provider": s.provider,
+                "root": s.root,
+                "reason": s.reason,
+                "mounted": s.mount in present,
+            }
+            for s in index.skipped
+        ],
         "letters": index.pathmap.letters(),
         "unresolved_letters": index.pathmap.unresolved(),
         "no_reader": [t for t in tools if t["path"]],
@@ -103,8 +130,10 @@ def _newer_than(sig, moment: str | None) -> bool:
     if moment is None:
         return True
     limit = parse_ts(moment)
-    return any(mtime_ns is None or parse_ts(mtime_ns // 1_000_000) >= limit
-               for _path, mtime_ns, _size in sig)
+    return any(
+        mtime_ns is None or parse_ts(mtime_ns // 1_000_000) >= limit
+        for _path, mtime_ns, _size in sig
+    )
 
 
 def _moved_on(sig) -> bool:
@@ -129,8 +158,13 @@ def verify(progress=None, cancel=None) -> dict:
     index = load_index()
     found = discover.brute_pass(mounts, providers, progress, cancel)
     result = {
-        "ok": False, "cancelled": found.cancelled, "differences": [], "stale": [],
-        "nested": [], "stores": 0, "sessions": 0,
+        "ok": False,
+        "cancelled": found.cancelled,
+        "differences": [],
+        "stale": [],
+        "nested": [],
+        "stores": 0,
+        "sessions": 0,
         "walk": {path: stats.to_dict() for path, stats in found.stats.items()},
         "seconds": 0.0,
     }
@@ -167,8 +201,7 @@ def verify(progress=None, cancel=None) -> dict:
             old, new = cached.get(hint), current.get(hint)
             if old is not None and new is not None and old["sig"] == new["sig"]:
                 if old["session"] != new["session"]:
-                    differences.append(
-                        f"{root}: {hint}: cached parse differs from a fresh parse")
+                    differences.append(f"{root}: {hint}: cached parse differs from a fresh parse")
                 continue
             if old is not None and new is not None:
                 stale.append(f"{root}: {hint}: changed since the last scan")
@@ -201,19 +234,24 @@ def verify(progress=None, cancel=None) -> dict:
                 if listed[key][name] != wanted[key][name]:
                     differences.append(
                         f"session {key}: {name} is {listed[key][name]!r} in the index, "
-                        f"{wanted[key][name]!r} on disk")
+                        f"{wanted[key][name]!r} on disk"
+                    )
 
     result.update(
-        ok=not differences, differences=differences, stale=stale,
+        ok=not differences,
+        differences=differences,
+        stale=stale,
         nested=sorted(f"{provider} {root}" for provider, root in nested),
-        stores=len(theirs), sessions=len(truth.sessions),
-        seconds=round(time.monotonic() - started, 3))
+        stores=len(theirs),
+        sessions=len(truth.sessions),
+        seconds=round(time.monotonic() - started, 3),
+    )
     return result
 
 
 # --- one session: find, show, open, import -----------------------------------
 
-MATCHES_SHOWN = 8   # keys named in an "ambiguous" message
+MATCHES_SHOWN = 8  # keys named in an "ambiguous" message
 
 
 def find_session(ref, index=None) -> Session:
@@ -236,8 +274,9 @@ def find_session(ref, index=None) -> Session:
     matches = [s for s in index.sessions if s.key.startswith(text) or s.id == text]
     if len(matches) > 1:
         native = [s for s in matches if s.origin == "native"]
-        if len(native) == 1 and all(s is native[0] or s.imported_as == native[0].key
-                                    for s in matches):
+        if len(native) == 1 and all(
+            s is native[0] or s.imported_as == native[0].key for s in matches
+        ):
             return native[0]
     if len(matches) == 1:
         return matches[0]
@@ -295,22 +334,21 @@ def open_session(ref, here=False, dry_run=False, index=None) -> LaunchPlan:
     where = None
     if session.origin != "native":
         index = index if index is not None else load_index()
-        copy = _native_copy(session, index)    # imported: resume that one
+        copy = _native_copy(session, index)  # imported: resume that one
         if copy is not None:
             session = copy
         else:
             where = index.where(session)
-            if where == NATIVE_LABEL:   # another store on this machine's own disks
+            if where == NATIVE_LABEL:  # another store on this machine's own disks
                 where = session.store
-    return launch.launch(session, _provider(session), where=where, here=here,
-                         dry_run=dry_run)
+    return launch.launch(session, _provider(session), where=where, here=here, dry_run=dry_run)
 
 
 @dataclass
 class ImportReport:
-    session: Session                 # the native copy, as indexed
-    created: bool                    # False: it was already there, nothing was copied
-    files: list[str] = field(default_factory=list)   # what this import put in place
+    session: Session  # the native copy, as indexed
+    created: bool  # False: it was already there, nothing was copied
+    files: list[str] = field(default_factory=list)  # what this import put in place
     bytes: int = 0
 
 
@@ -353,9 +391,17 @@ def import_plan(ref, index=None) -> dict:
     session = find_session(ref, index)
     copy = _native_copy(session, index)
     if copy is not None:
-        return {"provider": session.provider, "id": session.id, "source_key": session.key,
-                "native_key": copy.key, "already": copy.key, "copies": [], "rewrites": [],
-                "appends": [], "bytes": 0}
+        return {
+            "provider": session.provider,
+            "id": session.id,
+            "source_key": session.key,
+            "native_key": copy.key,
+            "already": copy.key,
+            "copies": [],
+            "rewrites": [],
+            "appends": [],
+            "bytes": 0,
+        }
     plan = _plan(session, index)
     importer.check(plan)
     return dict(importer.describe(plan), already=None)
@@ -381,7 +427,7 @@ def import_report(ref, progress=None, index=None) -> ImportReport:
         files, size = plan.destinations, plan.total_bytes
         provider.import_session(session, index.pathmap, progress)
     except importer.Exists as exc:
-        collision = exc     # in the store but not in this index: look again below
+        collision = exc  # in the store but not in this index: look again below
     except NotSupported as exc:
         raise ImportFailed(exc.reason) from None
     fresh = Index.load()
@@ -392,8 +438,9 @@ def import_report(ref, progress=None, index=None) -> ImportReport:
             raise collision
         return ImportReport(copy, False)
     if copy is None:
-        raise ImportFailed("the files were copied but the copy is not listed as a session: "
-                           + ", ".join(files))
+        raise ImportFailed(
+            "the files were copied but the copy is not listed as a session: " + ", ".join(files)
+        )
     return ImportReport(copy, True, files, size)
 
 
@@ -410,7 +457,26 @@ def import_session(ref, progress=None, index=None) -> Session:
     return import_report(ref, progress, index).session
 
 
-__all__ = ["ApiError", "ImportFailed", "ImportReport", "LaunchFailed", "LaunchPlan",
-           "NO_READER_TOOLS", "NotFound", "Turn", "cache_file", "can_import", "find_session",
-           "import_plan", "import_report", "import_session", "list_sessions", "load_index",
-           "open_session", "scan", "status", "transcript", "verify"]
+__all__ = [
+    "ApiError",
+    "ImportFailed",
+    "ImportReport",
+    "LaunchFailed",
+    "LaunchPlan",
+    "NO_READER_TOOLS",
+    "NotFound",
+    "Turn",
+    "cache_file",
+    "can_import",
+    "find_session",
+    "import_plan",
+    "import_report",
+    "import_session",
+    "list_sessions",
+    "load_index",
+    "open_session",
+    "scan",
+    "status",
+    "transcript",
+    "verify",
+]

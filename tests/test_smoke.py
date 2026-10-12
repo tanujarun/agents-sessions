@@ -30,14 +30,25 @@ class SmokeTest(unittest.TestCase):
     def test_imports(self):
         import importlib
 
-        for name in ("mounts", "discover", "pathmap", "index", "importer",
-                     "launch", "api", "fsutil", "providers.base"):
+        for name in (
+            "mounts",
+            "discover",
+            "pathmap",
+            "index",
+            "importer",
+            "launch",
+            "api",
+            "fsutil",
+            "providers.base",
+        ):
             importlib.import_module(f"agent_sessions.{name}")
         self.assertEqual(agent_sessions.__version__, "0.1.0")
 
     def test_registry_holds_the_five_adapters(self):
-        self.assertEqual([p.name for p in providers.all_providers()],
-                         ["antigravity", "claude", "codex", "gemini", "grok"])
+        self.assertEqual(
+            [p.name for p in providers.all_providers()],
+            ["antigravity", "claude", "codex", "gemini", "grok"],
+        )
         self.assertEqual(providers.get("claude").label, "Claude")
         with self.assertRaises(KeyError):
             providers.get("nope")
@@ -52,8 +63,7 @@ class SmokeTest(unittest.TestCase):
     def test_help_exits_zero(self):
         code, out, _ = run(["--help"])
         self.assertEqual(code, 0)
-        for cmd in ("tui", "scan", "list", "open", "import", "show",
-                    "status", "verify"):
+        for cmd in ("tui", "scan", "list", "open", "import", "show", "status", "verify"):
             self.assertIn(cmd, out)
         self.assertNotIn("menu", out)
         self.assertEqual(run(["menu", "claude"])[0], 2)
@@ -72,18 +82,26 @@ class SmokeTest(unittest.TestCase):
         import tempfile
         from unittest import mock
 
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {
-                "AGENT_SESSIONS_HOME": os.path.join(tmp, "home"),
-                "AGENT_SESSIONS_CACHE": os.path.join(tmp, "cache"),
-                "AGENT_SESSIONS_STATE": os.path.join(tmp, "state"),
-                "AGENT_SESSIONS_MOUNTS": "[]", "AGENT_SESSIONS_NOTIFY": "0"}):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(
+                os.environ,
+                {
+                    "AGENT_SESSIONS_HOME": os.path.join(tmp, "home"),
+                    "AGENT_SESSIONS_CACHE": os.path.join(tmp, "cache"),
+                    "AGENT_SESSIONS_STATE": os.path.join(tmp, "state"),
+                    "AGENT_SESSIONS_MOUNTS": "[]",
+                    "AGENT_SESSIONS_NOTIFY": "0",
+                },
+            ),
+        ):
             code, out, err = run(["show", "k"])
             self.assertEqual((code, out), (1, ""))
             self.assertIn("no session matches 'k'", err)
             self.assertEqual(run(["open", "k", "--dry-run"])[0], 1)
             self.assertEqual(run(["open", "k"])[0], 1)
             self.assertEqual(run(["import", "k", "--open"])[0], 1)
-            self.assertEqual(os.listdir(tmp), [])   # nothing was written
+            self.assertEqual(os.listdir(tmp), [])  # nothing was written
 
     def test_no_subcommand_returns_two(self):
         code, out, _ = run([])

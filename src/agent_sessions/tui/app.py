@@ -47,12 +47,12 @@ THEME = "ansi-dark"
 """Textual's ANSI theme: every colour is one of the terminal's own sixteen
 (or its default foreground/background), so the app follows the terminal."""
 
-STARTUP_SCAN_DEEP = None        # the engine decides: a full walk when the drives changed or the last one is over a day old
-PROGRESS_INTERVAL = 0.1         # seconds between progress updates sent to the UI
-VERDICT_DELAY = 0.15            # seconds a row must stay selected before can_import runs
-CLOCK_INTERVAL = 30.0           # seconds between refreshes of the ages on screen
-PAGER_BATCH = 50                # turns handed to the pager at once
-PAGER_SLICE = 0.01              # seconds of wrapping before the pager yields to input
+STARTUP_SCAN_DEEP = None  # the engine decides: a full walk when the drives changed or the last one is over a day old
+PROGRESS_INTERVAL = 0.1  # seconds between progress updates sent to the UI
+VERDICT_DELAY = 0.15  # seconds a row must stay selected before can_import runs
+CLOCK_INTERVAL = 30.0  # seconds between refreshes of the ages on screen
+PAGER_BATCH = 50  # turns handed to the pager at once
+PAGER_SLICE = 0.01  # seconds of wrapping before the pager yields to input
 
 
 def _utc_now() -> datetime:
@@ -83,16 +83,17 @@ class _UiCalls:
 
 # --- the session list ---------------------------------------------------------
 
+
 class SessionList(ScrollView, can_focus=True):
     """The list of sessions, drawn line by line: only the visible rows are
     formatted, so thousands of rows cost the same as twenty."""
 
     COMPONENT_CLASSES = {
-        "session-list--row",       # a native row
-        "session-list--foreign",   # a row from another drive
-        "session-list--cursor",    # the selected row (added to one of the above)
-        "session-list--cell",      # padding of every cell = the column spacing
-        "session-list--empty",     # the "No sessions found" line
+        "session-list--row",  # a native row
+        "session-list--foreign",  # a row from another drive
+        "session-list--cursor",  # the selected row (added to one of the above)
+        "session-list--cell",  # padding of every cell = the column spacing
+        "session-list--empty",  # the "No sessions found" line
     }
 
     class Highlighted(Message):
@@ -140,8 +141,17 @@ class SessionList(ScrollView, can_focus=True):
     def top(self) -> int:
         return int(self.scroll_offset.y)
 
-    def set_rows(self, rows, key=None, *, show_provider=False, provider_labels=None,
-                 widths=None, empty_text="", from_top=False) -> None:
+    def set_rows(
+        self,
+        rows,
+        key=None,
+        *,
+        show_provider=False,
+        provider_labels=None,
+        widths=None,
+        empty_text="",
+        from_top=False,
+    ) -> None:
         """Replace the rows, keeping the selection on ``key`` when it is
         still listed and near its old place when it is not (``from_top``:
         at the first row, for a list that is not the one shown before)."""
@@ -163,8 +173,12 @@ class SessionList(ScrollView, can_focus=True):
         padding = self.get_component_styles("session-list--cell").padding
         self._pad = (padding.left, padding.right)
         self.columns = view.fit_columns(
-            self.size.width, self.widths, show_provider=self.show_provider,
-            show_project=self.show_project, cell_pad=padding.left + padding.right)
+            self.size.width,
+            self.widths,
+            show_provider=self.show_provider,
+            show_project=self.show_project,
+            cell_pad=padding.left + padding.right,
+        )
         header = view.format_header(self.columns, *self._pad)
         if header != self._header:
             self._header = header
@@ -182,8 +196,7 @@ class SessionList(ScrollView, can_focus=True):
             self._announce()
 
     def move(self, move: str) -> None:
-        self.select(view.move_index(self.cursor, len(self.rows), move,
-                                    page=self.size.height - 1))
+        self.select(view.move_index(self.cursor, len(self.rows), move, page=self.size.height - 1))
 
     def _announce(self) -> None:
         row = self.current
@@ -227,8 +240,7 @@ class SessionList(ScrollView, can_focus=True):
         if index == self.cursor:
             names.append("session-list--cursor")
         style = self.get_component_rich_style(*names)
-        text = view.format_row(row, self.columns, self.clock(), self.provider_labels,
-                               *self._pad)
+        text = view.format_row(row, self.columns, self.clock(), self.provider_labels, *self._pad)
         return Strip([Segment(text, style)]).adjust_cell_length(width, style)
 
     def _empty_line(self, y: int, width: int) -> Strip:
@@ -238,8 +250,9 @@ class SessionList(ScrollView, can_focus=True):
         style = self.get_component_rich_style("session-list--empty")
         text = view.clip(self.empty_text, width)
         left = max((width - view.text_width(text)) // 2, 0)
-        return Strip([Segment(" " * left, self.rich_style), Segment(text, style)]
-                     ).adjust_cell_length(width, self.rich_style)
+        return Strip(
+            [Segment(" " * left, self.rich_style), Segment(text, style)]
+        ).adjust_cell_length(width, self.rich_style)
 
 
 class TabLabel(Static):
@@ -262,14 +275,15 @@ class TabLabel(Static):
 
 # --- data for the main screen ---------------------------------------------------
 
+
 @dataclass
 class Snapshot:
     """Everything the main screen shows, read from the engine in one go."""
 
     index: object = None
-    sessions: dict = field(default_factory=dict)    # key -> Session
-    rows: list = field(default_factory=list)        # newest first, as the engine lists
-    providers: list = field(default_factory=list)   # [(name, label)]
+    sessions: dict = field(default_factory=dict)  # key -> Session
+    rows: list = field(default_factory=list)  # newest first, as the engine lists
+    providers: list = field(default_factory=list)  # [(name, label)]
     drives: int = 0
     last_scan: str | None = None
 
@@ -280,13 +294,18 @@ def build_snapshot(engine) -> Snapshot:
     sessions = list(engine.list_sessions(index=index))
     rows = [view.make_row(session, engine.where(session, index)) for session in sessions]
     status = engine.status(index) or {}
-    return Snapshot(index=index, sessions={session.key: session for session in sessions},
-                    rows=rows, providers=list(engine.providers()),
-                    drives=view.drive_count(status.get("mounts")),
-                    last_scan=status.get("last_quick"))
+    return Snapshot(
+        index=index,
+        sessions={session.key: session for session in sessions},
+        rows=rows,
+        providers=list(engine.providers()),
+        drives=view.drive_count(status.get("mounts")),
+        last_scan=status.get("last_quick"),
+    )
 
 
 # --- main screen ------------------------------------------------------------------
+
 
 class MainScreen(_UiCalls, Screen):
     """Status line, provider tabs, the list, the detail pane, key hints."""
@@ -302,15 +321,15 @@ class MainScreen(_UiCalls, Screen):
         self.tab_index = 0
         self.tab_name: str | None = None
         self.needle = ""
-        self.mode = "list"              # "list" | "foreign" | "confirm"
+        self.mode = "list"  # "list" | "foreign" | "confirm"
         self._prompt_key: str | None = None
         self._prompt_stay = False
-        self._prompt_about = ("", "")           # (title, where) of the prompt's session
-        self._selected: dict[str, str] = {}     # tab name -> selected session key
+        self._prompt_about = ("", "")  # (title, where) of the prompt's session
+        self._selected: dict[str, str] = {}  # tab name -> selected session key
         self._message = ""
         self._message_error = False
         self._activity = ""
-        self._scan: dict | None = None          # {"deep": bool, "cancel": Event}
+        self._scan: dict | None = None  # {"deep": bool, "cancel": Event}
         self._importing = False
         self._opening = False
         self._verdicts: dict[str, tuple] = {}
@@ -330,13 +349,15 @@ class MainScreen(_UiCalls, Screen):
             with Horizontal(classes="detail-row", id="detail-row-main"):
                 for name in view.DETAIL_FIELDS[:3]:
                     yield Static(name, classes="detail-label", markup=False)
-                    yield Static(view.EMPTY, id=f"detail-{name}", classes="detail-value",
-                                 markup=False)
+                    yield Static(
+                        view.EMPTY, id=f"detail-{name}", classes="detail-value", markup=False
+                    )
             for name in view.DETAIL_FIELDS[3:]:
                 with Horizontal(classes="detail-row", id=f"detail-row-{name}"):
                     yield Static(name, classes="detail-label", markup=False)
-                    yield Static(view.EMPTY, id=f"detail-{name}", classes="detail-value",
-                                 markup=False)
+                    yield Static(
+                        view.EMPTY, id=f"detail-{name}", classes="detail-value", markup=False
+                    )
         yield Static("", id="prompt", markup=False)
         with Horizontal(id="filterbar"):
             yield Static("/", id="filter-label", markup=False)
@@ -367,8 +388,9 @@ class MainScreen(_UiCalls, Screen):
             self._scan["cancel"].set()
 
     def _work(self, function, *args, group: str = "default"):
-        return self.run_worker(partial(function, *args), thread=True, group=group,
-                               exit_on_error=False)
+        return self.run_worker(
+            partial(function, *args), thread=True, group=group, exit_on_error=False
+        )
 
     def _tick(self) -> None:
         self.session_list.refresh()
@@ -396,14 +418,17 @@ class MainScreen(_UiCalls, Screen):
         right = self.query_one("#status-summary", Static)
         room = self.size.width - sum(
             widget.styles.gutter.width + widget.styles.margin.width
-            for widget in (left, right, self.query_one("#statusbar")))
+            for widget in (left, right, self.query_one("#statusbar"))
+        )
         if self._activity:
             variants = [self._activity]
         else:
-            variants = view.summary_variants(self.snapshot.drives, len(self.snapshot.rows),
-                                             self.snapshot.last_scan, self.clock())
-        shown, summary = view.status_parts(self._message or view.APP_TITLE, variants,
-                                           room, gap=0, keep_left=bool(self._message))
+            variants = view.summary_variants(
+                self.snapshot.drives, len(self.snapshot.rows), self.snapshot.last_scan, self.clock()
+            )
+        shown, summary = view.status_parts(
+            self._message or view.APP_TITLE, variants, room, gap=0, keep_left=bool(self._message)
+        )
         left.update(shown)
         left.set_class(bool(self._message) and self._message_error, "-error")
         left.set_class(bool(self._message) and not self._message_error, "-info")
@@ -418,8 +443,9 @@ class MainScreen(_UiCalls, Screen):
     def _apply_layout(self) -> None:
         """Decide what a terminal of this size shows (``view.layout_for``)."""
         hints = self.query_one("#hints", Static)
-        layout = view.layout_for(self.size.width, self.size.height,
-                                 hints.styles.gutter.width + hints.styles.margin.width)
+        layout = view.layout_for(
+            self.size.width, self.size.height, hints.styles.gutter.width + hints.styles.margin.width
+        )
         self.query_one("#detail").display = layout.show_detail
         hints.update("\n".join(layout.hints))
         self.set_class(not layout.show_project, "-narrow")
@@ -498,17 +524,24 @@ class MainScreen(_UiCalls, Screen):
         if not self.loaded:
             empty = ""
         elif self.needle.strip():
-            empty = f"No sessions match \"{self.needle.strip()}\""
+            empty = f'No sessions match "{self.needle.strip()}"'
         else:
             empty = "No sessions found"
         current = self.session_list.current
-        key = select_key or (current.key if current and self._listed_under(current, provider)
-                             else self._selected.get(provider))
+        key = select_key or (
+            current.key
+            if current and self._listed_under(current, provider)
+            else self._selected.get(provider)
+        )
         self.session_list.set_rows(
-            rows, key, show_provider=provider == view.ALL,
+            rows,
+            key,
+            show_provider=provider == view.ALL,
             provider_labels=dict(self.snapshot.providers),
             widths=view.column_widths(rows, dict(self.snapshot.providers)),
-            empty_text=empty, from_top=from_top)
+            empty_text=empty,
+            from_top=from_top,
+        )
 
     @staticmethod
     def _listed_under(row: view.Row, provider: str) -> bool:
@@ -554,11 +587,17 @@ class MainScreen(_UiCalls, Screen):
             self._verdict_timer.stop()
             self._verdict_timer = None
         session = self.current_session()
-        if (session is None or session.origin == "native" or session.imported_as
-                or session.key in self._verdicts or session.key in self._verdict_pending):
+        if (
+            session is None
+            or session.origin == "native"
+            or session.imported_as
+            or session.key in self._verdicts
+            or session.key in self._verdict_pending
+        ):
             return
         self._verdict_timer = self.set_timer(
-            VERDICT_DELAY, partial(self._start_verdict, session.key))
+            VERDICT_DELAY, partial(self._start_verdict, session.key)
+        )
 
     def _start_verdict(self, key: str) -> None:
         self._verdict_timer = None
@@ -572,14 +611,14 @@ class MainScreen(_UiCalls, Screen):
         try:
             possible, reason = self.engine.can_import(session, index=index)
             verdict = (bool(possible), reason or "")
-        except Exception as exc:   # shown in the detail pane, never fatal
+        except Exception as exc:  # shown in the detail pane, never fatal
             verdict = (None, view.error_text(exc))
         self._ui(self._verdict_done, key, index, verdict)
 
     def _verdict_done(self, key, index, verdict) -> None:
         self._verdict_pending.discard(key)
         if index is not self.snapshot.index:
-            self._schedule_verdict()    # the index moved on; ask again if still selected
+            self._schedule_verdict()  # the index moved on; ask again if still selected
             return
         self._verdicts[key] = verdict
         self._render_detail()
@@ -759,8 +798,14 @@ class MainScreen(_UiCalls, Screen):
         if self._opening:
             return
         self._opening = True
-        self._work(self._open_thread, key, view.clean(title) or key, stay,
-                   self.snapshot.index, group="open")
+        self._work(
+            self._open_thread,
+            key,
+            view.clean(title) or key,
+            stay,
+            self.snapshot.index,
+            group="open",
+        )
 
     def _open_thread(self, key, title, stay, index) -> None:
         try:
@@ -812,8 +857,15 @@ class MainScreen(_UiCalls, Screen):
             return
         self._importing = True
         self._set_activity(view.import_progress_text(0, 0))
-        self._work(self._import_thread, key, view.clean(session.title) or key, then_open,
-                   stay, self.snapshot.index, group="import")
+        self._work(
+            self._import_thread,
+            key,
+            view.clean(session.title) or key,
+            then_open,
+            stay,
+            self.snapshot.index,
+            group="import",
+        )
 
     def _import_thread(self, key, title, then_open, stay, index) -> None:
         last = [0.0]
@@ -838,8 +890,7 @@ class MainScreen(_UiCalls, Screen):
             error = view.error_text(exc)
         if then_open and new_key is not None:
             try:
-                plan = self.engine.open_session(
-                    new_key, index=snapshot.index if snapshot else None)
+                plan = self.engine.open_session(new_key, index=snapshot.index if snapshot else None)
                 opened, note = True, getattr(plan, "note", None)
             except Exception as exc:
                 error = view.error_text(exc)
@@ -874,9 +925,11 @@ class MainScreen(_UiCalls, Screen):
         session = self.snapshot.sessions.get(key)
         if session is None:
             return
-        self.app.push_screen(TranscriptScreen(
-            self.engine, key, view.clean(session.title) or key, self.snapshot.index,
-            tz=self.tz))
+        self.app.push_screen(
+            TranscriptScreen(
+                self.engine, key, view.clean(session.title) or key, self.snapshot.index, tz=self.tz
+            )
+        )
 
     # --- load and scan -----------------------------------------------------
 
@@ -952,6 +1005,7 @@ class MainScreen(_UiCalls, Screen):
 
 # --- help overlay -------------------------------------------------------------------
 
+
 class HelpScreen(ModalScreen):
     """The key help; ``?``, ``q``, Esc, Enter or a click closes it."""
 
@@ -971,7 +1025,8 @@ class HelpScreen(ModalScreen):
         box = self.query_one("#help")
         text = self.query_one("#help-text", Static)
         room = self.size.width - sum(
-            widget.styles.gutter.width + widget.styles.margin.width for widget in (box, text))
+            widget.styles.gutter.width + widget.styles.margin.width for widget in (box, text)
+        )
         # One column is kept back for the scrollbar a short terminal needs.
         text.update("\n".join(view.help_lines(max(room - 1, 1))))
 
@@ -997,14 +1052,19 @@ class HelpScreen(ModalScreen):
 
 # --- transcript pager ----------------------------------------------------------------
 
+
 class TranscriptView(ScrollView, can_focus=True):
     """A transcript drawn line by line. Turns arrive in batches and are
     wrapped a slice at a time, so neither a long session nor a resize holds
     the keyboard up."""
 
     COMPONENT_CLASSES = {
-        "transcript--role-user", "transcript--role-assistant", "transcript--role-tool",
-        "transcript--text", "transcript--note", "transcript--blank",
+        "transcript--role-user",
+        "transcript--role-assistant",
+        "transcript--role-tool",
+        "transcript--text",
+        "transcript--note",
+        "transcript--blank",
     }
 
     def __init__(self, tz=None, **kwargs) -> None:
@@ -1012,7 +1072,7 @@ class TranscriptView(ScrollView, can_focus=True):
         self.tz = tz
         self.turns: list[tuple] = []
         self.lines: list[tuple[str, str]] = []
-        self._starts: list[int] = []     # first line of every wrapped turn
+        self._starts: list[int] = []  # first line of every wrapped turn
         self._width = 0
         self._anchor: int | None = None  # turn to scroll back to after a re-wrap
         self._wrapping = False
@@ -1083,8 +1143,9 @@ class TranscriptView(ScrollView, can_focus=True):
 class TranscriptScreen(_UiCalls, Screen):
     """The built-in pager: one session's transcript, read in a worker."""
 
-    def __init__(self, engine, key: str, title: str, index=None, tz=None,
-                 max_turns: int | None = None) -> None:
+    def __init__(
+        self, engine, key: str, title: str, index=None, tz=None, max_turns: int | None = None
+    ) -> None:
         super().__init__(id="pager")
         self.engine = engine
         self.key = key
@@ -1110,8 +1171,7 @@ class TranscriptScreen(_UiCalls, Screen):
     def on_mount(self) -> None:
         self.body.focus()
         self._render_status()
-        self.run_worker(self._load_thread, thread=True, group="transcript",
-                        exit_on_error=False)
+        self.run_worker(self._load_thread, thread=True, group="transcript", exit_on_error=False)
 
     def on_unmount(self) -> None:
         self._gone = True
@@ -1180,6 +1240,7 @@ class TranscriptScreen(_UiCalls, Screen):
 
 # --- the app ---------------------------------------------------------------------------
 
+
 class SessionsApp(App):
     """``engine`` is anything with the methods of ``tui.engine.Engine``."""
 
@@ -1223,5 +1284,15 @@ class SessionsApp(App):
         self._signals.clear()
 
 
-__all__ = ["HelpScreen", "MainScreen", "SessionList", "SessionsApp", "Snapshot", "TabLabel",
-           "TranscriptScreen", "TranscriptView", "UiCall", "build_snapshot"]
+__all__ = [
+    "HelpScreen",
+    "MainScreen",
+    "SessionList",
+    "SessionsApp",
+    "Snapshot",
+    "TabLabel",
+    "TranscriptScreen",
+    "TranscriptView",
+    "UiCall",
+    "build_snapshot",
+]

@@ -12,6 +12,7 @@ INSTALL_HINT = "agent-sessions: the TUI needs Textual; run ./install.sh in {repo
 def run(engine=None) -> int:
     """Run the app until it exits; the process exit code."""
     from .__main__ import main
+
     return main([], engine=engine)
 
 

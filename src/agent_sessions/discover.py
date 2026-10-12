@@ -21,10 +21,10 @@ from .model import Store
 class PruneList:
     """Directories a deep pass never descends."""
 
-    names: frozenset          # a directory with this name, anywhere
-    prefixes: tuple           # a directory whose name starts with this
-    path_suffixes: tuple      # a directory whose path ends with these segments
-    root_only: frozenset      # direct children of the mount at "/"
+    names: frozenset  # a directory with this name, anywhere
+    prefixes: tuple  # a directory whose name starts with this
+    path_suffixes: tuple  # a directory whose path ends with these segments
+    root_only: frozenset  # direct children of the mount at "/"
 
     def matches(self, name: str, parent: str, parent_is_root: bool) -> bool:
         if name in self.names or name.startswith(self.prefixes):
@@ -40,15 +40,32 @@ class PruneList:
 
 
 PRUNE = PruneList(
-    names=frozenset({
-        # Windows system trees (the recycle bin is spelled both ways on NTFS)
-        "Windows", "ProgramData", "$RECYCLE.BIN", "$Recycle.Bin",
-        "System Volume Information",
-        # package trees, game libraries, tool caches
-        "node_modules", ".git", "site-packages", "SteamLibrary", "XboxGames",
-        "_cacache", "npm-cache", ".cargo", ".rustup", ".pnpm-store", ".npm",
-        "__pycache__", ".venv", "miniforge", ".cache",
-    }),
+    names=frozenset(
+        {
+            # Windows system trees (the recycle bin is spelled both ways on NTFS)
+            "Windows",
+            "ProgramData",
+            "$RECYCLE.BIN",
+            "$Recycle.Bin",
+            "System Volume Information",
+            # package trees, game libraries, tool caches
+            "node_modules",
+            ".git",
+            "site-packages",
+            "SteamLibrary",
+            "XboxGames",
+            "_cacache",
+            "npm-cache",
+            ".cargo",
+            ".rustup",
+            ".pnpm-store",
+            ".npm",
+            "__pycache__",
+            ".venv",
+            "miniforge",
+            ".cache",
+        }
+    ),
     prefixes=("Program Files",),
     # A bare "Temp" may be a user folder; "AppData" and "Packages" hold stores.
     path_suffixes=(("AppData", "Local", "Temp"),),
@@ -87,16 +104,16 @@ PROJECT_ROOT = _project_root()
 # Directories whose children are home directories, relative to a mount.
 HOME_PARENTS = ("Users", "home")
 
-PROGRESS_EVERY = 0.1   # seconds between progress calls
+PROGRESS_EVERY = 0.1  # seconds between progress calls
 ERROR_SAMPLES = 20
 
 
 @dataclass
 class WalkStats:
-    dirs: int = 0          # directories listed
-    pruned: int = 0        # directories skipped by the prune list
-    errors: int = 0        # directories that could not be listed
-    mount_skips: int = 0   # other mountpoints not crossed
+    dirs: int = 0  # directories listed
+    pruned: int = 0  # directories skipped by the prune list
+    errors: int = 0  # directories that could not be listed
+    mount_skips: int = 0  # other mountpoints not crossed
     seconds: float = 0.0
     error_paths: list[str] = field(default_factory=list)
 
@@ -151,30 +168,33 @@ class _Found:
         mount = mounts_mod.find_mount(root, self.mounts)
         if mount is None:
             if not native:
-                return True   # on no listed mount: not ours to report
+                return True  # on no listed mount: not ours to report
             # A native store is listed even when no listed mount holds it.
             mount = mounts_mod.Mount(Path(root).anchor or os.sep, mounts_mod.NATIVE_LABEL)
         reason = _skip_reason(provider.name, root)
         if reason is not None:
             self.skipped[key] = Skipped(provider.name, root, reason, mount.path)
             return True
-        self.stores[key] = Store(provider.name, root,
-                                 "native" if native else "foreign",
-                                 mount.path, mount.label)
+        self.stores[key] = Store(
+            provider.name, root, "native" if native else "foreign", mount.path, mount.label
+        )
         return True
 
     def result(self, stats=None, cancelled=False) -> Discovery:
         return Discovery(
             stores=[self.stores[k] for k in sorted(self.stores)],
             skipped=[self.skipped[k] for k in sorted(self.skipped)],
-            stats=stats or {}, cancelled=cancelled)
+            stats=stats or {},
+            cancelled=cancelled,
+        )
 
 
 def _skip_reason(provider_name: str, root: str) -> str | None:
     segments = root.split(os.sep)
     for name, run, reason in SKIP_RULES:
         if name in (None, provider_name) and any(
-                tuple(segments[i:i + len(run)]) == run for i in range(len(segments))):
+            tuple(segments[i : i + len(run)]) == run for i in range(len(segments))
+        ):
             return reason
     if PROJECT_ROOT and (root == PROJECT_ROOT or root.startswith(PROJECT_ROOT + os.sep)):
         return IN_PROJECT
@@ -298,7 +318,8 @@ def deep_pass(mounts, providers, progress=None, cancel=None) -> Discovery:
     cancelled = False
     for mount in mounts:
         stats[mount.path], cancelled = _walk(
-            mount, table, found, stops - {mount.path}, PRUNE, progress, cancel)
+            mount, table, found, stops - {mount.path}, PRUNE, progress, cancel
+        )
         if cancelled:
             break
     return found.result(stats, cancelled)
@@ -367,5 +388,8 @@ def nested_stores(stores) -> list[Store]:
     directory named in ``ALWAYS_DESCEND`` is not nested: that one is descended
     by design."""
     outer = [s.root for s in stores if os.path.basename(s.root) not in ALWAYS_DESCEND]
-    return [s for s in stores
-            if any(s.root != root and s.root.startswith(root + os.sep) for root in outer)]
+    return [
+        s
+        for s in stores
+        if any(s.root != root and s.root.startswith(root + os.sep) for root in outer)
+    ]

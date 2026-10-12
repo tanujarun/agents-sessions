@@ -30,8 +30,11 @@ GROK_GROUP = "sessions/F%3A%5CProj%5CMy%20Site"
 # replaced by the first name in that place).
 CASES = (
     (Claude, "claude/windows/.claude", ("projects/F--Proj-My-Site", "projects")),
-    (Codex, "codex/windows/.codex", ("sessions/2026/08/29", "sessions/2026/08", "sessions/2026",
-                                     "sessions")),
+    (
+        Codex,
+        "codex/windows/.codex",
+        ("sessions/2026/08/29", "sessions/2026/08", "sessions/2026", "sessions"),
+    ),
     (Grok, "grok/windows/.grok", (GROK_GROUP, GROK_GROUP + "/*", "sessions")),
     (Gemini, "gemini/windows/.gemini", ("tmp/my-site/chats", "tmp/my-site", "tmp")),
     (Antigravity, "antigravity/windows/.gemini/antigravity-cli", ("conversations",)),
@@ -76,8 +79,9 @@ class AdapterTest(unittest.TestCase):
                     self.assertEqual(len(collected.items), 1, collected.items)
                     path, _, message = collected.items[0].rpartition(": ")
                     self.assertEqual(message, MESSAGE)
-                    self.assertTrue(path == str(locked) or path.startswith(str(locked) + os.sep),
-                                    path)
+                    self.assertTrue(
+                        path == str(locked) or path.startswith(str(locked) + os.sep), path
+                    )
                     with collect_warnings() as collected:
                         again = sorted(c.id_hint for c in provider.candidates(store))
                     self.assertEqual((again, collected.items), (before, []))
@@ -124,11 +128,11 @@ class IndexTest(unittest.TestCase):
         want = [f"{locked}: {MESSAGE}"]
         self.assertEqual(summary["warnings"], want)
         self.assertEqual(api.status()["warnings"], want)
-        self.assertEqual(api.load_index().warnings, want)       # kept in the cache
+        self.assertEqual(api.load_index().warnings, want)  # kept in the cache
         left = [s.key for s in api.list_sessions()]
         self.assertLess(len(left), len(before))
         self.assertTrue(set(left) < set(before))
-        self.assertEqual(api.scan()["warnings"], want)           # and on every scan
+        self.assertEqual(api.scan()["warnings"], want)  # and on every scan
 
         os.chmod(locked, 0o700)
         summary = api.scan()

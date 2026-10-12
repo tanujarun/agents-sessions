@@ -27,11 +27,16 @@ from .pathmap import PathMap
 from .providers import base
 
 CACHE_VERSION = 1
-DEEP_MAX_AGE = 24 * 3600   # seconds; an older deep pass is repeated by `scan`
-_CONVERSATION = {   # field -> accepted types, as stored per candidate
-    "id": (str,), "title": (str,), "cwd": (str, type(None)),
-    "started": (str, type(None)), "updated": (str, type(None)),
-    "messages": (int, type(None)), "files": (list,), "note": (str, type(None)),
+DEEP_MAX_AGE = 24 * 3600  # seconds; an older deep pass is repeated by `scan`
+_CONVERSATION = {  # field -> accepted types, as stored per candidate
+    "id": (str,),
+    "title": (str,),
+    "cwd": (str, type(None)),
+    "started": (str, type(None)),
+    "updated": (str, type(None)),
+    "messages": (int, type(None)),
+    "files": (list,),
+    "note": (str, type(None)),
 }
 
 
@@ -81,10 +86,14 @@ def _conversation(session) -> dict | None:
 
 
 def _is_conversation(row) -> bool:
-    return (isinstance(row, dict) and set(row) == set(_CONVERSATION)
-            and all(isinstance(row[k], t) and not isinstance(row[k], bool)
-                    for k, t in _CONVERSATION.items())
-            and all(isinstance(f, str) for f in row["files"]))
+    return (
+        isinstance(row, dict)
+        and set(row) == set(_CONVERSATION)
+        and all(
+            isinstance(row[k], t) and not isinstance(row[k], bool) for k, t in _CONVERSATION.items()
+        )
+        and all(isinstance(f, str) for f in row["files"])
+    )
 
 
 def _strings(items) -> list[str]:
@@ -97,14 +106,14 @@ class Index:
     def __init__(self, path=None):
         self.path = Path(path) if path is not None else None
         # persisted
-        self.stores: list[Store] = []        # every store remembered
-        self.skipped: list[Skipped] = []     # stores found but not listed
-        self.mounts: list[dict] = []         # as seen by the last scan
+        self.stores: list[Store] = []  # every store remembered
+        self.skipped: list[Skipped] = []  # stores found but not listed
+        self.mounts: list[dict] = []  # as seen by the last scan
         self.last_quick: str | None = None
         self.last_deep: str | None = None
-        self.deep_mounts: list[str] = []     # mount paths of the last deep pass
-        self.walk: dict[str, dict] = {}      # mount path -> stats of that pass
-        self.parsed: dict[str, dict] = {}    # store key -> parse cache
+        self.deep_mounts: list[str] = []  # mount paths of the last deep pass
+        self.walk: dict[str, dict] = {}  # mount path -> stats of that pass
+        self.parsed: dict[str, dict] = {}  # store key -> parse cache
         # set by load(), not persisted: why the cache gave nothing
         # ("missing", "unreadable: <reason>"), None when it was read
         self.load_error: str | None = None
@@ -128,8 +137,7 @@ class Index:
         except FileNotFoundError:
             index.__init__(index.path)
             index.load_error = "missing"
-        except (OSError, ValueError, TypeError, KeyError, AttributeError,
-                RecursionError) as exc:
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
             index.__init__(index.path)
             reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
             index.load_error = f"unreadable: {reason or type(exc).__name__}"
@@ -138,15 +146,23 @@ class Index:
     def _adopt(self, data) -> None:
         if data["version"] != CACHE_VERSION:
             raise ValueError("other cache version")
-        self.stores = [Store(*_strings([d["provider"], d["root"], d["origin"],
-                                        d["mount"], d["mount_label"]]))
-                       for d in data["stores"]]
-        self.skipped = [Skipped(*_strings([d["provider"], d["root"], d["reason"],
-                                           d["mount"]]))
-                        for d in data["skipped"]]
-        self.mounts = [dict(zip(("path", "label", "fstype", "device"),
-                                _strings([d["path"], d["label"], d["fstype"], d["device"]])))
-                       for d in data["mounts"]]
+        self.stores = [
+            Store(*_strings([d["provider"], d["root"], d["origin"], d["mount"], d["mount_label"]]))
+            for d in data["stores"]
+        ]
+        self.skipped = [
+            Skipped(*_strings([d["provider"], d["root"], d["reason"], d["mount"]]))
+            for d in data["skipped"]
+        ]
+        self.mounts = [
+            dict(
+                zip(
+                    ("path", "label", "fstype", "device"),
+                    _strings([d["path"], d["label"], d["fstype"], d["device"]]),
+                )
+            )
+            for d in data["mounts"]
+        ]
         for name in ("last_quick", "last_deep"):
             value = data[name]
             if value is not None and base.parse_ts(value) is None:
@@ -169,14 +185,19 @@ class Index:
                     raise ValueError("bad cached session")
                 if not isinstance(cached["sig"], list):
                     raise ValueError("bad signature")
-                candidates[hint] = {"sig": cached["sig"], "session": session,
-                                    "warnings": _strings(cached["warnings"])}
+                candidates[hint] = {
+                    "sig": cached["sig"],
+                    "session": session,
+                    "warnings": _strings(cached["warnings"]),
+                }
             if not isinstance(entry["reader"], str):
                 raise ValueError("bad reader id")
-            self.parsed[key] = {"reader": entry["reader"],
-                                "implemented": bool(entry["implemented"]),
-                                "warnings": _strings(entry["warnings"]),
-                                "candidates": candidates}
+            self.parsed[key] = {
+                "reader": entry["reader"],
+                "implemented": bool(entry["implemented"]),
+                "warnings": _strings(entry["warnings"]),
+                "candidates": candidates,
+            }
 
     def save(self) -> None:
         """Write the cache atomically: a temp file in the same directory, then
@@ -259,17 +280,28 @@ class Index:
                 skipped[key] = old
         self.stores = [stores[k] for k in sorted(stores)]
         self.skipped = [skipped[k] for k in sorted(skipped) if k not in stores]
-        self.mounts = [{"path": m.path, "label": m.label, "fstype": m.fstype,
-                        "device": m.device} for m in mounts]
+        self.mounts = [
+            {"path": m.path, "label": m.label, "fstype": m.fstype, "device": m.device}
+            for m in mounts
+        ]
         counts = {"parsed": 0, "cached": 0}
-        kept = {_store_key(s): self.parsed[_store_key(s)] for s in self.stores
-                if (s.provider, s.root) not in active and _store_key(s) in self.parsed}
+        kept = {
+            _store_key(s): self.parsed[_store_key(s)]
+            for s in self.stores
+            if (s.provider, s.root) not in active and _store_key(s) in self.parsed
+        }
         if not cancelled:
-            cancelled = self._parse([s for s in self.stores if (s.provider, s.root) in active],
-                                    providers, cancel, counts, kept)
+            cancelled = self._parse(
+                [s for s in self.stores if (s.provider, s.root) in active],
+                providers,
+                cancel,
+                counts,
+                kept,
+            )
         else:
-            kept.update({k: v for k, v in self.parsed.items()
-                         if k in {_store_key(s) for s in self.stores}})
+            kept.update(
+                {k: v for k, v in self.parsed.items() if k in {_store_key(s) for s in self.stores}}
+            )
         self.parsed = kept
         if not cancelled:
             self.last_quick = utc_now()
@@ -330,7 +362,8 @@ class Index:
                     continue
                 except Exception as exc:  # an adapter must not break the scan
                     entry["warnings"].append(
-                        f"{store.root}: cannot list sessions: {type(exc).__name__}: {exc}")
+                        f"{store.root}: cannot list sessions: {type(exc).__name__}: {exc}"
+                    )
                     continue
             # Directories the adapter could not list: kept with the store,
             # and gone again on the scan after they become readable.
@@ -344,8 +377,7 @@ class Index:
                     cancelled = True
                     for later in candidates[position:]:
                         if later.id_hint in reusable:
-                            entry["candidates"].setdefault(later.id_hint,
-                                                           reusable[later.id_hint])
+                            entry["candidates"].setdefault(later.id_hint, reusable[later.id_hint])
                     break
                 sig = signature(candidate.paths)
                 cached = reusable.get(hint)
@@ -362,15 +394,19 @@ class Index:
                         break
                     except Exception as exc:  # not cached: retried next scan
                         entry["warnings"].append(
-                            f"{store.root}: {hint}: parse failed: {type(exc).__name__}: {exc}")
+                            f"{store.root}: {hint}: parse failed: {type(exc).__name__}: {exc}"
+                        )
                         continue
                 counts["parsed"] += 1
                 conversation = _conversation(session)
                 warnings = sorted(set(collected.items))
                 if session is not None and conversation is None:
                     warnings.append(f"{store.root}: {hint}: adapter returned an unusable session")
-                entry["candidates"][hint] = {"sig": sig, "session": conversation,
-                                             "warnings": warnings}
+                entry["candidates"][hint] = {
+                    "sig": sig,
+                    "session": conversation,
+                    "warnings": warnings,
+                }
             entry["warnings"].sort()
         return cancelled
 
@@ -386,16 +422,24 @@ class Index:
         sessions: list[Session] = []
         rows = []
         warnings: set[str] = set()
-        found = []                         # (row, store, conversation), in order
-        best: dict[tuple[str, str, str], tuple[str, int]] = {}   # (origin, provider, id)
+        found = []  # (row, store, conversation), in order
+        best: dict[tuple[str, str, str], tuple[str, int]] = {}  # (origin, provider, id)
         for store in sorted(self.stores, key=_store_key):
             entry = self.parsed.get(_store_key(store)) or {}
             cached = entry.get("candidates", {})
-            row = {"provider": store.provider, "root": store.root, "origin": store.origin,
-                   "mount": store.mount, "mount_label": store.mount_label,
-                   "present": store.origin == "native" or store.mount in present,
-                   "reader": entry.get("implemented", True) and store.provider in by_name,
-                   "candidates": len(cached), "listed": 0, "skipped": 0, "duplicates": 0}
+            row = {
+                "provider": store.provider,
+                "root": store.root,
+                "origin": store.origin,
+                "mount": store.mount,
+                "mount_label": store.mount_label,
+                "present": store.origin == "native" or store.mount in present,
+                "reader": entry.get("implemented", True) and store.provider in by_name,
+                "candidates": len(cached),
+                "listed": 0,
+                "skipped": 0,
+                "duplicates": 0,
+            }
             rows.append(row)
             if not row["present"]:
                 continue
@@ -427,8 +471,9 @@ class Index:
         self.pathmap = PathMap.build(mounts, [(s.cwd, s.mount) for s in sessions if s.cwd])
         warnings.update(self.pathmap.warnings)
         native = {(s.provider, s.id): s.key for s in sessions if s.origin == "native"}
-        usable = {p.name: bool(p.resumable and p.binary and shutil.which(p.binary))
-                  for p in providers}
+        usable = {
+            p.name: bool(p.resumable and p.binary and shutil.which(p.binary)) for p in providers
+        }
         for s in sessions:
             if s.cwd:
                 s.cwd_local, s.cwd_exists = self.pathmap.to_local(s.cwd, s.mount)

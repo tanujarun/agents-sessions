@@ -39,12 +39,33 @@ EXEC_FILE = f"sessions/2026/08/29/rollout-2026-08-29T14-11-24-{EXEC}.jsonl"
 
 # id: (store, files, title, cwd, started, updated, messages)
 LISTED = {
-    SEGMENTED: (NATIVE, [BASE_FILE, SEGMENT_FILE], "title-168", "/home/user",
-                "2026-09-27T23:34:58.749Z", "2026-09-28T00:52:37.556Z", 4),
-    PLAIN: (NATIVE, [PLAIN_FILE], "title-169", "/home/user",
-            "2026-09-28T17:34:10.219Z", "2026-09-28T17:49:40.106Z", 2),
-    WIN: (WINDOWS, [WIN_FILE], "text-193", "F:\\Proj\\My Site",
-          "2026-08-29T08:27:23.048Z", "2026-08-29T08:38:45.669Z", 2),
+    SEGMENTED: (
+        NATIVE,
+        [BASE_FILE, SEGMENT_FILE],
+        "title-168",
+        "/home/user",
+        "2026-09-27T23:34:58.749Z",
+        "2026-09-28T00:52:37.556Z",
+        4,
+    ),
+    PLAIN: (
+        NATIVE,
+        [PLAIN_FILE],
+        "title-169",
+        "/home/user",
+        "2026-09-28T17:34:10.219Z",
+        "2026-09-28T17:49:40.106Z",
+        2,
+    ),
+    WIN: (
+        WINDOWS,
+        [WIN_FILE],
+        "text-193",
+        "F:\\Proj\\My Site",
+        "2026-08-29T08:27:23.048Z",
+        "2026-08-29T08:38:45.669Z",
+        2,
+    ),
 }
 NEW_ID = "01a11111-2222-7333-8444-555555555555"
 OTHER_ID = "01a1aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee"
@@ -52,8 +73,13 @@ OTHER_ID = "01a1aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee"
 
 def store_for(root) -> Store:
     native = Path(root) == NATIVE
-    return Store("codex", str(root), origin="native" if native else "foreign",
-                 mount="/" if native else "/mnt/win", mount_label="Linux" if native else "Win")
+    return Store(
+        "codex",
+        str(root),
+        origin="native" if native else "foreign",
+        mount="/" if native else "/mnt/win",
+        mount_label="Linux" if native else "Win",
+    )
 
 
 def line(kind, ordinal, payload, ts="2026-10-01T10:00:00.000Z") -> dict:
@@ -61,19 +87,38 @@ def line(kind, ordinal, payload, ts="2026-10-01T10:00:00.000Z") -> dict:
 
 
 def meta(ordinal=0, ident=NEW_ID, ts="2026-10-01T10:00:00.000Z", **extra) -> dict:
-    payload = {"session_id": ident, "id": ident, "timestamp": "2026-10-01T09:59:00.000Z",
-               "cwd": "/work/dir", "originator": "codex-tui", "cli_version": "0.156.1",
-               "source": "cli", "thread_source": "user", "history_mode": "paginated",
-               "base_instructions": {"text": "instructions " * 50}}
+    payload = {
+        "session_id": ident,
+        "id": ident,
+        "timestamp": "2026-10-01T09:59:00.000Z",
+        "cwd": "/work/dir",
+        "originator": "codex-tui",
+        "cli_version": "0.156.1",
+        "source": "cli",
+        "thread_source": "user",
+        "history_mode": "paginated",
+        "base_instructions": {"text": "instructions " * 50},
+    }
     payload.update(extra)
     return line("session_meta", ordinal, payload, ts)
 
 
 def item(ordinal, kind, text, ts="2026-10-01T10:00:00.000Z") -> dict:
-    block = ({"type": "text", "text": text, "text_elements": []} if kind == "UserMessage"
-             else {"type": "Text", "text": text})
-    return line("event_msg", ordinal, {"type": "item_completed", "thread_id": NEW_ID,
-                                       "item": {"type": kind, "id": "i", "content": [block]}}, ts)
+    block = (
+        {"type": "text", "text": text, "text_elements": []}
+        if kind == "UserMessage"
+        else {"type": "Text", "text": text}
+    )
+    return line(
+        "event_msg",
+        ordinal,
+        {
+            "type": "item_completed",
+            "thread_id": NEW_ID,
+            "item": {"type": kind, "id": "i", "content": [block]},
+        },
+        ts,
+    )
 
 
 def said(ordinal, text, ts="2026-10-01T10:00:01.000Z") -> dict:
@@ -85,8 +130,12 @@ def replied(ordinal, text, ts="2026-10-01T10:00:02.000Z") -> dict:
 
 
 def tool_call(ordinal, name, ts="2026-10-01T10:00:03.000Z", kind="custom_tool_call") -> dict:
-    return line("response_item", ordinal,
-                {"type": kind, "name": name, "call_id": "c", "input": "secret input"}, ts)
+    return line(
+        "response_item",
+        ordinal,
+        {"type": kind, "name": name, "call_id": "c", "input": "secret input"},
+        ts,
+    )
 
 
 class CodexCase(unittest.TestCase):
@@ -99,8 +148,15 @@ class CodexCase(unittest.TestCase):
         self.day.mkdir(parents=True)
         self.store = Store("codex", str(self.root), origin="native")
 
-    def write(self, records, ident=NEW_ID, segment=None, raw=b"", stamp="2026-10-01T10-00-00",
-              suffix=".jsonl") -> Path:
+    def write(
+        self,
+        records,
+        ident=NEW_ID,
+        segment=None,
+        raw=b"",
+        stamp="2026-10-01T10-00-00",
+        suffix=".jsonl",
+    ) -> Path:
         name = f"rollout-{stamp}-{ident}" + (f"_{segment}" if segment else "") + suffix
         path = self.day / name
         self.day.mkdir(parents=True, exist_ok=True)
@@ -144,19 +200,25 @@ class CandidatesTest(CodexCase):
     def test_one_candidate_per_thread(self):
         found = self.provider.candidates(store_for(NATIVE))
         index = str(NATIVE / "session_index.jsonl")
-        self.assertEqual([(c.id_hint, c.paths) for c in found], [
-            (SEGMENTED, [str(NATIVE / BASE_FILE), str(NATIVE / SEGMENT_FILE), index]),
-            (PLAIN, [str(NATIVE / PLAIN_FILE), index]),
-        ])
+        self.assertEqual(
+            [(c.id_hint, c.paths) for c in found],
+            [
+                (SEGMENTED, [str(NATIVE / BASE_FILE), str(NATIVE / SEGMENT_FILE), index]),
+                (PLAIN, [str(NATIVE / PLAIN_FILE), index]),
+            ],
+        )
 
     def test_index_is_listed_even_when_absent(self):
         index = WINDOWS / "session_index.jsonl"
         self.assertFalse(index.exists())
         found = self.provider.candidates(store_for(WINDOWS))
-        self.assertEqual([(c.id_hint, c.paths) for c in found], [
-            (WIN, [str(WINDOWS / WIN_FILE), str(index)]),
-            (EXEC, [str(WINDOWS / EXEC_FILE), str(index)]),
-        ])
+        self.assertEqual(
+            [(c.id_hint, c.paths) for c in found],
+            [
+                (WIN, [str(WINDOWS / WIN_FILE), str(index)]),
+                (EXEC, [str(WINDOWS / EXEC_FILE), str(index)]),
+            ],
+        )
 
     def test_counts_match_the_readme(self):
         for root, candidates, listed in ((NATIVE, 2, 2), (WINDOWS, 2, 1)):
@@ -166,9 +228,13 @@ class CandidatesTest(CodexCase):
 
     def test_only_rollouts_under_the_date_directories(self):
         path = self.write([meta(), said(1, "hello")])
-        for name in ("notes.jsonl", f"rollout-{NEW_ID}.jsonl", f"rollout-2026-10-01-{NEW_ID}.jsonl",
-                     f"rollout-2026-10-01T10-00-00-{NEW_ID}.json",
-                     f"rollout-2026-10-01T10-00-00-{NEW_ID.upper()}.jsonl"):
+        for name in (
+            "notes.jsonl",
+            f"rollout-{NEW_ID}.jsonl",
+            f"rollout-2026-10-01-{NEW_ID}.jsonl",
+            f"rollout-2026-10-01T10-00-00-{NEW_ID}.json",
+            f"rollout-2026-10-01T10-00-00-{NEW_ID.upper()}.jsonl",
+        ):
             (self.day / name).write_text("{}\n")
         stray = f"rollout-2026-10-01T10-00-00-{OTHER_ID}.jsonl"
         (self.root / "sessions" / stray).write_text("{}\n")
@@ -177,8 +243,10 @@ class CandidatesTest(CodexCase):
             (self.root / other).mkdir()
             (self.root / other / stray).write_text("{}\n")
         found = self.provider.candidates(self.store)
-        self.assertEqual([(c.id_hint, c.paths) for c in found],
-                         [(NEW_ID, [str(path), str(self.root / "session_index.jsonl")])])
+        self.assertEqual(
+            [(c.id_hint, c.paths) for c in found],
+            [(NEW_ID, [str(path), str(self.root / "session_index.jsonl")])],
+        )
 
     def test_candidates_read_no_file(self):
         boom = mock.Mock(side_effect=AssertionError("candidates must not read files"))
@@ -202,12 +270,22 @@ class FixtureParseTest(CodexCase):
             with self.subTest(session=ident):
                 session, store = found[ident], store_for(root)
                 self.assertEqual(
-                    (session.id, session.title, session.cwd, session.started, session.updated,
-                     session.messages, session.note),
-                    (ident, title, cwd, parse_ts(started), parse_ts(updated), messages, None))
+                    (
+                        session.id,
+                        session.title,
+                        session.cwd,
+                        session.started,
+                        session.updated,
+                        session.messages,
+                        session.note,
+                    ),
+                    (ident, title, cwd, parse_ts(started), parse_ts(updated), messages, None),
+                )
                 self.assertEqual(session.files, [str(root / rel) for rel in files])
-                self.assertEqual((session.provider, session.store, session.origin),
-                                 ("codex", store.root, store.origin))
+                self.assertEqual(
+                    (session.provider, session.store, session.origin),
+                    ("codex", store.root, store.origin),
+                )
                 self.assertEqual(session.key, Session.for_store(store, id=ident).key)
 
     def test_exec_run_is_excluded(self):
@@ -220,13 +298,20 @@ class FixtureParseTest(CodexCase):
         session = self.parse_all()[0][EXEC]
         self.assertEqual(
             (session.title, session.cwd, session.started, session.updated, session.messages),
-            ("text-208", "C:\\Users\\user\\sub1\\sub2\\sub3\\sub4\\sub5\\sub6\\sub7\\sub8",
-             parse_ts("2026-08-29T08:41:24.880Z"), parse_ts("2026-08-29T08:42:41.451Z"), 2))
+            (
+                "text-208",
+                "C:\\Users\\user\\sub1\\sub2\\sub3\\sub4\\sub5\\sub6\\sub7\\sub8",
+                parse_ts("2026-08-29T08:41:24.880Z"),
+                parse_ts("2026-08-29T08:42:41.451Z"),
+                2,
+            ),
+        )
 
     def test_title_is_the_last_index_line_for_the_thread(self):
         rows = (NATIVE / "session_index.jsonl").read_text().splitlines()
-        names = [json.loads(row)["thread_name"] for row in rows
-                 if json.loads(row)["id"] == SEGMENTED]
+        names = [
+            json.loads(row)["thread_name"] for row in rows if json.loads(row)["id"] == SEGMENTED
+        ]
         self.assertEqual(names, ["title-old", "title-168"])
         self.copy_store(NATIVE)
         with open(self.root / "session_index.jsonl", "a") as fh:
@@ -235,18 +320,21 @@ class FixtureParseTest(CodexCase):
             fh.write(json.dumps({"id": PLAIN, "thread_name": None}) + "\n")
             fh.write("not json\n")
         listed = self.parse_all()[0]
-        self.assertEqual((listed[SEGMENTED].title, listed[PLAIN].title),
-                         ("renamed again", "title-169"))
+        self.assertEqual(
+            (listed[SEGMENTED].title, listed[PLAIN].title), ("renamed again", "title-169")
+        )
 
     def test_resume_argv(self):
         for root in (NATIVE, WINDOWS):
             for session in self.provider.list_sessions(store_for(root)):
-                self.assertEqual(self.provider.resume_argv(session),
-                                 ["codex", "resume", session.id])
+                self.assertEqual(
+                    self.provider.resume_argv(session), ["codex", "resume", session.id]
+                )
 
     def test_import_needs_the_session_files(self):
         """The import itself: tests/test_importer.py."""
         from agent_sessions.providers.base import NotSupported
+
         store = Store("codex", "/nowhere/store", "foreign", "/nowhere", "x")
         session = Session.for_store(store, id="00000000-0000-4000-8000-000000000000")
         with self.assertRaises(NotSupported) as caught:
@@ -270,15 +358,27 @@ class SegmentTest(CodexCase):
         base_rows = [json.loads(r) for r in (NATIVE / BASE_FILE).read_text().splitlines()]
         seg_rows = [json.loads(r) for r in (NATIVE / SEGMENT_FILE).read_text().splitlines()]
         head = seg_rows[0]["payload"]
-        self.assertEqual((head["id"], head["history_base"]["end_ordinal_exclusive"]),
-                         (SEGMENTED, 366))
-        messages = [(r["ordinal"], r["payload"]["item"]["type"]) for r in base_rows + seg_rows
-                    if r["type"] == "event_msg" and r["payload"]["type"] == "item_completed"
-                    and r["payload"]["item"]["type"] in ("UserMessage", "AgentMessage")]
+        self.assertEqual(
+            (head["id"], head["history_base"]["end_ordinal_exclusive"]), (SEGMENTED, 366)
+        )
+        messages = [
+            (r["ordinal"], r["payload"]["item"]["type"])
+            for r in base_rows + seg_rows
+            if r["type"] == "event_msg"
+            and r["payload"]["type"] == "item_completed"
+            and r["payload"]["item"]["type"] in ("UserMessage", "AgentMessage")
+        ]
         # Five message items on disk; the base file's ordinal 369 is superseded.
-        self.assertEqual(messages, [(9, "UserMessage"), (10, "AgentMessage"),
-                                    (369, "UserMessage"), (373, "UserMessage"),
-                                    (376, "AgentMessage")])
+        self.assertEqual(
+            messages,
+            [
+                (9, "UserMessage"),
+                (10, "AgentMessage"),
+                (369, "UserMessage"),
+                (373, "UserMessage"),
+                (376, "AgentMessage"),
+            ],
+        )
         self.assertEqual(self.thread().messages, 4)
 
     def test_count_drops_base_records_from_the_segment_start_on(self):
@@ -286,6 +386,7 @@ class SegmentTest(CodexCase):
             rows.append(replied(365, "kept: before the segment start"))
             rows.append(replied(366, "dropped: at the segment start"))
             rows.append(said(400, "dropped: after it"))
+
         self.rewrite(BASE_FILE, add)
         session = self.thread()
         self.assertEqual(session.messages, 5)
@@ -295,60 +396,104 @@ class SegmentTest(CodexCase):
 
     def test_updated_is_the_last_timestamp_of_the_last_segment(self):
         def later(rows):
-            rows.append(line("event_msg", 500, {"type": "token_count"},
-                             "2027-01-01T00:00:00.000Z"))
+            rows.append(line("event_msg", 500, {"type": "token_count"}, "2027-01-01T00:00:00.000Z"))
+
         self.rewrite(BASE_FILE, later)
         session = self.thread()
         self.assertEqual(session.updated, parse_ts("2026-09-28T00:52:37.556Z"))
         # started, cwd and the first user message come from the base file.
         self.assertEqual(session.started, parse_ts("2026-09-27T23:34:58.749Z"))
-        self.rewrite(SEGMENT_FILE, lambda rows: rows[0]["payload"].update(
-            cwd="/segment/dir", timestamp="2026-09-28T00:52:25.821Z"))
-        self.assertEqual((self.thread().cwd, self.thread().started),
-                         ("/home/user", parse_ts("2026-09-27T23:34:58.749Z")))
+        self.rewrite(
+            SEGMENT_FILE,
+            lambda rows: rows[0]["payload"].update(
+                cwd="/segment/dir", timestamp="2026-09-28T00:52:25.821Z"
+            ),
+        )
+        self.assertEqual(
+            (self.thread().cwd, self.thread().started),
+            ("/home/user", parse_ts("2026-09-27T23:34:58.749Z")),
+        )
         (self.root / "session_index.jsonl").unlink()
         self.assertEqual(self.thread().title, "text-25")
 
     def test_files_are_in_thread_order_whatever_the_names_say(self):
         # Give the segment a name that sorts before the base file.
-        early = self.root / "sessions/2026/09/28" / (
-            f"rollout-2026-09-28T01-00-00-{SEGMENTED}_{SEGMENT}.jsonl")
+        early = (
+            self.root
+            / "sessions/2026/09/28"
+            / (f"rollout-2026-09-28T01-00-00-{SEGMENTED}_{SEGMENT}.jsonl")
+        )
         (self.root / SEGMENT_FILE).rename(early)
         session = self.thread()
         self.assertEqual(session.files, [str(self.root / BASE_FILE), str(early)])
-        self.assertEqual((session.messages, session.updated),
-                         (4, parse_ts("2026-09-28T00:52:37.556Z")))
+        self.assertEqual(
+            (session.messages, session.updated), (4, parse_ts("2026-09-28T00:52:37.556Z"))
+        )
 
     def test_two_segments(self):
-        self.write([meta(), said(1, "one"), replied(2, "two"), said(3, "three"),
-                    replied(4, "superseded by the first segment"),
-                    said(9, "superseded as well")], stamp="2026-10-01T10-00-00")
-        self.write([meta(4, history_base={"thread_id": NEW_ID, "end_ordinal_exclusive": 4}),
-                    replied(5, "four"), said(6, "five"),
-                    replied(7, "superseded by the second segment")],
-                   segment=SEGMENT, stamp="2026-10-01T11-00-00")
-        self.write([meta(7, history_base={"thread_id": NEW_ID, "end_ordinal_exclusive": 7},
-                         ts="2026-10-01T12:00:00.000Z"),
-                    replied(8, "six", "2026-10-01T12:00:05.000Z")],
-                   segment=OTHER_ID, stamp="2026-10-01T12-00-00")
+        self.write(
+            [
+                meta(),
+                said(1, "one"),
+                replied(2, "two"),
+                said(3, "three"),
+                replied(4, "superseded by the first segment"),
+                said(9, "superseded as well"),
+            ],
+            stamp="2026-10-01T10-00-00",
+        )
+        self.write(
+            [
+                meta(4, history_base={"thread_id": NEW_ID, "end_ordinal_exclusive": 4}),
+                replied(5, "four"),
+                said(6, "five"),
+                replied(7, "superseded by the second segment"),
+            ],
+            segment=SEGMENT,
+            stamp="2026-10-01T11-00-00",
+        )
+        self.write(
+            [
+                meta(
+                    7,
+                    history_base={"thread_id": NEW_ID, "end_ordinal_exclusive": 7},
+                    ts="2026-10-01T12:00:00.000Z",
+                ),
+                replied(8, "six", "2026-10-01T12:00:05.000Z"),
+            ],
+            segment=OTHER_ID,
+            stamp="2026-10-01T12-00-00",
+        )
         session = self.parse_all()[0][NEW_ID]
-        self.assertEqual((session.messages, session.updated, len(session.files)),
-                         (6, "2026-10-01T12:00:05.000000Z", 3))
-        self.assertEqual([t.text for t in self.provider.transcript(session)],
-                         ["one", "two", "three", "four", "five", "six"])
+        self.assertEqual(
+            (session.messages, session.updated, len(session.files)),
+            (6, "2026-10-01T12:00:05.000000Z", 3),
+        )
+        self.assertEqual(
+            [t.text for t in self.provider.transcript(session)],
+            ["one", "two", "three", "four", "five", "six"],
+        )
 
     def test_segment_without_its_base_file(self):
         (self.root / BASE_FILE).unlink()
         session = self.thread()
-        self.assertEqual((session.id, session.messages, session.files),
-                         (SEGMENTED, 2, [str(self.root / SEGMENT_FILE)]))
+        self.assertEqual(
+            (session.id, session.messages, session.files),
+            (SEGMENTED, 2, [str(self.root / SEGMENT_FILE)]),
+        )
         self.assertEqual(session.started, parse_ts("2026-09-28T00:52:25.821Z"))
 
 
 class RulesTest(CodexCase):
     def test_missing_index_falls_back_to_the_first_user_message(self):
-        self.write([meta(), replied(1, "agent first"),
-                    said(2, "  the first\n user message " + "x" * 100), said(3, "second")])
+        self.write(
+            [
+                meta(),
+                replied(1, "agent first"),
+                said(2, "  the first\n user message " + "x" * 100),
+                said(3, "second"),
+            ]
+        )
         self.assertFalse((self.root / "session_index.jsonl").exists())
         session = self.only()
         self.assertEqual(session.title, ("the first user message " + "x" * 100)[:80])
@@ -359,8 +504,17 @@ class RulesTest(CodexCase):
         record["payload"]["item"]["content"].append({"type": "text", "text": "part two"})
         record["payload"]["item"]["content"].append({"type": "image", "url": "x"})
         # response_item user messages are injected context, never the title.
-        injected = line("response_item", 0, {"type": "message", "role": "user", "content": [
-            {"type": "input_text", "text": "<environment_context>x</environment_context>"}]})
+        injected = line(
+            "response_item",
+            0,
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "<environment_context>x</environment_context>"}
+                ],
+            },
+        )
         self.write([meta(), injected, record])
         session = self.only()
         self.assertEqual((session.title, session.messages), ("part one part two", 1))
@@ -377,31 +531,45 @@ class RulesTest(CodexCase):
 
     def test_file_of_another_thread_is_left_out(self):
         base_path = self.write([meta(), said(1, "mine"), replied(2, "yours")])
-        stray = self.write([meta(3, ident=OTHER_ID), said(4, "from another thread")],
-                           segment=SEGMENT, stamp="2026-10-01T11-00-00")
+        stray = self.write(
+            [meta(3, ident=OTHER_ID), said(4, "from another thread")],
+            segment=SEGMENT,
+            stamp="2026-10-01T11-00-00",
+        )
         listed, excluded, warnings = self.parse_all()
         session = listed[NEW_ID]
         self.assertEqual((session.messages, session.files, excluded), (2, [str(base_path)], []))
-        self.assertEqual(warnings, [f"{stray}: belongs to thread {OTHER_ID}, not {NEW_ID}; skipped"])
+        self.assertEqual(
+            warnings, [f"{stray}: belongs to thread {OTHER_ID}, not {NEW_ID}; skipped"]
+        )
 
     def test_fallbacks_without_session_meta(self):
-        path = self.write([
-            line("turn_context", 5, {"cwd": "/from/turn", "workspace_roots": []},
-                 "2026-10-01T08:00:00.000Z"),
-            line("turn_context", 6, {"cwd": "/later/turn"}),
-            said(7, "hi", "2026-10-01T08:00:01.000Z")])
+        path = self.write(
+            [
+                line(
+                    "turn_context",
+                    5,
+                    {"cwd": "/from/turn", "workspace_roots": []},
+                    "2026-10-01T08:00:00.000Z",
+                ),
+                line("turn_context", 6, {"cwd": "/later/turn"}),
+                said(7, "hi", "2026-10-01T08:00:01.000Z"),
+            ]
+        )
         session = self.only()
-        self.assertEqual((session.id, session.cwd, session.started, session.updated),
-                         (NEW_ID, "/from/turn", "2026-10-01T08:00:00.000000Z",
-                          "2026-10-01T08:00:01.000000Z"))
+        self.assertEqual(
+            (session.id, session.cwd, session.started, session.updated),
+            (NEW_ID, "/from/turn", "2026-10-01T08:00:00.000000Z", "2026-10-01T08:00:01.000000Z"),
+        )
         # Without any timestamp, updated is the file's mtime.
         record = said(1, "no clock")
         del record["timestamp"]
         path.write_text(json.dumps(record) + "\n")
         os.utime(path, (1790000000, 1790000000))
         session = self.only()
-        self.assertEqual((session.started, session.updated, session.cwd),
-                         (None, parse_ts(1790000000), None))
+        self.assertEqual(
+            (session.started, session.updated, session.cwd), (None, parse_ts(1790000000), None)
+        )
 
     def test_cwd_falls_back_to_turn_context(self):
         head = meta()
@@ -414,14 +582,21 @@ class RulesTest(CodexCase):
         del head["payload"]["timestamp"]
         self.write([head, said(1, "x", "2026-10-01T07:00:09.000Z")])
         session = self.only()
-        self.assertEqual((session.started, session.updated),
-                         ("2026-10-01T07:00:00.123456Z", "2026-10-01T07:00:09.000000Z"))
+        self.assertEqual(
+            (session.started, session.updated),
+            ("2026-10-01T07:00:00.123456Z", "2026-10-01T07:00:09.000000Z"),
+        )
 
     def test_subagent_threads_are_excluded(self):
-        for change in ({"source": {"subagent": {"thread_spawn": {"parent_thread_id": "p"}}}},
-                       {"source": None}, {"thread_source": "agent"}, {"thread_source": None},
-                       {"agent_nickname": "scout"}, {"agent_role": "worker"},
-                       {"source": "exec", "originator": "codex_exec"}):
+        for change in (
+            {"source": {"subagent": {"thread_spawn": {"parent_thread_id": "p"}}}},
+            {"source": None},
+            {"thread_source": "agent"},
+            {"thread_source": None},
+            {"agent_nickname": "scout"},
+            {"agent_role": "worker"},
+            {"source": "exec", "originator": "codex_exec"},
+        ):
             with self.subTest(change=change):
                 self.write([meta(**change), said(1, "task"), replied(2, "done")])
                 self.assertEqual(self.parse_all(), ({}, [NEW_ID], []))
@@ -438,13 +613,27 @@ class RulesTest(CodexCase):
         self.assertEqual(self.only().messages, 1)
 
     def test_empty_thread_is_excluded(self):
-        self.write([meta(), line("event_msg", 1, {"type": "task_started"}),
-                    line("event_msg", 2, {"type": "item_completed",
-                                          "item": {"type": "Reasoning", "id": "r"}}),
-                    line("response_item", 3, {"type": "message", "role": "user", "content": [
-                        {"type": "input_text", "text": "injected"}]}),
-                    line("event_msg", 4, {"type": "item_started",
-                                          "item": {"type": "UserMessage"}})])
+        self.write(
+            [
+                meta(),
+                line("event_msg", 1, {"type": "task_started"}),
+                line(
+                    "event_msg",
+                    2,
+                    {"type": "item_completed", "item": {"type": "Reasoning", "id": "r"}},
+                ),
+                line(
+                    "response_item",
+                    3,
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "injected"}],
+                    },
+                ),
+                line("event_msg", 4, {"type": "item_started", "item": {"type": "UserMessage"}}),
+            ]
+        )
         self.assertEqual(self.parse_all(), ({}, [NEW_ID], []))
 
     def test_compressed_rollout_is_skipped_with_a_warning(self):
@@ -452,7 +641,8 @@ class RulesTest(CodexCase):
         listed, excluded, warnings = self.parse_all()
         self.assertEqual((listed, excluded), ({}, [NEW_ID]))
         self.assertEqual(
-            warnings, [f"{packed}: compressed rollout (.jsonl.zst) is not supported; skipped"])
+            warnings, [f"{packed}: compressed rollout (.jsonl.zst) is not supported; skipped"]
+        )
         # Beside a readable file of the same thread the rest still lists.
         plain = self.write([meta(), said(1, "readable")], stamp="2026-10-01T09-00-00")
         listed, excluded, warnings = self.parse_all()
@@ -460,16 +650,38 @@ class RulesTest(CodexCase):
 
     def test_unknown_and_malformed_records_are_ignored(self):
         records = [
-            meta(), {"type": "event_msg"}, {"type": "event_msg", "payload": None},
+            meta(),
+            {"type": "event_msg"},
+            {"type": "event_msg", "payload": None},
             {"type": "event_msg", "payload": {"type": "item_completed"}},
             {"type": "event_msg", "payload": {"type": "item_completed", "item": "x"}},
-            {"type": "event_msg", "payload": {"type": "item_completed",
-                                              "item": {"type": "UserMessage", "content": 5}}},
-            {"type": "event_msg", "ordinal": "7", "timestamp": 5.5, "payload": {
-                "type": "item_completed", "item": {"type": "AgentMessage", "content": [
-                    5, None, {"type": "Text"}, {"type": "Text", "text": 9},
-                    {"type": "Text", "text": "ok"}]}}},
-            {"type": "from-the-future", "payload": [1]}, {"no": "type"},
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {"type": "UserMessage", "content": 5},
+                },
+            },
+            {
+                "type": "event_msg",
+                "ordinal": "7",
+                "timestamp": 5.5,
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "AgentMessage",
+                        "content": [
+                            5,
+                            None,
+                            {"type": "Text"},
+                            {"type": "Text", "text": 9},
+                            {"type": "Text", "text": "ok"},
+                        ],
+                    },
+                },
+            },
+            {"type": "from-the-future", "payload": [1]},
+            {"no": "type"},
             {"type": "turn_context", "payload": {"cwd": 5}},
             {"type": "response_item", "payload": {"type": "custom_tool_call", "name": 5}},
             {"type": "response_item", "payload": {"type": "custom_tool_call_output", "name": "x"}},
@@ -478,8 +690,9 @@ class RulesTest(CodexCase):
         self.write(records, raw=b"[1]\n7\n\n")
         session = self.only()
         self.assertEqual((session.title, session.messages), (NEW_ID[:8], 2))
-        self.assertEqual([t[:2] for t in self.provider.transcript(session)],
-                         [("user", ""), ("assistant", "ok")])
+        self.assertEqual(
+            [t[:2] for t in self.provider.transcript(session)], [("user", ""), ("assistant", "ok")]
+        )
 
 
 class DamagedFileTest(CodexCase):
@@ -496,8 +709,10 @@ class DamagedFileTest(CodexCase):
 
     def test_half_written_last_line(self):
         with open(self.root / PLAIN_FILE, "ab") as fh:
-            fh.write(b'{"timestamp":"2027-01-01T00:00:00.000Z","ordinal":300,"type":"event_msg",'
-                     b'"payload":{"type":"item_completed","item":{"type":"AgentMessage","cont')
+            fh.write(
+                b'{"timestamp":"2027-01-01T00:00:00.000Z","ordinal":300,"type":"event_msg",'
+                b'"payload":{"type":"item_completed","item":{"type":"AgentMessage","cont'
+            )
         listed, excluded, warnings = self.parse_all()
         self.assertEqual((excluded, warnings), ([], []))
         self.assertEqual(self.fields(listed[PLAIN]), self.expected(PLAIN))
@@ -506,26 +721,34 @@ class DamagedFileTest(CodexCase):
         path = self.root / PLAIN_FILE
         rows = path.read_bytes().splitlines(keepends=True)
         self.assertEqual(json.loads(rows[6])["payload"]["item"]["type"], "AgentMessage")
-        path.write_bytes(b"".join(rows[:6]) + rows[6][:len(rows[6]) // 2])
+        path.write_bytes(b"".join(rows[:6]) + rows[6][: len(rows[6]) // 2])
         session = self.parse_all()[0][PLAIN]
-        self.assertEqual((session.title, session.messages, session.updated),
-                         ("title-169", 1, parse_ts("2026-09-28T17:34:30.804Z")))
+        self.assertEqual(
+            (session.title, session.messages, session.updated),
+            ("title-169", 1, parse_ts("2026-09-28T17:34:30.804Z")),
+        )
 
     def test_non_utf8_line(self):
         title, cwd, started, _updated, messages = self.expected(PLAIN)
         with open(self.root / PLAIN_FILE, "ab") as fh:
-            fh.write(b'{"timestamp":"2026-09-28T18:00:00.000Z","ordinal":300,"type":"event_msg",'
-                     b'"payload":{"type":"item_completed","item":{"type":"UserMessage",'
-                     b'"content":[{"type":"text","text":"caf\xe9 \xff ok"}]}}}\n')
+            fh.write(
+                b'{"timestamp":"2026-09-28T18:00:00.000Z","ordinal":300,"type":"event_msg",'
+                b'"payload":{"type":"item_completed","item":{"type":"UserMessage",'
+                b'"content":[{"type":"text","text":"caf\xe9 \xff ok"}]}}}\n'
+            )
             fh.write(b"\xff\xfe\x00\x80 not json at all\n")
         with open(self.root / "session_index.jsonl", "ab") as fh:
             fh.write(b"\xff\xfe broken index line\n")
         listed, excluded, warnings = self.parse_all()
         self.assertEqual((excluded, warnings), ([], []))
-        self.assertEqual(self.fields(listed[PLAIN]),
-                         (title, cwd, started, parse_ts("2026-09-28T18:00:00.000Z"), messages + 1))
-        self.assertEqual(list(self.provider.transcript(listed[PLAIN]))[-1],
-                         Turn("user", "caf\ufffd \ufffd ok", "2026-09-28T18:00:00.000000Z"))
+        self.assertEqual(
+            self.fields(listed[PLAIN]),
+            (title, cwd, started, parse_ts("2026-09-28T18:00:00.000Z"), messages + 1),
+        )
+        self.assertEqual(
+            list(self.provider.transcript(listed[PLAIN]))[-1],
+            Turn("user", "caf\ufffd \ufffd ok", "2026-09-28T18:00:00.000000Z"),
+        )
         self.assertEqual(self.fields(listed[SEGMENTED]), self.expected(SEGMENTED))
 
     def test_non_utf8_thread_name(self):
@@ -540,8 +763,10 @@ class DamagedFileTest(CodexCase):
         # An empty segment does not hide its thread.
         (self.root / SEGMENT_FILE).write_bytes(b"")
         session = self.parse_all()[0][SEGMENTED]
-        self.assertEqual((session.messages, session.files, session.updated),
-                         (3, [str(self.root / BASE_FILE)], parse_ts("2026-09-28T00:52:22.002Z")))
+        self.assertEqual(
+            (session.messages, session.files, session.updated),
+            (3, [str(self.root / BASE_FILE)], parse_ts("2026-09-28T00:52:22.002Z")),
+        )
 
     def test_missing_session_index(self):
         (self.root / "session_index.jsonl").unlink()
@@ -555,8 +780,13 @@ class DamagedFileTest(CodexCase):
         self.assertEqual(self.parse_all()[0][PLAIN].title, "text-152")
 
     def test_unreadable_rollout_is_a_warning(self):
-        candidate = Candidate(NEW_ID, [str(self.day / f"rollout-2026-10-01T10-00-00-{NEW_ID}.jsonl"),
-                                       str(self.root / "session_index.jsonl")])
+        candidate = Candidate(
+            NEW_ID,
+            [
+                str(self.day / f"rollout-2026-10-01T10-00-00-{NEW_ID}.jsonl"),
+                str(self.root / "session_index.jsonl"),
+            ],
+        )
         with collect_warnings() as collected:
             self.assertIsNone(self.provider.parse(self.store, candidate))
         self.assertEqual(len(collected.items), 1)
@@ -592,10 +822,12 @@ class StreamingTest(CodexCase):
             opened.append(str(path))
             return _Counting(real(path), reads)
 
-        with mock.patch.object(base, "open_ro", counting), \
-                mock.patch("builtins.open", side_effect=AssertionError("plain open")), \
-                mock.patch.object(Path, "read_bytes", side_effect=AssertionError("read_bytes")), \
-                mock.patch.object(Path, "read_text", side_effect=AssertionError("read_text")):
+        with (
+            mock.patch.object(base, "open_ro", counting),
+            mock.patch("builtins.open", side_effect=AssertionError("plain open")),
+            mock.patch.object(Path, "read_bytes", side_effect=AssertionError("read_bytes")),
+            mock.patch.object(Path, "read_text", side_effect=AssertionError("read_text")),
+        ):
             result = action()
         return result, opened, reads
 
@@ -605,7 +837,7 @@ class StreamingTest(CodexCase):
         session, opened, reads = self.run_counted(lambda: self.provider.parse(store, candidate))
         self.assertEqual(session.messages, 4)
         self.assertEqual(sorted(opened), sorted(candidate.paths))
-        self.assertEqual(len(opened), 3)   # base file, segment, thread-name index
+        self.assertEqual(len(opened), 3)  # base file, segment, thread-name index
         self.assertEqual(reads, [])
 
     def test_missing_index_is_not_opened(self):
@@ -625,72 +857,152 @@ class StreamingTest(CodexCase):
 
 class TranscriptTest(CodexCase):
     def test_fixture_transcripts(self):
-        sessions = {s.id: s for root in (NATIVE, WINDOWS)
-                    for s in self.provider.list_sessions(store_for(root))}
+        sessions = {
+            s.id: s
+            for root in (NATIVE, WINDOWS)
+            for s in self.provider.list_sessions(store_for(root))
+        }
         # "text-146" was typed twice: the first attempt (ordinal 369, turn
         # aborted) is superseded by the segment and appears once.
-        self.assertEqual(list(self.provider.transcript(sessions[SEGMENTED])), [
-            Turn("user", "text-25", "2026-09-27T23:35:18.636000Z"),
-            Turn("assistant", "text-26", "2026-09-27T23:35:21.396000Z"),
-            Turn("tool", "exec", "2026-09-27T23:35:23.117000Z"),
-            Turn("user", "text-146", "2026-09-28T00:52:28.383000Z"),
-            Turn("assistant", "text-151", "2026-09-28T00:52:37.530000Z"),
-        ])
-        self.assertEqual(list(self.provider.transcript(sessions[PLAIN])), [
-            Turn("user", "text-152", "2026-09-28T17:34:30.804000Z"),
-            Turn("assistant", "text-153", "2026-09-28T17:34:34.033000Z"),
-            Turn("tool", "exec", "2026-09-28T17:35:18.435000Z"),
-        ])
+        self.assertEqual(
+            list(self.provider.transcript(sessions[SEGMENTED])),
+            [
+                Turn("user", "text-25", "2026-09-27T23:35:18.636000Z"),
+                Turn("assistant", "text-26", "2026-09-27T23:35:21.396000Z"),
+                Turn("tool", "exec", "2026-09-27T23:35:23.117000Z"),
+                Turn("user", "text-146", "2026-09-28T00:52:28.383000Z"),
+                Turn("assistant", "text-151", "2026-09-28T00:52:37.530000Z"),
+            ],
+        )
+        self.assertEqual(
+            list(self.provider.transcript(sessions[PLAIN])),
+            [
+                Turn("user", "text-152", "2026-09-28T17:34:30.804000Z"),
+                Turn("assistant", "text-153", "2026-09-28T17:34:34.033000Z"),
+                Turn("tool", "exec", "2026-09-28T17:35:18.435000Z"),
+            ],
+        )
 
     def test_windows_session(self):
         session = self.provider.list_sessions(store_for(WINDOWS))[0]
         self.assertEqual((session.origin, session.cwd), ("foreign", "F:\\Proj\\My Site"))
-        self.assertEqual(list(self.provider.transcript(session)), [
-            Turn("user", "text-193", "2026-08-29T08:31:15.313000Z"),
-            Turn("assistant", "text-195", "2026-08-29T08:31:21.701000Z"),
-        ])
+        self.assertEqual(
+            list(self.provider.transcript(session)),
+            [
+                Turn("user", "text-193", "2026-08-29T08:31:15.313000Z"),
+                Turn("assistant", "text-195", "2026-08-29T08:31:21.701000Z"),
+            ],
+        )
 
     def test_content_and_order(self):
-        developer = line("response_item", 2, {"type": "message", "role": "developer", "content": [
-            {"type": "input_text", "text": "<permissions>hidden rules</permissions>"}]})
-        injected = line("response_item", 3, {"type": "message", "role": "user", "content": [
-            {"type": "input_text", "text": "<environment_context>hidden env</environment_context>"}]})
-        reasoning = line("event_msg", 6, {"type": "item_completed", "item": {
-            "type": "Reasoning", "id": "r", "summary_text": ["hidden thought"]}})
-        output = line("response_item", 8, {"type": "custom_tool_call_output", "call_id": "c",
-                                           "output": [{"type": "input_text", "text": "hidden out"}]})
-        command = line("event_msg", 9, {"type": "item_completed", "item": {
-            "type": "CommandExecution", "id": "e", "stdout": "hidden stdout"}})
+        developer = line(
+            "response_item",
+            2,
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {"type": "input_text", "text": "<permissions>hidden rules</permissions>"}
+                ],
+            },
+        )
+        injected = line(
+            "response_item",
+            3,
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "<environment_context>hidden env</environment_context>",
+                    }
+                ],
+            },
+        )
+        reasoning = line(
+            "event_msg",
+            6,
+            {
+                "type": "item_completed",
+                "item": {"type": "Reasoning", "id": "r", "summary_text": ["hidden thought"]},
+            },
+        )
+        output = line(
+            "response_item",
+            8,
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "c",
+                "output": [{"type": "input_text", "text": "hidden out"}],
+            },
+        )
+        command = line(
+            "event_msg",
+            9,
+            {
+                "type": "item_completed",
+                "item": {"type": "CommandExecution", "id": "e", "stdout": "hidden stdout"},
+            },
+        )
         answer = replied(11, "line one", "2026-10-01T10:00:09.000Z")
         answer["payload"]["item"]["content"].append({"type": "Text", "text": "line two"})
-        self.write([
-            meta(), developer, injected, said(4, "do the thing", "2026-10-01T10:00:01.000Z"),
-            reasoning, tool_call(7, "exec", "2026-10-01T10:00:03.000Z"), output, command,
-            tool_call(10, "shell", "2026-10-01T10:00:04.000Z", kind="function_call"), answer,
-            line("event_msg", 12, {"type": "task_complete", "last_agent_message": "hidden dup"}),
-        ])
+        self.write(
+            [
+                meta(),
+                developer,
+                injected,
+                said(4, "do the thing", "2026-10-01T10:00:01.000Z"),
+                reasoning,
+                tool_call(7, "exec", "2026-10-01T10:00:03.000Z"),
+                output,
+                command,
+                tool_call(10, "shell", "2026-10-01T10:00:04.000Z", kind="function_call"),
+                answer,
+                line(
+                    "event_msg", 12, {"type": "task_complete", "last_agent_message": "hidden dup"}
+                ),
+            ]
+        )
         session = self.only()
         self.assertEqual(session.messages, 2)
         turns = list(self.provider.transcript(session))
-        self.assertEqual(turns, [
-            Turn("user", "do the thing", "2026-10-01T10:00:01.000000Z"),
-            Turn("tool", "exec", "2026-10-01T10:00:03.000000Z"),
-            Turn("tool", "shell", "2026-10-01T10:00:04.000000Z"),
-            Turn("assistant", "line one\nline two", "2026-10-01T10:00:09.000000Z"),
-        ])
+        self.assertEqual(
+            turns,
+            [
+                Turn("user", "do the thing", "2026-10-01T10:00:01.000000Z"),
+                Turn("tool", "exec", "2026-10-01T10:00:03.000000Z"),
+                Turn("tool", "shell", "2026-10-01T10:00:04.000000Z"),
+                Turn("assistant", "line one\nline two", "2026-10-01T10:00:09.000000Z"),
+            ],
+        )
         self.assertNotIn("hidden", " ".join(turn.text for turn in turns))
         self.assertNotIn("secret", " ".join(turn.text for turn in turns))
 
     def test_superseded_tool_calls_are_dropped(self):
-        self.write([meta(), said(1, "go"), tool_call(2, "kept"), tool_call(5, "dropped"),
-                    replied(6, "dropped reply")])
-        self.write([meta(4, history_base={"thread_id": NEW_ID, "end_ordinal_exclusive": 4}),
-                    tool_call(5, "again"), replied(6, "final")],
-                   segment=SEGMENT, stamp="2026-10-01T11-00-00")
+        self.write(
+            [
+                meta(),
+                said(1, "go"),
+                tool_call(2, "kept"),
+                tool_call(5, "dropped"),
+                replied(6, "dropped reply"),
+            ]
+        )
+        self.write(
+            [
+                meta(4, history_base={"thread_id": NEW_ID, "end_ordinal_exclusive": 4}),
+                tool_call(5, "again"),
+                replied(6, "final"),
+            ],
+            segment=SEGMENT,
+            stamp="2026-10-01T11-00-00",
+        )
         session = self.parse_all()[0][NEW_ID]
-        self.assertEqual([t[:2] for t in self.provider.transcript(session)],
-                         [("user", "go"), ("tool", "kept"), ("tool", "again"),
-                          ("assistant", "final")])
+        self.assertEqual(
+            [t[:2] for t in self.provider.transcript(session)],
+            [("user", "go"), ("tool", "kept"), ("tool", "again"), ("assistant", "final")],
+        )
 
     def test_session_without_files_or_with_a_missing_file(self):
         self.write([meta(), said(1, "x")])
@@ -711,8 +1023,10 @@ class IndexIntegrationTest(unittest.TestCase):
         shutil.copytree(WINDOWS, disk / "Users" / "user" / ".codex")
         summary = api.scan(deep=True)
         self.assertEqual(summary["warnings"], [])
-        self.assertEqual((summary["stores"], summary["candidates"], summary["sessions"],
-                          summary["parsed"]), (2, 4, 3, 4))
+        self.assertEqual(
+            (summary["stores"], summary["candidates"], summary["sessions"], summary["parsed"]),
+            (2, 4, 3, 4),
+        )
         self.assertEqual({s.id for s in api.list_sessions("codex")}, set(LISTED))
         again = api.scan(deep=True)
         self.assertEqual((again["parsed"], again["cached"]), (0, 4))
