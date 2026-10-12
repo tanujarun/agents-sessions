@@ -6,16 +6,14 @@ import argparse
 import contextlib
 import json
 import os
-import re
 import shlex
 import shutil
 import signal
 import sys
 from collections.abc import Iterable, Iterator, Sequence
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, TextIO
 
-from . import __version__, api, logs, textsafe
+from . import __version__, api, fmt, logs, textsafe
 from .mounts import MountsError
 from .providers import all_providers
 
@@ -506,44 +504,11 @@ def _count(n: int, word: str, plural: str | None = None) -> str:
     return f"{n:,} {word if n == 1 else (plural or word + 's')}"
 
 
-def _size(count: int) -> str:
-    """A byte count in decimal units: ``812 B``, ``116.7 kB``, ``123.7 MB``."""
-    size = float(count)
-    for unit in ("B", "kB", "MB"):
-        if size < 1000:
-            return f"{int(size)} B" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1000
-    return f"{size:.1f} GB"
-
-
-def _age(stamp: str | None, now: datetime) -> str:
-    if not stamp:
-        return "-"
-    try:
-        then = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-    except ValueError:
-        return "-"
-    seconds = max((now - then).total_seconds(), 0)
-    days = int(seconds // 86400)
-    if seconds < 60:
-        return "now"
-    if seconds < 3600:
-        return f"{int(seconds // 60)}m"
-    if days < 1:
-        return f"{int(seconds // 3600)}h"
-    if days < 14:
-        return f"{days}d"
-    if days < 60:
-        return f"{days // 7}w"
-    if days < 365:
-        return f"{days // 30}mo"
-    return f"{days // 365}y"
-
-
-def _project(cwd: str | None) -> str:
-    """The folder a session ran in: the last segment of its recorded cwd."""
-    parts = [p for p in re.split(r"[\\/]+", cwd or "") if p]
-    return parts[-1] if parts else "-"
+# How a listing words a byte count, an age and a project's name: the one
+# copy both front ends use (``fmt``).
+_size = fmt.size
+_age = fmt.age
+_project = fmt.project
 
 
 def _walk_rows(mounts: list[dict], walks: dict | None) -> list[list[str]]:
@@ -635,11 +600,10 @@ def _list(args: argparse.Namespace) -> int:
         return 0
     if index.last_quick is None:
         _err(f"no index yet; run `{PROG} scan`")
-    now = datetime.now(UTC)
     _table(
         [
             [
-                _age(s.updated or s.started, now),
+                _age(s.updated or s.started),
                 index.where(s),
                 s.provider,
                 s.title or "-",

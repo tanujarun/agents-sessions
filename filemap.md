@@ -51,6 +51,9 @@
   write on an appending descriptor, fsync), `open_for_append`/`write` for a caller that holds the lock; the
   two kinds of record, `IMPORT` and `UNDO`; which imports still stand: `ident`, `not_undone` and
   `find_record` (the last import of a session that no undo took back)
+- `src/agent_sessions/fmt.py` — small values as a listing shows them, one copy for both front ends: `age`,
+  `size` (bytes), `project` (the last segment of a folder), `local_time`, `parse_stamp`; each gives `-` for
+  what it cannot place and never raises; and `utc_now`, the clock the engine stamps its files with
 - `src/agent_sessions/textsafe.py` — the one sanitiser for text from a store: `clean` (control and
   bidirectional characters become spaces; `multiline` keeps line feed and tab), `json_escape` (the same
   characters as `\uXXXX` in `--json` output), the set `UNSAFE`. Used by the CLI's output helpers, `clean_title`,
@@ -160,6 +163,9 @@
   an old Python, no `venv`, the `PATH` warning, the desktop file's validation, what is not ours and is
   left, `--purge` with its question (a pty), `--yes`; a guard that the real home's installation is
   unchanged; `shellcheck` when it is installed
+- `tests/test_fmt.py` — `fmt` (the steps of an age, units chosen after rounding, nothing it is given makes
+  it raise), that the command line uses that one copy, and the cached times a listing computes with
+  (a time the cache holds that `parse_ts` would not write is dropped on load and read again by the next scan)
 - `tests/test_base_helpers.py` — `iter_jsonl`, `open_sqlite_ro`, `parse_ts`, `clean_title`, warnings, model
 - `tests/test_mounts.py` — mountinfo parsing and filtering, env override, `find_mount`
 - `tests/test_volumes.py` — `mounts` on a fake `/dev/disk` tree and mount table: UUID and label of each

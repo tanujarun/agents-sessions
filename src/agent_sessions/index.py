@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import discover, journal, launch, textsafe
 from .discover import Skipped
+from .fmt import utc_now
 from .fsutil import cache_file, make_private_dir, open_private
 from .model import Candidate, Session, Store
 from .mounts import NATIVE_LABEL, UUID_PATTERN, Mount, identity_from_mount_point
@@ -53,10 +54,6 @@ _CONVERSATION = {  # field -> accepted types, as stored per candidate
     "files": (list,),
     "note": (str, type(None)),
 }
-
-
-def utc_now() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def signature(paths: Iterable[str]) -> list:
@@ -110,6 +107,23 @@ def _is_conversation(row: object) -> bool:
         )
         and all(isinstance(f, str) for f in row["files"])
     )
+
+
+_TIMES = ("started", "updated")
+
+
+def _sound_times(session: dict) -> tuple[dict, bool]:
+    """A cached session with only such times as ``parse_ts`` writes them,
+    and whether it had no other. The loader checks the type of a cached
+    value; of a time it also checks the form, since a listing computes with
+    it: text that is no time, a time without a zone or one of the year 9999
+    would stop ``list`` or the TUI every time, and no scan would mend it
+    while the session's file stays as it is. Such a time is dropped."""
+    odd = [name for name in _TIMES if session[name] is not None]
+    odd = [name for name in odd if base.parse_ts(session[name]) != session[name]]
+    if not odd:
+        return session, True
+    return dict(session, **dict.fromkeys(odd)), False
 
 
 ID_SHOWN = 40  # characters of a refused session id that a warning quotes
@@ -366,10 +380,15 @@ class Index:
                 session = cached["session"]
                 if session is not None and not _is_conversation(session):
                     raise ValueError("bad cached session")
-                if not isinstance(cached["sig"], list):
+                sig = cached["sig"]
+                if not isinstance(sig, list):
                     raise ValueError("bad signature")
+                if session is not None:
+                    session, sound = _sound_times(session)
+                    if not sound:
+                        sig = []  # no file has this signature: the next scan parses it again
                 candidates[hint] = {
-                    "sig": cached["sig"],
+                    "sig": sig,
                     "session": session,
                     "warnings": _strings(cached["warnings"]),
                 }
