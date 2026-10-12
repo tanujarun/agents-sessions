@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import time
 from typing import TYPE_CHECKING
 
 from . import __version__, fsutil, textsafe
@@ -116,7 +117,10 @@ def write(path: StrPath, pieces: Iterable[str], overwrite: bool = False) -> int:
 
     The document is first written to a temp file in the same directory, for
     the user alone (0600), and flushed to disk; then that file is given the
-    name. With ``overwrite`` it replaces a file that is there
+    name. The temp file is always a new one (``O_EXCL``, under a name with
+    the process id and the time in it): the directory is any the user
+    named, a shared one included, and nothing that lies there is written
+    through. With ``overwrite`` the document replaces a file that is there
     (``os.replace``). Without, the name is made with ``os.link``, which the
     kernel refuses in the same step when the name exists: a file that
     appears at the last moment is not replaced either. Only where the
@@ -150,15 +154,17 @@ def write(path: StrPath, pieces: Iterable[str], overwrite: bool = False) -> int:
             raise ExportFailed(f"{target} is not a regular file; nothing was written")
         if not overwrite:
             raise _exists(target)
-    tmp = f"{target}.{os.getpid()}.tmp"
+    tmp = f"{target}.{os.getpid()}-{time.time_ns():x}.tmp"
     size = 0
+    made = False  # the temp file is ours to remove
     try:
         try:
             fd = os.open(
                 tmp,
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
                 fsutil.PRIVATE_FILE,
             )
+            made = True
             with os.fdopen(fd, "wb") as fh:
                 if hasattr(os, "fchmod"):
                     os.fchmod(fh.fileno(), fsutil.PRIVATE_FILE)
@@ -172,10 +178,11 @@ def write(path: StrPath, pieces: Iterable[str], overwrite: bool = False) -> int:
                 _link(tmp, target)
             fsutil.fsync_dir(folder)
         finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            if made:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
     except OSError as exc:
         raise ExportFailed(
             f"{target} was not written: {exc.strerror or exc}; nothing was left behind"

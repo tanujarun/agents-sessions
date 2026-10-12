@@ -646,7 +646,11 @@ tool, an unimportable provider, a folder that is gone):
   beside `FILE` and moves it into place, mode 0600; a file that exists is
   refused unless `--force` (and is then replaced, never written through),
   and so is a path inside a session store, forced or not. A session whose
-  drive is not mounted is refused (`Offline`).
+  drive is not mounted is refused (`Offline`). The temp file is always a
+  new one (`O_EXCL`), so nothing that lies in a shared directory is written
+  through. This file is the one thing the program writes outside the
+  native stores and its own cache, state and configuration ("Read-only
+  rule"): it is where the user said, and never in a store.
 - `continue <key> [--with TOOL] [--in DIR] [--dry-run] [--here]`: writes the
   Markdown export to `<state>/handoff/<provider>-<id>.md` (the directory
   0700, the file 0600, replaced atomically; regular files of exactly that

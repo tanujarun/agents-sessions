@@ -365,6 +365,25 @@ class WriteTest(unittest.TestCase):
             self.skipTest("this user writes everywhere")
         self.assertIn("was not written: Permission denied", self.refused(locked / "out.md"))
 
+    def test_the_temp_file_is_always_a_new_one(self):
+        """The directory can be a shared one: what lies there under the temp
+        file's name is not written through, and not removed."""
+        mine = self.dir / "mine"
+        mine.write_text("mine", encoding="utf-8")
+        tmp = f"{self.file}.{os.getpid()}-ff.tmp"
+        os.symlink(mine, tmp)
+        with mock.patch.object(export.time, "time_ns", return_value=0xFF):
+            reason = self.refused(self.file)
+        self.assertEqual(
+            reason, f"{self.file} was not written: File exists; nothing was left behind"
+        )
+        self.assertEqual(mine.read_text(encoding="utf-8"), "mine")
+        self.assertTrue(os.path.islink(tmp))
+        self.assertFalse(self.file.exists())
+        # Any other moment, and it is written beside it.
+        self.assertEqual(export.write(self.file, ["x"]), 2)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["mine", "out.md", os.path.basename(tmp)])
+
     def test_text_that_is_not_unicode_is_escaped_not_fatal(self):
         (line,) = export.json_lines([Turn("user", "half \ud83d pair", None)])
         export.write(self.file, [line, "markdown \udc80"])
