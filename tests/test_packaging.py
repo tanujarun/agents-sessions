@@ -341,6 +341,59 @@ class DocumentsTest(unittest.TestCase):
         for command in cli.subcommands():
             self.assertTrue(self.names(sections, command), command)
 
+    def test_every_command_line_in_the_readme_is_one_the_parser_takes(self):
+        """The lines of the README's ``sh`` blocks that run ``agent-sessions``
+        (after variable assignments, before a ``#`` comment): each parses."""
+        parser = cli.build_parser()
+        blocks = re.findall(r"(?ms)^```sh\n(.*?)^```", self.read("README.md"))
+        self.assertGreater(len(blocks), 8)
+        seen = set()
+        for line in "\n".join(blocks).splitlines():
+            words = shlex.split(line, comments=True)
+            while words and re.fullmatch(r"[A-Z_]+=.*", words[0]):
+                words.pop(0)
+            if not words or words[0] != "agent-sessions":
+                continue
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                try:
+                    args = parser.parse_args(words[1:])
+                except SystemExit:
+                    self.fail(f"{line!r} does not parse: {err.getvalue()}")
+            seen.add(args.command or "tui")
+        self.assertEqual(sorted(seen), cli.subcommands())  # and each command is shown once
+
+    def test_the_make_targets_the_readme_names_exist(self):
+        makefile = self.read("Makefile")
+        named = set(re.findall(r"(?m)^make ([a-z-]+)", self.read("README.md")))
+        self.assertGreaterEqual(len(named), 8)
+        for target in sorted(named):
+            self.assertRegex(makefile, rf"(?m)^{target}:", target)
+
+    def test_links_and_test_files_the_documents_name_exist(self):
+        for name in (
+            "README.md",
+            "CHANGELOG.md",
+            "docs/SECURITY.md",
+            "docs/ADDING_A_PROVIDER.md",
+            "docs/SPEC.md",
+        ):
+            text = self.read(name)
+            base = (REPO / name).parent
+            for target in re.findall(r"\]\(([^)#\s]+)(?:#[^)]*)?\)", text):
+                if not target.startswith(("http://", "https://")):
+                    self.assertTrue((base / target).exists(), f"{name}: link to {target}")
+            for path in re.findall(r"`(tests/[\w/]+\.py)`", text):
+                self.assertTrue((REPO / path).is_file(), f"{name}: {path}")
+        # The modules a defence is said to live in are modules of the package.
+        security = self.read("docs/SECURITY.md")
+        implemented = re.findall(r"(?m)^- Implemented: (.*(?:\n  .*)*)", security)
+        self.assertEqual(len(implemented), 12)
+        for entry in implemented:
+            modules = re.findall(r"`((?:providers/|tui/)?\w+\.py)`", entry)
+            self.assertTrue(modules, entry)
+            for module in modules:
+                self.assertTrue((PACKAGE / module).is_file(), module)
+
     def test_the_readme_names_every_environment_variable_the_code_reads(self):
         readme = self.read("README.md")
         read = set()

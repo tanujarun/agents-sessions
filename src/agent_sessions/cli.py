@@ -13,7 +13,7 @@ import signal
 import sys
 from collections.abc import Iterable, Iterator, Sequence
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, TextIO
+from typing import TYPE_CHECKING, Any, TextIO
 
 from . import __version__, api, logs, textsafe
 from .mounts import MountsError
@@ -86,9 +86,12 @@ class _HelpFormatter(argparse.HelpFormatter):
     line breaks of its own (the command groups, the examples) is kept as it
     is written; everything else is wrapped."""
 
-    def __init__(self, prog: str) -> None:
+    def __init__(self, prog: str, **kwargs: Any) -> None:
+        # Whatever else argparse passes (it differs between Python versions)
+        # goes through; the width is ours.
         columns = shutil.get_terminal_size().columns
-        super().__init__(prog, width=max(min(HELP_WIDTH, columns - 2), 40))
+        kwargs["width"] = max(min(HELP_WIDTH, columns - 2), 40)
+        super().__init__(prog, **kwargs)
 
     def _fill_text(self, text: str, width: int, indent: str) -> str:
         if "\n" not in text:
@@ -1297,15 +1300,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.debug:
             logs.debug()
             debugging = True
-        if args.command is None:
-            if _on_a_terminal():
-                command = "tui"
-                return _tui()
+        if args.command is None and not _on_a_terminal():
             parser.print_help()
             return 2
-        command = args.command
+        command = args.command or "tui"  # no command on a terminal: the TUI
+        if command == "tui":
+            # Not inside ``_signals``: the app has the terminal, and what a
+            # signal does to it stays what it is under the launcher script.
+            return _tui(args)
         with _signals():
-            code = _COMMANDS.get(args.command, _not_implemented)(args)
+            code = _COMMANDS.get(command, _not_implemented)(args)
             sys.stdout.flush()
         return code
     except BrokenPipeError:
