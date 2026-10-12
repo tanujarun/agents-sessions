@@ -538,16 +538,22 @@ def drive_count(mounts: Iterable[Mapping[str, Any]] | None) -> int:
     )
 
 
-def summary_variants(drives: int, sessions: int, last_scan: object, now: datetime) -> list[str]:
+def summary_variants(
+    drives: int, sessions: int, last_scan: object, now: datetime, offline: int = 0
+) -> list[str]:
     """The right-hand status text, longest first, for ``status_parts`` to
-    pick from: ``5 drives · 63 sessions · scanned 2m ago``."""
+    pick from: ``5 drives · 63 sessions · scanned 2m ago``. ``offline`` is
+    how many of the sessions are on drives that are not mounted; when there
+    are any, the count reads ``136 sessions · 29 offline``."""
     if parse_stamp(last_scan) is None:
         scanned = "never scanned"
     else:
         age = age_text(last_scan, now)
         scanned = "scanned just now" if age == "now" else f"scanned {age} ago"
-    count = plural(sessions, "session")
-    return [f"{plural(drives, 'drive')} · {count} · {scanned}", f"{count} · {scanned}", count]
+    total = plural(sessions, "session")
+    count = f"{total} · {offline:,} offline" if offline else total
+    variants = [f"{plural(drives, 'drive')} · {count} · {scanned}", f"{count} · {scanned}", count]
+    return variants + [total] if offline else variants
 
 
 def status_parts(

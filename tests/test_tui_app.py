@@ -45,6 +45,9 @@ FOREIGN = "claude:bbbbbbbb:clf-0012"  # "claude session 12", on C:
 FOREIGN_COPY = "claude:aaaaaaaa:clf-0012"  # what importing FOREIGN makes
 IMPORTED = "claude:bbbbbbbb:clf-0090"  # foreign, already imported
 IMPORTED_COPY = "claude:aaaaaaaa:cln-0090"
+OFFLINE = "claude:bbbbbbbb:clf-0070"  # foreign, its drive is not mounted
+OFFLINE_IMPORTED = "claude:bbbbbbbb:clf-0091"  # the same, and imported before
+OFFLINE_COPY = "claude:aaaaaaaa:cln-0091"
 
 
 async def until(condition, timeout: float = 5.0, what: str = "condition") -> None:
@@ -1557,6 +1560,210 @@ class HelpAndQuitTest(TuiCase):
                 inline = widget.styles.inline
                 rules = set(inline.get_rules()) - {"display"}
                 self.assertEqual(rules, set(), widget)
+
+
+class OfflineTest(TuiCase):
+    """Sessions whose drive is not mounted: listed from the engine's cache.
+    The keys and prompts for mounting are not here yet; what is: the rows
+    are dimmed like foreign rows and say where they are, Enter, ``o``, ``v``
+    and ``i`` show the engine's refusal, and the status line counts them."""
+
+    def setUp(self):
+        super().setUp()
+        sessions = support.default_sessions()
+        sessions.append(
+            make_session("claude", 70, foreign=True, offline=True, title="Offline one", age=3)
+        )
+        sessions.append(make_session("codex", 71, foreign=True, offline=True, age=4))
+        copy = make_session("claude", 91, title="Offline imported", age=5)
+        sessions.append(copy)
+        sessions.append(
+            make_session(
+                "claude",
+                91,
+                foreign=True,
+                offline=True,
+                title="Offline imported",
+                age=6,
+                imported_as=copy.key,
+            )
+        )
+        self.engine = FakeEngine(sessions)
+        self.total = len(sessions)
+
+    def row(self, key) -> "view.Row":
+        return next(row for row in self.rows.rows if row.key == key)
+
+    def line_style(self, key):
+        """The style the list draws a row in."""
+        index = [row.key for row in self.rows.rows].index(key)
+        strip = self.rows.render_line(index - self.rows.top)
+        return next(iter(strip)).style
+
+    def nothing_was_started(self) -> None:
+        self.assertEqual(self.opened() + self.imported(), [])
+        self.assertEqual(self.main.mode, "list")
+        self.assertFalse(self.main.query_one("#prompt").display)
+        self.assertIsInstance(self.app.screen, MainScreen)
+        self.assertFalse(self.exited())
+
+    async def test_rows_say_where_they_are_and_are_dimmed_like_foreign_rows(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, NATIVE)  # the cursor is on none of the rows compared
+            offline, foreign = self.row(OFFLINE), self.row(FOREIGN)
+            self.assertEqual((offline.where, offline.foreign), ("C: · offline", True))
+            self.assertEqual(self.row(OFFLINE_IMPORTED).where, "C: · imported")
+            line = next(line for line in self.text().splitlines() if "Offline one" in line)
+            self.assertIn("C: · offline", line)
+            self.assertFalse(foreign.imported)
+            self.assertEqual(self.line_style(OFFLINE), self.line_style(FOREIGN))
+            self.assertNotEqual(self.line_style(OFFLINE), self.line_style(IMPORTED_COPY))
+
+    async def test_the_status_line_counts_them(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            self.assertIn(
+                f"2 drives · {self.total} sessions · 3 offline · scanned just now", self.status()
+            )
+            self.assertEqual(self.main.snapshot.offline, 3)
+            await pilot.press("r")  # still there after a rescan
+            await settle(pilot)
+            await pilot.press("down")
+            self.assertIn(f"{self.total} sessions · 3 offline", self.status())
+
+    async def test_no_count_when_none_is_offline(self):
+        async with self.started(engine=FakeEngine()) as pilot:
+            await settle(pilot)
+            self.assertNotIn("offline", self.text())
+            self.assertRegex(self.status(), r"2 drives · \d+ sessions · scanned")
+
+    async def test_a_narrow_terminal_still_fits_the_status_line(self):
+        async with self.started(size=(50, 24)) as pilot:
+            await settle(pilot)
+            self.assertIn(f"{self.total} sessions · 3 offline", self.status())
+            self.assertNotIn("drives", self.status())
+        async with self.started(size=(30, 24)) as pilot:  # no room beside the name: the total
+            await settle(pilot)
+            self.assertIn(f"{self.total} sessions", self.status())
+            self.assertNotIn("offline", self.status())
+
+    async def test_enter_shows_the_refusal_and_asks_nothing(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+            await pilot.press("enter")
+            await self.message(support.NOT_MOUNTED)
+            self.assertTrue(self.main.query_one("#status-message").has_class("-error"))
+            self.nothing_was_started()
+            # The engine was asked, in a way that could not have opened a window.
+            self.assertEqual(self.engine.called("open_dry_run"), [OFFLINE])
+            self.assertNotIn("[i] import and resume", self.text())
+            await pilot.press("down")  # a key clears it, as any message
+            self.assertNotIn(support.NOT_MOUNTED, self.status())
+
+    async def test_o_shows_the_refusal_too(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+            await pilot.press("o")
+            await self.message(support.NOT_MOUNTED)
+            self.nothing_was_started()
+            self.assertEqual(self.selected(), OFFLINE)
+
+    async def test_v_shows_the_refusal_and_opens_no_pager(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+            await pilot.press("v")
+            await self.message(support.NOT_MOUNTED)
+            self.nothing_was_started()
+            self.assertEqual(self.engine.called("transcript"), [OFFLINE])
+
+    async def test_i_shows_the_refusal_and_asks_no_question(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+            await pilot.press("i")
+            await self.message(support.NOT_MOUNTED)
+            self.nothing_was_started()
+            self.assertNotIn("Import", self.text())
+            await pilot.press("y")  # there is no question to answer
+            await settle(pilot)
+            self.assertEqual(self.imported(), [])
+
+    async def test_i_before_the_detail_pane_has_its_answer(self):
+        """The refusal does not wait for, or depend on, the verdict the
+        detail pane asks for."""
+        with mock.patch.object(app_mod, "VERDICT_DELAY", 60):
+            async with self.started() as pilot:
+                await settle(pilot)
+                await self.select(pilot, OFFLINE)
+                self.assertEqual(self.engine.called("can_import"), [])
+                await pilot.press("i")
+                await self.message(support.NOT_MOUNTED)
+                self.nothing_was_started()
+
+    async def test_a_double_click_is_enter(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+            y = [row.key for row in self.rows.rows].index(OFFLINE) - self.rows.top
+            await pilot.click("#list", offset=(3, y), times=2)
+            await self.message(support.NOT_MOUNTED)
+            self.nothing_was_started()
+
+    async def test_one_that_was_imported_resumes_its_linux_copy(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE_IMPORTED)
+            await pilot.press("i")
+            await self.message("already imported; Enter resumes the Linux copy")
+            await pilot.press("enter")
+            await until(self.exited, what="exit")
+        self.assertEqual(self.opened(), [OFFLINE_COPY])
+        self.assertEqual(self.imported(), [])
+
+    async def test_the_detail_pane_says_why(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+
+            def detail(name) -> str:
+                return str(self.main.query_one(f"#detail-{name}").render())
+
+            await until(lambda: "not possible" in detail("import"), what="the verdict")
+            self.assertEqual(detail("import"), f"not possible: {support.NOT_MOUNTED}")
+            self.assertEqual(detail("note"), "drive not mounted")
+            self.assertEqual(detail("local"), "(not found)")
+            self.assertEqual(detail("cwd"), "C:\\Work\\project-70")
+
+    async def test_an_engine_that_does_not_refuse_still_starts_nothing(self):
+        """A listing that is behind the engine, say. The TUI itself never
+        opens, views or imports a row it shows as offline: it passes on what
+        the engine answers, and what the row says when that is nothing."""
+        self.engine.by_key(OFFLINE).offline = False  # to the engine it is an ordinary foreign one
+        async with self.started() as pilot:
+            await settle(pilot)
+            self.main.snapshot.sessions[OFFLINE].offline = True  # the list still has it offline
+            await self.select(pilot, OFFLINE)
+            for key, answer in (
+                ("enter", "import first"),  # the fake engine's word for any foreign session
+                ("v", "drive not mounted"),  # no refusal at all: the row's own note
+            ):
+                await pilot.press(key)
+                await self.message(answer)
+                self.nothing_was_started()
+                await pilot.press("escape")
+
+    async def test_the_filter_and_the_tabs_treat_them_like_any_row(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await pilot.press("0")
+            self.assertIn(OFFLINE, [row.key for row in self.rows.rows])
+            await pilot.press("slash", *"offline one", "enter")
+            await settle(pilot)
+            self.assertEqual([row.key for row in self.rows.rows], [OFFLINE])
 
 
 if __name__ == "__main__":

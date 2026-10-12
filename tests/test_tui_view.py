@@ -172,6 +172,16 @@ class RowTest(unittest.TestCase):
         session.cwd = None
         self.assertEqual(view.make_row(session, "C:").project, "-")
 
+    def test_make_row_offline(self):
+        """A session whose drive is not mounted is a foreign row like any
+        other: dimmed the same way, WHERE as the engine words it."""
+        session = support.make_session("claude", 5, foreign=True, offline=True, title="Old site")
+        row = view.make_row(session, "C: · offline\x1b[2J")
+        self.assertEqual((row.where, row.foreign, row.imported), ("C: · offline [2J", True, False))
+        self.assertEqual((row.title, row.project), ("Old site", "project-5"))
+        self.assertTrue(view.matches(row, "project-5"))  # the recorded folder is still searched
+        self.assertEqual(view.drive_of(row.where), "C:")
+
     def test_filter_matches_title_project_and_cwd(self):
         session = support.make_session(
             "claude", 1, title="Portfolio Hero", cwd="/home/user/Website Works/landing"
@@ -529,6 +539,35 @@ class StatusTest(unittest.TestCase):
             view.summary_variants(0, 0, None, NOW)[0], "0 drives · 0 sessions · never scanned"
         )
 
+    def test_summary_counts_offline_sessions(self):
+        self.assertEqual(
+            view.summary_variants(2, 136, ago(minutes=2), NOW, offline=29),
+            [
+                "2 drives · 136 sessions · 29 offline · scanned 2m ago",
+                "136 sessions · 29 offline · scanned 2m ago",
+                "136 sessions · 29 offline",
+                "136 sessions",
+            ],
+        )
+        self.assertEqual(
+            view.summary_variants(1, 1, None, NOW, offline=1)[0],
+            "1 drive · 1 session · 1 offline · never scanned",
+        )
+        self.assertEqual(
+            view.summary_variants(5, 1234, ago(minutes=2), NOW, 1000)[2],
+            "1,234 sessions · 1,000 offline",
+        )
+        # None offline: nothing is said, by name or by position.
+        self.assertEqual(
+            view.summary_variants(5, 63, ago(minutes=2), NOW, offline=0),
+            view.summary_variants(5, 63, ago(minutes=2), NOW),
+        )
+        variants = view.summary_variants(2, 136, ago(minutes=2), NOW, offline=29)
+        for width, wanted in ((80, 0), (60, 1), (42, 2), (30, 3), (8, 3)):
+            with self.subTest(width=width):
+                right = view.status_parts("agent-sessions", variants, width)[1]
+                self.assertEqual(right, view.clip(variants[wanted], width))
+
     def test_status_parts(self):
         variants = view.summary_variants(5, 63, ago(minutes=2), NOW)
         self.assertEqual(
@@ -672,6 +711,21 @@ class DetailTest(unittest.TestCase):
             "already imported; Enter resumes the Linux copy",
         )
         self.assertEqual(view.verdict_text(support.make_session("grok", 1), (False, "x")), "-")
+
+    def test_offline(self):
+        session = support.make_session("claude", 7, foreign=True, offline=True)
+        refusal = (False, support.NOT_MOUNTED)
+        fields = view.detail_fields(session, refusal, self.tz)
+        self.assertEqual(fields["cwd"], "C:\\Work\\project-7")
+        self.assertEqual(fields["local"], "(not found)")
+        self.assertEqual(fields["note"], "drive not mounted")
+        self.assertEqual(fields["import"], "not possible: the drive WINVOL is not mounted")
+        self.assertEqual(view.detail_fields(session, None, self.tz)["import"], "checking…")
+        session.imported_as = "claude:aaaaaaaa:x"  # imported before the drive went away
+        self.assertEqual(
+            view.detail_fields(session, refusal, self.tz)["import"],
+            "already imported; Enter resumes the Linux copy",
+        )
 
     def test_nothing_selected(self):
         self.assertEqual(view.detail_fields(None), dict.fromkeys(view.DETAIL_FIELDS, "-"))

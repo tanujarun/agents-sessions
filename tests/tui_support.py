@@ -25,6 +25,7 @@ PROVIDERS = [
     ("grok", "Grok"),
 ]
 WINDOWS = "/run/media/user/WINVOL"
+NOT_MOUNTED = "the drive WINVOL is not mounted"  # the engine's refusal for an offline session
 NATIVE_HASH = "aaaaaaaa"
 FOREIGN_HASH = "bbbbbbbb"
 
@@ -55,9 +56,11 @@ def make_session(
     cwd=None,
     note=None,
     messages=12,
+    offline=False,
 ) -> Session:
     """A fake session; ``n`` makes it distinct. Newer for smaller ``age``
-    (minutes ago)."""
+    (minutes ago). ``offline``: a foreign one whose drive is not mounted, as
+    the engine lists it from its cache."""
     sid = f"{provider[:2]}{'f' if foreign else 'n'}-{n:04d}"
     age = age if age is not None else 10 + n * 7
     if foreign:
@@ -76,8 +79,8 @@ def make_session(
         key=key,
         title=title if title is not None else f"{provider} session {n}",
         cwd=recorded,
-        cwd_local=local,
-        cwd_exists=True,
+        cwd_local=None if offline else local,
+        cwd_exists=not offline,
         started=stamp(minutes=age + 30),
         updated=stamp(minutes=age),
         messages=messages,
@@ -88,7 +91,8 @@ def make_session(
         files=[],
         launchable=not foreign,
         imported_as=imported_as,
-        note=note,
+        note="drive not mounted" if offline else note,
+        offline=offline,
     )
 
 
@@ -123,7 +127,9 @@ class FakeIndex:
     def where(self, session) -> str:
         if session.origin == "native":
             return "Linux"
-        return "C: · imported" if session.imported_as else "C:"
+        if session.imported_as:
+            return "C: · imported"
+        return "C: · offline" if session.offline else "C:"
 
 
 class FakeEngine:
@@ -213,11 +219,15 @@ class FakeEngine:
 
     def can_import(self, session, index=None):
         self._record("can_import", session.key)
+        if session.offline:
+            return False, NOT_MOUNTED
         return self.verdicts.get(session.key, (True, ""))
 
     def transcript(self, ref, index=None):
         self._record("transcript", ref)
-        yield from self.turns.get(ref, self.default_turns)
+        if self.by_key(ref).offline:  # at the call, as the engine does
+            raise FakeError(NOT_MOUNTED)
+        return iter(self.turns.get(ref, self.default_turns))
 
     def scan(self, deep=None, progress=None, cancel=None):
         self._record("scan", deep)
@@ -261,8 +271,11 @@ class FakeEngine:
         return copy
 
     def open_session(self, ref, here=False, dry_run=False, index=None):
-        self._record("open_session", ref)
+        # A dry run opens nothing: it is recorded under a name of its own.
+        self._record("open_dry_run" if dry_run else "open_session", ref)
         session = self.by_key(ref)
+        if session.offline:
+            raise FakeError(NOT_MOUNTED)
         if session.origin != "native":
             raise FakeError("import first")
         return Plan(
