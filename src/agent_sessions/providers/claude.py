@@ -39,6 +39,7 @@ _TITLE_FIELDS = (
 _TITLE_FIELD = dict(_TITLE_FIELDS)
 
 ENCODED_MAX = 200  # longer directory names are cut and get a hash
+_ENCODED = re.compile(r"[A-Za-z0-9-]+")  # all ``encode_cwd`` can give
 _HEAD = 65536  # the tool itself reads this much for cheap fields
 _BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
@@ -352,8 +353,17 @@ class Claude(Provider):
         transcript = next((f for f in s.files if _TRANSCRIPT.match(os.path.basename(f))), None)
         if transcript is None:
             raise NotSupported("this session has no transcript file to copy")
-        plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern)
+        # The file's name becomes a name in the native store: it must be
+        # exactly ``<this session's id>.jsonl`` (``match`` and ``$`` alone
+        # would let a name with a trailing line break through).
         name = os.path.basename(transcript)
+        named = _TRANSCRIPT.fullmatch(name)
+        if named is None or named.group(1) != s.id:
+            raise NotSupported(f"the transcript is not named after its session id: {transcript}")
+        plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern)
+        folder = encode_cwd(plan.cwd_local)
+        if not _ENCODED.fullmatch(folder):
+            raise NotSupported(f"the project folder {plan.cwd_local} has no directory name")
         projects = os.path.join(plan.native_root, "projects")
         try:
             dirs = sorted(subdirs(projects))
@@ -364,7 +374,7 @@ class Claude(Provider):
             for path in (os.path.join(projects, d, name) for d in dirs)
             if os.path.lexists(path)
         ]
-        target = os.path.join(projects, encode_cwd(plan.cwd_local))
+        target = os.path.join(projects, folder)
         side = transcript[: -len(".jsonl")]
         if os.path.isdir(side) and not os.path.islink(side):
             sub, files = importer.tree(side)

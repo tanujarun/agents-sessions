@@ -388,11 +388,19 @@ class ImporterRefusesTest(unittest.TestCase):
         self.assertFalse(Path(importer.provenance_file()).exists())
 
     def test_a_session_with_a_bad_id_cannot_be_imported(self):
+        """Through the facade, with an adapter that plans it all the same."""
         session = dataclasses.replace(self.source, id="--yolo")
-        self.assertEqual(api.can_import(session, self.index), (False, NOT_IMPORTED))
-        with self.assertRaises(api.ImportFailed):
-            api.import_session(session, index=self.index)
+        bad = dataclasses.replace(api._plan(self.source, self.index), session_id="--yolo")
+        with mock.patch.object(Claude, "import_plan", return_value=bad):
+            self.assertEqual(api.can_import(session, self.index), (False, NOT_IMPORTED))
+            for action in (api.import_session, api.import_plan):
+                with self.assertRaises(api.ImportFailed) as caught:
+                    action(session, index=self.index)
+                self.assertEqual(caught.exception.reason, NOT_IMPORTED)
+        # The real adapter does not plan it in the first place.
+        self.assertFalse(api.can_import(session, self.index)[0])
         self.assertFalse((self.w.home / ".claude").exists())
+        self.assertFalse(Path(importer.provenance_file()).exists())
 
     def test_the_plan_carries_the_providers_grammar(self):
         plan = api._plan(self.source, self.index)

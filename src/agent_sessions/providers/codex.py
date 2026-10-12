@@ -25,6 +25,7 @@ _ROLLOUT = re.compile(
     rf"^rollout-(\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}-\d{{2}}-\d{{2}})-({_UUID})(?:_({_UUID}))?"
     r"\.jsonl(\.zst)?$"
 )
+_DATE_DIRS = re.compile(r"[0-9]{4}/[0-9]{2}/[0-9]{2}")  # YYYY/MM/DD below sessions/
 _INDEX = "session_index.jsonl"
 _ROLES = {"UserMessage": "user", "AgentMessage": "assistant"}
 # Where the Orca app keeps its own CODEX_HOME, relative to the profile that
@@ -422,9 +423,15 @@ class Codex(Provider):
                 plan.existing = [p for p in candidate.paths if _ROLLOUT.match(os.path.basename(p))]
         source_sessions = os.path.join(s.store, "sessions")
         for position, path in enumerate(files):
+            # These four names become names in the native store: the date
+            # directories must be digits and the file must be a rollout of
+            # this thread, matched whole.
             parts = os.path.relpath(path, source_sessions).split(os.sep)
-            if len(parts) != 4 or parts[0] == os.pardir:
+            if len(parts) != 4 or not _DATE_DIRS.fullmatch("/".join(parts[:3])):
                 raise NotSupported(f"a rollout is not under sessions/YYYY/MM/DD: {path}")
+            named = _ROLLOUT.fullmatch(parts[3])
+            if named is None or named.group(2) != s.id:
+                raise NotSupported(f"a rollout is not named after its thread id: {path}")
             rewrite = None
             if position == len(files) - 1:
                 rewrite = _CwdRewrite(pathmap, s.mount)

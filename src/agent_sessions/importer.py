@@ -7,6 +7,9 @@ the rules that hold for every provider, ``execute`` carries the plan out:
 
 - the source is only read, through ``fsutil.open_ro`` and ``listdir_ro`` (no
   access time moves on the other drive);
+- the session id must be in the form its provider's ids have, and every
+  destination must lie below the native store (``contained``): the names in
+  a plan come from the source and are not trusted;
 - nothing that exists is overwritten: an id already in the native store, or a
   destination path that exists, raises ``Exists``;
 - there must be room for the copy plus 10 %;
@@ -323,17 +326,95 @@ def read_provenance() -> list[dict]:
     return records
 
 
-def check(plan: ImportPlan) -> None:
-    """Everything ``execute`` would refuse, without writing: a session id
-    that is not in the form its provider's ids have, an id or a destination
-    that already exists (``Exists``), too little free space, an unusable
-    import record."""
+_SEPARATORS = re.compile("[" + re.escape(os.sep + (os.altsep or "")) + "]")
+
+
+def _below(root: str) -> str:
+    return root if root.endswith(os.sep) else root + os.sep
+
+
+def _relative_ok(rel: str) -> bool:
+    """True for a path below a unit that names one place inside it: no
+    drive, not absolute, no empty, ``.`` or ``..`` component, no NUL."""
+    if not rel or "\0" in rel or os.path.isabs(rel) or os.path.splitdrive(rel)[0]:
+        return False
+    return not any(part in ("", ".", "..") for part in _SEPARATORS.split(rel))
+
+
+def contained(plan: ImportPlan) -> None:
+    """Refuse a plan that would write anywhere but below its native store.
+
+    The names in a plan come from the source: ids, date directories and
+    file names of a store on another drive. Whatever the adapter that built
+    the plan checked, every destination is checked again here: each unit,
+    each directory and file below a unit, each file appended to. A
+    destination must be the native root plus components none of which is
+    empty, ``.`` or ``..``, must hold no NUL, and must still be below the
+    native root once the symbolic links on the way are resolved (the links
+    in the part of the path that exists; the native root itself may be a
+    link, as a home directory kept in a dotfiles repository has it).
+
+    Raises ``ImportFailed``; reads only.
+    """
+    root = plan.native_root
+    if not root or "\0" in root or not os.path.isabs(root):
+        raise ImportFailed(f"the native store {root!r} is not an absolute path")
+    targets: list[str] = []
+    for unit in plan.units:
+        targets.append(unit.dst)
+        if unit.is_dir:
+            for rel in unit.dirs + [item.rel for item in unit.files]:
+                if not isinstance(rel, str) or not _relative_ok(rel):
+                    raise ImportFailed(
+                        f"{rel!r} is not a path below {unit.dst}; nothing was imported"
+                    )
+                targets.append(os.path.join(unit.dst, rel))
+        elif len(unit.files) != 1 or unit.files[0].rel or unit.dirs:
+            raise ImportFailed(f"{unit.dst} is planned as one file but is not one")
+    targets += [addition.path for addition in plan.appends]
+    real_root = os.path.realpath(root)
+    for path in targets:
+        if not isinstance(path, str) or "\0" in path or not path.startswith(_below(root)):
+            raise ImportFailed(f"{path!r} is outside the native store {root}; nothing was imported")
+        if not _relative_ok(path[len(_below(root)) :]):
+            raise ImportFailed(f"{path!r} is not a plain path below {root}; nothing was imported")
+        real = os.path.realpath(path)
+        if not real.startswith(_below(real_root)):
+            raise ImportFailed(
+                f"{path} leads out of the native store {root} through a symbolic link; "
+                "nothing was imported"
+            )
+    for addition in plan.appends:  # a line is only ever added to a plain file
+        try:
+            mode = os.stat(addition.path).st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ImportFailed(f"cannot read {addition.path}: {exc.strerror or exc}") from exc
+        if not stat.S_ISREG(mode):
+            raise ImportFailed(f"{addition.path} is not a regular file; nothing was imported")
+
+
+def _sound(plan: ImportPlan) -> None:
+    """The refusals that do not depend on what is in the native store: a
+    session id that is not in the form its provider's ids have, and a
+    destination outside the native store. ``execute`` makes them before it
+    touches anything."""
     # The id becomes file and directory names in the native store and, once
     # the copy is listed, an argument of the tool that resumes it.
     if not isinstance(plan.session_id, str) or not plan.id_pattern.fullmatch(plan.session_id):
         raise ImportFailed(
             "the id of this session is not in the form its tool gives ids; nothing was imported"
         )
+    contained(plan)
+
+
+def check(plan: ImportPlan) -> None:
+    """Everything ``execute`` would refuse, without writing: a session id
+    that is not in the form its provider's ids have, a destination outside
+    the native store (``contained``), an id or a destination that already
+    exists (``Exists``), too little free space, an unusable import record."""
+    _sound(plan)
     taken = list(plan.existing) + [dst for dst in plan.destinations if os.path.lexists(dst)]
     if taken:
         raise Exists(taken)
@@ -567,6 +648,7 @@ def execute(plan: ImportPlan, progress: Progress | None = None) -> dict:
     Raises ``Exists`` or ``ImportFailed``; after a failure nothing of this
     import is left in the native store.
     """
+    _sound(plan)
     sweep_staging(plan.native_root)
     check(plan)
     records = read_provenance()  # read again below the checks: this is what gets extended
@@ -661,6 +743,7 @@ __all__ = [
     "Rewrite",
     "Unit",
     "check",
+    "contained",
     "describe",
     "execute",
     "file_copy",

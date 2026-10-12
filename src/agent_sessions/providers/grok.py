@@ -42,6 +42,7 @@ _INJECTED = ("<user_info>", "<system-reminder>")
 # Import (FORMATS section 6): the only cwd shape whose group directory name
 # is known for certain, and the reason given for every other one.
 _PLAIN_CWD = re.compile(r"[A-Za-z0-9/ ]+")
+_GROUP_NAME = re.compile(r"[A-Za-z0-9%]+")  # all a percent-encoded plain cwd can give
 _GROUP_NAME_MAX = 255  # bytes; longer names get a slug and a hash [docs]
 ENCODING_UNVERIFIED = "Grok's directory encoding of '-', '.', '_', '~' is unverified"
 
@@ -422,6 +423,12 @@ class Grok(Provider):
         if not s.files:
             raise NotSupported("this session has no directory to copy")
         source = s.files[0]
+        # The directory's name becomes a name in the native store. The tool
+        # names a session directory after the session's id; one that is named
+        # otherwise is not copied under either name.
+        name = os.path.basename(os.path.normpath(source))
+        if name != s.id or not self.valid_id(name):
+            raise NotSupported(f"the session directory is not named after its session id: {source}")
         plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern)
         sessions = os.path.join(plan.native_root, "sessions")
         try:
@@ -438,7 +445,8 @@ class Grok(Provider):
                     "Grok shortens directory names over 255 bytes in a way that is "
                     f"unverified (project folder {plan.cwd_local})"
                 )
-        name = os.path.basename(os.path.normpath(source))
+            if not _GROUP_NAME.fullmatch(group):
+                raise NotSupported(f"{ENCODING_UNVERIFIED} (project folder {plan.cwd_local})")
         plan.existing = sorted(
             {
                 path
