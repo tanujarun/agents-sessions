@@ -803,7 +803,7 @@ class UnimportReport:
     differences: list[str] = field(default_factory=list)  # from the record: a forced undo
     forced: bool = False
     dry_run: bool = False
-    bytes: int = 0  # of the files in ``removed``, as they were
+    bytes: int = 0  # of the files the undo set out to remove
 
 
 def _undo_target(ref: Session | str, index: Index) -> tuple[str, str]:
@@ -877,11 +877,13 @@ def unimport(
         if not dry_run:
             log.warning("unimport %s %s refused: %s", name, session_id, exc.reason)
         raise
+    keys = [made.record.get(key) for key in ("native_key", "source_key")]
+    native_key, source_key = (key if isinstance(key, str) else None for key in keys)
     report = UnimportReport(
         provider=name,
         id=session_id,
-        native_key=made.record.get("native_key"),
-        source_key=made.record.get("source_key"),
+        native_key=native_key,
+        source_key=source_key,
         removed=made.files + made.dirs,
         left=list(made.left),
         differences=list(made.differences),

@@ -221,6 +221,13 @@ Verdict: **supported, copy-only** `[inferred from the verified lookup]`.
    already equals the stem. Re-serialising a 120 MB transcript only to change `cwd` strings is
    the larger risk.
 5. Do not copy `file-history/`, `session-env/`, `history.jsonl` rows, `sessions/<pid>.json`.
+6. Into a folder the user chose (`import --to T`; Phase 2, Q8): the same copy under
+   `projects/<enc(T)>/`, and nothing else differs. The transcript is not touched and no
+   `relocated` record is written. The native copy therefore still reads as the folder it
+   recorded, so the listing shows that folder and `open` starts in it when it maps to one, else
+   in the home directory (lookup step 3 finds the session by id from anywhere `[inferred]`).
+7. Undo (`unimport`): the transcript and the side directory, then `projects/<enc>/` and the
+   directories above it that the import made, each only when empty.
 
 Verified: directory encoding, lookup order, title/has-message logic. To confirm live: that
 2.1.296 resumes a transcript whose records carry Windows cwds, Windows tool paths and an older
@@ -370,6 +377,15 @@ Verdict: **supported: copy, rewrite `cwd` in two record types** `[inferred]`.
 5. Never write `state_5.sqlite` or `thread_history_1.sqlite`; both are derived
    (`backfill_state`, `thread_history_projection_state` hold watermarks and byte offsets), and the
    file-name fallback plus read-repair is expected to register the thread `[inferred, medium risk]`.
+6. Into a folder the user chose (`import --to T`; Phase 2, Q8): the destination is the same, and
+   the same four fields are re-pointed. With `O` the working directory the thread recorded: a
+   value that is `O` (compared without regard to case, with either slash, with or without the
+   `\\?\` prefix) becomes `T`; a value below `O` becomes the same path below `T`, in the
+   value's own spelling and whether or not it exists there; any other value, one with a `..`
+   segment included, goes through the path map as in step 3. Every other byte is as in step 3.
+7. Undo (`unimport`): the rollout files and the `sessions/YYYY/MM/DD` directories the import
+   made, when empty. The line of step 4 stays in `session_index.jsonl` and is reported: the
+   file is the tool's, and a line in it is not taken out again.
 
 To confirm live: that 0.162.0 finds a rollout that has no `threads` row; that it resumes a
 0.150.1 rollout (cross-version; `history_mode` is `paginated` in both); that a rewritten
@@ -515,9 +531,23 @@ sandbox: `sessions list` and `export`; the resume itself not run]`.
    first decides `sessions list`, the second `sessions search` `[verified, sandbox]`.
 5. Leave `session_search.sqlite`, `active_sessions.json` and `prompt_history.jsonl` alone (the
    index is rebuilt by the tool `[verified, sandbox]`).
+6. Into a folder the user chose (`import --to T`; Phase 2, Q8): group directory and `info.cwd`
+   are made for `os.path.realpath(T)`, since the tool goes by the physical working directory.
+   The record keeps `T` as it was given and the real path as the folder used.
+7. Undo (`unimport`): the session directory's files as the import put them, then the directory
+   and the group directory when empty. A file the tool added to the session directory since
+   (a lock file, say) keeps it in place, and that is reported.
 
 Confirmed in the sandbox (Phase 2, Q1): the imported 1.0.34 session is found by id and exported
-in full by 1.0.46 (`chat_format_version` is 1 in both). Still to confirm live: `grok --resume
+in full by 1.0.46 (`chat_format_version` is 1 in both). Confirmed again on 2026-10-13 with the
+adapter's own naming `[verified, sandbox]`: two copies of a native session, built into a foreign
+store whose folder does not exist here, were imported with `target` into
+`…/work/my-proj_v1.2~x y/Ünï` (group `…%2Fwork%2Fmy-proj_v1.2~x%20y%2F%C3%9Cn%C3%AF`, 157 bytes)
+and into a folder whose encoded path is 336 bytes (group
+`long-project-name-long-project-name-long-65221dd8d0426ca3`). `grok sessions list` run inside
+each folder listed exactly its session, `grok export <id>` returned it (exit 0), a folder with
+no session listed none, and both imports were undone afterwards without `--force` (the two
+commands had written `docs/` and `logs/` into the store and nothing into a session directory). Still to confirm live: `grok --resume
 <id>` itself, and that Windows paths in `prompt_context.json` / `system_prompt.txt` are
 regenerated rather than trusted. The one Windows conversation is 123.7 MB on disk.
 
@@ -782,7 +812,7 @@ reproduced for the one session]`.
 ### 6. Import
 
 Verdict: **NotSupported** — "Gemini CLI is not installed on this machine, and no resumable
-Gemini session exists to import". For later: an import would copy the chat file into
+Gemini session exists to import", with or without a chosen folder or `--experimental`. For later: an import would copy the chat file into
 `~/.gemini/tmp/<slug>/chats/`, where `<slug>` must be the one the Linux CLI assigns to the mapped
 cwd in `~/.gemini/projects.json` (creating the entry and both `.project_root` markers when
 absent), and would probably need `projectHash` recomputed for the Linux path `[inferred;
@@ -1498,6 +1528,12 @@ for Grok take `os.path.realpath(T)`), compared with the recipes of each provider
   (`working_directory`).
 - **Every provider**: the import record should say that the folder was chosen, and keep both
   the recorded cwd and `T`. `imported_as` is found by id and is not affected.
+
+Implemented as written (each provider's §6): `Provider.import_plan(session, pathmap, target)`,
+`import --to DIR`. `T` must be an absolute path of a directory that exists
+(`importer.chosen_folder`; the command expands `~`). The record has `cwd` (as recorded),
+`chosen_folder` (`T`, or null) and `cwd_local` (the folder the copy was made for: `T`, its real
+path for Grok, else the mapped folder).
 
 ---
 

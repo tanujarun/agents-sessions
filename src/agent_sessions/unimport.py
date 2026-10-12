@@ -419,7 +419,10 @@ def undo(
     meanwhile, and the plan's ``files``, ``dirs`` and ``left`` are what was
     really removed and left.
 
-    Raises ``UndoFailed``; then nothing was removed."""
+    Raises ``UndoFailed``, and then nothing was removed. The one exception
+    says so in its reason: the copy went and the journal could not take the
+    record of it (the import then still stands in the journal, with its
+    files gone, and a forced undo settles it)."""
     extras = list(extras)
     record = find_record(read_records(), provider, session_id)
     if record is None:
@@ -435,7 +438,7 @@ def undo(
             made = plan(record, native_root, extras, force)
             # Opened before anything goes: what can still fail for the
             # journal afterwards is one small write.
-            fd, _created = journal.open_for_append()
+            fd, created = journal.open_for_append()
             try:
                 removed, left = _carry_out(made)
                 written = undo_record(made, removed, left)
@@ -449,6 +452,8 @@ def undo(
                     ) from exc
             finally:
                 os.close(fd)
+            if created:  # the import was recorded in the old ``imports.json``
+                fsutil.fsync_dir(os.path.dirname(journal.path()))
     except fsutil.LockTimeout as exc:
         who = f"process {exc.pid}" if exc.pid is not None else "another process"
         raise UndoFailed(

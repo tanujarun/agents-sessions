@@ -198,11 +198,11 @@ class Provider:
 
         ``progress(done_bytes, total_bytes)`` is called while copying;
         ``target`` and ``experimental`` are ``import_plan``'s. May raise
-        ``NotSupported(reason)``
-        or ``ImportFailed`` (``importer.Exists`` when the id is already in
-        the native store). The copy is read back (``read_back``) while the
-        import can still be undone: when it is not the session that was
-        planned, nothing of it stays in the native store.
+        ``NotSupported(reason)`` or ``ImportFailed`` (``importer.Exists``
+        when the id is already in the native store). The copy is read back
+        (``read_back``) while the import can still be undone: when it is not
+        the session that was planned, nothing of it stays in the native
+        store.
         """
         plan = self.import_plan(s, pathmap, target, experimental)
         verified: list[Session] = []
