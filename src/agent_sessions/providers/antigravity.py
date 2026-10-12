@@ -16,6 +16,7 @@ from ..fsutil import home, listdir_ro
 from ..model import Candidate, Session, Store
 from . import register
 from .base import (
+    SQLITE_ERRORS,
     NotSupported,
     Provider,
     Turn,
@@ -239,7 +240,7 @@ def _optional(con: sqlite3.Connection, sql: str) -> tuple[Any, ...] | None:
     try:
         row: tuple[Any, ...] | None = con.execute(sql).fetchone()
         return row
-    except sqlite3.Error:
+    except SQLITE_ERRORS:
         return None
 
 
@@ -399,7 +400,7 @@ class Antigravity(Provider):
                 ).fetchone()
                 blob = _optional(con, "SELECT data FROM trajectory_metadata_blob WHERE id = 'main'")
                 parents = _optional(con, "SELECT count(*) FROM parent_references")
-        except sqlite3.Error as exc:
+        except SQLITE_ERRORS as exc:
             warn(f"conversation database not readable: {exc}", db)
             return None
         return {
@@ -426,7 +427,7 @@ class Antigravity(Provider):
                 if row is None:
                     return {}
                 return dict(zip((column[0] for column in cursor.description), row, strict=False))
-        except sqlite3.Error as exc:
+        except SQLITE_ERRORS as exc:
             warn(f"conversation summaries not readable: {exc}", path)
             return {}
 
@@ -512,7 +513,7 @@ class Antigravity(Provider):
                 rows = con.execute(
                     "SELECT step_type, metadata, step_payload FROM steps ORDER BY idx"
                 ).fetchall()
-        except sqlite3.Error:
+        except SQLITE_ERRORS:
             return
         for step_type, metadata, payload in rows:
             ts = parse_ts(pb_timestamp(pb_first(metadata, 1)))

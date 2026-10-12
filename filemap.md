@@ -83,6 +83,9 @@
 - `tests/test_hostile_files.py` — named pipes, devices and directories named like session files (`open_ro`,
   whole scans in a child process under a timeout), over-long lines and the 200 MB line's memory ceiling, size
   caps of files read whole, deeply nested JSON
+- `tests/test_sqlite_hardening.py` — `open_sqlite_ro` on files that are not trusted: the settings made before
+  anything is read, schemas with a view, a trigger or a virtual table refused, truncated and scrambled
+  databases as one skipped candidate each
 - `tests/test_import_safety.py` — what keeps an import inside the native store: `importer.contained`
   (destinations, paths below a unit, appended files, symbolic links), the names each adapter takes from the
   source; the read-back of a placed copy (`Provider.read_back`, the `verify` step of `importer.execute`) and

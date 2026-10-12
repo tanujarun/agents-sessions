@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from ..pathmap import PathMap
 
 __all__ = [
+    "SQLITE_ERRORS",
     "Candidate",
     "NotSupported",
     "Provider",
@@ -334,6 +335,62 @@ _SQLITE_MAGIC = b"SQLite format 3\x00"
 _SQLITE_HEADER = 100
 
 
+# What reading a damaged database can raise: sqlite3's own errors, and
+# UnicodeDecodeError when sqlite3 cannot build the message of one (it names
+# something in the schema, and the name is not UTF-8).
+SQLITE_ERRORS = (sqlite3.Error, UnicodeDecodeError)
+
+
+def _harden(con: sqlite3.Connection) -> None:
+    """Settings for a connection that is about to read a database file from
+    anywhere, made before any statement looks at that file's schema or pages.
+
+    ``query_only`` first: nothing can be written through the connection.
+    ``trusted_schema`` off: views, triggers and expressions stored in the
+    file cannot call functions or virtual tables that are not safe for
+    untrusted input. ``cell_size_check`` on: cell sizes on a b-tree page are
+    checked when it is loaded, not assumed. Defensive mode (where this
+    Python can set it, 3.12 and later): no statement can change the schema
+    table or the pages directly.
+    """
+    con.execute("pragma query_only = 1")
+    con.execute("pragma trusted_schema = off")
+    con.execute("pragma cell_size_check = on")
+    defensive = getattr(sqlite3, "SQLITE_DBCONFIG_DEFENSIVE", None)
+    setconfig = getattr(con, "setconfig", None)
+    if defensive is not None and setconfig is not None:
+        setconfig(defensive, True)
+
+
+def _plain_schema(con: sqlite3.Connection) -> None:
+    """Raise ``sqlite3.DatabaseError`` unless the database holds ordinary
+    tables and their indexes, nothing else.
+
+    A session database of the tools read here holds no view, no trigger and
+    no virtual table. In a file from another drive, a view under the name of
+    a table would run whatever query it was given the moment that "table" is
+    read. What a schema row is called in its ``type`` column proves nothing
+    (SQLite goes by the SQL text beside it), so the schema as SQLite parsed
+    it is asked too (``pragma_table_list``, SQLite 3.37 and later).
+    """
+    try:
+        odd = con.execute(
+            "select count(*) from sqlite_master where type not in ('table', 'index')"
+        ).fetchone()[0]
+        try:
+            odd += con.execute(
+                "select count(*) from pragma_table_list where schema = 'main' and type <> 'table'"
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            pass  # an older SQLite: the type column is all there is to ask
+    except UnicodeDecodeError as exc:
+        raise sqlite3.DatabaseError("malformed database schema (a name is not UTF-8)") from exc
+    if odd:
+        raise sqlite3.DatabaseError(
+            "the schema holds a view, a trigger or a virtual table; not read"
+        )
+
+
 def _sqlite_in_memory(path: StrPath) -> sqlite3.Connection | None:
     """A read-only in-memory copy of a SQLite file, or None when the file is
     missing, too large, not a database, or this Python cannot load one.
@@ -367,9 +424,9 @@ def _sqlite_in_memory(path: StrPath) -> sqlite3.Connection | None:
     con = None
     try:
         con = sqlite3.connect(":memory:")
+        _harden(con)  # before the file's bytes are loaded: no statement runs on them unprotected
         con.deserialize(data)
         con.execute("select count(*) from sqlite_master").fetchone()
-        con.execute("pragma query_only = 1")
         return con
     except (sqlite3.Error, OverflowError, ValueError):
         if con is not None:
@@ -377,7 +434,7 @@ def _sqlite_in_memory(path: StrPath) -> sqlite3.Connection | None:
         return None
 
 
-def open_sqlite_ro(path: StrPath) -> sqlite3.Connection:
+def open_sqlite_ro(path: StrPath, plain_schema: bool = True) -> sqlite3.Connection:
     """Open a SQLite file for reading without leaving a trace.
 
     Files up to 64 MB are read through ``open_ro`` and loaded into an
@@ -387,10 +444,17 @@ def open_sqlite_ro(path: StrPath) -> sqlite3.Connection:
     ``-shm``/``-wal`` next to a WAL database, ``immutable=1`` does not.
 
     Either way the connection refuses writes, and rows still in a hot
-    ``-wal`` are not visible. Raises ``sqlite3.Error`` when the file cannot
-    be opened (a missing file: on the first query), and at once for
-    something that is not a regular file: SQLite itself would open a named
-    pipe and wait, or read a device.
+    ``-wal`` are not visible. The file is not trusted: the connection is
+    hardened before any statement reads it (``_harden``), and a database
+    whose schema holds anything but ordinary tables and indexes is refused
+    (``_plain_schema``; ``plain_schema=False`` leaves that check out, for a
+    database that is known to hold more).
+
+    Raises ``sqlite3.Error`` when the file cannot be opened or its schema
+    cannot be read, and at once for something that is not a regular file:
+    SQLite itself would open a named pipe and wait, or read a device. A
+    damaged database can also raise ``UnicodeDecodeError`` from a later
+    query; catch ``SQLITE_ERRORS``.
     """
     try:
         regular = stat.S_ISREG(os.stat(path).st_mode)
@@ -399,10 +463,17 @@ def open_sqlite_ro(path: StrPath) -> sqlite3.Connection:
     if not regular:
         raise sqlite3.OperationalError("not a regular file")
     con = _sqlite_in_memory(path)
-    if con is not None:
-        return con
-    uri = "file:" + urllib.parse.quote(os.fspath(path)) + "?mode=ro&immutable=1"
-    return sqlite3.connect(uri, uri=True)
+    if con is None:
+        uri = "file:" + urllib.parse.quote(os.fspath(path)) + "?mode=ro&immutable=1"
+        con = sqlite3.connect(uri, uri=True)
+    try:
+        _harden(con)
+        if plain_schema:
+            _plain_schema(con)
+    except BaseException:
+        con.close()
+        raise
+    return con
 
 
 # --- values -----------------------------------------------------------------
