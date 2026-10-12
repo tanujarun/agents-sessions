@@ -39,6 +39,7 @@ _SUBAGENTS = "subagents"
 _META = "meta.json"
 _FIXED_PATHS = 3  # summary.json, chat_history.jsonl, <group>/.cwd
 _SMALL_FILE = 16 * 1024 * 1024
+_BOM = b"\xef\xbb\xbf"  # a UTF-8 byte order mark; not something the tool writes
 # How deep a ``meta.json`` value is searched. The tool writes a flat object;
 # a file from elsewhere can nest values without end.
 _NEST_MAX = 32
@@ -119,7 +120,9 @@ class _SummaryRewrite(importer.Rewrite):
     """Sets ``info.cwd`` and ``grok_home`` in ``summary.json``; every other
     key keeps its value. The file is written in the source's own layout when
     that is one the tool is known to write (two-space indent, as every real
-    summary is), else as compact JSON."""
+    summary is), else as compact JSON. A byte order mark at the start of
+    the source (the listing reads such a file too, ``_load_json``) is not
+    part of the JSON and is left out of the copy."""
 
     label = "info.cwd and grok_home in summary.json"
 
@@ -140,12 +143,16 @@ class _SummaryRewrite(importer.Rewrite):
         try:
             if len(raw) > _SMALL_FILE:
                 raise ValueError("too large")
+            marked = raw.startswith(_BOM)
+            raw = raw[len(_BOM) :] if marked else raw
             text = raw.decode("utf-8")
             data, original = json.loads(text), json.loads(text)
         except (ValueError, RecursionError) as exc:
             raise importer.ImportFailed(f"summary.json cannot be rewritten: {exc}") from exc
         if not isinstance(data, dict):
             raise importer.ImportFailed("summary.json cannot be rewritten: not a JSON object")
+        if marked:
+            self.changes.append("the byte order mark at the start is left out")
         pretty = self._dump(original, True) == raw
         info = data.get("info")
         if isinstance(info, dict) and "cwd" in info and info["cwd"] != self._cwd:
@@ -474,9 +481,10 @@ class Grok(Provider):
     ) -> importer.ImportPlan:
         """The session directory without ``*.lock``, into the group directory
         of the mapped cwd, with ``summary.json`` rewritten (FORMATS section
-        6). The group directory is the one the tool itself would use
-        (``group_name``); when the native store has none of that name but
-        has one that decodes to the same folder, that one is used.
+        6). The group directory is always the one the tool itself would use
+        (``group_name``): it lists a folder's sessions from that name alone
+        (FORMATS Q1), so a directory of the native store that merely decodes
+        to the same folder (lower-case hex, an escaped ``-``) is not used.
 
         With a chosen folder (``target``) both are made for its real path
         (``os.path.realpath``): the tool goes by the physical working
@@ -501,8 +509,6 @@ class Grok(Provider):
         except OSError:
             groups = []
         group = group_name(cwd)
-        if group not in groups:
-            group = next((g for g in groups if urllib.parse.unquote(g) == cwd), group)
         plan.existing = sorted(
             {
                 path

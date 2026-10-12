@@ -1279,16 +1279,55 @@ class GrokImportTest(ImportCase):
         self.assertRegex(grok_mod.group_name(too_long[:-1]), r"^t{18}-[0-9a-f]{16}$")
         self.assert_nothing_written()
 
-    def test_an_existing_group_that_decodes_to_the_folder_is_reused(self):
+    def test_a_group_that_only_decodes_to_the_folder_is_not_used(self):
+        """docs/AUDIT.md A-24: the tool lists a folder's sessions from one
+        name only (FORMATS Q1). A directory that merely decodes to the
+        folder (lower-case hex, an escaped ``-``) is not that name, and a
+        session filed there would not be listed."""
         source = self.source(GROK_WIN)
         sessions = self.home / ".grok" / "sessions"
-        (sessions / "%2Fwith%2Dhyphen").mkdir(parents=True)  # another spelling of the folder
+        for other in ("%2Fwith%2Dhyphen", "%2fwith-hyphen"):
+            (sessions / other).mkdir(parents=True)  # another spelling of the folder
+            self.assertEqual(urllib.parse.unquote(other), "/with-hyphen")
         plan = Grok().import_plan(source, StubMap({source.cwd: "/with-hyphen"}))
-        self.assertEqual(plan.units[0].dst, str(sessions / "%2Fwith%2Dhyphen" / GROK_WIN))
-        # The tool's own name wins once it is there too.
+        self.assertEqual(plan.units[0].dst, str(sessions / "%2Fwith-hyphen" / GROK_WIN))
+        # The same once the tool's own name is there too.
         (sessions / "%2Fwith-hyphen").mkdir()
         plan = Grok().import_plan(source, StubMap({source.cwd: "/with-hyphen"}))
         self.assertEqual(plan.units[0].dst, str(sessions / "%2Fwith-hyphen" / GROK_WIN))
+
+    def test_a_summary_that_starts_with_a_byte_order_mark_is_imported(self):
+        """docs/AUDIT.md A-24: such a session was listed and could not be
+        imported. The copy's summary is the same JSON without the mark."""
+        summary = self.original / "summary.json"
+        plain = read(summary)
+        summary.write_bytes(b"\xef\xbb\xbf" + plain)
+        self.w.scan()
+        source = self.source(GROK_WIN)
+        self.assertEqual(source.id, GROK_WIN)  # listed, as before
+        planned = api.import_plan(source)
+        self.assertIn(
+            "the byte order mark at the start is left out", planned["rewrites"][0]["changes"]
+        )
+        native = api.import_session(source)
+        self.assertEqual(native.id, GROK_WIN)
+        copied = read(self.copy / "summary.json")
+        self.assertFalse(copied.startswith(b"\xef\xbb\xbf"))
+        after, before = json.loads(copied), json.loads(plain)
+        self.assertEqual(after["info"]["cwd"], str(self.w.site))
+        for key in before:
+            if key not in ("info", "grok_home"):
+                self.assertEqual(after[key], before[key], key)
+        # A summary in the tool's own layout keeps it, mark or no mark.
+        pretty = json.dumps(before, ensure_ascii=False, indent=2).encode("utf-8")
+        rewrite = _SummaryRewrite("/c", "/g")
+        for mark in (b"", b"\xef\xbb\xbf"):
+            with open(self.w.box.root / "summary.json", "w+b") as fh:
+                fh.write(mark + pretty)
+                fh.seek(0)
+                out = b"".join(rewrite.apply(fh))
+            self.assertTrue(out.startswith(b'{\n  "'), out[:20])
+            self.assertEqual(json.loads(out)["info"]["cwd"], "/c")
 
     def test_an_id_in_any_group_is_a_collision(self):
         taken = self.home / ".grok" / "sessions" / "%2Felsewhere" / GROK_WIN
