@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,7 @@ from .base import (
     NotSupported,
     Provider,
     Turn,
+    between,
     clean_title,
     iter_jsonl,
     parse_ts,
@@ -31,10 +33,8 @@ if TYPE_CHECKING:
 
 _TRANSCRIPT = re.compile(r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
 
-# The tool's own first-prompt rule (FORMATS "Real prompt").
-_COMMAND = re.compile(r"<command-name>(.*?)</command-name>")
-_COMMAND_ARGS = re.compile(r"<command-args>(.*?)</command-args>")
-_BASH = re.compile(r"<bash-input>([\s\S]*?)</bash-input>")
+# The tool's own first-prompt rule (FORMATS "Real prompt"). The tags are
+# found with ``between``, in one pass over the text.
 _NOT_A_PROMPT = re.compile(
     r"^(?:\s*<[a-z][A-Za-z0-9_-]*[\s>]|\[Request interrupted by user[^\]]*\])"
 )
@@ -51,6 +51,8 @@ _TITLE_FIELD = dict(_TITLE_FIELDS)
 ENCODED_MAX = 200  # longer directory names are cut and get a hash
 _ENCODED = re.compile(r"[A-Za-z0-9-]+")  # all ``encode_cwd`` can give
 _HEAD = 65536  # the tool itself reads this much for cheap fields
+_ID_KEPT = 128  # characters of a message id that are kept as they are
+_VERSION_MAX = 64  # characters; a longer "version" is not one
 _BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 
@@ -98,7 +100,7 @@ def _recorded_version(path: StrPath) -> str | None:
             continue
         version = record.get("version") if isinstance(record, dict) else None
         if isinstance(version, str):
-            return version
+            return version if len(version) <= _VERSION_MAX else None
     return None
 
 
@@ -134,16 +136,15 @@ def _prompts(record: dict) -> tuple[list[str], str | None]:
         flat = raw.replace("\n", " ").strip()
         if not flat:
             continue
-        found = _COMMAND.search(flat)
-        if found:
+        name = between(flat, "<command-name>", "</command-name>")
+        if name is not None:
             if command is None:
-                found_args = _COMMAND_ARGS.search(flat)
-                args = found_args.group(1).strip() if found_args else ""
-                command = f"{found.group(1)} {args}" if args else found.group(1)
+                args = (between(flat, "<command-args>", "</command-args>") or "").strip()
+                command = f"{name} {args}" if args else name
             continue
-        found = _BASH.search(raw)
-        if found:
-            real.append("! " + found.group(1).strip())
+        bash = between(raw, "<bash-input>", "</bash-input>")
+        if bash is not None:
+            real.append("! " + bash.strip())
         elif not _NOT_A_PROMPT.match(flat):
             real.append(raw.strip())
     return real, command
@@ -211,6 +212,9 @@ def _scan(path: StrPath) -> _Scan:
             message = record.get("message")
             ident = message.get("id") if isinstance(message, dict) else None
             if isinstance(ident, str) and ident:
+                if len(ident) > _ID_KEPT:  # counted all the same, by its digest
+                    data = ident.encode("utf-8", "surrogatepass")
+                    ident = hashlib.sha256(data).hexdigest()
                 scan.assistant_ids.add(ident)
             else:
                 scan.assistant_anonymous += 1

@@ -20,6 +20,7 @@ from .base import (
     NotSupported,
     Provider,
     Turn,
+    between,
     clean_title,
     iter_jsonl,
     open_sqlite_ro,
@@ -46,8 +47,10 @@ _SUMMARIES = "conversation_summaries.db"
 _SIDECARS = ("-wal", "-shm", "-journal")
 _SMALL_FILE = 16 * 1024 * 1024
 _STEP_USER, _STEP_PLANNER = 14, 15
-_USER_REQUEST = re.compile(r"<USER_REQUEST>(.*?)</USER_REQUEST>", re.S)
-_PBTXT_TITLE = re.compile(rb'^\s*title\s*:\s*"((?:[^"\\]|\\.)*)"', re.M | re.S)
+# ``title`` as the first thing on a line. The blanks before it are matched
+# without line breaks: ``^\s*`` finds the same titles, but on a file of blank
+# lines it reads the rest of the file again from every line.
+_PBTXT_TITLE = re.compile(rb'^[ \t\r\f\v]*title\s*:\s*"((?:[^"\\]|\\.)*)"', re.M | re.S)
 _PBTXT_ESCAPE = re.compile(rb"\\(x[0-9a-fA-F]{1,2}|[0-7]{1,3}|.)", re.S)
 _PBTXT_SIMPLE = {
     b"n": b"\n",
@@ -210,8 +213,8 @@ def _user_request(content: object) -> str:
     ``<USER_REQUEST>``, which is followed by injected metadata blocks."""
     if not isinstance(content, str):
         return ""
-    wrapped = _USER_REQUEST.search(content)
-    return (wrapped.group(1) if wrapped else content).strip()
+    wrapped = between(content, "<USER_REQUEST>", "</USER_REQUEST>")
+    return (content if wrapped is None else wrapped).strip()
 
 
 def _mtime(path: StrPath) -> str | None:

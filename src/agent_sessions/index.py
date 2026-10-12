@@ -105,6 +105,8 @@ def _is_conversation(row: object) -> bool:
 
 
 ID_SHOWN = 40  # characters of a refused session id that a warning quotes
+CWD_MAX = 32767  # characters; the longest path Windows takes, eight times Linux's
+NOTE_MAX = 200  # characters of a session's note that are kept
 
 
 def _id_refusal(provider: base.Provider, store: Store, hint: str, conversation: dict) -> str | None:
@@ -130,6 +132,26 @@ def _id_refusal(provider: base.Provider, store: Store, hint: str, conversation: 
         f"{store.root}: {where}: session id '{shown}' is not in the form "
         f"{label} ids have; not listed"
     )
+
+
+def _bound(store: Store, hint: str, conversation: dict) -> list[str]:
+    """Hold a parsed session's free text to sizes that make sense, in place;
+    returns the warnings. Adapters take a folder and a note over as the
+    store has them, and a store on another drive can hold megabytes there;
+    every listed session is kept in memory and written to the cache."""
+    warnings = []
+    conversation["title"] = base.clean_title(conversation["title"])
+    cwd = conversation["cwd"]
+    if cwd is not None and len(cwd) > CWD_MAX:
+        conversation["cwd"] = None
+        warnings.append(
+            f"{store.root}: {hint}: the recorded folder is {len(cwd):,} characters long, "
+            "which no path is; left out"
+        )
+    note = conversation["note"]
+    if note is not None and len(note) > NOTE_MAX:
+        conversation["note"] = note[:NOTE_MAX]
+    return warnings
 
 
 def _strings(items: object) -> list[str]:
@@ -473,6 +495,8 @@ class Index:
                     if refusal is not None:
                         warnings.append(refusal)
                         conversation = None
+                    else:
+                        warnings += _bound(store, hint, conversation)
                 entry["candidates"][hint] = {
                     "sig": sig,
                     "session": conversation,

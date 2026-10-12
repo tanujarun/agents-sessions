@@ -86,6 +86,8 @@
 - `tests/test_sqlite_hardening.py` — `open_sqlite_ro` on files that are not trusted: the settings made before
   anything is read, schemas with a view, a trigger or a virtual table refused, truncated and scrambled
   databases as one skipped candidate each
+- `tests/test_hostile_values.py` — text that used to cost minutes (unclosed tags, blank lines, an endless
+  "time"), `between`, long message ids, the index's bounds on a session's folder, note and title
 - `tests/test_import_safety.py` — what keeps an import inside the native store: `importer.contained`
   (destinations, paths below a unit, appended files, symbolic links), the names each adapter takes from the
   source; the read-back of a placed copy (`Provider.read_back`, the `verify` step of `importer.execute`) and

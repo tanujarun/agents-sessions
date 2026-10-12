@@ -42,6 +42,7 @@ _INDEX = "session_index.jsonl"
 # this many bytes is not read. A line of it holds an id and a name.
 _INDEX_MAX = 64 * 1024 * 1024
 _INDEX_LINE_MAX = 64 * 1024
+_VERSION_MAX = 64  # characters; a longer "cli_version" is not one
 _ROLES = {"UserMessage": "user", "AgentMessage": "assistant"}
 # Where the Orca app keeps its own CODEX_HOME, relative to the profile that
 # holds ``.codex`` (FORMATS section 1, "Mirror stores"). Its thread-name index
@@ -489,8 +490,9 @@ class Codex(Provider):
         if line is not None and _index_line(index, s.id) is None:
             plan.appends.append(importer.Append(index, line + b"\n", "the thread's name"))
         meta = _read_meta(files[0])
-        if isinstance(meta.get("cli_version"), str):
-            plan.info["source_tool_version"] = meta["cli_version"]
+        version = meta.get("cli_version")
+        if isinstance(version, str) and len(version) <= _VERSION_MAX:
+            plan.info["source_tool_version"] = version
         return plan
 
 

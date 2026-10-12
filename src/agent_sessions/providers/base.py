@@ -36,6 +36,7 @@ __all__ = [
     "Session",
     "Store",
     "Warnings",
+    "between",
     "clean_title",
     "collect_warnings",
     "iter_jsonl",
@@ -479,6 +480,10 @@ def open_sqlite_ro(path: StrPath, plain_schema: bool = True) -> sqlite3.Connecti
 # --- values -----------------------------------------------------------------
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+# No recorded time is longer than some 40 characters. Longer text is not a
+# time, and is not given to the pattern below (which is slow on a long run of
+# spaces) or to ``int`` (which refuses more than 4300 digits by raising).
+_TS_TEXT_MAX = 64
 _TS = re.compile(
     r"^\s*(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})(?:[.,](\d+))?"
     r"\s*(?:([Zz])|([+-])(\d{2}):?(\d{2}))?\s*$"
@@ -542,7 +547,7 @@ def parse_ts(value: object) -> str | None:
         ):
             return None
         return _from_epoch(seconds, nanos // 1000)
-    if not isinstance(value, str):
+    if not isinstance(value, str) or len(value) > _TS_TEXT_MAX:
         return None
     text = value.strip()
     if re.fullmatch(r"-?\d+(\.\d+)?", text):
@@ -560,6 +565,23 @@ def parse_ts(value: object) -> str | None:
     except (OverflowError, ValueError):
         return None
     return _iso(moment)
+
+
+def between(text: str, opening: str, closing: str) -> str | None:
+    """The text between the first ``opening`` and the first ``closing``
+    after it, or None when either is missing.
+
+    What ``re.search(opening + "(.*?)" + closing, text, re.S)`` captures,
+    found in one pass. The pattern is not used on text from a store: with
+    no ``closing`` in the text it starts over at every ``opening``, and a
+    megabyte of them keeps a scan busy for minutes.
+    """
+    start = text.find(opening)
+    if start < 0:
+        return None
+    start += len(opening)
+    stop = text.find(closing, start)
+    return None if stop < 0 else text[start:stop]
 
 
 def clean_title(text: object) -> str:

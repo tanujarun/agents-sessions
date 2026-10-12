@@ -18,6 +18,7 @@ from .base import (
     NotSupported,
     Provider,
     Turn,
+    between,
     clean_title,
     iter_jsonl,
     open_ro,
@@ -41,7 +42,6 @@ _SMALL_FILE = 16 * 1024 * 1024
 # How deep a ``meta.json`` value is searched. The tool writes a flat object;
 # a file from elsewhere can nest values without end.
 _NEST_MAX = 32
-_QUERY = re.compile(r"<user_query>(.*?)</user_query>", re.S)
 _INJECTED = ("<user_info>", "<system-reminder>")
 # Import (FORMATS section 6): the only cwd shape whose group directory name
 # is known for certain, and the reason given for every other one.
@@ -164,9 +164,9 @@ def _prompt_text(record: dict[str, Any]) -> str | None:
     if record.get("type") != "user" or record.get("synthetic_reason"):
         return None
     text = _text(record.get("content"))
-    wrapped = _QUERY.search(text)
-    if wrapped:
-        return wrapped.group(1).strip()
+    wrapped = between(text, "<user_query>", "</user_query>")
+    if wrapped is not None:
+        return wrapped.strip()
     if not _is_prompt(record):
         return None
     text = text.strip()
