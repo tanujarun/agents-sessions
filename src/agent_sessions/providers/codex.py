@@ -377,7 +377,7 @@ class Codex(Provider):
         title = _index_title(os.path.join(store.root, _INDEX), thread_id)
         if not title:
             first = next((t.text for t in turns if t.role == "user"), None)
-            title = clean_title(first) or thread_id[:8]
+            title = clean_title(first) or clean_title(thread_id[:8])
         cwd = meta.get("cwd")
         if not isinstance(cwd, str) or not cwd:
             cwd = base.turn_cwd or next((r.turn_cwd for r in ordered if r.turn_cwd), None)

@@ -17,6 +17,10 @@
 - `src/agent_sessions/model.py` — `Session` (`for_store`, `from_dict`), `Store`, `Candidate`, `make_key`
 - `src/agent_sessions/fsutil.py` — our own locations (`home`, `cache_file`, `cache_dir`, `state_dir`, `config_dir`, env overrides)
   and trace-free reads (`open_ro`, `subdirs`, `listdir_ro`: `O_NOATIME` where the platform has it)
+- `src/agent_sessions/textsafe.py` — the one sanitiser for text from a store: `clean` (control and
+  bidirectional characters become spaces; `multiline` keeps line feed and tab), `json_escape` (the same
+  characters as `\uXXXX` in `--json` output), the set `UNSAFE`. Used by the CLI's output helpers, `clean_title`,
+  `tui/view.clean` and the desktop notification
 - `src/agent_sessions/mounts.py` — platform layer: `Mount`, `list_mounts`, `mount_points`, `find_mount`,
   `parse_mountinfo`; the real-filesystem list `REAL_FSTYPES`; `AGENT_SESSIONS_MOUNTS` override
 - `src/agent_sessions/discover.py` — `fast_pass`, `deep_pass`, `brute_pass` (the walk `verify` uses), the prune
@@ -42,7 +46,8 @@
 - `share/agent-sessions.desktop` — desktop launcher for the TUI
 - `tests/` — unittest suites
 - `tests/__init__.py` — puts `src` on `sys.path`
-- `tests/support.py` — `Sandbox` (fake home, cache, mounts, registry) and `FakeProvider` for the engine tests
+- `tests/support.py` — `Sandbox` (fake home, cache, mounts, registry) and `FakeProvider` for the engine tests;
+  `write_jsonl`, `claude_transcript` (a minimal transcript written from scratch)
 - `tests/test_smoke.py` — imports, CLI skeleton, `make_key`
 - `tests/test_base_helpers.py` — `iter_jsonl`, `open_sqlite_ro`, `parse_ts`, `clean_title`, warnings, model
 - `tests/test_mounts.py` — mountinfo parsing and filtering, env override, `find_mount`
@@ -51,6 +56,9 @@
 - `tests/test_index.py` — parse cache, scan policy, vanished mounts, derived fields, order, `verify`
 - `tests/test_claude.py`, `tests/test_codex.py`, `tests/test_grok.py`, `tests/test_antigravity.py`, `tests/test_gemini.py` — one suite per adapter, on the fixtures
 - `tests/test_cli.py` — `scan`, `list`, `status`, `verify` through `cli.main`
+- `tests/test_textsafe.py` — `textsafe`, the JSON round trip, every CLI command on stores full of escape
+  sequences, the rule that only the CLI's output helpers write to a stream, id-fallback titles, the
+  notification text
 - `tests/test_wrong_types.py` — all five adapters against records, JSON values and SQLite column values of
   the wrong type, on temp copies of every fixture store
 - `tests/test_unreadable.py` — a directory inside a store at mode 000: the warning per adapter and through

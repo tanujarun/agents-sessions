@@ -10,9 +10,9 @@ import shlex
 import sys
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TextIO
 
-from . import __version__, api
+from . import __version__, api, textsafe
 from .mounts import MountsError
 from .providers import all_providers
 
@@ -76,19 +76,48 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # --- output -----------------------------------------------------------------
+#
+# Titles, folders, ids, keys, paths, mount labels, warnings and transcript
+# text come from stores on other drives and may hold terminal escape
+# sequences. Nothing below this block writes to a stream itself: readable text
+# goes through ``_out`` or ``_err``, JSON through ``_json``, the progress line
+# through ``_progress``, and each of those makes its text safe on the way out
+# (``textsafe``). tests/test_textsafe.py holds this module to that.
 
 
-def _out(text: str) -> None:
-    """Print; a path with bytes that are not UTF-8 is escaped, not fatal."""
+def _emit(stream: TextIO, text: str) -> None:
+    """Write one line that is already safe; a path with bytes that are not
+    UTF-8 is escaped, not fatal."""
     try:
-        sys.stdout.write(text + "\n")
+        stream.write(text + "\n")
     except UnicodeEncodeError:
-        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-        sys.stdout.write(text.encode(encoding, "backslashreplace").decode(encoding) + "\n")
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        stream.write(text.encode(encoding, "backslashreplace").decode(encoding) + "\n")
+
+
+def _out(text: object, multiline: bool = False) -> None:
+    """Print one line. Control characters in it, a line break included,
+    become spaces; ``multiline`` keeps line breaks and tabs, for transcript
+    text."""
+    _emit(sys.stdout, textsafe.clean(text, multiline))
+
+
+def _err(text: object) -> None:
+    """One line on stderr, after the program's name."""
+    _emit(sys.stderr, f"{PROG}: {textsafe.clean(text)}")
 
 
 def _json(value: object) -> None:
-    _out(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False))
+    """Print a value as JSON: exact data, with the characters a terminal
+    would act on written as ``\\uXXXX`` escapes."""
+    document = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False)
+    _emit(sys.stdout, textsafe.json_escape(document))
+
+
+def _progress(text: str = "") -> None:
+    """Replace the progress line on stderr; no text clears it."""
+    sys.stderr.write("\r\033[K" + textsafe.clean(text))
+    sys.stderr.flush()
 
 
 def _table(rows: Iterable[Iterable[object]], indent: str = "") -> None:
@@ -173,13 +202,11 @@ def _scan(args: argparse.Namespace) -> int:
     if sys.stderr.isatty() and not args.json:
 
         def progress(label: str, dirs: int) -> None:
-            sys.stderr.write(f"\r\033[Kscanning {label}… {dirs:,} dirs")
-            sys.stderr.flush()
+            _progress(f"scanning {label}… {dirs:,} dirs")
 
     summary = api.scan(deep=True if args.deep else None, progress=progress)
     if progress is not None and summary["walk"] is not None:
-        sys.stderr.write("\r\033[K")
-        sys.stderr.flush()
+        _progress()
     if args.json:
         _json(summary)
         return 0
@@ -216,7 +243,7 @@ def _list(args: argparse.Namespace) -> int:
     if index.load_error is not None:
         # No cache, or one that cannot be used: an empty listing would look
         # like "no sessions". stdout stays the listing alone.
-        print(f"{PROG}: no usable cache; scanning…", file=sys.stderr)
+        _err("no usable cache; scanning…")
         api.scan()
         index = api.load_index()
     sessions = api.list_sessions(args.provider, index=index)
@@ -224,7 +251,7 @@ def _list(args: argparse.Namespace) -> int:
         _json([s.to_dict() for s in sessions])
         return 0
     if index.last_quick is None:
-        print(f"{PROG}: no index yet; run `{PROG} scan`", file=sys.stderr)
+        _err(f"no index yet; run `{PROG} scan`")
     now = datetime.now(UTC)
     _table(
         [
@@ -253,7 +280,8 @@ def _status(args: argparse.Namespace) -> int:
         f"last deep scan: {status['last_deep'] or 'never'}"
     )
 
-    _out("\nmounts")
+    _out("")
+    _out("mounts")
     rows = []
     for mount in status["mounts"]:
         walk = mount["walk"]
@@ -272,7 +300,8 @@ def _status(args: argparse.Namespace) -> int:
         for path in (mount["walk"] or {}).get("error_paths", []):
             _out(f"  unreadable: {path}")
 
-    _out("\nstores")
+    _out("")
+    _out("stores")
     rows = []
     for store in status["stores"]:
         flags = []
@@ -296,7 +325,8 @@ def _status(args: argparse.Namespace) -> int:
     if not rows:
         _out("  none")
 
-    _out("\nproviders")
+    _out("")
+    _out("providers")
     _table(
         [
             [
@@ -312,7 +342,8 @@ def _status(args: argparse.Namespace) -> int:
     )
 
     if status["skipped_stores"]:
-        _out("\nskipped stores")
+        _out("")
+        _out("skipped stores")
         _table(
             [
                 [s["provider"], s["reason"] + ("" if s["mounted"] else ", not mounted"), s["root"]]
@@ -321,7 +352,8 @@ def _status(args: argparse.Namespace) -> int:
             "  ",
         )
 
-    _out("\ndrive letters")
+    _out("")
+    _out("drive letters")
     rows = [
         [
             row["letter"],
@@ -348,10 +380,12 @@ def _status(args: argparse.Namespace) -> int:
         _out("  none recorded")
 
     if status["no_reader"]:
-        _out("\ninstalled tools with no reader")
+        _out("")
+        _out("installed tools with no reader")
         _table([[t["tool"], t["path"]] for t in status["no_reader"]], "  ")
 
-    _out(f"\nwarnings: {len(status['warnings'])}")
+    _out("")
+    _out(f"warnings: {len(status['warnings'])}")
     for warning in status["warnings"]:
         _out(f"  {warning}")
     return 0
@@ -362,13 +396,11 @@ def _verify(args: argparse.Namespace) -> int:
     if sys.stderr.isatty():
 
         def progress(label: str, dirs: int) -> None:
-            sys.stderr.write(f"\r\033[Kwalking {label}… {dirs:,} dirs")
-            sys.stderr.flush()
+            _progress(f"walking {label}… {dirs:,} dirs")
 
     result = api.verify(progress=progress)
     if progress is not None:
-        sys.stderr.write("\r\033[K")
-        sys.stderr.flush()
+        _progress()
     dirs = sum(walk["dirs"] for walk in result["walk"].values())
     _out(
         f"verify: walked {_count(len(result['walk']), 'mount')}, {_count(dirs, 'dir')}, "
@@ -454,23 +486,20 @@ def _import(args: argparse.Namespace) -> int:
 
         def progress(done: int, total: int) -> None:
             share = 100 * done // total if total else 100
-            sys.stderr.write(f"\r\033[Kcopying… {share}% of {_size(total)}")
-            sys.stderr.flush()
+            _progress(f"copying… {share}% of {_size(total)}")
 
     try:
         report = api.import_report(args.key, progress=progress, index=index)
     finally:
         if progress is not None:
-            sys.stderr.write("\r\033[K")
-            sys.stderr.flush()
+            _progress()
     if report.created:
-        print(
-            f"{PROG}: imported {_count(len(report.files), 'item')} "
-            f"({_size(report.bytes)}) into {report.session.store}",
-            file=sys.stderr,
+        _err(
+            f"imported {_count(len(report.files), 'item')} "
+            f"({_size(report.bytes)}) into {report.session.store}"
         )
     else:
-        print(f"{PROG}: already imported; nothing was copied", file=sys.stderr)
+        _err("already imported; nothing was copied")
     _out(report.session.key)
     if args.open:
         return _resume(report.session, False, False)
@@ -505,13 +534,13 @@ def _show(args: argparse.Namespace) -> int:
         else:
             _out("")
             _out(f"{turn.role}:")
-            _out(turn.text)
+            _out(turn.text, multiline=True)
         last = turn.role
     return 0
 
 
 def _not_implemented(args: argparse.Namespace) -> int:
-    print(f"{PROG}: {args.command}: not implemented", file=sys.stderr)
+    _err(f"{args.command}: not implemented")
     return 1
 
 
@@ -550,8 +579,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         _quiet_stdout()  # the reader (head, less) went away: not an error
         return 0
     except api.ApiError as exc:
-        print(f"{PROG}: {exc.reason}", file=sys.stderr)
+        _err(exc.reason)
         return 1
     except MountsError as exc:
-        print(f"{PROG}: {exc}", file=sys.stderr)
+        _err(exc)
         return 1

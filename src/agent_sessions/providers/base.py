@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
-from .. import importer
+from .. import importer, textsafe
 from ..fsutil import open_ro
 from ..model import Candidate, Session, Store
 
@@ -388,13 +388,11 @@ def parse_ts(value: object) -> str | None:
     return _iso(moment)
 
 
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-
-
 def clean_title(text: object) -> str:
-    """One line, whitespace collapsed, control characters removed, at most
-    80 characters. None gives an empty string."""
+    """One line, whitespace collapsed, control characters and the characters
+    that reorder text taken out (``textsafe.clean``), at most 80 characters.
+    None gives an empty string."""
     if text is None:
         return ""
-    collapsed = " ".join(_CONTROL.sub(" ", str(text)).split())
+    collapsed = " ".join(textsafe.clean(str(text)).split())
     return collapsed[:TITLE_MAX].rstrip()

@@ -347,7 +347,7 @@ class Grok(Provider):
         elif first_prompt:
             title, title_source = first_prompt, "first prompt"
         else:
-            title, title_source = session_id[:8], "id"
+            title, title_source = clean_title(session_id[:8]), "id"
 
         cwd, cwd_source = info.get("cwd"), "info.cwd"
         if not isinstance(cwd, str) or not cwd:

@@ -349,7 +349,7 @@ class Antigravity(Provider):
         if not title:
             title, title_source = clean_title(self._first_request(log)), "first user input"
         if not title:
-            title, title_source = cid[:8], "id"
+            title, title_source = clean_title(cid[:8]), "id"
 
         cwd, cwd_source = self._workspace(row.get("workspace_uris")), "workspace_uris"
         if not cwd:

@@ -230,7 +230,7 @@ def _title(scan: _Scan, session_id: str) -> tuple[str, str]:
     title = clean_title(scan.command)
     if title:
         return title, "command"
-    return session_id[:8], "id"
+    return clean_title(session_id[:8]), "id"
 
 
 def _mtime(path: StrPath) -> str | None:

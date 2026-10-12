@@ -20,6 +20,7 @@ import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from . import textsafe
 from .errors import LaunchFailed
 from .fsutil import home
 
@@ -59,13 +60,24 @@ def _spawn(command: list[str], cwd: str | None) -> None:
     _detached(command, cwd)
 
 
+def _notice(reason: object) -> str:
+    """The text of a notification: one line with nothing a terminal or a
+    notification daemon would act on (``textsafe.clean``), and never an
+    option. The reason can quote a session's folder, which is data from
+    another drive; ``notify-send`` reads an argument that starts with ``-``
+    as an option wherever it stands (its ``--help`` names no ``--``
+    terminator), so such a text gets a space in front."""
+    text = textsafe.clean(reason).strip()
+    return f" {text}" if text.startswith("-") else text
+
+
 def _notify(reason: str) -> None:
     """A desktop notification, when ``notify-send`` exists."""
     if os.environ.get(NOTIFY_ENV, "").strip().lower() in ("0", "false", "no", "off"):
         return
     tool = shutil.which(NOTIFIER)
     if tool:
-        _detached([tool, "--app-name=agent-sessions", NOTIFY_TITLE, reason])
+        _detached([tool, "--app-name=agent-sessions", NOTIFY_TITLE, _notice(reason)])
 
 
 starter = _spawn  # starter(command, cwd): open the terminal window
@@ -73,9 +85,10 @@ notifier = _notify  # notifier(reason): tell the desktop about a failure
 
 
 def _tell(reason: str) -> None:
-    """Best effort: a notification that fails never hides the real failure."""
+    """Best effort: a notification that fails never hides the real failure.
+    The notifier gets the reason with control characters taken out."""
     try:
-        notifier(reason)
+        notifier(textsafe.clean(reason))
     except Exception:  # noqa: S110  (best effort, see the docstring)
         pass
 

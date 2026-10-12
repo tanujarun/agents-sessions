@@ -26,6 +26,46 @@ from agent_sessions.providers.base import (  # noqa: E402
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
+def write_jsonl(path, records) -> Path:
+    """Write ``records`` as JSON lines, non-ASCII as it is (the way the
+    tools write them); parents are created."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        for record in records:
+            fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return path
+
+
+def claude_transcript(
+    store_root, session_id, cwd, prompt="hello", reply="hi", project="proj", tool=None
+) -> Path:
+    """A minimal Claude transcript, one prompt and one reply, written to
+    ``<store>/projects/<project>/<session_id>.jsonl``."""
+    content = [{"type": "text", "text": reply}]
+    if tool is not None:
+        content.append({"type": "tool_use", "name": tool})
+    return write_jsonl(
+        Path(store_root) / "projects" / project / f"{session_id}.jsonl",
+        [
+            {
+                "type": "user",
+                "parentUuid": None,
+                "isSidechain": False,
+                "cwd": cwd,
+                "timestamp": "2026-10-01T10:00:00.000Z",
+                "message": {"role": "user", "content": prompt},
+            },
+            {
+                "type": "assistant",
+                "parentUuid": "p",
+                "timestamp": "2026-10-01T10:00:05.000Z",
+                "message": {"id": "m1", "role": "assistant", "content": content},
+            },
+        ],
+    )
+
+
 class FakeProvider(Provider):
     """A store is a ``.fake`` directory with ``sessions/``; a candidate is a
     ``sessions/<hint>.json`` file holding the conversation fields."""

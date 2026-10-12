@@ -348,7 +348,7 @@ class Gemini(Provider):
                     if title:
                         break
         if not title:
-            title, title_source = session_id[:8], "id"
+            title, title_source = clean_title(session_id[:8]), "id"
         start, last = parse_ts(meta.get("startTime")), parse_ts(meta.get("lastUpdated"))
         return {
             "id": session_id,
