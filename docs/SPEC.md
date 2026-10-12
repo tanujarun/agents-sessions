@@ -516,8 +516,12 @@ agent-sessions continue <key> [--with TOOL] [--in DIR] [--dry-run] [--here]
 ```
 
 `list` gains `--mounted` (leave offline sessions out). Exit codes: 0 ok,
-1 failure, 2 usage, 130 interrupted. Every `--json` shape is documented in
-`docs/JSON.md` and pinned by a test.
+1 failure, 2 usage, 130 interrupted (Ctrl-C; SIGTERM and SIGHUP end a
+command the same way, with 128 + the signal: 143, 129). An interrupt prints
+one line and no traceback, and an import that was under way is rolled back
+first. An exception nobody planned for prints `internal error: <Type>:
+<message> (details in <log>)` and exits 1; `--debug` shows the traceback.
+Every `--json` shape is documented in `docs/JSON.md` and pinned by a test.
 
 ## Logs
 

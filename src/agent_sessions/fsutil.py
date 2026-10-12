@@ -199,24 +199,39 @@ def _still_named(fd: int, path: str) -> bool:
         return False
 
 
+def _note_holder(fd: int) -> None:
+    """Write this process's id into the lock file, for whoever waits. The
+    lock is the descriptor, not this number: a disk too full to take it does
+    not cost the lock."""
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, b"%d\n" % os.getpid())
+    except OSError:
+        pass
+
+
 def _acquire(path: str, deadline: float, timeout: float) -> int:
     """Open the lock file and lock it, by ``deadline`` (``timeout`` is what
     the caller asked for, for the error); the descriptor is the lock."""
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
     while True:
         fd = os.open(path, flags, PRIVATE_FILE)
+        mine = False
         try:
             while not _try_lock(fd):
                 if time.monotonic() >= deadline:
                     raise LockTimeout(path, timeout, _holder(path))
                 time.sleep(_LOCK_POLL)
-            if _still_named(fd, path):
-                os.lseek(fd, 0, os.SEEK_SET)
-                os.ftruncate(fd, 0)
-                os.write(fd, b"%d\n" % os.getpid())
+            mine = _still_named(fd, path)
+            if mine:
+                _note_holder(fd)
                 return fd
         except BaseException:
-            os.close(fd)
+            if mine:
+                _release(fd, path)  # interrupted with the lock in hand: no file is left
+            else:
+                os.close(fd)
             raise
         # The holder before us removed the file on its way out, and what was
         # locked just now is a file nobody can find: take the one that is

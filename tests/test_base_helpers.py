@@ -1,5 +1,6 @@
 """The helpers adapters share: JSONL, SQLite, timestamps, titles, warnings."""
 
+import contextlib
 import os
 import sqlite3
 import sys
@@ -177,7 +178,10 @@ class SqliteTest(TempCase):
         self.assertEqual(path.read_bytes(), raw)  # the file keeps its WAL header
         if getattr(os, "O_NOATIME", 0):
             os.utime(path, ns=(1_000_000_000, before.st_mtime_ns))
-            open_sqlite_ro(path).execute("select v from t").fetchall()
+            # Closed here: a connection left to the garbage collector reports
+            # itself on stderr whenever that runs, in the middle of another test.
+            with contextlib.closing(open_sqlite_ro(path)) as con:
+                con.execute("select v from t").fetchall()
             self.assertEqual(os.stat(path).st_atime_ns, 1_000_000_000)
 
     def test_in_memory_copy_refuses_writes_of_every_kind(self):

@@ -57,6 +57,16 @@ with fsutil.lock():
     sys.stdin.read()
 """
 
+# Try for the lock, briefly, and say how it went.
+TRY = """
+from agent_sessions import fsutil
+try:
+    with fsutil.lock(timeout=0.2):
+        print("got it")
+except fsutil.LockTimeout as exc:
+    print("held by", exc.pid)
+"""
+
 
 class StateCase(unittest.TestCase):
     def setUp(self):
@@ -153,6 +163,35 @@ class LockTest(StateCase):
         self.lock_path.write_text("999999999\n")
         with fsutil.lock(timeout=0):
             self.assertEqual(self.lock_path.read_text(), f"{os.getpid()}\n")
+
+    def test_a_disk_too_full_for_the_holders_number_does_not_cost_the_lock(self):
+        real = os.write
+
+        def full(fd, data):
+            if data == b"%d\n" % os.getpid():
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real(fd, data)
+
+        with mock.patch.object(os, "write", full), fsutil.lock(timeout=0):
+            self.assertEqual(self.lock_path.read_bytes(), b"")
+            # It is the lock all the same: another process cannot have it,
+            # and has no number to name.
+            ((status, out, err),) = finish(self, [python_child(TRY)])
+            self.assertEqual((status, out, err), (0, "held by None\n", ""))
+        if POSIX:
+            self.assertEqual(os.listdir(self.state), [])
+
+    def test_an_interrupt_while_the_lock_is_taken_leaves_no_file(self):
+        with (
+            mock.patch.object(fsutil, "_note_holder", side_effect=KeyboardInterrupt),
+            self.assertRaises(KeyboardInterrupt),
+            fsutil.lock(timeout=0),
+        ):
+            self.fail("not reached")
+        if POSIX:
+            self.assertEqual(os.listdir(self.state), [])
+        with fsutil.lock(timeout=0):  # and it is free
+            pass
 
     def test_without_the_directory_there_is_no_lock(self):
         os.rmdir(self.state)

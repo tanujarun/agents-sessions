@@ -105,6 +105,9 @@
   databases as one skipped candidate each
 - `tests/test_hostile_values.py` — text that used to cost minutes (unclosed tags, blank lines, an endless
   "time"), `between`, long message ids, the index's bounds on a session's folder, note and title
+- `tests/test_interrupts.py` — Ctrl-C (exit 130, one line), SIGTERM and SIGHUP raised as an exception for
+  the length of a command, the `internal error` line and `--debug`; a real child process signalled in the
+  middle of an import's copy; the source disappearing and the disk filling up mid-copy (complete roll back)
 - `tests/test_logs.py` — `logs` (nothing created until a message is written, modes, rotation, a log that
   cannot be written, cleaned messages and tracebacks, `--debug`) and what the facade logs (scan, warnings
   once per scan, import, launch, unexpected exceptions)

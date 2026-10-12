@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
 import shlex
+import signal
 import sys
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, TextIO
 
@@ -569,17 +571,76 @@ _COMMANDS = {
 }
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.command is None:
-        parser.print_help()
-        return 2
-    if args.debug:
-        logs.debug()
+INTERRUPTED = 130  # exit status after Ctrl-C: 128 + SIGINT, as a shell reports it
+_TERMINATING = ("SIGTERM", "SIGHUP")  # ended like Ctrl-C: cleanly, with 128 + the signal
+
+
+class _Signalled(BaseException):
+    """SIGTERM or SIGHUP arrived while a command ran. Not an ``Exception``:
+    nothing that catches errors to carry on may swallow it."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+@contextlib.contextmanager
+def _signals() -> Iterator[None]:
+    """For the length of a command, turn SIGTERM and SIGHUP into an
+    exception raised in the main thread, the way Ctrl-C is one already.
+
+    Left alone, either ends the process on the spot and no ``finally`` runs:
+    an import would leave its staging directory and whatever it had already
+    put in place. Only the first signal is raised; one that arrives while
+    the command is unwinding is ignored, so a roll back is not cut short.
+    The handlers that were there come back when the command is over.
+    """
+
+    def raise_it(signum: int, frame: object) -> None:
+        if not seen:
+            seen.append(signum)
+            raise _Signalled(signum)
+
+    seen: list[int] = []
+    before = {}
+    for name in _TERMINATING:
+        signum = getattr(signal, name, None)  # SIGHUP is not on every platform
+        if signum is None:
+            continue
+        try:
+            before[signum] = signal.signal(signum, raise_it)
+        except (ValueError, OSError):
+            pass  # not the main thread, or a signal this platform does not let us handle
     try:
-        code = _COMMANDS.get(args.command, _not_implemented)(args)
-        sys.stdout.flush()
+        yield
+    finally:
+        for signum, handler in before.items():
+            signal.signal(signum, handler)
+
+
+def _stopped(text: str) -> None:
+    """The one line after an interrupt, on a line of its own."""
+    if sys.stderr.isatty():
+        _progress()  # whatever progress line was showing
+    _err(text)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run one command; the exit status is 0, 1 (failure), 2 (usage) or,
+    after an interrupt, 130 (Ctrl-C) or 128 + the signal (SIGTERM, SIGHUP)."""
+    command = None
+    try:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        if args.command is None:
+            parser.print_help()
+            return 2
+        command = args.command
+        if args.debug:
+            logs.debug()
+        with _signals():
+            code = _COMMANDS.get(args.command, _not_implemented)(args)
+            sys.stdout.flush()
         return code
     except BrokenPipeError:
         _quiet_stdout()  # the reader (head, less) went away: not an error
@@ -589,4 +650,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     except MountsError as exc:
         _err(exc)
+        return 1
+    except KeyboardInterrupt:
+        _stopped("interrupted")
+        return INTERRUPTED
+    except _Signalled as exc:
+        _stopped(f"terminated ({signal.Signals(exc.signum).name})")
+        return 128 + exc.signum
+    except Exception as exc:
+        # Not a failure anyone planned for. The traceback goes to the log
+        # (and, with --debug, to stderr through the log's copy there).
+        logs.unexpected(exc, f"`{PROG} {command}`" if command else PROG)
+        where = logs.written()
+        details = f" (details in {where})" if where is not None else ""
+        _err(f"internal error: {type(exc).__name__}: {exc}{details}")
         return 1
