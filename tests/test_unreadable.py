@@ -12,7 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from support import FIXTURES, Sandbox
+from support import FIXTURES, MODES_BIND, NEEDS_MODES, Sandbox
 
 from agent_sessions import api
 from agent_sessions.model import Store
@@ -46,7 +46,7 @@ def lock(case, path) -> None:
     case.addCleanup(os.chmod, path, 0o700)
 
 
-@unittest.skipIf(os.geteuid() == 0, "root can read everything")
+@unittest.skipUnless(MODES_BIND, NEEDS_MODES)
 class AdapterTest(unittest.TestCase):
     def test_every_adapter_reports_a_directory_it_cannot_list(self):
         for adapter, fixture, directories in CASES:
@@ -103,7 +103,7 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(collected.items, [], provider.name)
 
 
-@unittest.skipIf(os.geteuid() == 0, "root can read everything")
+@unittest.skipUnless(MODES_BIND, NEEDS_MODES)
 class IndexTest(unittest.TestCase):
     def setUp(self):
         self.box = Sandbox(self, {"claude": Claude, "grok": Grok})

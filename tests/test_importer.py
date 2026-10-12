@@ -36,7 +36,7 @@ from fixture_world import (
     files_below,
     tree_state,
 )
-from support import FIXTURES, state_names
+from support import FIXTURES, MODES_BIND, NEEDS_MODES, state_names
 
 from agent_sessions import api, blake3, importer, journal
 from agent_sessions.model import make_key
@@ -1385,7 +1385,7 @@ class StagingSweepTest(ImportCase):
         self.assertEqual([p for p in stale if os.path.lexists(p)], [])
         self.assertEqual([p for p in kept if not os.path.lexists(p)], [])
 
-    @unittest.skipIf(os.geteuid() == 0, "root can remove everything")
+    @unittest.skipUnless(MODES_BIND, NEEDS_MODES)
     def test_a_staging_directory_that_cannot_be_removed_is_ignored(self):
         stuck = self.make(f"{importer.STAGING_PREFIX}{dead_pid()}-1", 2 * self.HOUR)
         os.chmod(stuck / "0", 0o500)

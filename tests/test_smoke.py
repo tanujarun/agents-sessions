@@ -7,12 +7,14 @@ import sys
 import unittest
 from pathlib import Path
 
-_SRC = str(Path(__file__).resolve().parent.parent / "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import agent_sessions  # noqa: E402
-from agent_sessions import cli, model, providers  # noqa: E402
+import support  # noqa: F401  (for its effect: src on sys.path, the temp state directory)
+
+import agent_sessions
+from agent_sessions import cli, model, providers
+
+_SRC = str(Path(__file__).resolve().parent.parent / "src")
 
 
 def run(argv):

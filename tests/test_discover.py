@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from support import FIXTURES, FakeProvider, OtherProvider, Sandbox
+from support import FIXTURES, MODES_BIND, NEEDS_MODES, FakeProvider, OtherProvider, Sandbox
 
 from agent_sessions import discover, providers
 from agent_sessions.discover import PRUNE, brute_pass, deep_pass, fast_pass
@@ -61,7 +61,7 @@ class DeepPassTest(unittest.TestCase):
             [(str(store), "native", "Linux")],
         )
 
-    @unittest.skipIf(os.geteuid() == 0, "root can read everything")
+    @unittest.skipUnless(MODES_BIND, NEEDS_MODES)
     def test_unreadable_dir_is_counted_not_fatal(self):
         mount = self.box.mount("Disk")
         locked = mount / "locked"

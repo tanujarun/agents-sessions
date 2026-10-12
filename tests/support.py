@@ -31,13 +31,30 @@ from agent_sessions.providers.base import (  # noqa: E402
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 # A net below every test: the engine writes its log into the state directory
-# from many places, and a test that reaches one outside a ``Sandbox`` must
-# not write the user's real one. ``Sandbox`` puts its own directory over
-# this for the length of a test.
-if "AGENT_SESSIONS_STATE" not in os.environ:
-    _stray_state = tempfile.mkdtemp(prefix="agent-sessions-test-state-")
-    os.environ["AGENT_SESSIONS_STATE"] = _stray_state
-    atexit.register(shutil.rmtree, _stray_state, ignore_errors=True)
+# from many places, the index into the cache and the drive letters below the
+# home, and a test that reaches one outside a ``Sandbox`` must not write the
+# user's real ones. Set whatever the caller's environment holds: the README
+# gives these variables to users, and a run with one exported would write
+# there (docs/AUDIT.md A-23). ``Sandbox`` puts its own directories over these
+# for the length of a test.
+OWN_PLACES = {
+    "AGENT_SESSIONS_STATE": "state",
+    "AGENT_SESSIONS_CACHE": "cache",
+    "AGENT_SESSIONS_HOME": "home",  # an empty one: no stores, and the configuration below it
+}
+_stray = tempfile.mkdtemp(prefix="agent-sessions-test-own-")
+os.mkdir(os.path.join(_stray, OWN_PLACES["AGENT_SESSIONS_HOME"]))
+for _variable, _name in OWN_PLACES.items():
+    os.environ[_variable] = os.path.join(_stray, _name)
+atexit.register(shutil.rmtree, _stray, ignore_errors=True)
+
+
+# For the tests that take a mode away (a directory at 000, a file nobody may
+# read) and expect to be kept out: true on POSIX for anyone but root. Windows
+# has no ``os.geteuid``, and a module that calls it in a decorator does not
+# import there.
+MODES_BIND = hasattr(os, "geteuid") and os.geteuid() != 0
+NEEDS_MODES = "needs file modes that keep the test's user out (POSIX, and not root)"
 
 
 def _no_mount(argv):
