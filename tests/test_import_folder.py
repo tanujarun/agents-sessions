@@ -281,6 +281,24 @@ class ClaudeFolderTest(FolderCase):
         self.assertEqual(native.cwd, RECORDED)
         self.assertEqual(self.source(CLAUDE_WIN).imported_as, native.key)
 
+    def test_the_real_path_of_the_chosen_folder_names_the_directory(self):
+        """docs/AUDIT.md N-23: the tool looks a session up under the name of
+        its own working directory, which is the folder's physical path. A
+        copy filed under the name of a link to it would not be found."""
+        link = self.home / "link to it"
+        os.symlink(self.chosen, link)
+        source = self.source(CLAUDE_WIN)
+        plan = api.import_plan(source, target=str(link))
+        self.assertEqual((plan["cwd_local"], plan["chosen_folder"]), (str(self.chosen), str(link)))
+        api.import_session(source, target=str(link))
+        self.assert_copied_into(self.target)  # projects/<the folder itself>, not the link
+        (record,) = journal.not_undone(journal.read())
+        self.assertEqual(
+            (record["cwd_local"], record["chosen_folder"]), (str(self.chosen), str(link))
+        )
+        # And the copy is resumed in the folder that was chosen.
+        self.assertEqual(self.w.session(CLAUDE_WIN, "native").cwd_local, str(link))
+
     def test_the_tools_own_marker_for_a_moved_session_is_not_written(self):
         self.lose_the_folder()
         api.import_session(self.source(CLAUDE_WIN), target=str(self.chosen))

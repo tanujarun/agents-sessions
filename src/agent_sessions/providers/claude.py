@@ -404,9 +404,10 @@ class Claude(Provider):
         is rewritten and nothing else is copied.
 
         With a chosen folder (``target``) only that directory's name
-        differs: ``projects/<encoded target>/``. The transcript stays byte
-        for byte what it was, and the tool's own marker for a session that
-        moved (a ``relocated`` record) is not written (FORMATS Q8)."""
+        differs: ``projects/<encoded real path of the target>/``. The
+        transcript stays byte for byte what it was, and the tool's own
+        marker for a session that moved (a ``relocated`` record) is not
+        written (FORMATS Q8)."""
         transcript = next((f for f in s.files if _TRANSCRIPT.fullmatch(os.path.basename(f))), None)
         if transcript is None:
             raise NotSupported("this session has no transcript file to copy")
@@ -418,6 +419,12 @@ class Claude(Provider):
         if named is None or named.group(1) != s.id:
             raise NotSupported(f"the transcript is not named after its session id: {transcript}")
         plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern, target)
+        if plan.chosen_folder is not None:
+            # The tool looks a session up under the name of its own working
+            # directory, and that is the physical path of the folder it was
+            # started in: a copy filed under the name of a symbolic link to
+            # the folder would not be found there (as for Grok, FORMATS Q8).
+            plan.cwd_local = os.path.realpath(plan.chosen_folder)
         folder = encode_cwd(plan.cwd_local or "")
         if not _ENCODED.fullmatch(folder):
             raise NotSupported(f"the project folder {plan.cwd_local} has no directory name")
