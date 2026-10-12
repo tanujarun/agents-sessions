@@ -127,6 +127,14 @@ class ContinueCase(unittest.TestCase):
         self.handoff_dir = self.state / "handoff"
         self.work = self.home / "Work" / "new place"
         self.work.mkdir(parents=True)
+        # A net below every test here: whatever a mistake lets through, this
+        # process is not replaced by a tool. A test of ``--here`` puts its
+        # own recorder over it.
+        net = mock.patch.object(
+            launch.os, "execvp", side_effect=AssertionError("a test reached exec")
+        )
+        net.start()
+        self.addCleanup(net.stop)
 
     def handoff(self, provider, session_id) -> Path:
         return self.handoff_dir / f"{provider}-{session_id}.md"
