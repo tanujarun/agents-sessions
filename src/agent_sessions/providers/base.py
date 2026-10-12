@@ -463,16 +463,17 @@ def open_sqlite_ro(path: StrPath, plain_schema: bool = True) -> sqlite3.Connecti
         regular = True  # missing or unreachable: reported by the first query, as before
     if not regular:
         raise sqlite3.OperationalError("not a regular file")
-    con = _sqlite_in_memory(path)
-    if con is None:
-        uri = "file:" + urllib.parse.quote(os.fspath(path)) + "?mode=ro&immutable=1"
-        con = sqlite3.connect(uri, uri=True)
+    con = _sqlite_in_memory(path)  # hardened before the bytes were loaded
     try:
-        _harden(con)
+        if con is None:
+            uri = "file:" + urllib.parse.quote(os.fspath(path)) + "?mode=ro&immutable=1"
+            con = sqlite3.connect(uri, uri=True)
+            _harden(con)
         if plain_schema:
             _plain_schema(con)
     except BaseException:
-        con.close()
+        if con is not None:
+            con.close()
         raise
     return con
 
