@@ -352,7 +352,7 @@ class Claude(Provider):
         transcript = next((f for f in s.files if _TRANSCRIPT.match(os.path.basename(f))), None)
         if transcript is None:
             raise NotSupported("this session has no transcript file to copy")
-        plan = importer.start_plan(s, self.native_store(), pathmap)
+        plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern)
         name = os.path.basename(transcript)
         projects = os.path.join(plan.native_root, "projects")
         try:

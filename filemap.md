@@ -14,7 +14,8 @@
 - `.github/workflows/ci.yml` — CI: lint, typecheck and both suites on Python 3.11 to 3.14 (Linux); engine
   suite on Windows, allowed to fail until the port is done
 - `src/agent_sessions/__init__.py` — package marker, `__version__`
-- `src/agent_sessions/model.py` — `Session` (`for_store`, `from_dict`), `Store`, `Candidate`, `make_key`
+- `src/agent_sessions/model.py` — `Session` (`for_store`, `from_dict`), `Store`, `Candidate`, `make_key`,
+  `UUID_PATTERN` (the default session id grammar)
 - `src/agent_sessions/fsutil.py` — our own locations (`home`, `cache_file`, `cache_dir`, `state_dir`, `config_dir`, env overrides)
   and trace-free reads (`open_ro`, `subdirs`, `listdir_ro`: `O_NOATIME` where the platform has it)
 - `src/agent_sessions/textsafe.py` — the one sanitiser for text from a store: `clean` (control and
@@ -56,6 +57,9 @@
 - `tests/test_index.py` — parse cache, scan policy, vanished mounts, derived fields, order, `verify`
 - `tests/test_claude.py`, `tests/test_codex.py`, `tests/test_grok.py`, `tests/test_antigravity.py`, `tests/test_gemini.py` — one suite per adapter, on the fixtures
 - `tests/test_cli.py` — `scan`, `list`, `status`, `verify` through `cli.main`
+- `tests/test_session_ids.py` — the session id grammar (`Provider.id_pattern`) in its three places: the
+  index (fresh parses and cached entries), `launch.plan` (the id, and every argument that came from session
+  data), `importer.check`
 - `tests/test_textsafe.py` — `textsafe`, the JSON round trip, every CLI command on stores full of escape
   sequences, the rule that only the CLI's output helpers write to a stream, id-fallback titles, the
   notification text

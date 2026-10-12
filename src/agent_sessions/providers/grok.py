@@ -422,7 +422,7 @@ class Grok(Provider):
         if not s.files:
             raise NotSupported("this session has no directory to copy")
         source = s.files[0]
-        plan = importer.start_plan(s, self.native_store(), pathmap)
+        plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern)
         sessions = os.path.join(plan.native_root, "sessions")
         try:
             groups = sorted(subdirs(sessions))

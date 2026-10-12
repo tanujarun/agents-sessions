@@ -3,6 +3,7 @@ provider. Nothing here touches a real store."""
 
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -76,6 +77,8 @@ class FakeProvider(Provider):
     app_id = "org.test.fake"
     resumable = True
     dir_names = {".fake"}
+    # This tool's ids are short names (``a``, ``n1``), not UUIDs.
+    id_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
     parsed: list = []  # id hints, in call order; reset by Sandbox
 
     def native_store(self):

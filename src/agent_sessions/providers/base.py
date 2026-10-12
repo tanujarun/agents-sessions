@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 from .. import importer, textsafe
 from ..fsutil import open_ro
-from ..model import Candidate, Session, Store
+from ..model import UUID_PATTERN, Candidate, Session, Store
 
 if TYPE_CHECKING:
     from ..fsutil import StrPath
@@ -70,6 +70,14 @@ class Provider:
     # True when the tool finds a session only from its project directory
     resume_needs_cwd: bool = False
     dir_names: ClassVar[set[str]] = set()  # directory names that may be a store root
+    # The form of the tool's session ids, matched whole. The index lists no
+    # session whose id fails it, ``launch`` resumes none and ``importer``
+    # copies none, so an adapter cannot let another kind of id through.
+    id_pattern: ClassVar[re.Pattern[str]] = UUID_PATTERN
+
+    def valid_id(self, session_id: object) -> bool:
+        """True when ``session_id`` is text in the form ``id_pattern``."""
+        return isinstance(session_id, str) and self.id_pattern.fullmatch(session_id) is not None
 
     def native_store(self) -> Path | None:
         raise NotImplementedError

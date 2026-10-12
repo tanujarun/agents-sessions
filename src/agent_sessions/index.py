@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import discover
+from . import discover, textsafe
 from .discover import Skipped
 from .fsutil import cache_file
 from .model import Candidate, Session, Store
@@ -101,6 +101,34 @@ def _is_conversation(row: object) -> bool:
             isinstance(row[k], t) and not isinstance(row[k], bool) for k, t in _CONVERSATION.items()
         )
         and all(isinstance(f, str) for f in row["files"])
+    )
+
+
+ID_SHOWN = 40  # characters of a refused session id that a warning quotes
+
+
+def _id_refusal(provider: base.Provider, store: Store, hint: str, conversation: dict) -> str | None:
+    """None when the session's id is in the form the provider's ids have,
+    else the warning that says why it is not listed.
+
+    The check is here, not in the adapters, and it is made twice: on what
+    ``parse`` returns and on every cached entry when it is used. An id is
+    text from a file on another drive, and a listed session's id goes into a
+    command line (``launch``) and into file names (``importer``).
+    """
+    if provider.valid_id(conversation["id"]):
+        return None
+    files = conversation["files"]
+    where = files[0] if files else hint  # the candidate's file, below the store
+    if where.startswith(store.root + os.sep):
+        where = where[len(store.root) + 1 :]
+    shown = textsafe.clean(conversation["id"])
+    if len(shown) > ID_SHOWN:
+        shown = shown[:ID_SHOWN] + "…"
+    label = provider.label or provider.name
+    return (
+        f"{store.root}: {where}: session id '{shown}' is not in the form "
+        f"{label} ids have; not listed"
     )
 
 
@@ -413,6 +441,12 @@ class Index:
                     break
                 sig = signature(candidate.paths)
                 cached = reusable.get(hint)
+                if (
+                    cached is not None
+                    and cached["session"] is not None
+                    and _id_refusal(provider, store, hint, cached["session"]) is not None
+                ):
+                    cached = None  # not taken over: parsed again, and refused below
                 if cached is not None and cached["sig"] == sig:
                     entry["candidates"][hint] = cached
                     counts["cached"] += 1
@@ -434,6 +468,11 @@ class Index:
                 warnings = sorted(set(collected.items))
                 if session is not None and conversation is None:
                     warnings.append(f"{store.root}: {hint}: adapter returned an unusable session")
+                if conversation is not None:
+                    refusal = _id_refusal(provider, store, hint, conversation)
+                    if refusal is not None:
+                        warnings.append(refusal)
+                        conversation = None
                 entry["candidates"][hint] = {
                     "sig": sig,
                     "session": conversation,
@@ -484,6 +523,12 @@ class Index:
                 warnings.update(cached[hint]["warnings"])
                 conversation = cached[hint]["session"]
                 if conversation is None:
+                    row["skipped"] += 1
+                    continue
+                # Every listed session passes here, whatever wrote the cache.
+                refusal = _id_refusal(by_name[store.provider], store, hint, conversation)
+                if refusal is not None:
+                    warnings.add(refusal)
                     row["skipped"] += 1
                     continue
                 # Of several copies of one session (a hard-linked mirror, a

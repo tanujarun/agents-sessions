@@ -415,7 +415,7 @@ class Codex(Provider):
         files = [f for f in s.files if _ROLLOUT.match(os.path.basename(f))]
         if not files:
             raise NotSupported("this thread has no rollout file to copy")
-        plan = importer.start_plan(s, self.native_store(), pathmap)
+        plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern)
         native = Store(self.name, plan.native_root, "native")
         for candidate in self.candidates(native):
             if candidate.id_hint == s.id:

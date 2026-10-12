@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, BinaryIO
 from . import __version__
 from .errors import ImportFailed
 from .fsutil import listdir_ro, open_ro, state_dir
-from .model import make_key
+from .model import UUID_PATTERN, make_key
 
 if TYPE_CHECKING:
     from .fsutil import StrPath
@@ -149,6 +149,10 @@ class ImportPlan:
     appends: list[Append] = field(default_factory=list)  # after the units
     existing: list[str] = field(default_factory=list)  # native paths that hold this id
     info: dict = field(default_factory=dict)  # extra provenance fields
+    # The form ``session_id`` must have (``Provider.id_pattern``); ``check``
+    # refuses any other. The default is the strict one, so a plan built
+    # without the provider's own pattern is refused rather than let through.
+    id_pattern: re.Pattern[str] = UUID_PATTERN
 
     @property
     def total_bytes(self) -> int:
@@ -166,10 +170,16 @@ class ImportPlan:
 # --- helpers for adapters ---------------------------------------------------
 
 
-def start_plan(session: Session, native_root: StrPath, pathmap: PathMap) -> ImportPlan:
-    """A plan with everything but the copies filled in. Raises ``ImportFailed``
-    when the session's project folder is not on any mounted drive: an import
-    without it would resume in the wrong place."""
+def start_plan(
+    session: Session,
+    native_root: StrPath,
+    pathmap: PathMap,
+    id_pattern: re.Pattern[str] = UUID_PATTERN,
+) -> ImportPlan:
+    """A plan with everything but the copies filled in; ``id_pattern`` is
+    the provider's. Raises ``ImportFailed`` when the session's project folder
+    is not on any mounted drive: an import without it would resume in the
+    wrong place."""
     local, exists = pathmap.to_local(session.cwd, session.mount) if session.cwd else (None, False)
     if not exists or not local:
         if not session.cwd:
@@ -185,6 +195,7 @@ def start_plan(session: Session, native_root: StrPath, pathmap: PathMap) -> Impo
         native_root=str(native_root),
         cwd=session.cwd,
         cwd_local=local,
+        id_pattern=id_pattern,
     )
 
 
@@ -313,9 +324,16 @@ def read_provenance() -> list[dict]:
 
 
 def check(plan: ImportPlan) -> None:
-    """Everything ``execute`` would refuse, without writing: an id or a
-    destination that already exists (``Exists``), too little free space, an
-    unusable import record."""
+    """Everything ``execute`` would refuse, without writing: a session id
+    that is not in the form its provider's ids have, an id or a destination
+    that already exists (``Exists``), too little free space, an unusable
+    import record."""
+    # The id becomes file and directory names in the native store and, once
+    # the copy is listed, an argument of the tool that resumes it.
+    if not isinstance(plan.session_id, str) or not plan.id_pattern.fullmatch(plan.session_id):
+        raise ImportFailed(
+            "the id of this session is not in the form its tool gives ids; nothing was imported"
+        )
     taken = list(plan.existing) + [dst for dst in plan.destinations if os.path.lexists(dst)]
     if taken:
         raise Exists(taken)
