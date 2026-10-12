@@ -579,7 +579,7 @@ class SessionCommandsTest(unittest.TestCase):
                 1,
                 "",
                 "agent-sessions: the project folder F:\\Proj\\My Site was not found on any "
-                "mounted drive\n",
+                "mounted drive; use --to DIR to import it into a folder you choose\n",
             ),
         )
         self.assertEqual(self.w.started, [])

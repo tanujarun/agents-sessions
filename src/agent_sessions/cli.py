@@ -673,7 +673,21 @@ def _folder_line(plan: dict) -> str:
     return line + ")"
 
 
+# What ``import`` adds to the engine's reason when the session's own folder is
+# not there to import into (``importer.NoFolder``): the way out is this
+# command's flag, which another front end does not have.
+_TO_HINT = "use --to DIR to import it into a folder you choose"
+
+
 def _import(args: argparse.Namespace) -> int:
+    try:
+        return _import_into(args)
+    except api.NoFolder as exc:
+        _err(f"{exc.reason}; {_TO_HINT}")
+        return 1
+
+
+def _import_into(args: argparse.Namespace) -> int:
     # ``~`` is expanded here: the engine takes an absolute path and nothing else.
     target = os.path.expanduser(args.to) if args.to is not None else None
     index = api.load_index()

@@ -36,6 +36,7 @@ from .errors import (
     UndoFailed,
 )
 from .fsutil import cache_file, home, log_file
+from .importer import NoFolder
 from .index import Index
 from .launch import LaunchPlan
 from .model import Session, make_key
@@ -1075,6 +1076,7 @@ __all__ = [
     "LaunchFailed",
     "LaunchPlan",
     "MountFailed",
+    "NoFolder",
     "NotFound",
     "Offline",
     "Turn",
