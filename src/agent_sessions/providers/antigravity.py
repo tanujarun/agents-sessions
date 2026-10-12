@@ -49,8 +49,8 @@ IMPORT_WARNING = (
 # And what is answered when one was not asked for.
 EXPERIMENTAL_ONLY = (
     "importing an Antigravity conversation is experimental and is done only when asked "
-    "for (import --experimental): no imported copy has been resumed by hand yet, and agy "
-    "starts a new conversation without an error when it cannot read one"
+    "for: no imported copy has been resumed by hand yet, and agy starts a new conversation "
+    "without an error when it cannot read one"
 )
 
 _SUMMARIES = "conversation_summaries.db"

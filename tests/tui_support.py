@@ -34,7 +34,7 @@ NOT_MOUNTED = "the drive WINVOL is not mounted"  # the engine's refusal for an o
 NO_RECORD = "no import of this session is recorded; nothing was removed"
 USED_SINCE = (
     "the imported copy was used since the import: /home/user/.claude/x.jsonl was modified. "
-    "Nothing was removed (--force removes it all the same)"
+    "Nothing was removed; a forced undo removes it all the same"
 )
 TOOLS = (("claude", "Claude"), ("codex", "Codex"), ("grok", "Grok"))
 NATIVE_HASH = "aaaaaaaa"

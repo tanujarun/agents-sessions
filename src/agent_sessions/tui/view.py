@@ -806,6 +806,12 @@ def foreign_mode(verdict: Verdict) -> str:
     return "foreign_none"
 
 
+EXPERIMENTAL_LINE = (
+    "experimental import: not yet tried with a real resume; you are asked again first"
+)
+"""The first line of the foreign-row prompt of an experimental import."""
+
+
 def foreign_prompt(where: str, verdict: Verdict, width: int | None = None) -> list[str]:
     """The foreign-row prompt, one or two lines: when the session cannot be
     imported as it is, the reason; then the choices that apply (``On C: [i]
@@ -814,6 +820,10 @@ def foreign_prompt(where: str, verdict: Verdict, width: int | None = None) -> li
     lead = f"On {_lead(drive_of(where))} " if mode == "foreign" else ""
     lines = [_choice_line(mode, lead, width)]
     reason = clean(verdict.reason or "").strip()
+    if verdict.experimental and not verdict.possible:
+        # The engine's reason is a paragraph, and the warning it leads to is
+        # shown whole before anything is copied: here, the short of it.
+        reason = EXPERIMENTAL_LINE
     if reason and not verdict.possible:
         lines.insert(0, reason if width is None else clip(reason, width))
     return lines
@@ -1041,6 +1051,12 @@ def start_prompt(label: str, folder: str, width: int | None = None) -> str:
         "Start? y/n",
     ]
     return fit_first(variants, width)
+
+
+def starting_text(label: str) -> str:
+    """``starting Claude…``: while a continue exports the transcript and
+    starts the tool."""
+    return f"starting {clean(label)}{ELLIPSIS}"
 
 
 def started_text(label: str) -> str:

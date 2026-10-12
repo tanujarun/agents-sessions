@@ -48,7 +48,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from . import __version__, fsutil, importer, journal
-from .errors import UndoFailed
+from .errors import REMEDY_FORCE, UndoFailed
 from .journal import find_record, not_undone
 
 if TYPE_CHECKING:
@@ -60,14 +60,14 @@ DIFFERENCES_SHOWN = 5  # how many differences a refusal names
 
 # Why something is left where it is.
 APPENDED = "a line was added to this file of the tool's; it is left as it is"
-EXTRA = "made by the tool after the import; removed only with --force"
+EXTRA = "made by the tool after the import; removed only by a forced undo"
 NOT_EMPTY = "not empty: it holds something this import did not create"
 NOT_NAMED = "not named after the session; a record without a manifest cannot say more"
 
 NO_RECORD = "no import of this session is recorded; nothing was removed"
 LEGACY = (
     "this import was recorded before imports listed what they created, so what was "
-    "added since cannot be told; it can only be undone with --force. Nothing was removed"
+    "added since cannot be told; it can only be undone by force. Nothing was removed"
 )
 
 
@@ -255,7 +255,7 @@ def plan(
     going: dict[str, int] = {}  # what is removed: path -> size
     if "manifest" not in record:
         if not force:
-            raise UndoFailed(LEGACY)
+            raise UndoFailed(LEGACY, remedy=REMEDY_FORCE)
         dirs = _legacy(record, root, session_id, going, made.left)
     else:
         items, dirs = _manifest(record, root)
@@ -267,8 +267,9 @@ def plan(
                 "the imported copy was used since the import: "
                 + shown
                 + (f"; and {more} more" if more > 0 else "")
-                + ". Nothing was removed (--force removes it all the same)",
+                + ". Nothing was removed; a forced undo removes it all the same",
                 differences=made.differences,
+                remedy=REMEDY_FORCE,
             )
         for item in items:
             _removable(item["path"], going, made.left)
@@ -408,7 +409,8 @@ def undo(
                     raise UndoFailed(
                         f"{len(removed)} files and directories of the imported copy were "
                         f"removed, but the journal could not take the record of it "
-                        f"({exc.strerror or exc}); `unimport --force` records it once it can"
+                        f"({exc.strerror or exc}); a forced undo records it once it can",
+                        remedy=REMEDY_FORCE,
                     ) from exc
             finally:
                 os.close(fd)

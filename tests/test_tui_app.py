@@ -2340,7 +2340,7 @@ class ImportOptionsTest(TuiCase):
             await settle(pilot)
             await self.ask(pilot, "enter", "foreign_experimental", AGY)
             self.assertEqual(
-                self.prompt().splitlines(), [EXPERIMENTAL.reason, EXPERIMENTAL_CHOICES]
+                self.prompt().splitlines(), [view.EXPERIMENTAL_LINE, EXPERIMENTAL_CHOICES]
             )
             await pilot.press("t", "y", "enter")  # not offered: nothing
             self.assertEqual(self.main.mode, "foreign_experimental")
@@ -3096,6 +3096,82 @@ class ContinueTest(TuiCase):
             await pilot.press("y")
             await self.message("started Claude in a new window")
             self.assertEqual(len(self.continued()), 2)
+
+    async def test_the_status_line_says_starting_until_the_engine_answers(self):
+        """The engine exports the transcript before it starts the tool: for
+        that time the status line shows that something is under way."""
+        gate = threading.Event()
+        real = self.engine.continue_session
+
+        def slow(ref, tool=None, folder=None, index=None):
+            gate.wait(5)
+            return real(ref, tool=tool, folder=folder, index=index)
+
+        self.engine.continue_session = slow
+        starting = f"starting Claude{view.ELLIPSIS}"
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.to(pilot, "start")
+            summary = self.main.query_one("#status-summary")
+            self.assertNotIn("starting", self.status())
+            self.assertFalse(summary.has_class("-busy"))
+            await pilot.press("y")
+            await self.message(starting)
+            self.assertTrue(summary.has_class("-busy"))
+            self.assertEqual(self.continued(), [])  # the engine has not answered
+            await pilot.press("j")  # the list stays usable, and the text stays
+            await pilot.pause()
+            self.assertIn(starting, self.status())
+            gate.set()
+            await self.message("started Claude in a new window")
+            self.assertNotIn("starting", self.status())
+            self.assertFalse(summary.has_class("-busy"))
+            self.assertEqual(self.continued(), [(NATIVE, "claude", self.tmp)])
+
+    async def test_starting_goes_when_the_engine_refuses(self):
+        gate = threading.Event()
+
+        def refuse(ref, tool=None, folder=None, index=None):
+            gate.wait(5)
+            raise FakeError("codex is not installed")
+
+        self.engine.continue_session = refuse
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.to(pilot, "start")
+            await pilot.press("y")
+            await self.message(f"starting Claude{view.ELLIPSIS}")
+            gate.set()
+            await self.message("codex is not installed")
+            self.assertNotIn("starting", self.status())
+            self.assertFalse(self.main.query_one("#status-summary").has_class("-busy"))
+
+    async def test_a_scan_that_runs_meanwhile_keeps_its_own_progress(self):
+        """The text of a continue is shown only while no other job has one,
+        and ending the continue does not wipe that job's."""
+        gate = threading.Event()
+        real = self.engine.continue_session
+
+        def slow(ref, tool=None, folder=None, index=None):
+            gate.wait(5)
+            return real(ref, tool=tool, folder=folder, index=index)
+
+        self.engine.continue_session = slow
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.to(pilot, "start")
+            await pilot.press("y")
+            await self.message(f"starting Claude{view.ELLIPSIS}")
+            self.main._set_activity("scanning Zephyro")  # as a scan's progress does
+            await pilot.pause()
+            self.assertIn("scanning Zephyro", self.status())
+            self.assertNotIn("starting", self.status())
+            gate.set()
+            await self.message("started Claude in a new window")
+            self.assertIn("scanning Zephyro", self.status())
+            self.main._set_activity("")
+            await pilot.pause()
+            self.assertNotIn("scanning", self.status())
 
     async def test_a_second_start_while_the_first_is_under_way_is_ignored(self):
         gate = threading.Event()

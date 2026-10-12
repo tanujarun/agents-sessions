@@ -42,7 +42,7 @@ class SmokeTest(unittest.TestCase):
             "providers.base",
         ):
             importlib.import_module(f"agent_sessions.{name}")
-        self.assertEqual(agent_sessions.__version__, "0.1.0")
+        self.assertEqual(agent_sessions.__version__, "0.2.0")
 
     def test_registry_holds_the_five_adapters(self):
         self.assertEqual(
@@ -97,10 +97,7 @@ class SmokeTest(unittest.TestCase):
     def test_version(self):
         code, out, _ = run(["--version"])
         self.assertEqual(code, 0)
-        self.assertIn("0.1.0", out)
-
-    def test_stub_returns_one(self):
-        self.assertEqual(run(["tui"]), (1, "", "agent-sessions: tui: not implemented\n"))
+        self.assertEqual(out, "agent-sessions 0.2.0\n")
 
     def test_unknown_key_returns_one(self):
         """With an empty index (a temp home, no mounts) no key matches."""

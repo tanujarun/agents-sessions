@@ -141,7 +141,7 @@ files, terminal fallback.
 
 SPEC "TUI additions".
 
-## 18. Packaging and docs — Medium — after: 17 — [ ]
+## 18. Packaging and docs — Medium — after: 17 — [x]
 
 SPEC "Packaging": entry point starts the TUI, `uninstall.sh`, README, CHANGELOG,
 `docs/JSON.md`, `docs/SECURITY.md`, help texts, version 0.2.0.

@@ -273,7 +273,7 @@ class WriteTest(unittest.TestCase):
         before = self.file.stat()
         self.assertEqual(
             self.refused(self.file),
-            f"{self.file} exists; nothing was written (--force replaces it)",
+            f"{self.file} exists; nothing was written",
         )
         self.assertEqual(self.file.read_text(encoding="utf-8"), "mine")
         self.assertEqual(self.file.stat().st_mtime_ns, before.st_mtime_ns)

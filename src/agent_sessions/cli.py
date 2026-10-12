@@ -8,11 +8,12 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import sys
 from collections.abc import Iterable, Iterator, Sequence
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, TextIO
+from typing import TYPE_CHECKING, Any, TextIO
 
 from . import __version__, api, logs, textsafe
 from .mounts import MountsError
@@ -26,28 +27,168 @@ if TYPE_CHECKING:
 PROG = "agent-sessions"
 
 
+HELP_WIDTH = 78  # every help text fits a terminal of 80 columns
+
+# The commands as the top-level help groups them, each with its one-line
+# summary. ``build_parser`` takes the summaries from here, and a test holds
+# the table to the parser (every command in exactly one group).
+GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    (
+        "browse",
+        (
+            ("tui", "open the full-screen browser"),
+            ("list", "list the sessions, newest first"),
+            ("show", "print a session's details and its transcript"),
+            ("status", "drives, stores, counts per provider, tools, warnings"),
+        ),
+    ),
+    (
+        "act on a session",
+        (
+            ("open", "resume a session in a new terminal window"),
+            ("import", "copy a session of another drive into this system's store"),
+            ("unimport", "remove the copy an import made"),
+            ("continue", "start a new session that carries an old one on"),
+            ("export", "write a transcript as Markdown or JSON lines"),
+        ),
+    ),
+    (
+        "drives",
+        (
+            ("mount", "mount a remembered drive, then scan it"),
+            ("forget", "drop a drive that is not mounted from the index"),
+            ("map", "print the drive letters, or set one by hand"),
+        ),
+    ),
+    (
+        "maintenance",
+        (
+            ("scan", "refresh the index"),
+            ("verify", "compare the index with a walk of every drive"),
+        ),
+    ),
+)
+
+_DESCRIPTION = (
+    "Find, list and resume saved AI coding-agent sessions (Claude Code, Codex, Grok, "
+    "Antigravity, Gemini CLI) on this machine and on every mounted drive. With no command "
+    "on a terminal, the full-screen browser starts."
+)
+
+_KEY_NOTE = (
+    f"A session is named by its key (`{PROG} list --keys`), by a unique start\n"
+    "of its key, or by its id."
+)
+
+
+class _HelpFormatter(argparse.HelpFormatter):
+    """Help at a fixed width, narrower only when the terminal is. Text with
+    line breaks of its own (the command groups, the examples) is kept as it
+    is written; everything else is wrapped."""
+
+    def __init__(self, prog: str, **kwargs: Any) -> None:
+        # Whatever else argparse passes (it differs between Python versions)
+        # goes through; the width is ours.
+        columns = shutil.get_terminal_size().columns
+        kwargs["width"] = max(min(HELP_WIDTH, columns - 2), 40)
+        super().__init__(prog, **kwargs)
+
+    def _fill_text(self, text: str, width: int, indent: str) -> str:
+        if "\n" not in text:
+            return super()._fill_text(text, width, indent)
+        return "\n".join(indent + line for line in text.splitlines())
+
+
+def _groups_text() -> str:
+    """The grouped command list of the top-level help."""
+    width = max(len(name) for _title, commands in GROUPS for name, _summary in commands)
+    lines = []
+    for title, commands in GROUPS:
+        lines.append(f"{title}:")
+        lines += [f"  {name.ljust(width)}  {summary}" for name, summary in commands]
+        lines.append("")
+    lines.append(f"`{PROG} <command> --help` shows a command's options and examples.")
+    lines.append(_KEY_NOTE)
+    return "\n".join(lines)
+
+
+def _examples(*lines: str) -> str:
+    """An epilog: command lines as they are typed, each with what it does
+    on the lines below it."""
+    return "examples:\n" + "\n".join(f"  {line}" for line in lines)
+
+
+def subcommands(parser: argparse.ArgumentParser | None = None) -> list[str]:
+    """The names of the parser's subcommands, sorted."""
+    parser = parser if parser is not None else build_parser()
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return sorted(action.choices)
+    return []
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG,
-        description="Find, list and resume saved AI coding-agent sessions.",
+        usage=f"{PROG} [-h] [--version] [--debug] [<command> ...]",
+        description=_DESCRIPTION,
+        epilog=_groups_text(),
+        formatter_class=_HelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
     parser.add_argument(
         "--debug", action="store_true", help="log more, and to stderr as well as to the log file"
     )
-    sub = parser.add_subparsers(dest="command", metavar="<command>")
+    # The commands are listed by ``_groups_text``, not by argparse.
+    sub = parser.add_subparsers(
+        dest="command", metavar="<command>", prog=PROG, help=argparse.SUPPRESS
+    )
+    summaries = {name: summary for _title, commands in GROUPS for name, summary in commands}
 
-    sub.add_parser("tui", help="open the TUI")
+    def command(
+        name: str, description: str, examples: str | None = None
+    ) -> argparse.ArgumentParser:
+        return sub.add_parser(
+            name,
+            help=summaries[name],
+            description=description,
+            epilog=examples,
+            formatter_class=_HelpFormatter,
+        )
 
-    p = sub.add_parser("scan", help="refresh index; print summary")
+    command(
+        "tui",
+        "Open the full-screen browser: the sessions of every provider in one list, with keys "
+        "to resume, import, continue, view and mount. Press ? in it for the keys. This is "
+        f"also what `{PROG}` with no command does on a terminal. It needs Textual.",
+    )
+
+    p = command(
+        "scan",
+        "Refresh the index: look at the known stores again and read the sessions that "
+        "changed. A full walk of every drive (--deep) is made by itself when the set of "
+        "mounted drives changed or the last one is older than a day.",
+    )
     p.add_argument("--deep", action="store_true", help="walk every mount completely")
     p.add_argument("--json", action="store_true", help="JSON output")
 
-    p = sub.add_parser("list", help="sessions, newest first")
+    p = command(
+        "list",
+        "List the sessions from the index, newest first: age, where the session is (Linux, "
+        "a drive letter or a drive's label), provider, title and project folder. Sessions of "
+        "a drive that is not mounted are listed as offline.",
+        _examples(
+            f"{PROG} list",
+            f"{PROG} list --provider claude --keys",
+            "    the key of each session as a last column, for the other commands",
+            f"{PROG} list --json",
+            "    every field of every session (docs/JSON.md)",
+        ),
+    )
     p.add_argument(
         "--provider",
         metavar="P",
-        help="only this provider",
+        help="only this provider: " + ", ".join(provider.name for provider in all_providers()),
         choices=[provider.name for provider in all_providers()],
     )
     p.add_argument("--json", action="store_true", help="JSON output")
@@ -59,14 +200,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     key_help = "a session key (`list --keys`), a unique start of one, or a session id"
-    p = sub.add_parser("open", help="native: resume. foreign: import first")
+    p = command(
+        "open",
+        "Resume a session of this system's own store with its tool, in a new terminal "
+        "window, in the session's folder. A session of another drive is not resumed where "
+        "it is: import it first, or continue it as a new session. The tool is started only "
+        "when it is installed.",
+        _examples(
+            f"{PROG} open claude:1a2b3c4d --dry-run",
+            "    print the folder and the command, start nothing",
+            f"{PROG} open claude:1a2b3c4d",
+            f"{PROG} open claude:1a2b3c4d --here",
+            "    in this terminal: the tool takes the place of this command",
+        ),
+    )
     p.add_argument("key", help=key_help)
     p.add_argument("--dry-run", action="store_true", help="print the command, do not run it")
     p.add_argument(
         "--here", action="store_true", help="resume in this terminal instead of a new window"
     )
 
-    p = sub.add_parser("import", help="import; optionally resume after")
+    p = command(
+        "import",
+        "Copy a session from a store on another drive into this system's own store, so that "
+        "its tool can resume it here. The source is never changed, nothing that exists is "
+        "overwritten, and the copy is recorded so that `unimport` can take it back. Prints "
+        "the key of the copy.",
+        _examples(
+            f"{PROG} import claude:1a2b3c4d --dry-run",
+            "    what would be copied and rewritten; nothing is written",
+            f"{PROG} import claude:1a2b3c4d --open",
+            "    import, then resume the copy in a new window",
+            f"{PROG} import codex:5e6f7a8b --to ~/Work/site",
+            "    for a session whose own folder is gone or was not recorded",
+            f"{PROG} import antigravity:9c0d1e2f --experimental",
+            "    an import that no real resume has confirmed yet",
+        ),
+    )
     p.add_argument("key", help=key_help)
     p.add_argument(
         "--to",
@@ -91,14 +261,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="print what would be copied and rewritten, write nothing",
     )
 
-    p = sub.add_parser(
+    p = command(
         "unimport",
-        help="remove the copy an import made",
-        description=(
-            "Take an import back: remove from the native store what the last import of the "
-            "session created, and nothing else. Refused when the copy was used since. "
-            "Directories are removed only when they are empty, and a line the import added "
-            "to a file of the tool's is left; both are reported."
+        "Take an import back: remove from this system's store what the last import of the "
+        "session created, and nothing else. Refused when the copy was used since. "
+        "Directories are removed only when they are empty, and a line the import added "
+        "to a file of the tool's is left; both are reported.",
+        _examples(
+            f"{PROG} unimport claude:1a2b3c4d --dry-run",
+            "    what would be removed and what would be left; nothing is removed",
+            f"{PROG} unimport claude:1a2b3c4d",
+            "    asks before it removes anything",
+            f"{PROG} unimport claude:1a2b3c4d --force --yes",
+            "    also when the copy was used since: its new turns are lost",
         ),
     )
     p.add_argument("key", help=key_help + ": the imported copy, or what it was imported from")
@@ -115,16 +290,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--yes", action="store_true", help="do not ask")
 
-    p = sub.add_parser("show", help="plain-text transcript to stdout")
+    p = command(
+        "show",
+        "Print what is known about a session (title, provider, where it is, folder, dates, "
+        "message count, key), then its transcript as plain text: the user's and the "
+        "assistant's turns, and one line per tool call.",
+    )
     p.add_argument("key", help=key_help)
 
-    p = sub.add_parser(
+    p = command(
         "export",
-        help="the transcript as Markdown or JSON lines",
-        description=(
-            "Print the transcript of a session as a document: Markdown (a header, then a "
-            "section per turn and a line per tool call) or JSON lines (one object per turn: "
-            "role, text, ts). With -o it is written to a file that only you can read."
+        "Print the transcript of a session as a document: Markdown (a header, then a "
+        "section per turn and a line per tool call) or JSON lines (one object per turn: "
+        "role, text, ts). With -o it is written to a file that only you can read.",
+        _examples(
+            f"{PROG} export claude:1a2b3c4d | less",
+            f"{PROG} export claude:1a2b3c4d -o ~/notes/session.md",
+            "    refused when the file exists, unless --force is given",
+            f"{PROG} export claude:1a2b3c4d --format json",
+            "    one JSON object per turn (docs/JSON.md)",
         ),
     )
     p.add_argument("key", help=key_help)
@@ -142,14 +326,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--force", action="store_true", help="with -o: replace a file that exists")
 
-    p = sub.add_parser(
+    p = command(
         "continue",
-        help="carry a session on as a new session, in its own tool or another",
-        description=(
-            "Start a tool as a NEW session that continues an old one: for a session that "
-            "cannot be resumed where it is wanted. The transcript is exported to a file in "
-            "the state directory, and the tool is started with a fixed first message that "
-            "names that file. The tool sends that message to its model as soon as it starts."
+        "Start a tool as a NEW session that continues an old one: for a session that "
+        "cannot be resumed where it is wanted. The transcript is exported to a file in "
+        "the state directory, and the tool is started with a fixed first message that "
+        "names that file. The tool sends that message to its model as soon as it starts.",
+        _examples(
+            f"{PROG} continue gemini:1a2b3c4d --with claude --dry-run",
+            "    the folder, the command and the transcript file; starts nothing",
+            f"{PROG} continue codex:5e6f7a8b --in ~/Work/site",
+            "    for a session whose own folder is gone",
+            f"{PROG} continue claude:9c0d1e2f --with codex --here",
+            "    in this terminal instead of a new window",
         ),
     )
     p.add_argument("key", help=key_help)
@@ -185,39 +374,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="start the tool in this terminal instead of a new window",
     )
 
-    p = sub.add_parser("status", help="mounts, stores, counts per provider, warnings")
+    p = command(
+        "status",
+        "Print what the index knows: where the index and the log are, the drives and "
+        "whether each is mounted, the stores and how many sessions each lists, the "
+        "providers and whether their tools are installed, the drive letters, and the "
+        "warnings of the last scan.",
+    )
     p.add_argument("--json", action="store_true", help="JSON output")
 
-    sub.add_parser("verify", help="compare index against a brute-force walk")
+    command(
+        "verify",
+        "Walk every mounted drive without the index, count the sessions on disk and "
+        "compare them with what the index lists. Exit status 1 when they differ. Sessions "
+        "of drives that are not mounted are left out.",
+    )
 
     drive_help = "a remembered drive: its label, drive letter (C:), mount path or volume id"
-    p = sub.add_parser(
+    p = command(
         "mount",
-        help="mount a remembered drive, then scan",
-        description=(
-            "Mount a drive whose sessions are listed as offline, then scan it. The mount is "
-            "`udisksctl mount`; when it needs a password, the desktop asks for it."
+        "Mount a drive whose sessions are listed as offline, then scan it. The mount is "
+        "`udisksctl mount`; when it needs a password, the desktop asks for it.",
+        _examples(
+            f"{PROG} status",
+            "    the remembered drives, with their letters and volume ids",
+            f"{PROG} mount C:",
+            f"{PROG} mount Zephyro",
         ),
     )
     p.add_argument("drive", help=drive_help)
 
-    p = sub.add_parser(
+    p = command(
         "forget",
-        help="drop a drive that is not mounted from the index",
-        description=(
-            "Drop a remembered drive that is not mounted, and with it its sessions, from the "
-            "index. Nothing on the drive is touched; a scan finds it again once it is mounted."
-        ),
+        "Drop a remembered drive that is not mounted, and with it its sessions, from the "
+        "index. Nothing on the drive is touched; a scan finds it again once it is mounted.",
     )
     p.add_argument("drive", help=drive_help)
     p.add_argument("--yes", action="store_true", help="do not ask")
 
-    p = sub.add_parser(
+    p = command(
         "map",
-        help="drive letters: print them, or set one by hand",
-        description=(
-            "With no argument, print the drive letters and what each stands for. "
-            "`map D: DIR` says by hand that D: is DIR; `map --remove D:` takes that back."
+        "With no argument, print the drive letters and what each stands for. "
+        "`map D: DIR` says by hand that D: is DIR; `map --remove D:` takes that back.",
+        _examples(
+            f"{PROG} map",
+            f"{PROG} map D: '/run/media/me/Data'",
+            "    written to ~/.config/agent-sessions/pathmap.json",
+            f"{PROG} map --remove D:",
         ),
     )
     p.add_argument("letter", nargs="?", metavar="LETTER:", help="a drive letter, like D:")
@@ -752,6 +955,23 @@ def _folder_line(plan: dict) -> str:
 # command's flag, which another front end does not have.
 _TO_HINT = "use --to DIR to import it into a folder you choose"
 
+# The same for every other refusal that asking in another way gets past
+# (``ApiError.remedy``): the engine's reason names no flag, since the TUI
+# shows it too; what this command line calls the way out is added here.
+_REMEDIES = {
+    api.REMEDY_KEYS: "; `list --keys` shows the keys",
+    api.REMEDY_FOLDER: " (--in DIR)",
+    api.REMEDY_FORCE: " (--force)",
+    api.REMEDY_OVERWRITE: " (--force replaces it)",
+    api.REMEDY_EXPERIMENTAL: "; --experimental imports it all the same",
+}
+
+
+def _reason(exc: api.ApiError) -> str:
+    """An engine refusal as this command line words it: the reason, and the
+    flag that gets past it when there is one."""
+    return exc.reason + _REMEDIES.get(exc.remedy, "")
+
 
 def _import(args: argparse.Namespace) -> int:
     try:
@@ -839,7 +1059,8 @@ def _print_undo(report: api.UnimportReport) -> None:
     for path in report.removed:
         _out(f"{removed} {path}")
     for path, why in report.left:
-        _out(f"{left} {path} ({why})")
+        flag = ": --force" if why == api.LEFT_FOR_A_FORCED_UNDO else ""
+        _out(f"{left} {path} ({why}{flag})")
 
 
 def _unimport(args: argparse.Namespace) -> int:
@@ -960,6 +1181,27 @@ def _continue(args: argparse.Namespace) -> int:
     return 0
 
 
+def _tui(args: argparse.Namespace | None = None) -> int:
+    """Start the TUI and return its exit status (1, with one line that says
+    how to get Textual, when that is missing).
+
+    The one place outside ``tui/`` that imports it, and only when the TUI is
+    what was asked for: every other command runs without Textual installed.
+    """
+    from . import tui
+
+    return tui.run()
+
+
+def _on_a_terminal() -> bool:
+    """Whether a person is at both ends: the TUI needs to read keys and to
+    draw."""
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):  # a stream that was closed or replaced
+        return False
+
+
 def _not_implemented(args: argparse.Namespace) -> int:
     _err(f"{args.command}: not implemented")
     return 1
@@ -976,6 +1218,7 @@ def _quiet_stdout() -> None:
 
 
 _COMMANDS = {
+    "tui": _tui,
     "scan": _scan,
     "list": _list,
     "status": _status,
@@ -1054,22 +1297,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         parser = build_parser()
         args = parser.parse_args(argv)
-        if args.command is None:
-            parser.print_help()
-            return 2
-        command = args.command
         if args.debug:
             logs.debug()
             debugging = True
+        if args.command is None and not _on_a_terminal():
+            parser.print_help()
+            return 2
+        command = args.command or "tui"  # no command on a terminal: the TUI
+        if command == "tui":
+            # Not inside ``_signals``: the app has the terminal, and what a
+            # signal does to it stays what it is under the launcher script.
+            return _tui(args)
         with _signals():
-            code = _COMMANDS.get(args.command, _not_implemented)(args)
+            code = _COMMANDS.get(command, _not_implemented)(args)
             sys.stdout.flush()
         return code
     except BrokenPipeError:
         _quiet_stdout()  # the reader (head, less) went away: not an error
         return 0
     except api.ApiError as exc:
-        _err(exc.reason)
+        _err(_reason(exc))
         return 1
     except MountsError as exc:
         _err(exc)

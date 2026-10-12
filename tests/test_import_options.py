@@ -145,7 +145,7 @@ class AnswersTest(OptionsCase):
             self.assertEqual(api.can_import(source, experimental=True), (True, ""))
         self.assertIn("has been resumed by hand", EXPERIMENTAL.warning)
         self.assertIn("starts a new conversation without an error", EXPERIMENTAL.warning)
-        self.assertIn("--experimental", EXPERIMENTAL.reason)
+        self.assertIn("is done only when asked for", EXPERIMENTAL.reason)
 
     def test_an_antigravity_conversation_that_the_flag_would_not_help(self):
         source = self.source(AGY_WIN)
@@ -175,7 +175,7 @@ class AnswersTest(OptionsCase):
         options = self.options("claude:nope")
         self.assertEqual(
             options,
-            ImportOptions(False, "no session matches 'claude:nope'; `list --keys` shows the keys"),
+            ImportOptions(False, "no session matches 'claude:nope'"),
         )
         self.assertEqual(self.options("").reason, "no session key given")
         self.assertIn("matches", self.options("claude:").reason)
@@ -406,7 +406,14 @@ class WarningOnTheCommandLineTest(OptionsCase):
         self.assertEqual((code, err), (0, ""))
         # Without the flag there is the refusal, not the warning.
         code, out, err = run("import", AGY_WIN, "--dry-run")
-        self.assertEqual((code, err), (1, f"agent-sessions: {agy_mod.EXPERIMENTAL_ONLY}\n"))
+        self.assertEqual(
+            (code, err),
+            (
+                1,
+                f"agent-sessions: {agy_mod.EXPERIMENTAL_ONLY}; "
+                "--experimental imports it all the same\n",
+            ),
+        )
         # A key that names nothing: the usual answer, once.
         code, out, err = run("import", "nope", "--experimental")
         self.assertEqual(code, 1)
