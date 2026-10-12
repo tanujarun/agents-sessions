@@ -11,3 +11,4 @@ scratch/
 .coverage
 .coverage.*
 htmlcov/
+.claude/
