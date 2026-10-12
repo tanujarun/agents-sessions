@@ -27,6 +27,12 @@ REPO = Path(__file__).resolve().parent.parent
 _SRC = str(REPO / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
+if str(REPO / "tests") not in sys.path:
+    sys.path.insert(0, str(REPO / "tests"))
+
+# Imported for what it does when it is loaded: AGENT_SESSIONS_STATE points at
+# a temp directory from then on, so nothing here can write the user's own log.
+import support  # noqa: E402, F401
 
 import agent_sessions  # noqa: E402
 from agent_sessions import api, cli, errors, unimport  # noqa: E402

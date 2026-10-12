@@ -22,8 +22,15 @@ REPO = Path(__file__).resolve().parent.parent
 _SRC = str(REPO / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
+if str(REPO / "tests") not in sys.path:
+    sys.path.insert(0, str(REPO / "tests"))
 
-from agent_sessions import cli, tui  # noqa: E402
+# Imported for what it does when it is loaded: it points AGENT_SESSIONS_STATE
+# at a temp directory. A command that fails here writes to the log, and that
+# must never be the user's own, also when this module is run by itself.
+import support  # noqa: E402, F401
+
+from agent_sessions import cli, fsutil, tui  # noqa: E402
 
 
 def run(*argv):
@@ -85,10 +92,15 @@ class StartsTheTuiTest(unittest.TestCase):
         self.started.assert_not_called()
 
     def test_what_the_app_raises_is_an_internal_error_not_a_traceback(self):
+        # It is logged: into the temp state directory, never the user's.
+        state = fsutil.state_dir()
+        self.assertEqual(os.environ.get("AGENT_SESSIONS_STATE"), str(state))
+        self.assertNotEqual(state, Path.home() / ".local" / "state" / "agent-sessions")
         self.started.side_effect = RuntimeError("boom")
         code, out, err = run("tui")
         self.assertEqual((code, out), (1, ""))
         self.assertIn("agent-sessions: internal error: RuntimeError: boom", err)
+        self.assertIn(f"(details in {state}", err)
 
 
 class CheckoutTest(unittest.TestCase):
