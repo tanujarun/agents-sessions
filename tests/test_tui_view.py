@@ -2,6 +2,7 @@
 the system Python: nothing here needs Textual."""
 
 import os
+import re
 import subprocess
 import sys
 import unittest
@@ -804,7 +805,7 @@ class PromptAndKeyTest(unittest.TestCase):
         self.assertEqual(
             view.foreign_prompt("C:", EXPERIMENTAL),
             [
-                "experimental, only when asked for",
+                "experimental import: not yet tried with a real resume; you are asked again first",
                 "[i] import and resume (experimental)  [I] import only (experimental)  "
                 "[c] continue as new  [v] view  [Esc] cancel",
             ],
@@ -1052,6 +1053,8 @@ class PromptAndKeyTest(unittest.TestCase):
             if width >= 41:  # the model call is said as long as there is room at all
                 self.assertIn("first message", view.start_prompt("Codex", folder, width))
         self.assertEqual(view.started_text("Codex"), "started Codex in a new window")
+        self.assertEqual(view.starting_text("Codex"), "starting Codex…")
+        self.assertEqual(view.starting_text("Co\x1b[2Jdex"), "starting Co [2Jdex…")
         self.assertEqual(view.clip_left("abcdef", 4), "…def")
         self.assertEqual(view.clip_left("abcdef", 6), "abcdef")
         self.assertEqual(view.clip_left("abcdef", 0), "")
@@ -1759,7 +1762,13 @@ class EntryTest(unittest.TestCase):
         self.assertEqual(result.stdout.strip().splitlines()[-1], "[]", result.stderr)
 
     def test_no_engine_module_imports_the_tui(self):
+        """One import of ``tui`` from outside it is allowed: the one inside
+        ``cli._tui``, the function that starts the TUI (SPEC "Packaging").
+        Nothing imports Textual."""
+        import ast
+
         package = REPO / "src" / "agent_sessions"
+        found = []
         for path in sorted(package.rglob("*.py")):
             if "tui" in path.relative_to(package).parts:
                 continue
@@ -1767,7 +1776,18 @@ class EntryTest(unittest.TestCase):
                 stripped = line.strip()
                 if stripped.startswith(("import ", "from ")):
                     self.assertNotIn("textual", stripped, path)
-                    self.assertNotRegex(stripped, r"\btui\b", path)
+                    if re.search(r"\btui\b", stripped):
+                        found.append((path.name, stripped))
+        self.assertEqual(found, [("cli.py", "from . import tui")])
+        tree = ast.parse((package / "cli.py").read_text(encoding="utf-8"))
+        inside = [
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            for child in ast.walk(node)
+            if isinstance(child, ast.ImportFrom) and [a.name for a in child.names] == ["tui"]
+        ]
+        self.assertEqual(inside, ["_tui"])  # in that one function, not at module level
 
     def test_no_colour_or_spacing_in_python(self):
         tui = REPO / "src" / "agent_sessions" / "tui"

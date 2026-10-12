@@ -588,7 +588,7 @@ class SessionCommandsTest(unittest.TestCase):
 
     def test_import_refusals_exit_one_with_the_reason(self):
         for ref, needle in (
-            (AGY_WIN, "is experimental and is done only when asked for (import --experimental)"),
+            (AGY_WIN, "when it cannot read one; --experimental imports it all the same\n"),
             (GEMINI_WIN, "Gemini CLI is not installed on this machine"),
             (CLAUDE_NATIVE, "this session is already on Linux"),
         ):

@@ -9,12 +9,25 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
 
-class ApiError(Exception):
-    """``reason`` is plain words, shown to the user as it is."""
+# What would get past a refusal (``ApiError.remedy``). The reason itself never
+# names a command-line flag, a key or a button: it says what is the case, and
+# each front end turns the word into its own hint (``cli._REMEDIES``).
+REMEDY_KEYS = "keys"  # no session matches: a listing of the keys helps
+REMEDY_FOLDER = "folder"  # a folder has to be chosen
+REMEDY_FORCE = "force"  # a forced undo does it
+REMEDY_OVERWRITE = "overwrite"  # the file is replaced when that is asked for
+REMEDY_EXPERIMENTAL = "experimental"  # done only as an experimental import
 
-    def __init__(self, reason: str):
+
+class ApiError(Exception):
+    """``reason`` is plain words, shown to the user as it is. It names no
+    flag of the command line: ``remedy`` is one of the ``REMEDY_`` words when
+    asking in another way would get past the refusal, else ""."""
+
+    def __init__(self, reason: str, *, remedy: str = ""):
         super().__init__(reason)
         self.reason = reason
+        self.remedy = remedy
 
 
 class NotFound(ApiError):
@@ -40,9 +53,14 @@ class UndoFailed(ApiError):
     refusal has neither."""
 
     def __init__(
-        self, reason: str, *, no_record: bool = False, differences: Iterable[str] = ()
+        self,
+        reason: str,
+        *,
+        no_record: bool = False,
+        differences: Iterable[str] = (),
+        remedy: str = "",
     ) -> None:
-        super().__init__(reason)
+        super().__init__(reason, remedy=remedy)
         self.no_record = no_record
         self.differences = list(differences)
 
@@ -61,6 +79,11 @@ class MountFailed(ApiError):
 
 
 __all__ = [
+    "REMEDY_EXPERIMENTAL",
+    "REMEDY_FOLDER",
+    "REMEDY_FORCE",
+    "REMEDY_KEYS",
+    "REMEDY_OVERWRITE",
     "ApiError",
     "ExportFailed",
     "ImportFailed",

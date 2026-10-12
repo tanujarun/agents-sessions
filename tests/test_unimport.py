@@ -480,7 +480,7 @@ class UsedSinceTest(UndoCase):
             reason,
             "the imported copy was used since the import: "
             f"{self.transcript} was {size:,} bytes and is {size + 16:,}. "
-            "Nothing was removed (--force removes it all the same)",
+            "Nothing was removed; a forced undo removes it all the same",
         )
         self.assertEqual(len(self.records()), 1)
         self.assertIn(f"unimport claude {CLAUDE_WIN} refused: the imported copy", self.log())
@@ -970,7 +970,7 @@ class LegacyRecordTest(UndoCase):
 
     def test_it_is_undone_only_when_forced(self):
         self.assertEqual(self.refused(CLAUDE_WIN), unimport.LEGACY)
-        self.assertIn("--force", unimport.LEGACY)
+        self.assertIn("can only be undone by force", unimport.LEGACY)
         extra = self.target / CLAUDE_WIN / "added later.txt"
         extra.write_text("by the tool", encoding="utf-8")
         planned = api.unimport(CLAUDE_WIN, force=True, dry_run=True)
@@ -1095,7 +1095,7 @@ class ExtrasTest(UndoCase):
         self.assertEqual(
             files_below(self.dst), sorted(os.path.relpath(p, self.dst) for p in self.extras)
         )
-        self.assertIn("--force", unimport.EXTRA)
+        self.assertIn("removed only by a forced undo", unimport.EXTRA)
 
     def test_with_force_they_go_too(self):
         planned = api.unimport(AGY_WIN, force=True, dry_run=True)
@@ -1238,7 +1238,7 @@ class LockAndRecordTest(UndoCase):
                     + imported["manifest"]["dirs"]
                 ),
                 "left": [],
-                "agent_sessions_version": "0.1.0",
+                "agent_sessions_version": "0.2.0",
             },
         )
         # In the report: the files, then the directories from the deepest up.

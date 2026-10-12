@@ -29,6 +29,11 @@ from . import mounts as mounts_mod
 from . import providers as registry
 from . import unimport as undoing
 from .errors import (
+    REMEDY_EXPERIMENTAL,
+    REMEDY_FOLDER,
+    REMEDY_FORCE,
+    REMEDY_KEYS,
+    REMEDY_OVERWRITE,
     ApiError,
     ExportFailed,
     ImportFailed,
@@ -53,6 +58,8 @@ if TYPE_CHECKING:
 # Agent CLIs that may be installed but have no adapter (SPEC non-goals).
 NO_READER_TOOLS = ("copilot", "crush", "cursor-agent", "opencode")
 EXPORT_FORMATS = exporting.FORMATS  # what ``export_transcript`` takes as ``fmt``
+# Why an undo left a file (``UnimportReport.left``) that a forced one removes.
+LEFT_FOR_A_FORCED_UNDO = undoing.EXTRA
 HANDOFF_MAX_AGE = 30 * 24 * 3600  # seconds; an older handoff file goes with the next continue
 
 _P = ParamSpec("_P")
@@ -418,7 +425,7 @@ def find_session(ref: Session | str, index: Index | None = None) -> Session:
     if len(matches) == 1:
         return matches[0]
     if not matches:
-        raise NotFound(f"no session matches {text!r}; `list --keys` shows the keys")
+        raise NotFound(f"no session matches {text!r}", remedy=REMEDY_KEYS)
     keys = sorted(s.key for s in matches)
     shown = ", ".join(keys[:MATCHES_SHOWN])
     more = f", and {len(keys) - MATCHES_SHOWN} more" if len(keys) > MATCHES_SHOWN else ""
@@ -792,7 +799,10 @@ def continue_session(
             folder = _own_folder(session)
             if folder is None:
                 state = "is gone" if session.cwd else "was not recorded"
-                raise LaunchFailed(f"the session's folder {state}; choose one with --in")
+                raise LaunchFailed(
+                    f"the session's folder {state}; choose a folder to start in",
+                    remedy=REMEDY_FOLDER,
+                )
         planned = launch.plan_new(target, source, session.id, folder, here)
         if dry_run:
             return planned
@@ -839,6 +849,8 @@ def _plan(
     _need_files(session)
     try:
         return _provider(session).import_plan(session, index.pathmap, target, experimental)
+    except ExperimentalOnly as exc:
+        raise ImportFailed(exc.reason, remedy=REMEDY_EXPERIMENTAL) from None
     except NotSupported as exc:
         raise ImportFailed(exc.reason) from None
     except NotFound as exc:
@@ -1047,6 +1059,8 @@ def _import(
         provider.import_session(session, index.pathmap, progress, target, experimental)
     except importer.Exists as exc:
         collision = exc  # in the store but not in this index: look again below
+    except ExperimentalOnly as exc:
+        raise ImportFailed(exc.reason, remedy=REMEDY_EXPERIMENTAL) from None
     except NotSupported as exc:
         raise ImportFailed(exc.reason) from None
     fresh = Index.load()
@@ -1376,7 +1390,13 @@ def remove_letter(letter: str) -> str:
 __all__ = [
     "EXPORT_FORMATS",
     "HANDOFF_MAX_AGE",
+    "LEFT_FOR_A_FORCED_UNDO",
     "NO_READER_TOOLS",
+    "REMEDY_EXPERIMENTAL",
+    "REMEDY_FOLDER",
+    "REMEDY_FORCE",
+    "REMEDY_KEYS",
+    "REMEDY_OVERWRITE",
     "ApiError",
     "ContinueOptions",
     "ContinuePlan",

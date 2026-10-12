@@ -375,9 +375,7 @@ class OptionsTest(ContinueCase):
     def test_what_cannot_be_continued(self):
         self.assertEqual(
             api.continue_options("claude:0000"),
-            ContinueOptions(
-                False, "no session matches 'claude:0000'; `list --keys` shows the keys"
-            ),
+            ContinueOptions(False, "no session matches 'claude:0000'"),
         )
         for name in ("agy", "claude", "codex", "grok"):
             self.w.installed.discard(name)
@@ -591,13 +589,13 @@ class RefusalTest(ContinueCase):
         for index in (self.index, self.w.scan()):  # a stale listing, then a fresh one
             self.assertEqual(
                 self.refused(CLAUDE_NATIVE, index=index),
-                "the session's folder is gone; choose one with --in",
+                "the session's folder is gone; choose a folder to start in",
             )
         native = self.w.session(CLAUDE_NATIVE, "native")
         native.cwd = native.cwd_local = None
         self.assertEqual(
             self.refused(native, dry_run=True),
-            "the session's folder was not recorded; choose one with --in",
+            "the session's folder was not recorded; choose a folder to start in",
         )
         self.assert_nothing_done()
         # A parent that still exists is never used; a folder that is given is.
@@ -896,7 +894,11 @@ class CommandTest(ContinueCase):
             ),
             ((gemini,), f"Gemini is not installed; {INSTALLED}"),
             ((CLAUDE_NATIVE, "--with", "cursor"), f"unknown tool 'cursor'; {INSTALLED}"),
-            ((GROK_NATIVE,), "the session's folder is gone; choose one with --in"),
+            (
+                (GROK_NATIVE,),
+                # The engine's reason, and the flag this command line adds to it.
+                "the session's folder is gone; choose a folder to start in (--in DIR)",
+            ),
             (
                 (CLAUDE_NATIVE, "--in", "Work"),
                 "the folder to start in must be an absolute path: Work",

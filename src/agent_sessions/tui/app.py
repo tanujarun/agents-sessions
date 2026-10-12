@@ -383,6 +383,7 @@ class MainScreen(_UiCalls, Screen):
         self._undoing = False
         self._opening = False
         self._continuing = False
+        self._starting = ""  # what the status line says while a continue starts
         self._verdicts: dict[str, view.Verdict] = {}
         self._verdict_pending: set[str] = set()
         self._verdict_timer: Timer | None = None
@@ -483,8 +484,9 @@ class MainScreen(_UiCalls, Screen):
             widget.styles.gutter.width + widget.styles.margin.width
             for widget in (left, right, self.query_one("#statusbar"))
         )
-        if self._activity:
-            variants = [self._activity]
+        activity = self._activity or self._starting
+        if activity:
+            variants = [activity]
         else:
             variants = view.summary_variants(
                 self.snapshot.drives,
@@ -500,7 +502,7 @@ class MainScreen(_UiCalls, Screen):
         left.set_class(bool(self._message) and self._message_error, "-error")
         left.set_class(bool(self._message) and not self._message_error, "-info")
         right.update(summary)
-        right.set_class(bool(self._activity), "-busy")
+        right.set_class(bool(activity), "-busy")
 
     # --- layout ----------------------------------------------------------
 
@@ -1519,6 +1521,9 @@ class MainScreen(_UiCalls, Screen):
             return
         name, label = question.tools[question.tool]
         self._continuing = True
+        # The transcript is exported before the tool starts: said meanwhile.
+        self._starting = view.starting_text(label)
+        self._render_status()
         self._work(
             self._continue_thread,
             question.key,
@@ -1541,6 +1546,8 @@ class MainScreen(_UiCalls, Screen):
 
     def _continued(self, label: str, error: str | None) -> None:
         self._continuing = False
+        self._starting = ""
+        self._render_status()
         if error:
             self.set_message(error, error=True)
         else:

@@ -28,7 +28,7 @@ import time
 from typing import TYPE_CHECKING
 
 from . import __version__, fsutil, textsafe
-from .errors import ExportFailed
+from .errors import REMEDY_OVERWRITE, ExportFailed
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -191,7 +191,7 @@ def write(path: StrPath, pieces: Iterable[str], overwrite: bool = False) -> int:
 
 
 def _exists(target: str) -> ExportFailed:
-    return ExportFailed(f"{target} exists; nothing was written (--force replaces it)")
+    return ExportFailed(f"{target} exists; nothing was written", remedy=REMEDY_OVERWRITE)
 
 
 def _link(tmp: str, target: str) -> None:

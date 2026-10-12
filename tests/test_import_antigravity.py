@@ -117,7 +117,8 @@ class OnlyWhenAskedForTest(AgyImportCase):
             with self.assertRaises(api.ImportFailed) as caught:
                 api.import_plan(source)
             self.assertEqual(caught.exception.reason, agy_mod.EXPERIMENTAL_ONLY)
-        self.assertIn("(import --experimental)", agy_mod.EXPERIMENTAL_ONLY)
+        self.assertIn("is done only when asked for", agy_mod.EXPERIMENTAL_ONLY)
+        self.assertEqual(caught.exception.remedy, api.REMEDY_EXPERIMENTAL)
         self.assertIn("has been resumed by hand", agy_mod.EXPERIMENTAL_ONLY)
         self.assertIn("starts a new conversation without an error", agy_mod.EXPERIMENTAL_ONLY)
         self.assert_nothing_written()
@@ -641,7 +642,7 @@ class WhatTheBrowserShowsTest(AgyImportCase):
         self.assertEqual(view.foreign_mode(verdict), "foreign_experimental")
         self.assertEqual(view.import_step(verdict, "import"), "warn")
         reason, choices = view.foreign_prompt("C:", verdict)
-        self.assertEqual(reason, agy_mod.EXPERIMENTAL_ONLY)
+        self.assertEqual(reason, view.EXPERIMENTAL_LINE)  # the short of it, never clipped
         self.assertIn("[i] import and resume (experimental)", choices)
         # The warning is whole in the three lines a prompt gives it at 120 columns.
         lines = view.warn_prompt(verdict.warning, 118)
@@ -659,7 +660,12 @@ class ExperimentalCommandTest(AgyImportCase):
         for extra in ((), ("--dry-run",), ("--open",)):
             code, out, err = run("import", AGY_WIN, *extra)
             self.assertEqual((code, out), (1, ""))
-            self.assertEqual(err, f"agent-sessions: {agy_mod.EXPERIMENTAL_ONLY}\n")
+            # The engine's reason, and the flag this command line adds to it.
+            self.assertEqual(
+                err,
+                f"agent-sessions: {agy_mod.EXPERIMENTAL_ONLY}; "
+                "--experimental imports it all the same\n",
+            )
         self.assertIn("--experimental", run("import", "--help")[1])
         self.assert_nothing_written()
 

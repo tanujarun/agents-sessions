@@ -244,7 +244,7 @@ class ClaudeImportTest(ImportCase):
                 ),
                 "rewritten": {},
                 "appended": [],
-                "agent_sessions_version": "0.1.0",
+                "agent_sessions_version": "0.2.0",
                 "source_tool_version": "2.1.293",
             },
         )
@@ -1287,8 +1287,8 @@ class NotSupportedTest(ImportCase):
         self.assertEqual(
             antigravity.EXPERIMENTAL_ONLY,
             "importing an Antigravity conversation is experimental and is done only when "
-            "asked for (import --experimental): no imported copy has been resumed by hand "
-            "yet, and agy starts a new conversation without an error when it cannot read one",
+            "asked for: no imported copy has been resumed by hand yet, and agy starts a new "
+            "conversation without an error when it cannot read one",
         )
         self.assertEqual(
             gemini.IMPORT_UNSAFE,
