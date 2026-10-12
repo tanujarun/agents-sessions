@@ -111,33 +111,33 @@ argv, Antigravity lookup, tools with no data, `D:`, re-pointing at import.
 `pyproject.toml`, ruff (lint and format), mypy, coverage, Makefile targets, CI file;
 suites pass on Python 3.11 and 3.14.
 
-## 12. Security hardening — Careful — after: 9, 11 — [ ]
+## 12. Security hardening — Careful — after: 9, 11 — [x]
 
 REVIEW R-01, R-02, R-03, R-04, R-05, R-08, R-09, plus import destination containment.
 SPEC "Threat model". A regression test per finding.
 
-## 13. Robustness hardening — Careful — after: 12 — [ ]
+## 13. Robustness hardening — Careful — after: 12 — [x]
 
 REVIEW R-06, R-07, R-10 to R-14; the import journal (`imports.jsonl`, lock, manifest);
 no-overwrite placement; interrupts and signals; logs; tool detection (SPEC "Tool
 detection", "Logs"); cache and state file modes; the latent `None` comparisons.
 
-## 14. Offline drives and mounting — Careful — after: 10, 13 — [ ]
+## 14. Offline drives and mounting — Careful — after: 10, 13 — [x]
 
 SPEC "Offline drives" and "Drive letters": volume identity, cache version 2, offline
 sessions, `mount`, `forget`, `map`, Claude path evidence.
 
-## 15. Import retarget and undo — Careful — after: 14 — [ ]
+## 15. Import retarget and undo — Careful — after: 14 — [x]
 
 SPEC "Import": `--to`, Grok group naming with BLAKE3, Antigravity experimental import,
 `unimport`, `import_options`.
 
-## 16. Continue as new session — Careful — after: 15 — [ ]
+## 16. Continue as new session — Careful — after: 15 — [x]
 
 SPEC "Continue as a new session": `export`, `continue`, `new_session_argv`, handoff
 files, terminal fallback.
 
-## 17. TUI for new actions — Careful — after: 16 — [ ]
+## 17. TUI for new actions — Careful — after: 16 — [x]
 
 SPEC "TUI additions".
 

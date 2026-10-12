@@ -11,7 +11,7 @@ Textual, from the project `.venv` (`./install.sh` creates it).
   formatter; `make typecheck` runs `mypy`; `make coverage`; `make check` runs lint, typecheck and
   both suites. These need the tools in `.venv`: `make dev` (installs `.[tui,dev]` editable)
 - Run: `bin/agent-sessions` (TUI) or `bin/agent-sessions <scan|list|open|import|unimport|export|continue|show|status|verify|mount|forget|map>`
-- TUI tests: `make test-tui` (needs `.venv`; about 80 s)
+- TUI tests: `make test-tui` (needs `.venv`; about 3 minutes)
 - Install: `./install.sh` (creates `.venv` with Textual, symlinks into
   `~/.local/bin`, installs the desktop launcher)
 
