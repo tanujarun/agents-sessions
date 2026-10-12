@@ -9,10 +9,14 @@ Investigated 2026-10-12 on this machine, read-only. Sources of every claim:
   was resumed, so **everything about what a tool does at resume time is unproven until a
   live test**, even where the lookup code was read. See "Open questions".
 
+The one exception is in "Phase 2 findings": four model-free Grok commands were run in a
+throwaway home with no network. What they showed is tagged `[verified, sandbox]`.
+
 Tool versions: `claude` 2.1.296, `codex` 0.162.0, `grok` 1.0.46, `agy` 1.3.3. `gemini` is not
 installed (see Gemini CLI). Stores were written by: Claude 2.1.281–2.1.296 (Linux),
 2.1.229–2.1.295 (Windows); Codex 0.156.1 (Linux), 0.150.1 (Windows); Grok 1.0.46 (Linux),
-1.0.34 (Windows); Gemini CLI 0.54.0 (Windows).
+1.0.34 (Windows); Gemini CLI 0.54.0 (Windows). The commands on PATH are wrappers, and the
+Grok npm package is 1.0.50 while the binary it starts is 1.0.46: see "Phase 2 findings".
 
 Throwaway scripts that produced the numbers are in `scratch/` (git-ignored): `walk.py`,
 `claude_count.py`, `codex_count.py`, `grok_count.py`, `agy_count.py`, `drives.py`,
@@ -183,6 +187,8 @@ must be ignored.
 - No list/sessions subcommand exists `[verified, --help]`. `claude agents` lists background
   sessions only. The source also accepts `--resume <path ending in .jsonl>` (undocumented;
   do not use).
+- `CLAUDE_CONFIG_DIR` moves the whole store, `projects/` included (Phase 2, Q2). Starting a
+  new session with a first prompt: Phase 2, Q3.
 
 ### 6. Import
 
@@ -325,6 +331,7 @@ Every line is `{"timestamp", "ordinal", "type", "payload"}`. `type` values: `ses
 - Possible no-model check `[verified, --help; not run]`: `codex migrate-rollouts --thread <id>
   --json` without `--apply` "only reports eligible sessions" (it is about legacy rollouts and may
   report nothing for `paginated` ones). `codex agents` needs the app-server daemon.
+- `CODEX_HOME` moves the store, `CODEX_SQLITE_HOME` the SQLite files (Phase 2, Q2).
 
 ### 6. Import
 
@@ -371,7 +378,8 @@ The tool ships its own documentation in the store (`<store>/docs/user-guide/17-s
 ### 1. Store signature
 
 - A directory named `.grok` that contains a directory `sessions` `[verified]`.
-  `dir_names = {".grok"}`. `GROK_HOME` can relocate it `[docs]`.
+  `dir_names = {".grok"}`. `GROK_HOME` can relocate it `[docs]`; without it the store is
+  `$HOME/.grok` `[verified, sandbox]`.
 
 ### 2. Layout
 
@@ -393,14 +401,15 @@ The tool ships its own documentation in the store (`<store>/docs/user-guide/17-s
 
 `Session.files` = the whole `<session-uuid>/` directory.
 
-`<enc-cwd>` `[verified on 3 names]`: percent-encoding of the UTF-8 cwd, upper-case hex:
-`/home/tanuj/Work` → `%2Fhome%2Ftanuj%2FWork`; `F:\AI Projects\Website Works` →
-`F%3A%5CAI%20Projects%5CWebsite%20Works`. Space is `%20` (not `+`). `urllib.parse.quote(cwd,
-safe="")` reproduces all three, **but** whether Grok also escapes `-`, `.`, `_`, `~` is unknown:
-no recorded cwd contains one, and the binary links the `percent-encoding` crate, whose usual
-sets do escape them. Decode with `urllib.parse.unquote` (works either way) and prefer
-`summary.json` `info.cwd`. "When the encoded name exceeds 255 bytes, it instead uses a slug plus
-a hash and records the original path in a `.cwd` file inside the group" `[docs; not seen]`.
+`<enc-cwd>` `[verified, sandbox: Phase 2, Q1]`: `urllib.parse.quote(cwd, safe="")`, that is,
+`A-Z a-z 0-9 - . _ ~` stay as they are and every other byte of the UTF-8 cwd becomes `%XX` in
+upper-case hex: `/home/tanuj/Work` → `%2Fhome%2Ftanuj%2FWork`; `F:\AI Projects\Website Works` →
+`F%3A%5CAI%20Projects%5CWebsite%20Works`. Space is `%20` (not `+`). When that name is longer
+than 255 bytes the group is `<slug>-<16 hex>` instead (slug of the last path segment, BLAKE3
+of the cwd; exact rule in Phase 2, Q1); the documentation adds that the tool "records the
+original path in a `.cwd` file inside the group" `[docs; no instance seen]`. The cwd is the
+physical path (symbolic links resolved). To read a store, decode with `urllib.parse.unquote`
+and prefer `summary.json` `info.cwd`; a `<slug>-<hex>` name cannot be decoded.
 
 ### 3. One session, and what is excluded
 
@@ -438,7 +447,8 @@ A candidate is a directory `sessions/<group>/<name>/` that contains `summary.jso
 - `num_chat_messages` == number of lines of `chat_history.jsonl`; `num_messages` == number of
   lines of `updates.jsonl` (all 22) `[verified]`. Neither is a count of conversation messages.
 - `session_search.sqlite` is a derived index (`meta.last_bootstrap_at`); its `title` lags
-  `summary.json` (one stale row found). Do not read it.
+  `summary.json` (one stale row found). Do not read it. The tool builds it by itself on the
+  first `grok sessions search` and adds sessions that appeared since `[verified, sandbox]`.
 - Cheap read: `summary.json` alone gives everything except the empty test and `messages`.
   `chat_history.jsonl` up to 24.3 MB (Windows), 9.2 MB native; longest line 1.7 MB.
   `updates.jsonl` up to 49.6 MB; a session directory up to 123.7 MB. Do not read `updates.jsonl`.
@@ -450,35 +460,47 @@ A candidate is a directory `sessions/<group>/<name>/` that contains `summary.jso
   for the current directory …; UUID-shaped values always mean IDs"]`. `--cwd <CWD>` sets the
   working directory. `-c` = most recent session of the current directory. `-s/--session-id`
   creates, never resumes.
-- Scoping: listing and title lookup are per current directory `[docs]`. For an id, the binary
-  holds `Session found locally`, `Session found locally under different CWD`, `Session not found
-  locally…`, `No session found with id` — so other groups are searched `[inferred from strings]`.
+- Scoping: listing and title lookup are per current directory `[docs]`; `grok sessions list`
+  shows exactly the sessions in the group directory named after the current directory, whatever
+  their `info.cwd` says `[verified, sandbox]`. For an id, the binary holds `Session found
+  locally`, `Session found locally under different CWD`, `Session not found locally…`, `No
+  session found with id` — so other groups are searched `[inferred from strings]`; `grok export
+  <id>` does find a session in any group from any directory `[verified, sandbox]`, `grok
+  --resume <id>` itself was not run.
 - Launcher: `cd <cwd> && grok --resume <id>`. When the cwd no longer exists: start from `$HOME`
   `[inferred]`.
-- No-model checks `[verified, --help]`: `grok sessions list [-n N]` (current directory only),
-  `grok sessions search <query>`, `grok export <id>` (Markdown transcript to stdout),
-  `grok usage <id>` (JSON).
+- No-model checks `[verified, --help; run in the sandbox]`: `grok sessions list [-n N]` (current
+  directory only), `grok sessions search <query>` (current directory only, by `info.cwd`),
+  `grok export <id>` (Markdown transcript to stdout; any directory; exit 1 and `Error: Session
+  '<id>' not found.` for an unknown id), `grok usage <id>` (JSON; exit 1 with `No usage recorded`
+  for a session without `usage.json`, so not an existence probe). None needs a login. `list` and
+  `search` also try a remote search and wait about 5 s for it when offline. Details: Phase 2, Q1.
+- `grok sessions delete <id>` exists `[verified, --help]`: never call it.
 
 ### 6. Import
 
-Verdict: **supported only in the narrow case below, otherwise NotSupported** `[inferred, medium
-to high risk]`.
+Verdict: **supported for any target folder; the adapter still applies the narrow rule of step 1
+until it is changed** (the encoding it waited for is verified since Phase 2, Q1).
 
-1. Mapped cwd must consist of `[A-Za-z0-9/ ]` only, **or** an existing native group directory
-   must already decode to it (then reuse that directory name). Otherwise raise
-   `NotSupported("Grok's directory encoding of '-', '.', '_', '~' is unverified")`.
+1. As implemented today: mapped cwd must consist of `[A-Za-z0-9/ ]` only, **or** an existing
+   native group directory must already decode to it (then reuse that directory name); otherwise
+   `NotSupported("Grok's directory encoding of '-', '.', '_', '~' is unverified")`, and a name
+   over 255 bytes is refused. What the tool does `[verified, sandbox]`: the group is
+   `quote(realpath(cwd), safe="")` for every character, and `<slug>-<16 hex of BLAKE3>` over
+   255 bytes (Phase 2, Q1), so both refusals can go; the long form needs a BLAKE3
+   implementation, which the standard library does not have.
 2. Refuse when `~/.grok/sessions/*/<id>/` exists.
-3. Copy the session directory to `~/.grok/sessions/<quote(mapped cwd, safe="")>/<id>/`, leaving
-   out `*.lock`.
-4. Rewrite `summary.json` only: `info.cwd` → mapped cwd; `grok_home` → the native store path.
-   Write it as compact JSON.
-5. Leave `session_search.sqlite`, `active_sessions.json` and `prompt_history.jsonl` alone (index
-   is rebuilt by the tool `[inferred]`).
+3. Copy the session directory to `~/.grok/sessions/<group>/<id>/`, leaving out `*.lock`.
+4. Rewrite `summary.json` only: `info.cwd` → mapped cwd; `grok_home` → the native store path
+   (layout: see "Import and launch notes"). Both the group name and `info.cwd` matter: the
+   first decides `sessions list`, the second `sessions search` `[verified, sandbox]`.
+5. Leave `session_search.sqlite`, `active_sessions.json` and `prompt_history.jsonl` alone (the
+   index is rebuilt by the tool `[verified, sandbox]`).
 
-To confirm live: that the id is found (`grok export <id>` is a model-free probe), that a
-1.0.34 session loads in 1.0.46 (`chat_format_version` is 1 in both), and that Windows paths in
-`prompt_context.json` / `system_prompt.txt` are regenerated rather than trusted. The one
-Windows conversation is 123.7 MB on disk.
+Confirmed in the sandbox (Phase 2, Q1): the imported 1.0.34 session is found by id and exported
+in full by 1.0.46 (`chat_format_version` is 1 in both). Still to confirm live: `grok --resume
+<id>` itself, and that Windows paths in `prompt_context.json` / `system_prompt.txt` are
+regenerated rather than trusted. The one Windows conversation is 123.7 MB on disk.
 
 ### 7. Quirks
 
@@ -514,6 +536,7 @@ annotations/<conversation-uuid>.pbtxt       text proto: title:"…"
 presence/<conversation-uuid>.lock           empty lock file
 cache/last_conversations.json               {"<cwd>": "<conversation-uuid>"}   (what --continue uses [inferred])
 cache/conversation_metadata.json, history.jsonl {display, timestamp(ms), workspace, type}, implicit/<uuid>.pb (opaque)
+log/cli-<YYYYMMDD_HHMMSS>.log, cli.log      the tool's own log, one file per start (version, data directory, summary reconcile, resume)
 ```
 
 `Session.files` = `conversations/<id>.db`, `brain/<id>/`, `annotations/<id>.pbtxt`.
@@ -585,6 +608,10 @@ the SQL columns):
   Resume a previous conversation by ID"]`. `-c/--continue` = most recent conversation.
 - Scoping: files are flat under `conversations/`, so by id it is presumably global `[inferred]`.
   Launcher: `cd <cwd> && agy --conversation <id>`; when the cwd is unknown or gone, `$HOME`.
+- An id the tool cannot find does **not** fail: the flag is dropped with `warning: conversation
+  "<id>" not found` and a new conversation starts `[verified, code: entrypoints.resolveProject;
+  not run]`. The id is looked up as the file `conversations/<id>.db`, not in either summary
+  index (Phase 2, Q5).
 - There is no list subcommand `[verified, --help]`.
 - IDE conversations: none exist to test. The summaries table has an `app_data_dir` column
   (`antigravity-cli` in every row), which suggests one schema for both apps and that `agy` reads
@@ -592,14 +619,15 @@ the SQL columns):
 
 ### 6. Import
 
-Verdict: **NotSupported** — "Antigravity keeps conversations in SQLite files with protobuf
-columns; registering one needs a row in `conversation_summaries.db` and the workspace path is
-inside protobuf blobs".
+Verdict: **NotSupported as implemented; a copy-only import is specified in Phase 2, Q5, to ship
+as an experimental action until one resume has been tested by hand.**
 
-Whether a bare copy of `conversations/<id>.db` + `brain/<id>/` is enough for `agy --conversation
-<id>` is unknown (the summaries DB and `jetbox_summaries_proto.pb` both index conversations;
-which one the tool trusts, and whether it rebuilds them, was not established). Even if it is,
-the conversation would keep Windows workspace URIs.
+The reason given so far ("registering one needs a row in `conversation_summaries.db`") does not
+hold: the tool finds a conversation by its file `conversations/<id>.db` `[verified, code]`, and
+it rebuilds both summary indexes from the conversation files at start-up `[verified, the
+Windows store's own log: "reconcile checked 4 conversations, restored 4"]`. What stays true: the
+workspace path is inside protobuf blobs, so an imported conversation keeps its Windows
+workspace URIs, and nothing about an actual resume has been observed.
 
 ### 7. Quirks
 
@@ -701,6 +729,9 @@ reproduced for the one session]`.
   gone the session cannot be resumed.
 - No-model check: `gemini --list-sessions` ("List available sessions for the current project and
   exit") `[verified, source]`.
+- `GEMINI_CLI_HOME` replaces the home directory the store is looked up in (the store is then
+  `$GEMINI_CLI_HOME/.gemini`) `[verified, source: homedir()]`. First prompt of a new session:
+  Phase 2, Q3.
 
 ### 6. Import
 
@@ -921,7 +952,8 @@ the parsed count on both stores.)
   JSON object with `sessionId` and `messages`, and a resumed `.json` gets a `.jsonl` twin
   (duplicate rule: newest `lastUpdated` wins).
 - **Path map**: `D:` stays unresolved from listed sessions (the only listed session on it points
-  at a folder that is gone); no listed session is affected.
+  at a folder that is gone); no listed session is affected. Which session, and the override:
+  Phase 2, Q7.
 
 ### Import and launch notes (task 5, 2026-10-12)
 
@@ -961,9 +993,445 @@ the parsed count on both stores.)
 
 ---
 
+## Phase 2 findings (2026-10-12)
+
+Read-only on the real stores and drives. Agent programs run: `--help` / `--version` of the real
+`claude`, `codex` and `agy` binaries, and four model-free Grok commands (`sessions list`,
+`sessions search`, `export`, `usage`) in a throwaway home. System tools were used to read only
+(`udisksctl info`, `pkaction`, `journalctl`, `objdump`). Nothing was mounted, unmounted,
+resumed or sent to a model. Two more tags are used below:
+
+- `[verified, sandbox]` — seen when one of the four Grok commands ran in the throwaway home;
+- `[verified, code]` — read in the tool's own code (bundled JavaScript, or the disassembled
+  function that is named), not run. What the tool does with it at run time stays unproven.
+
+The sandbox: a byte-identical copy of the 1.0.46 binary (same SHA-256) in
+`<sandbox>/home/.grok/bin/`, started as `unshare -r -n -- env -i HOME=<sandbox>/home
+XDG_{CONFIG,DATA,CACHE,STATE}_HOME=<below it> PATH=/usr/bin:/bin <copy> …` with `stdin
+</dev/null` and `timeout 30`; `<sandbox>` was `/tmp/ags…`, a path of letters, digits and `/`
+only, so that each test path adds one kind of character. A listing of `~/.grok` (2,385 entries:
+type, size, modification time) taken before the first run and after the last is identical.
+
+**What is on PATH.** `~/.local/bin/{claude,codex,grok,gemini,opencode,cursor-agent,copilot,crush}`
+are one and the same 4-line wrapper: `mise use -g --quiet <tool> || exit 1; exec mise x <tool>
+-- <tool> "$@"` (it installs the tool when it is missing). Only `~/.local/bin/agy` is a program.
+Behind the wrappers `[verified]`:
+
+| tool | real program | state |
+|---|---|---|
+| claude | `~/.local/share/mise/installs/claude/2.1.296/claude` | installed |
+| codex | `~/.local/share/mise/installs/codex/0.162.0/bin/codex` | installed |
+| grok | npm package 1.0.50 under `…/installs/npm-xai-official-grok/`; its launcher (`grok-bootstrap.js`) starts `$GROK_HOME/bin/grok` when that exists, here `~/.grok/bin/grok -> grok-1.0.46` | 1.0.46 is what runs |
+| opencode | `~/.local/share/mise/installs/opencode/1.18.35/opencode` | installed, never used (Q6) |
+| gemini | `…/installs/gemini/0.63.0/` holds `package.json` only | install incomplete |
+| cursor-agent, copilot, crush | no directory under `…/installs/`, not in `~/.config/mise/config.toml` | not installed; the first call would install |
+
+### Q1. Grok: group directory, lookup by id, search index, 1.0.34 sessions
+
+Method: copies of the native session `01a106cb-…` (118 kB) with the last 12 hex digits of the
+id changed and a title naming the candidate, each placed under one candidate group name;
+`summary.json` `info.cwd` set to the test directory; `grok sessions list` run with that (real)
+directory as the current directory. A copy that is listed has the name the tool looks for.
+Controls: from another directory the listing is `No sessions found.`
+
+**Rule** `[verified, sandbox]`. With `enc = urllib.parse.quote(cwd, safe="")`:
+
+```python
+if len(enc.encode()) <= 255:
+    group = enc                                  # A-Z a-z 0-9 - . _ ~ kept; all else %XX, upper-case hex, per UTF-8 byte
+else:
+    slug = re.sub(r"[^a-z0-9]+", "-", os.path.basename(cwd).lower()).strip("-")[:40] or "workspace"
+    group = slug + "-" + blake3(cwd.encode("utf-8")).hexdigest()[:16]
+```
+
+`cwd` is the physical working directory: entered through a symbolic link, the session under
+the name of the link is not listed and the one under the resolved path is, with or without
+`PWD` in the environment.
+
+| tested | candidates | listed |
+|---|---|---|
+| `-` `.` `_` `~`, an upper-case letter, a digit | the character itself; `%XX` | the character itself |
+| space | `%20`; `+`; a literal space | `%20` |
+| `Ü` `ï` `漢` `😀` | UTF-8 `%XX` in upper-case hex; the same in lower-case hex; the character itself | upper-case hex |
+| `u` + U+0308 (decomposed ü) | `u%CC%88`; the composed form `%C3%BC`; the characters themselves | `u%CC%88` (no Unicode normalisation) |
+| each of ``! ' ( ) * + , = @ & $ # % [ ] { } ; : \ ^ ` \| " < > ?`` | the character itself; `%XX` upper; `%XX` lower where it differs | `%XX` upper |
+| `<sandbox>/work/my-proj_v1.2~x y/Ünï` | `quote(safe="")`; `quote_plus`; every non-alphanumeric escaped | `…%2Fwork%2Fmy-proj_v1.2~x%20y%2F%C3%9Cn%C3%AF` |
+| encoded length 254, 255 | the full encoded name | listed |
+| encoded length 256, 257, 299 | `<slug>-<hex>`; arbitrary name with a `.cwd` file | `<slug>-<16 hex>` only |
+
+`/` is `%2F` and `:` `\` are `%3A` `%5C` in every native and Windows group name `[verified,
+data]`. The long form was found by trying 2,144 slug and hash combinations for one path, then
+worked out on 18 more paths, the last 10 of them named by the rule before the run: `MyProj` →
+`myproj`; `my proj.v1_2~x` → `my-proj-v1-2-x`;
+`Ünï Köln` → `n-k-ln`; `a  b__c` → `a-b-c`; `.hidden` → `hidden`; `name.` → `name`; `--x--` →
+`x`; a 59-character name → its first 40 slug characters; 39 × `x` + `Ütail` → 39 × `x` + `-`
+(the cut comes after trimming, and is not trimmed again); `a` + 45 spaces + 30 × `b` → `a-` +
+30 × `b` (runs collapse before the cut); `漢字` → `workspace`. BLAKE3 is not in Python's
+standard library; a 40-line single-chunk implementation (input up to 1,024 bytes), checked
+against the published digests of the empty input and of one zero byte, gave every name above.
+The same hash, first 8 hex digits, names Grok's memory folders, which gives three data points
+outside the sandbox `[verified, data]`: `memory-v2/workspaces/tanuj-db4bfc44` for `/home/tanuj`,
+`work-6b15ba01` for `/home/tanuj/Work`, and on Windows `memory/website-works-32f235e1` for
+`F:\AI Projects\Website Works` (the hash is over the path exactly as recorded).
+
+**What decides what** `[verified, sandbox]`:
+
+| question | answer |
+|---|---|
+| `sessions list` in directory X | the sessions in the group directory named after X. `info.cwd` is not consulted (a session in X's group that records another cwd is listed in X and nowhere else). A `.cwd` file is not consulted either: an arbitrary group name with `.cwd` = X is not listed; the right name is listed with `.cwd` absent, correct, correct plus a newline, or wrong |
+| `export <id>`, `usage <id>` | found from any directory, in any group directory (one was named `zzz-not-an-encoding`), whatever `info.cwd` says. Unknown id: `Error: Session '<id>' not found.`, exit 1 |
+| `usage <id>` on the 1.0.34 session | `Error: No usage recorded for session '<id>'.`, exit 1 (it has no `usage.json`): not an existence probe |
+| `sessions search <query>` in directory X | rows of `session_search.sqlite` whose `cwd` equals X, and that column is `summary.json` `info.cwd`. A session in X's group with another `info.cwd` is listed but not found by search; one in a wrongly named group whose `info.cwd` is X is found by search but not listed. An id as the query is found from the session's own directory only |
+| who builds `session_search.sqlite` | the tool: the file is absent after `list`, `export` and `usage`, and created by the first `sessions search` (`meta.session_search_schema_version` = 4) with one row per session directory of every group; a session added afterwards is in the next search |
+| login, network | none of the four commands needs a login. `list` and `search` also ask a remote service; with no network `search` prints `warning: remote session search timed out` (`list` says so only in `--debug-file`) after about 5 s and exits 0. With a network and a login they would contact xAI `[inferred]` |
+| what the commands write in the store | `docs/user-guide/*.md` (27 files, unpacked on first run), `logs/unified.jsonl`, an empty `logs/hooks.log`, and `sessions/session_search.sqlite` (search only). No session directory, no `.cwd`, no `active_sessions.json` |
+
+So an import must set **both** the group directory name and `info.cwd`, and needs nothing else
+to be visible to `list`, `search` and `export`.
+
+`session_docs.content` (prompt and reply text) stays empty for a session whose group directory
+does not match its `info.cwd` (2 of 2) and for the imported 1.0.34 session; its title is
+indexed. A native 36 MB session (`updates.jsonl` 18.8 MB) copied into the sandbox got 17,940
+characters. Cause for the 1.0.34 session not established (format or size: its `updates.jsonl`
+is 49.6 MB).
+
+**The project's own import, end to end** `[verified, sandbox]`: with `AGENT_SESSIONS_HOME=<sandbox>/home`,
+`bin/agent-sessions import grok:f75c715e:01a0a4c9-5206-7b00-8471-d1ab6503810c` copied 62 files,
+123.7 MB, in 0.3 s into `sessions/%2Frun%2Fmedia%2Ftanuj%2FZephyro%2FAI%20Projects%2FWebsite%20Works/`
+and rewrote `info.cwd` and `grok_home`. `grok export 01a0a4c9-…` from an unrelated directory
+then exits 0 in 0.2 s with 66,112 bytes: 10 `## User`, 33 `## Assistant` and 26 `## Tools`
+sections, which are the 10 `user_message_chunk` and 33 `agent_message_chunk` records of
+`updates.jsonl` and the 10 user and 33 assistant turns `agent-sessions show` prints. So a
+session written by 1.0.34 on Windows loads in 1.0.46 for export. `grok sessions list` was not
+run inside the NTFS folder (the tool would read project files there without `O_NOATIME`); that
+the group name is the right one follows from the rule above, and from a native-version session
+placed in the same group getting indexed content, which a mismatched group does not `[inferred]`.
+
+Not established: `grok --resume <id>` itself (interactive, model); what the tool writes into
+`.cwd`; whether Windows paths in `prompt_context.json` (`working_directory`, `memory_*_path`,
+`agents_md_files[].file_path`) are regenerated on resume.
+
+### Q2. Model-free commands and data-directory variables
+
+Does a non-interactive command that makes no model call list saved sessions, or load one by id?
+
+| tool | answer | closest commands `[verified, --help; none run]` |
+|---|---|---|
+| claude | **no** | `claude agents --json`: "Print active sessions (interactive and background) as a JSON array and exit (for scripting; does not require a TTY)"; `--all`: "With --json: also include completed background sessions"; `--cwd <path>`: "Show only background sessions started under <path>". These are live and background sessions, not the transcript store. `claude purge --dry-run [path]`: "List what would be deleted without deleting anything" (the preview of a command that deletes a project's transcripts). `claude logs <id\|name>`: a background session's terminal output. `claude import [source]` imports **config** from `codex`, `gemini`, `cursor`, not sessions |
+| codex | **no listing; one read-only inspector** | `codex migrate-rollouts [--thread <THREAD_ID>] [--json] [--verbose]`: without `--apply` "the command only reports eligible sessions"; `--verbose`: "Print one line for every inspected rollout"; `--json`: "Emit the complete per-thread report as JSON". Whether it reports `paginated` threads is unknown. `codex archive\|unarchive\|delete <SESSION>` resolve "Session id (UUID) or session name" without a model but change the store. `codex queue --thread <THREAD> --message <TEXT>` ("Queue a message for an existing session") ends in a model turn. `codex agents` is a TUI on the app-server daemon. `codex debug prompt-input [PROMPT]` takes no session |
+| agy | **no** | subcommands are `agent(s)`, `changelog`, `install`, `mcp`, `mic-serve`, `models`, `plugin(s)`, `remote-control`, `update`; none reads conversations. `agy plugin import [source]` imports plugins |
+| grok | yes | `sessions list`, `sessions search`, `export`, `usage` (Q1) |
+| gemini | yes, per project | `--list-sessions` `[verified, source; not installed]` |
+
+Variable that moves the data directory:
+
+| tool | variable | evidence |
+|---|---|---|
+| claude | `CLAUDE_CONFIG_DIR` | `[verified, code]`: `ve = (process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")).normalize("NFC")`, `Df = join(ve(), "projects")`; the `.claude.json` file then sits inside that directory (`join(process.env.CLAUDE_CONFIG_DIR \|\| homedir(), ".claude.json")`). Message in the binary: "the configuration home (CLAUDE_CONFIG_DIR) is not an absolute path" |
+| codex | `CODEX_HOME`; `CODEX_SQLITE_HOME` for the SQLite files | `[verified, --help]`: `-p, --profile`: "Layer $CODEX_HOME/<name>.config.toml on top of the base user config"; `codex exec resume --ignore-user-config`: "Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`". Strings: "CODEX_HOME points to …, but that path does not exist", "Environment value for `$CODEX_SQLITE_HOME` is overridden by the required `sqlite_home` value" |
+| grok | `GROK_HOME`, else `$HOME/.grok` | `[docs]` "Override config directory (default: `~/.grok`)"; `$HOME` `[verified, sandbox]` |
+| agy | no variable found; hidden flags `--gemini_dir` and `--app_data_dir` | Q5 |
+| gemini | `GEMINI_CLI_HOME` (replaces the home directory) | `[verified, source]`: `homedir()` returns `process.env["GEMINI_CLI_HOME"]` when set |
+
+### Q3. Starting a new session with a first prompt
+
+Help output and shipped documentation only; none was started. "Sent at once" means the prompt
+is submitted as the first turn without a key press.
+
+| tool | argv | help line `[verified]` | sent at once | fill without sending | working directory |
+|---|---|---|---|---|---|
+| claude | `claude "<prompt>"` | "Usage: claude [options] [command] [prompt]"; "prompt  Your prompt"; "starts an interactive session by default, use -p/--print for non-interactive output" | `[inferred]`: the help does not say | hidden option `--prefill <text>`: "Pre-fill the prompt input with text without submitting it" `[verified, code: defined with hideHelp(), applied whenever set; absent from --help; not run]` | no flag (`--add-dir` only grants access); `cd` first |
+| codex | `codex "<prompt>"` | "Usage: codex [OPTIONS] [PROMPT]"; "[PROMPT]  Optional user prompt to start the session" | `[inferred]` from "to start the session" | none in the help | `-C, --cd <DIR>`: "Tell the agent to use the specified directory as its working root" |
+| grok | `grok "<prompt>"` | "[PROMPT]  Initial prompt for the interactive session, e.g. `grok "fix the bug"`" | yes `[docs, 01-getting-started.md]`: "Launch the interactive TUI and submit an initial prompt as the first turn" | none in the help | `--cwd <CWD>`: "Working directory" |
+| agy | `agy --prompt-interactive "<prompt>"` (`-i`) | "--prompt-interactive  Run an initial prompt interactively and continue the session"; "-i  Short alias for --prompt-interactive" | yes, by that wording | none in the help | no flag (`--add-dir`: "Add a directory to the workspace (repeatable)"); `cd` first |
+| gemini 0.54.0 | `gemini "<prompt>"` or `gemini -i "<prompt>"` | `[verified, source]` positional `query`: "Initial prompt. Runs in interactive mode by default; use -p/--prompt for non-interactive."; `-i, --prompt-interactive`: "Execute the provided prompt and continue in interactive mode" | yes, by that wording | none seen | none seen; not installed |
+
+- Never use `claude -p`, `codex exec`, `grok -p`, `agy -p/--print/--prompt`, `gemini -p`: those
+  are the non-interactive forms.
+- Length `[verified on this machine]`: one argument can be at most 131,071 bytes (`/bin/true`
+  with 131,072 fails with "Argument list too long"); `getconf ARG_MAX` is 2,097,152 for the
+  whole command line and environment. No tool states a limit of its own in its help. A first
+  prompt that names an exported transcript file stays far below this; do not pass the
+  transcript itself.
+- Claude's two other hidden options, `--prefill-b64` and `--deep-link-cwd-b64`, act only
+  together with `--deep-link-origin` `[verified, code]`; do not use them.
+
+### Q4. Mounting a drive that is attached but not mounted
+
+All four NTFS volumes are internal NVMe partitions. Nothing was mounted or unmounted, so what
+`udisksctl mount` prints and how it asks for a password are `[inferred]`.
+
+**(a) Identity at scan time, from files only** `[verified]`. A `/proc/self/mountinfo` line is
+`<id> <parent> <major:minor> <root> <mount point> <options> [optional fields] - <fstype>
+<source> <super options>`; spaces in the mount point and the source are `\040`. For the NTFS
+volumes: `224 29 259:3 / /run/media/tanuj/22EEA841EEA80F5B rw,nosuid,nodev,relatime shared:412 -
+ntfs3 /dev/nvme2n1p3 rw,uid=1000,…`.
+
+| want | read |
+|---|---|
+| device of a mount | the source field; or `major:minor`, which equals `os.stat(<device node>).st_rdev` for these volumes. Not for btrfs: `/` shows `0:29` while its device `dm-0` is `253:0`, so match btrfs by the resolved source path |
+| filesystem UUID | the name in `/dev/disk/by-uuid/` whose link resolves to the device (`22EEA841EEA80F5B -> ../../nvme2n1p3`) |
+| label | the name in `/dev/disk/by-label/`, with udev's escapes decoded: `\xNN` is one byte (`No\x20Other\x20Way`). The Windows system volume has **no label** and no entry there |
+| type, label and UUID of a device that is not mounted | `/run/udev/data/b<major>:<minor>` (world-readable text): `E:ID_FS_TYPE=ntfs`, `E:ID_FS_UUID=583E82883E825EBE`, `E:ID_FS_LABEL_ENC=No\x20Other\x20Way`. Use `_ENC`: `E:ID_FS_LABEL` is `No_Other_Way` |
+
+The UUID is the persistent key (`22EEA841EEA80F5B`, `524ADB244ADB041F` Zephyro, `583E82883E825EBE`
+No Other Way, `9E94CE9494CE6E79` Folded); device names such as `nvme0n1p2` can change between boots.
+
+**(b) Attached but not mounted** `[verified]`: `/dev/disk/by-uuid/<UUID>` exists and resolves to
+a block device, and no mountinfo line has that device as its source. An example exists now:
+`72E47873E4783B83` (`nvme2n1p4`, NTFS, no label) is attached and not mounted. When the UUID is
+absent from `/dev/disk/by-uuid/` the drive is not attached.
+
+**(c) Mounting.** `udisksctl mount --help` `[verified]`:
+
+```
+  -p, --object-path         Object to mount
+  -b, --block-device        Block device to mount
+  -t, --filesystem-type     Filesystem type to use
+  -o, --options             Mount options
+  --no-user-interaction     Do not authenticate the user if needed
+```
+
+- Invocation: `udisksctl mount --block-device /dev/disk/by-uuid/<UUID>`. With
+  `--no-user-interaction` the call fails instead of asking when authentication is needed
+  `[inferred from the help line]`.
+- Where: `/run/media/<user>/<label>`, or `/run/media/<user>/<UUID>` for a volume without a
+  label `[verified by the present mounts]`; `/run/mount/utab` marks all four `uhelper=udisks2`.
+- Authentication **is** needed here `[verified up to the polkit defaults; the prompt itself is
+  inferred]`: `udisksctl info -b`
+  shows `HintSystem: true`, `HintAuto: false`, `IdType: ntfs` for all four; a system device
+  falls under the polkit action `org.freedesktop.udisks2.filesystem-mount-system`, whose
+  defaults are `implicit active: auth_admin_keep` (the action for removable drives,
+  `…filesystem-mount`, is `implicit active: yes`); administrators are `unix-group:wheel`
+  (`/usr/share/polkit-1/rules.d/50-default.rules`), and the user is in `wheel`. No rule under
+  `/usr/share/polkit-1/rules.d` mentions udisks; `/etc/polkit-1/rules.d` cannot be listed
+  (mode `drwxr-x--- root:polkitd`) but its size is 0, which on this btrfs means no entries
+  `[inferred: three readable directories beside it have size = 2 × the summed name lengths]`.
+  `/etc/fstab` has no line for these volumes; `/etc/udisks2/` holds the default `udisks2.conf`
+  and no `mount_options.conf`. So a mount asks for the user's password through the session's
+  polkit agent (the Omarchy shell registers one), once; `auth_admin_keep` then covers further
+  mounts for a few minutes `[inferred]`.
+- This boot `[verified, journal and directory times]`: booted at about 19:38; `udiskie
+  --automount --no-notify --no-tray` runs in the session and left these volumes alone (they
+  have `HintAuto: false`); Dolphin was opened at 20:27:23, a `polkit-agent-helper` ran
+  20:27:25–29 (the only one this boot), the `ntfs3` module loaded at 20:27:29, `/run/media` was
+  created at 20:27:29 and the last of the four mount points at 20:27:31. So the four were
+  mounted from Dolphin after one password entry `[inferred from those times; udisksd logged
+  nothing]`.
+
+**(d) Mount options in effect** `[verified, /proc/mounts]`, the same for all four: driver
+`ntfs3` (in-kernel; `ntfs-3g` is installed and not used), `rw,nosuid,nodev,relatime,uid=1000,
+gid=1000,acl,iocharset=utf8,prealloc`.
+
+Not verified, because nothing may be mounted: the text `udisksctl mount` prints on success and
+its exit codes, the error under `--no-user-interaction`, how the password is asked when
+`udisksctl` is a child of a TUI with no terminal of its own, the mount point chosen when the
+label directory already exists, and unmounting.
+
+### Q5. Antigravity: lookup by id, data directory, copy-only import
+
+**Model-free command**: none (Q2).
+
+**Data directory** `[verified, code: main.init.1 registers the flags, main.hideFlagsForExternal
+hides them from --help; not run]`: `--gemini_dir` (default `.gemini`: "Path where Gemini files
+are stored. If absolute path, will set directly. If relative path, will be resolved relative to
+HomeDir.") and `--app_data_dir` (default `antigravity-cli`: "Path where application data is
+stored, relative to GeminiDir"). Every start logs the result: `CLI app data directory:
+/home/tanuj/.gemini/antigravity-cli` `[verified, native log]`. No environment variable that
+moves the store was found: `JETSKI_APP_DATA_DIR`, `ANTIGRAVITY_APP_DATA_DIR` and
+`ANTIGRAVITY_EXECUTABLE_DATA_DIR` occur only where the tool builds the environment of child
+processes. A hand test can therefore run against a throwaway directory:
+`agy --gemini_dir=<absolute dir> --conversation <id>` `[inferred]`. Give an absolute path: every
+log has `Failed to resolve GeminiDir ".gemini": .gemini must be an absolute path … falling
+back to default` for the relative default.
+
+**Which index `--conversation <id>` consults: the bare file `conversations/<id>.db`.**
+
+- `[verified, code]` `entrypoints.launchCLI` calls `resolveProject`, which asks the backend for
+  the conversation (an indirect call; the log in the next item shows it is
+  `GetConversationDetail`). `backend.(*ServerBackend).GetConversationDetail` looks in the live
+  trajectories in memory, then calls `trajectorystore.(*Manager).LoadUnsafe`: a registry filled
+  at start-up by listing the directory (`SqliteStore.List` → `os.ReadDir`), else
+  `SqliteStore.Exists` → `os.Stat(<conversations>/<id>.db)`, then `SqliteStore.Load` →
+  `dbtrajectory.newOrLoad`. Failing that, `fallbackGetConversationDetail` ("conversation %s not
+  found locally, searching fallback import dirs") tries `conversations/<id>.db`, then the older
+  `.pb` form, in another data directory named `antigravity` (what it is joined to was not
+  traced). Neither `conversation_summaries.db` nor `jetbox_summaries_proto.pb` is on that path.
+- `[verified, the Windows store's log of a real resume, 2026-09-08, version 1.1.22]` the same
+  order at run time: `Creating trajectory store manager with proto store and SQLite store` →
+  `GetConversationDetail: found conversation d2562a97-… (active=false)` → `project: resuming
+  conversation belonging to project ID: default-cli-project` → `Resuming conversation d2562a97-…`.
+- `[verified, the Windows store's log, 2026-10-08, first start of 1.3.1 after 1.1.27]` both
+  summary indexes are rebuilt from the conversation files: `summary store: reconcile func
+  returned 0 records, skipping`, then `[Summaries] reconcile checked 4 conversations, restored 4,
+  cached 0, skipped 0, dropped 0`, then `summary store: reconciliation complete, synced 4
+  records`. Every later start, Linux 1.3.x included, logs `restored 0, cached N`.
+- When the id is not found the flag is ignored: `Conversation %s not found, ignoring
+  --conversation flag` and `warning: conversation %q not found` `[verified, code:
+  resolveProject]`, and a new conversation starts `[inferred]`.
+
+**Copy-only import, to implement as an experimental action.** Source `S` = the foreign
+`antigravity-cli` directory, destination `N` = `~/.gemini/antigravity-cli`.
+
+| step | rule |
+|---|---|
+| copy, required | `S/conversations/<id>.db` → `N/conversations/<id>.db`, byte for byte |
+| copy when present | `S/brain/<id>/` (whole tree: `.system_generated/`, `.user_uploaded/`, `.tempmediaStorage/`, `scratch/`, images) → `N/brain/<id>/`; `S/annotations/<id>.pbtxt` (the title) → `N/annotations/<id>.pbtxt` |
+| copy only if not empty | `S/conversations/<id>.db-wal` beside the database, never `-shm` `[inferred: SQLite replays a WAL on open; all DBs found have no sidecars]`. Simpler and as safe: refuse a conversation that has a non-empty `-wal` |
+| never copy or write | `conversation_summaries.db`, `jetbox_summaries_proto.pb` (rebuilt by the tool), `presence/<id>.lock`, `cache/last_conversations.json` (maps a cwd to the conversation `--continue` picks), `cache/conversation_metadata.json`, `history.jsonl`, `implicit/*.pb` (not named after conversations), `config/projects/*.json`, anything under an `antigravity-ide` store |
+| order | `brain/<id>/` and the annotation first, the `.db` last, each staged and renamed as every import is: the `.db` is what makes the conversation exist for the tool |
+| collision | refuse when any of `N/conversations/<id>.db`, `N/conversations/<id>.db-wal`, `N/conversations/<id>.pb`, `N/brain/<id>`, `N/annotations/<id>.pbtxt`, `N/presence/<id>.lock` exists (the last one means the id has been opened in this store before) |
+| precondition | refuse a sub-agent conversation (§3) and one with no steps. `N/conversations/` exists once the tool has been started; otherwise the importer creates it as it creates any directory |
+| undo | remove the paths the import record lists (`N/conversations/<id>.db`, `N/brain/<id>/`, `N/annotations/<id>.pbtxt`) and, when present, what the tool adds once it has opened the conversation: `N/conversations/<id>.db-wal`, `N/conversations/<id>.db-shm`, `N/presence/<id>.lock`. The row in `conversation_summaries.db` and the entry in `jetbox_summaries_proto.pb` are left to the tool (its reconcile has a `dropped` counter; what it does for a missing file is `[inferred]`). The lock file stays after the tool exits (both stores hold one per conversation at rest `[verified]`), so it does not tell whether the conversation is open: an undo must not run while `agy` is running, and the files cannot say whether it is |
+| launch | `cd <mapped folder or $HOME> && agy --conversation <id>` |
+
+Risks, all untested:
+
+1. **A wrong or unreadable copy does not fail, it starts a new conversation** (flag ignored).
+   The hand test must check that the old turns are on screen.
+2. **Pruning** `[verified, code]`: at start-up `trajectorystore.(*Manager).Init(limit)` registers
+   every file and, when `limit > 0`, `PruneAll` sorts the conversations by time and deletes the
+   oldest beyond `limit`. Where `limit` comes from was not traced (the binary has a
+   `max_conversations` field), nor which time is compared (the file's or a stored one), and no
+   log here shows a prune. An imported conversation is old by either time until the tool
+   rewrites it, so it would be among the first to go, and adding conversations can push native
+   ones over a limit.
+3. **Workspace**: the conversation keeps Windows workspace URIs in its blobs (three of the four
+   have none at all); what resume does with a URI that does not exist is unknown. `agy` has no
+   working-directory flag.
+4. **Project**: a resume reads `~/.gemini/config/projects/<project id>.json` (`project: failed
+   to read project config %s: %v` when it cannot). All four Windows conversations belong to
+   `default-cli-project`, which also exists natively with the same content.
+5. **Versions, and writes on first start**: the conversations date from 2026-08-29 (the oldest
+   log left, of 2026-09-08, is from 1.1.22). The first start of 1.3.1 on 2026-10-08 rewrote
+   three of the four conversation files
+   (modification times 14:55:26.32–26.41, inside the 161 ms of the reconcile that logged
+   `restored 4`) `[verified]`; native is 1.3.3. Expect the tool to write to a copied database
+   the first time it starts, before any resume.
+6. **Not logged in**: every native `cli-*.log` so far says `You are not logged into
+   Antigravity`; the hand test needs a login first.
+
+### Q6. Tools with no reader: gemini, opencode, cursor-agent, copilot, crush
+
+**No session data exists for any of them, on Linux or on any mounted drive** `[verified]`.
+
+| tool | installed command | data found |
+|---|---|---|
+| gemini | wrapper; install incomplete (above) | Windows: `…/Users/arunt/.gemini/tmp/` with one chat file that has no resumable content (see "Gemini CLI"). Linux: `~/.gemini` has no `tmp/`, `history/` or `projects.json` |
+| opencode | wrapper; real 1.18.35 behind it | `~/.local/share/opencode/` holds two empty directories, `log/` and `repos/`, made 2026-10-10 17:57; no `opencode.db`. `~/.local/state/opencode/` empty; `~/.cache/opencode/bin/` empty; `~/.config/opencode/` holds `opencode.json`, `tui.jsonc`, `herdr-tui-session.js` and `plugins/` (herdr and orca status plugins). Windows: `…/Users/arunt/.config/opencode/` (`tui.json` and the orca plugins), no data directory |
+| cursor-agent | wrapper; not installed | `~/.cursor/` holds `hooks.json`, `hooks.json.bak`, `herdr-agent-state.sh` only. Windows: a project folder `mcp-servers/davinci-resolve-mcp/.cursor/rules/` (rule files) |
+| copilot | wrapper; not installed | `~/.copilot/` holds `settings.json` and `hooks/` only. Windows: `AppData/Local/Microsoft/Copilot` and the `Microsoft.Copilot_8wekyb3d8bbwe` package (the Windows Copilot app), and VS Code's bundled `extensions/copilot`: none is the Copilot CLI |
+| crush | wrapper; not installed | nothing |
+
+Where it was looked for:
+
+- by name, on `/`, `/home` and the four NTFS volumes (48,269 directories listed, the SPEC's
+  prune list, case-insensitive): directories `opencode`, `.opencode`, `.cursor`, `cursor`,
+  `cursor-agent`, `.cursor-agent`, `.copilot`, `copilot`, `gh-copilot`, `github-copilot`,
+  `.crush`, `crush`, `.gemini`, `gemini-cli`, `session-state`, `history-session-state`; files
+  `crush.db`, `opencode.db`, `store.db`, `crush.json`, `opencode.json(c)`, `cli-config.json`.
+  Every hit is in the table, bar these: the fixtures of this project, mise's own folders for
+  opencode, the `/etc/skel` copy of the opencode config, an editor colour theme, a web asset
+  folder, and the Windows Store's own `store.db`;
+- by path, under `/home/tanuj` and `…/Users/arunt` (the only profile besides `Default` and
+  `Public`): `.local/share/opencode`, `.local/state/opencode`, `.cache/opencode`, `.opencode`,
+  `AppData/Local/opencode`, `AppData/Roaming/opencode`; `.cursor/chats`,
+  `.cursor/cli-config.json`, `.config/cursor`, `.config/Cursor`, `.local/share/cursor-agent`,
+  `AppData/Roaming/Cursor`, `AppData/Local/cursor-agent`, `AppData/Local/Programs/cursor`;
+  `.copilot/session-state`, `.copilot/history-session-state`, `.config/github-copilot`,
+  `.config/gh-copilot`, `.config/copilot`, `.local/share/copilot`, `.local/state/copilot`,
+  `AppData/Local/copilot`, `AppData/Local/github-copilot`, `AppData/Roaming/GitHub Copilot`;
+  `.crush`, `.config/crush`, `.local/share/crush`, `.cache/crush`, `AppData/Local/crush`,
+  `AppData/Roaming/crush`. The default locations of cursor-agent, copilot and crush are from
+  memory of their documentation, not checked against the tools `[inferred]`.
+
+Known from the opencode binary, for when data appears `[verified, code; not run]`: sessions are
+in one SQLite file, `<data>/opencode.db` (`opencode-<channel>.db` for other release channels),
+with `<data>` = `$XDG_DATA_HOME/opencode` or `~/.local/share/opencode`; it has a `session`
+command group (`session delete <sessionID>` among it). No format section is written: there is
+no file to describe.
+
+Consequence for `status`: it lists `copilot`, `crush` and `cursor-agent` as "installed tools
+with no reader" because a wrapper of that name is on PATH; they are not installed.
+
+### Q7. Drive letter `D:`
+
+- The one recorded path `[verified]`: `D:\Hypermedia\Ep2`, the working directory of the Claude
+  session `900c4cc6-3c32-4c76-8b5d-d31aabfb0ff9` ("Crime doc asset organization and timeline",
+  98 messages, last used 2026-08-25; key `claude:01d855c4:900c4cc6-…`; transcript
+  `…/Users/arunt/.claude/projects/D--Hypermedia-Ep2/900c4cc6-….jsonl`).
+- It exists on no mounted volume, compared case-insensitively `[verified]`. Only `No Other Way`
+  has a `Hypermedia` folder, and it holds `Cine_Ads`, `Creative Content`, `Dr. Insanity`,
+  `Ep.2`, `UGC Ads`; `Ep.2` is presumably the renamed folder `[inferred]`.
+- The override is `~/.config/agent-sessions/pathmap.json` (the file does not exist yet):
+
+  ```json
+  {"D:": "/run/media/tanuj/No Other Way"}
+  ```
+
+  Checked with `PathMap.build(…, overrides=…)`, no file written `[verified]`: `D:` then shows as
+  resolved by override, `D:\Hypermedia\Cine_Ads` and `D:\D Drive\The Pencl Projects\Final
+  Fantasy Lore` map to existing folders, and **`D:\Hypermedia\Ep2` still maps to nothing**,
+  because the folder is gone. The override file takes drive letters and absolute POSIX
+  prefixes only; a per-folder entry is rejected (`_load_overrides`).
+- Without an override `[verified]`: the path map uses the working directories of listed
+  sessions as evidence, and this is the only one on `D:`. Adding the keys of the Windows
+  `.claude.json` `projects` object (`D:\D Drive\The Pencl Projects\Final Fantasy Lore`,
+  `D:\Hypermedia\Cine_Ads`, `D:\Hypermedia\Ep2`, `d:/Fable 5/Crime YT`) resolves `D:` to
+  `No Other Way` by evidence, 2 paths.
+
+### Q8. Sessions whose folder is gone, and re-pointing at import
+
+Of the 29 listed foreign sessions, 5 have no existing local folder `[verified]`:
+
+| provider | title | recorded cwd | reason |
+|---|---|---|---|
+| claude | Crime doc asset organization and timeline (`900c4cc6`) | `D:\Hypermedia\Ep2` | `D:` unresolved (Q7), and the folder is gone: `No Other Way/Hypermedia/` has `Ep.2`, no `Ep2` |
+| claude | Matcha on Yu site localhost (`c732c3a3`) | `F:\AI Projects\Website Works\UWW Sites` | exists up to `Zephyro/AI Projects/Website Works`; no `UWW Sites` there (there is a `UWW Website`) |
+| antigravity | Japanese Regulatory Document Design (`1a614fc4`) | `C:\Users\arunt\AppData\Local\Temp\claude\F--AI-Projects-Website-Works\402d1819-…\scratchpad\codex-img\agy` | temporary folder, deleted (exists up to `…\Temp\claude\F--AI-Projects-Website-Works`) |
+| antigravity | Unbleached Kinari Paper Texture (`b8d26378`) | `C:\Users\arunt\AppData\Local\Temp\sig-img-MwTxj4` | temporary folder, deleted |
+| antigravity | Vintage Japanese Regulatory Document (`a630b5c4`) | none recorded | no cwd can be recovered (Antigravity §4: empty `workspace_uris`, not in `last_conversations.json`) |
+
+The one foreign Codex session and the one foreign Grok session resolve; so do the other 21
+Claude sessions and 1 Antigravity conversation.
+
+What must change to import a session into a folder `T` the user chooses (`T` exists, absolute;
+for Grok take `os.path.realpath(T)`), compared with the recipes of each provider's §6:
+
+- **Claude**: only the destination directory, `~/.claude/projects/<enc(T)>/<id>.jsonl` and the
+  `<id>/` side directory, with `enc` as in §2 (the 200-character hash rule included). Nothing
+  inside the transcript: the tool finds the file by path (§5, step 1, when started in `T`).
+  Compared with a mapped import no other file differs. What differs is meaning: the paths in
+  the transcript (each record's `cwd`, the tool calls) name a folder that is not `T` under any
+  mapping. The tool's own marker for a moved session, a trailing
+  `{"type":"relocated","relocatedCwd":T,"sessionId":<id>}`, is read by its code (`[verified,
+  code]`: the last one in the file's tail wins over the head `cwd`) and was never seen in
+  data: still not to be written without a test. Today `importer.start_plan` refuses a session
+  whose folder is not found; that check is what a chosen folder replaces.
+- **Codex**: the destination path does not depend on the cwd, so it is unchanged. In the
+  copies the same four fields as in §6 step 3 get `T` instead of the mapped path:
+  `session_meta.payload.cwd`, `session_meta.payload.runtime_workspace_roots[]`,
+  `turn_context.payload.cwd`, `turn_context.payload.workspace_roots[]`. The difference: the path
+  map cannot produce the value, so the rule becomes "a value equal to the recorded cwd `O`
+  (case-insensitive, either slash, with or without `\\?\`) becomes `T`; a value below `O`
+  becomes the same path below `T`; any other value goes through the path map as now". In the
+  one foreign rollout all 1 + 3 + 3 values equal `O`. `thread_settings_applied` stays as
+  history. The segment caveat of §6 is unchanged.
+- **Grok**: two places, the same two as for a mapped import: the group directory, named by the
+  rule of Q1 for `T`, and `summary.json` `info.cwd` = `T` (plus `grok_home`). The difference:
+  the name can no longer be taken from an existing group or limited to `[A-Za-z0-9/ ]`; it has
+  to be computed for any `T`, which Q1 now allows. Left as recorded, as before: the cwd inside
+  `chat_history.jsonl`, `updates.jsonl`, `recap_requests/*.json` and `prompt_context.json`
+  (`working_directory`).
+- **Every provider**: the import record should say that the folder was chosen, and keep both
+  the recorded cwd and `T`. `imported_as` is found by id and is not affected.
+
+---
+
 ## Open questions / needs live test
 
-Each needs one supervised resume by the user; none can be answered from the files.
+Each open item needs one supervised run by the user; none can be answered from the files.
+Items answered since are struck through, with where the answer is.
 
 1. **Claude import** — does 2.1.296 resume a byte-copied Windows transcript placed under
    `projects/<enc(mapped cwd)>/`? Risk low–medium. Also: does `claude --resume <id>` started in
@@ -971,20 +1439,38 @@ Each needs one supervised resume by the user; none can be answered from the file
    source, not run)?
 2. **Codex import** — does 0.162.0 find a rollout with no `threads` row and repair its DB? Does it
    accept 0.150.1 rollouts? Does the directory prompt read `session_meta.payload.cwd` or the last
-   `turn_context.payload.cwd`? Risk medium.
+   `turn_context.payload.cwd`? Risk medium. `codex migrate-rollouts --thread <id> --json` (no
+   `--apply`) may serve as a model-free check; it was not run (Phase 2, Q2).
 3. **Codex segments** — what creates a `<A>_<B>` segment, and is `end_byte_offset` validated
    against the base file (matters only when importing a thread that has one; none of the foreign
    threads does).
-4. **Grok encoding** — are `-`, `.`, `_`, `~` percent-encoded in group directory names? One
-   `grok` session started in such a directory answers it. Until then import is limited as in §6.
-5. **Grok import and cross-cwd resume** — `grok export <id>` after a test import is a
-   model-free probe. Does `grok --resume <id>` work from another directory?
-6. **Antigravity** — does `agy --conversation <id>` work after copying only `conversations/<id>.db`
-   and `brain/<id>/`? If yes the verdict could become "supported, copy-only, cwd not rewritten".
-   Is resume by id independent of the cwd?
+4. ~~**Grok encoding** — are `-`, `.`, `_`, `~` percent-encoded in group directory names?~~
+   Answered in the sandbox (Phase 2, Q1): they are kept; the full rule, the form for names over
+   255 bytes included, is there. The adapter's narrow rule (Grok §6, step 1) can be lifted.
+5. **Grok import and cross-cwd resume** — ~~`grok export <id>` after a test import is a
+   model-free probe.~~ Done (Phase 2, Q1): the imported 1.0.34 session exports in full from any
+   directory. Still open: `grok --resume <id>` itself, from the mapped folder and from another
+   one; what the tool writes into a `.cwd` file (no group over 255 bytes was ever created by
+   it); why the search index holds no text for the imported session.
+6. **Antigravity** — ~~which index the tool trusts, and whether it rebuilds them~~: it looks for
+   the file `conversations/<id>.db` and rebuilds both indexes (Phase 2, Q5; code and the store's
+   own logs, not a run of ours). Still open, for the one hand test of the experimental import:
+   does `agy --conversation <id>` show the old turns after a copy of `conversations/<id>.db`,
+   `brain/<id>/` and `annotations/<id>.pbtxt`; what it does with Windows workspace URIs; is
+   resume by id independent of the cwd; the value of the start-up prune limit.
 7. **Antigravity IDE** — conversation format unknown (no data).
 8. **Gemini CLI** — nothing is testable until a real `gemini` is installed. Version skew to
    expect: the wrapper would install 0.63.0, the Windows data is 0.54.0.
 9. **Sub-agent detection for Codex, Grok, Antigravity** rests on schema and docs; no instance
    exists on any drive.
 10. **Cold walk time** — measure once after a reboot or remount.
+11. **Mounting** (Phase 2, Q4) — `udisksctl mount` was never run: what it prints, its exit
+    codes, the error under `--no-user-interaction`, and where the password is asked when it is
+    started from a TUI.
+12. **First prompt** (Phase 2, Q3) — are `claude "<prompt>"` and `codex "<prompt>"` sent
+    without a key press; does Claude's hidden `--prefill <text>` behave as its description
+    says.
+13. **Re-pointing** (Phase 2, Q8) — does a Claude session imported under a folder its
+    transcript never names resume cleanly there, and is a `relocated` record needed.
+14. **`grok sessions list` as a probe** — it also asks a remote service; what it sends when
+    logged in and online was not observed (the sandbox had neither).
