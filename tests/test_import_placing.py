@@ -318,7 +318,7 @@ class OneAtATimeTest(PlacingCase):
 
     def test_an_import_that_cannot_get_the_lock_is_refused(self):
         self.state.mkdir(exist_ok=True)
-        holder = python_child(HOLDER, stdin=-1)  # -1: a pipe, closed to let it go
+        holder = python_child(HOLDER, stdin=-1)  # -1: a pipe; `finish` closes it, which lets it go
         try:
             self.assertEqual(holder.stdout.readline(), "held\n")
             with (
@@ -327,7 +327,6 @@ class OneAtATimeTest(PlacingCase):
             ):
                 importer.execute(self.plan())
         finally:
-            holder.stdin.close()
             finish(self, [holder])
         self.assertEqual(
             caught.exception.reason,

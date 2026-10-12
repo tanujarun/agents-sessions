@@ -315,7 +315,9 @@ def launcher_child(*argv, **options):
 
 def finish(case, children, timeout=CHILD_TIMEOUT) -> list[tuple[int, str, str]]:
     """Wait for child processes; ``(exit status, stdout, stderr)`` of each.
-    One that does not finish is killed and fails the test."""
+    One that does not finish is killed and fails the test. A child's stdin,
+    when it is a pipe, is closed here (``communicate`` does it): do not close
+    it before, Python 3.11 then fails on the closed file."""
     results = []
     try:
         for child in children:

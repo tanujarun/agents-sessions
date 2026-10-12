@@ -138,7 +138,7 @@ class LockTest(StateCase):
         self.assertEqual(order, ["first", "other"])
 
     def test_a_lock_held_by_another_process_is_named_in_the_error(self):
-        holder = python_child(HOLDER, stdin=-1)  # -1: a pipe, closed to let it go
+        holder = python_child(HOLDER, stdin=-1)  # -1: a pipe; `finish` closes it, which lets it go
         try:
             self.assertEqual(holder.stdout.readline(), "held\n")
             started = time.monotonic()
@@ -151,7 +151,6 @@ class LockTest(StateCase):
                 f"{self.lock_path} is locked by process {holder.pid}; gave up after 0.3 s",
             )
         finally:
-            holder.stdin.close()
             ((status, _out, err),) = finish(self, [holder])
         self.assertEqual((status, err), (0, ""))
         with fsutil.lock(timeout=5):  # the holder is gone: it is free
