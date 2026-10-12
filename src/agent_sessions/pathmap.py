@@ -17,11 +17,14 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .fsutil import config_dir, listdir_ro
+from .errors import ApiError
+from .fsutil import config_dir, listdir_ro, make_private_dir, open_private
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
+    from pathlib import Path
 
+    from .fsutil import StrPath
     from .mounts import Mount
 
 OVERRIDE_FILE = "pathmap.json"
@@ -42,6 +45,7 @@ SYSTEM_LETTER = "C:"  # what Windows calls the volume it runs from
 
 _DRIVE = re.compile(r"([A-Za-z]):(?:[\\/]+(.*))?", re.S)  # the whole text, with ``fullmatch``
 _SPLIT_ANY = re.compile(r"[\\/]+")
+_LETTER = re.compile(r"[A-Za-z]:")  # a drive letter and nothing else, with ``fullmatch``
 
 
 @dataclass(frozen=True)
@@ -79,6 +83,103 @@ def normalise(recorded: object) -> Recorded | None:
     if text.startswith("/") and not text.startswith("//"):
         return Recorded("/", tuple(p for p in text.split("/") if p and p != "."))
     return None
+
+
+# --- the override file --------------------------------------------------------
+
+
+def override_file() -> Path:
+    return config_dir() / OVERRIDE_FILE
+
+
+def _read_overrides() -> dict[str, object]:
+    """The override file as it is, for a change to it; empty when there is
+    none. Raises ``ApiError`` for a file that is there and cannot be used:
+    writing would throw away whatever it holds."""
+    path = override_file()
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, RecursionError) as exc:
+        reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+        raise ApiError(f"{path} cannot be read ({reason}); it was not changed") from exc
+    if not isinstance(data, dict):
+        raise ApiError(f"{path} is not a JSON object; it was not changed")
+    return data
+
+
+def _write_overrides(data: Mapping[str, object]) -> None:
+    """Replace the override file: a temp file in the same directory, then
+    ``os.replace``. The file is private (0600), and so is a configuration
+    directory this makes (0700)."""
+    path = override_file()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        make_private_dir(path.parent)
+        try:
+            with open_private(tmp) as fh:
+                json.dump(data, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+            os.replace(tmp, path)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    except OSError as exc:
+        raise ApiError(f"{path} was not written: {exc.strerror or exc}") from exc
+
+
+def _letter(text: object) -> str:
+    """``text`` as a drive letter with its colon, upper case. Raises
+    ``ApiError`` for anything else."""
+    if not isinstance(text, str) or not _LETTER.fullmatch(text):
+        raise ApiError(f"{text!r} is not a drive letter; write it like D:")
+    return text.upper()
+
+
+def _other_letters(data: Mapping[str, object], letter: str) -> dict[str, object]:
+    """``data`` without the entries for ``letter``, however they are spelled
+    (``d:``, ``D:\\``): the loader reads them all as the same drive."""
+    kept = {}
+    for key, value in data.items():
+        recorded = normalise(key)
+        if recorded is None or recorded.root != letter or recorded.parts:
+            kept[key] = value
+    return kept
+
+
+def set_override(letter: str, directory: StrPath) -> tuple[str, str]:
+    """Write ``letter`` -> ``directory`` into the override file and return
+    the pair as written. The letter is a drive letter (``D:``), the
+    directory absolute and existing; the other entries of the file stay as
+    they are. Raises ``ApiError`` otherwise, and for a file that is there
+    and cannot be read."""
+    root = _letter(letter)
+    target = os.fspath(directory)
+    if not os.path.isabs(target):
+        raise ApiError(f"{target} is not an absolute path")
+    if not os.path.isdir(target):
+        raise ApiError(f"{target} is not a directory that exists")
+    target = os.path.normpath(target)
+    data = _other_letters(_read_overrides(), root)
+    data[root] = target
+    _write_overrides(data)
+    return root, target
+
+
+def remove_override(letter: str) -> str:
+    """Take ``letter`` out of the override file and return it. Raises
+    ``ApiError`` when the file has no entry for it."""
+    root = _letter(letter)
+    data = _read_overrides()
+    kept = _other_letters(data, root)
+    if len(kept) == len(data):
+        raise ApiError(f"{root} has no entry in {override_file()}")
+    _write_overrides(kept)
+    return root
 
 
 def _mount_path(mount: Mount | str) -> str:

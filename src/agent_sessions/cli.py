@@ -52,6 +52,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--json", action="store_true", help="JSON output")
     p.add_argument("--keys", action="store_true", help="add the session key as a last column")
+    p.add_argument(
+        "--mounted",
+        action="store_true",
+        help="leave out the sessions of drives that are not mounted",
+    )
 
     key_help = "a session key (`list --keys`), a unique start of one, or a session id"
     p = sub.add_parser("open", help="native: resume. foreign: import first")
@@ -77,6 +82,40 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="JSON output")
 
     sub.add_parser("verify", help="compare index against a brute-force walk")
+
+    drive_help = "a remembered drive: its label, drive letter (C:), mount path or volume id"
+    p = sub.add_parser(
+        "mount",
+        help="mount a remembered drive, then scan",
+        description=(
+            "Mount a drive whose sessions are listed as offline, then scan it. The mount is "
+            "`udisksctl mount`; when it needs a password, the desktop asks for it."
+        ),
+    )
+    p.add_argument("drive", help=drive_help)
+
+    p = sub.add_parser(
+        "forget",
+        help="drop a drive that is not mounted from the index",
+        description=(
+            "Drop a remembered drive that is not mounted, and with it its sessions, from the "
+            "index. Nothing on the drive is touched; a scan finds it again once it is mounted."
+        ),
+    )
+    p.add_argument("drive", help=drive_help)
+    p.add_argument("--yes", action="store_true", help="do not ask")
+
+    p = sub.add_parser(
+        "map",
+        help="drive letters: print them, or set one by hand",
+        description=(
+            "With no argument, print the drive letters and what each stands for. "
+            "`map D: DIR` says by hand that D: is DIR; `map --remove D:` takes that back."
+        ),
+    )
+    p.add_argument("letter", nargs="?", metavar="LETTER:", help="a drive letter, like D:")
+    p.add_argument("dir", nargs="?", metavar="DIR", help="the directory the letter stands for")
+    p.add_argument("--remove", metavar="LETTER:", help="remove the hand-made entry of a letter")
     return parser
 
 
@@ -86,8 +125,9 @@ def build_parser() -> argparse.ArgumentParser:
 # text come from stores on other drives and may hold terminal escape
 # sequences. Nothing below this block writes to a stream itself: readable text
 # goes through ``_out`` or ``_err``, JSON through ``_json``, the progress line
-# through ``_progress``, and each of those makes its text safe on the way out
-# (``textsafe``). tests/test_textsafe.py holds this module to that.
+# through ``_progress``, a question through ``_ask``, and each of those makes
+# its text safe on the way out (``textsafe``). tests/test_textsafe.py holds
+# this module to that.
 
 
 def _emit(stream: TextIO, text: str) -> None:
@@ -123,6 +163,15 @@ def _progress(text: str = "") -> None:
     """Replace the progress line on stderr; no text clears it."""
     sys.stderr.write("\r\033[K" + textsafe.clean(text))
     sys.stderr.flush()
+
+
+def _ask(question: str) -> bool:
+    """Ask a yes/no question and read the answer from stdin; only ``y`` or
+    ``yes`` is a yes. The question goes to stderr, so stdout stays what the
+    command prints."""
+    sys.stderr.write(textsafe.clean(question) + " [y/N] ")
+    sys.stderr.flush()
+    return sys.stdin.readline().strip().lower() in ("y", "yes")
 
 
 def _table(rows: Iterable[Iterable[object]], indent: str = "") -> None:
@@ -215,6 +264,12 @@ def _scan(args: argparse.Namespace) -> int:
     if args.json:
         _json(summary)
         return 0
+    _print_scan(summary)
+    return 0
+
+
+def _print_scan(summary: dict) -> None:
+    """A scan summary for a person."""
     _out(
         f"scan: {summary['mode']}, {_count(len(summary['mounts']), 'mount')}, "
         f"{summary['seconds']:.2f} s"
@@ -228,29 +283,35 @@ def _scan(args: argparse.Namespace) -> int:
     _out(f"stores: {summary['stores']}" + (f" ({', '.join(extra)})" if extra else ""))
     _table(
         [
-            [name, _count(row["stores"], "store"), _count(row["sessions"], "session")]
+            [
+                name,
+                _count(row["stores"], "store"),
+                _count(row["sessions"], "session"),
+                f"{row['offline']:,} offline" if row["offline"] else "",
+            ]
             for name, row in sorted(summary["by_provider"].items())
         ],
         "  ",
     )
+    offline = summary["offline"]
     _out(
-        f"sessions: {summary['sessions']:,} listed of "
+        f"sessions: {summary['sessions'] - offline:,} listed of "
         f"{_count(summary['candidates'], 'candidate')} "
         f"({summary['parsed']:,} parsed, {summary['cached']:,} from cache)"
+        + (f"; {offline:,} more offline, on drives not mounted" if offline else "")
     )
     if summary["warnings"]:
         _out(f"warnings: {len(summary['warnings'])} (see `{PROG} status`)")
-    return 0
 
 
 def _list(args: argparse.Namespace) -> int:
-    index = api.load_index()
+    index = api.load_index(offline=not args.mounted)
     if index.load_error is not None:
         # No cache, or one that cannot be used: an empty listing would look
         # like "no sessions". stdout stays the listing alone.
         _err("no usable cache; scanning…")
         api.scan()
-        index = api.load_index()
+        index = api.load_index(offline=not args.mounted)
     sessions = api.list_sessions(args.provider, index=index)
     if args.json:
         _json([s.to_dict() for s in sessions])
@@ -292,7 +353,7 @@ def _status(args: argparse.Namespace) -> int:
     for mount in status["mounts"]:
         walk = mount["walk"]
         if not mount["mounted"]:
-            detail = "not mounted"
+            detail = ""
         elif walk:
             detail = (
                 f"{_count(walk['dirs'], 'dir')}, {walk['pruned']:,} pruned, "
@@ -300,7 +361,17 @@ def _status(args: argparse.Namespace) -> int:
             )
         else:
             detail = "not walked yet"
-        rows.append([mount["letter"] or "", mount["label"], mount["path"], mount["fstype"], detail])
+        rows.append(
+            [
+                mount["letter"] or "",
+                mount["label"],
+                mount["path"],
+                mount["fstype"],
+                mount["uuid"],
+                _STATES[mount["state"]] if mount["mounted"] or mount["uuid"] else _NO_VOLUME_ID,
+                detail,
+            ]
+        )
     _table(rows, "  ")
     for mount in status["mounts"]:
         for path in (mount["walk"] or {}).get("error_paths", []):
@@ -338,7 +409,8 @@ def _status(args: argparse.Namespace) -> int:
             [
                 p["name"],
                 _count(p["stores"], "store"),
-                _count(p["sessions"], "session"),
+                _count(p["sessions"], "session")
+                + (f" ({p['offline']:,} offline)" if p["offline"] else ""),
                 (p["installed"] or f"{p['binary']} {p['tool']}")
                 + ("" if p["resumable"] else " (not resumable)"),
             ]
@@ -360,30 +432,7 @@ def _status(args: argparse.Namespace) -> int:
 
     _out("")
     _out("drive letters")
-    rows = [
-        [
-            row["letter"],
-            "->",
-            row["mount"],
-            f"{row['how']}, {_count(row['paths'], 'path')}"
-            + (f", recorded on {row['source_mount']}" if row["source_mount"] else ""),
-        ]
-        for row in status["letters"]
-    ]
-    rows += [
-        [
-            row["letter"],
-            "->",
-            "unresolved",
-            f"{row['reason']}, {_count(row['paths'], 'path')}, "
-            f"recorded on {row['source_mount']}"
-            + (f", candidates: {', '.join(row['candidates'])}" if row["candidates"] else ""),
-        ]
-        for row in status["unresolved_letters"]
-    ]
-    _table(rows, "  ")
-    if not rows:
-        _out("  none recorded")
+    _print_letters(status)
 
     _out("")
     _out("tools")
@@ -408,6 +457,105 @@ def _status(args: argparse.Namespace) -> int:
     _out(f"warnings: {len(status['warnings'])}")
     for warning in status["warnings"]:
         _out(f"  {warning}")
+    return 0
+
+
+# How a volume's state reads (``api.volumes``).
+_STATES = {"mounted": "mounted", "attached": "attached, not mounted", "absent": "not attached"}
+# For a volume that is not mounted and whose id no scan has recorded: whether
+# its device is attached cannot be looked up.
+_NO_VOLUME_ID = "not mounted"
+
+
+def _print_letters(status: dict) -> None:
+    """The drive letters of a status report: the resolved ones and how, the
+    letters remembered for drives that are not mounted, the unresolved."""
+    rows = [
+        [
+            row["letter"],
+            "->",
+            row["mount"],
+            f"{row['how']}, {_count(row['paths'], 'path')}"
+            + (f", recorded on {row['source_mount']}" if row["source_mount"] else ""),
+        ]
+        for row in status["letters"]
+    ]
+    rows += [
+        [volume["letter"], "->", volume["path"], "as last resolved; the drive is not mounted"]
+        for volume in status["volumes"]
+        if volume["letter"] and volume["state"] != "mounted"
+    ]
+    rows += [
+        [
+            row["letter"],
+            "->",
+            "unresolved",
+            f"{row['reason']}, {_count(row['paths'], 'path')}, "
+            f"recorded on {row['source_mount']}"
+            + (f", candidates: {', '.join(row['candidates'])}" if row["candidates"] else ""),
+        ]
+        for row in status["unresolved_letters"]
+    ]
+    _table(rows, "  ")
+    if not rows:
+        _out("  none recorded")
+
+
+def _mount(args: argparse.Namespace) -> int:
+    volume = api.find_volume(args.drive)
+    if volume["state"] != "mounted":
+        _err(f"mounting {volume['label']}… (the desktop may ask for your password)")
+    progress = None
+    if sys.stderr.isatty():
+
+        def progress(label: str, dirs: int) -> None:
+            _progress(f"scanning {label}… {dirs:,} dirs")
+
+    result = api.mount_drive(args.drive, progress=progress)
+    if progress is not None and result["scan"]["walk"] is not None:
+        _progress()
+    _out(f"mounted at {result['mount_point']}")
+    _print_scan(result["scan"])
+    return 0
+
+
+def _forget(args: argparse.Namespace) -> int:
+    volume = api.find_volume(args.drive)
+    what = (
+        f"{volume['label']} ({volume['path']}): {_count(volume['stores'], 'store')}, "
+        f"{_count(volume['sessions'], 'session')}"
+    )
+    if not args.yes and volume["state"] != "mounted":  # a mounted one is refused below
+        if not (sys.stdin.isatty() and sys.stderr.isatty()):
+            _err(f"forget {what}: not a terminal to ask on; pass --yes")
+            return 1
+        if not _ask(f"Forget {what}?"):
+            _err("nothing was forgotten")
+            return 1
+    done = api.forget_drive(volume["path"])
+    _out(
+        f"forgot {done['label']} ({done['path']}): {_count(done['stores'], 'store')}, "
+        f"{_count(done['sessions'], 'session')}"
+    )
+    return 0
+
+
+def _map(args: argparse.Namespace) -> int:
+    if args.remove is not None:
+        if args.letter is not None:
+            _err("map: --remove takes the letter alone")
+            return 2
+        letter = api.remove_letter(args.remove)
+        _out(f"{letter} is no longer set by hand")
+        return 0
+    if args.letter is None:
+        _print_letters(api.status())
+        return 0
+    if args.dir is None:
+        _err(f"map: say which directory {args.letter} stands for, or use --remove")
+        return 2
+    letter, directory = api.set_letter(args.letter, args.dir)
+    _out(f"{letter} -> {directory}")
     return 0
 
 
@@ -544,9 +692,10 @@ def _show(args: argparse.Namespace) -> int:
         ["messages", "-" if session.messages is None else session.messages],
         ["key", session.key],
     ]
+    turns = api.transcript(session)  # refused before anything is printed, when it is
     _table(rows)
     last = None
-    for turn in api.transcript(session):
+    for turn in turns:
         if turn.role == "tool":
             if last != "tool":
                 _out("")
@@ -582,6 +731,9 @@ _COMMANDS = {
     "open": _open,
     "import": _import,
     "show": _show,
+    "mount": _mount,
+    "forget": _forget,
+    "map": _map,
 }
 
 

@@ -35,6 +35,7 @@ TABLES = {
     "ProviderCount",
     "Status",
     "StatusMount",
+    "Volume",
     "ProviderStatus",
     "StoreStatus",
     "SkippedStore",
@@ -48,6 +49,7 @@ SCAN_TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 QDRIVE = "aaaaaaaa-1111-4222-8333-444444444444"
 DESKTOP = "bbbbbbbb-1111-4222-8333-444444444444"
 GONE = "cccccccc-1111-4222-8333-444444444444"
+GONE_UUID = "0A1B-2C3D"  # the filesystem UUID of the drive that is unplugged
 
 
 def read_doc() -> tuple[dict[str, dict[str, str]], dict[str, str]]:
@@ -186,8 +188,8 @@ class ContractTest(unittest.TestCase):
         # A store that is found and skipped on purpose.
         desktop = profile / "AppData" / "Roaming" / "Claude" / "local-agent-mode-sessions" / "a"
         claude_transcript(desktop / ".claude", DESKTOP, "C:\\Users\\user")
-        # A drive with a store that is then unplugged.
-        self.gone = self.w.box.mount("Gone")
+        # A drive with a store that is then unplugged: its session stays listed, offline.
+        self.gone = self.w.box.mount("Gone", uuid=GONE_UUID, fs_label="GONE", fstype="exfat")
         claude_transcript(self.gone / "Users" / "x" / ".claude", GONE, "C:\\Users\\x")
         # Tools: one that is only a wrapper, one that is installed and has no reader.
         self.w.path.wrapper("crush")
@@ -291,13 +293,22 @@ class ContractTest(unittest.TestCase):
             else:
                 self.assertFalse(row["launchable"])
             self.assertTrue(all(os.path.isabs(path) for path in row["files"]))
+            self.assertEqual(row["offline"], row["id"] == GONE)
         by_id = {(row["origin"], row["id"]): row for row in listing}
         self.assertEqual(
             by_id["foreign", CLAUDE_WIN]["imported_as"], by_id["native", CLAUDE_WIN]["key"]
         )
         self.assertIsNone(by_id["foreign", AGY_NO_CWD]["cwd"])
         self.assertEqual(by_id["foreign", QDRIVE]["cwd"], "Q:\\Nowhere\\x")
-        self.assertNotIn(GONE, [row["id"] for row in listing])  # its drive is not mounted
+        gone = by_id["foreign", GONE]  # its drive is not mounted: listed from the cache
+        self.assertEqual(
+            (gone["offline"], gone["cwd"], gone["cwd_local"], gone["launchable"], gone["note"]),
+            (True, "C:\\Users\\x", None, False, "drive not mounted"),
+        )
+        self.assertEqual((gone["mount"], gone["mount_label"]), (str(self.gone), "Gone"))
+        self.assertEqual(
+            self.json("list", "--mounted", "--json"), [row for row in listing if not row["offline"]]
+        )
         self.assertNotIn(DESKTOP, [row["id"] for row in listing])  # skipped on purpose
         self.assertEqual(
             {row["provider"] for row in listing},
@@ -324,6 +335,15 @@ class ContractTest(unittest.TestCase):
             )
             self.assertEqual(summary["parsed"] + summary["cached"], summary["candidates"])
         self.assertEqual((deep["stores_not_mounted"], quick["stores_not_mounted"]), (0, 1))
+        self.assertEqual((deep["offline"], quick["offline"]), (0, 1))
+        self.assertEqual(
+            {name: p["offline"] for name, p in quick["by_provider"].items() if p["offline"]},
+            {"claude": 1},
+        )
+        self.assertEqual(
+            [(m["label"], m["uuid"], m["fs_label"]) for m in deep["mounts"] if m["uuid"]],
+            [("Gone", GONE_UUID, "GONE")],
+        )
         self.assertEqual((deep["skipped_stores"], quick["skipped_stores"]), (1, 1))
 
     def test_status(self):
@@ -341,29 +361,60 @@ class ContractTest(unittest.TestCase):
                 {
                     "path": str(self.gone),
                     "label": "Gone",
-                    "fstype": "",
+                    "fstype": "exfat",
                     "device": "",
+                    "uuid": GONE_UUID,
+                    "fs_label": "GONE",
                     "mounted": False,
-                    "letter": None,
+                    "state": "absent",  # no such device on the machine the suite runs on
+                    "letter": "C:",  # as resolved while it was mounted
                     "walk": None,
                 }
             ],
+        )
+        self.assertEqual({m["state"] for m in status["mounts"] if m["mounted"]}, {"mounted"})
+        volumes = {v["label"]: v for v in status["volumes"]}
+        self.assertEqual(sorted(volumes), ["Gone", "Linux", "WinC"])  # DataF holds no store
+        gone = dict(volumes["Gone"])
+        self.assertRegex(gone.pop("last_seen"), SCAN_TIME)
+        self.assertEqual(
+            gone,
+            {
+                "path": str(self.gone),
+                "label": "Gone",
+                "fs_label": "GONE",
+                "uuid": GONE_UUID,
+                "fstype": "exfat",
+                "letter": "C:",
+                "state": "absent",
+                "stores": 1,
+                "sessions": 1,
+            },
+        )
+        self.assertEqual(
+            (volumes["WinC"]["state"], volumes["WinC"]["letter"], volumes["Linux"]["letter"]),
+            ("mounted", "C:", None),
+        )
+        self.assertEqual(
+            {p["name"]: p["offline"] for p in status["providers"] if p["offline"]}, {"claude": 1}
         )
         self.assertEqual([s["present"] for s in status["stores"]].count(False), 1)
         self.assertEqual(
             [(s["provider"], s["reason"], s["mounted"]) for s in status["skipped_stores"]],
             [("claude", "Claude Desktop history", True)],
         )
+        # C: by the folders .claude.json names (Provider.path_evidence), which exist.
         self.assertEqual(
             {row["letter"]: row["how"] for row in status["letters"]},
-            {"C:": "system volume", "F:": "evidence"},
+            {"C:": "evidence", "F:": "evidence"},
         )
         self.assertEqual(
             [
                 (row["letter"], row["reason"], row["candidates"])
                 for row in status["unresolved_letters"]
             ],
-            [("Q:", "no evidence", [])],
+            # D: is in .claude.json alone: no session of the fixtures recorded it.
+            [("D:", "no evidence", []), ("Q:", "no evidence", [])],
         )
         tools = {row["tool"]: row for row in status["tools"]}
         self.assertEqual(
@@ -435,6 +486,7 @@ class ContractTest(unittest.TestCase):
             self.assertGreater(len(values), 0)
             self.assertEqual(values, sorted(values))
 
+        in_order(status["volumes"], lambda r: r["path"])
         in_order(status["providers"], lambda r: r["name"])
         in_order(status["stores"], lambda r: f"{r['provider']}:{r['root']}")
         in_order(status["skipped_stores"], lambda r: (r["provider"], r["root"]))

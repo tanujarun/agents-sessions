@@ -137,11 +137,11 @@ class PlanTest(LaunchCase):
         for dry_run in (True, False):
             self.assertEqual(
                 self.failure(foreign.key, dry_run=dry_run),
-                "this session is on WinC; import it first",
+                "this session is on C:; import it first",
             )
         self.assertEqual(self.w.started, [])
         # Only the real attempt tells the desktop.
-        self.assertEqual(self.w.notified, ["this session is on WinC; import it first"])
+        self.assertEqual(self.w.notified, ["this session is on C:; import it first"])
 
     def test_imported_foreign_session_resumes_the_native_copy(self):
         foreign = self.w.session(CLAUDE_WIN, "foreign", self.index)

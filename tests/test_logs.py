@@ -288,7 +288,7 @@ class FacadeTest(LogCase):
         self.assertRegex(
             line,
             r"^scan deep: \d+\.\d\d s, 1 mounts, 1 stores, 2 candidates "
-            r"\(2 parsed, 0 from cache\), 2 sessions, 0 warnings$",
+            r"\(2 parsed, 0 from cache\), 2 sessions \(0 on drives not mounted\), 0 warnings$",
         )
         self.assertEqual(summary["sessions"], 2)
         api.scan()

@@ -207,7 +207,7 @@ class ClaudeImportTest(ImportCase):
         index = api.load_index()
         again = self.w.session(CLAUDE_WIN, "foreign", index)
         self.assertEqual(again.imported_as, native.key)
-        self.assertEqual(index.where(again), "WinC · imported")
+        self.assertEqual(index.where(again), "C: · imported")
         self.assertEqual(self.w.session(CLAUDE_WIN, "native", index), native)
         self.assertEqual(api.can_import(again), (False, "already imported"))
 

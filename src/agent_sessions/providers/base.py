@@ -119,6 +119,20 @@ class Provider:
                 found.append(session)
         return found
 
+    def evidence_files(self, store: Store) -> list[str]:
+        """The files ``path_evidence`` reads, existing or not. Their
+        signature decides whether the evidence the index has cached still
+        stands, so a scan reads them only when they changed. None by
+        default, and then ``path_evidence`` is not called."""
+        return []
+
+    def path_evidence(self, store: Store) -> list[str]:
+        """Folders the store recorded besides the working directories of its
+        sessions, as the tool wrote them (``D:\\Proj\\Site``): more evidence
+        for which mount a drive letter stands for. Read bounded, and never
+        raise on a malformed file. None by default."""
+        return []
+
     def resume_argv(self, s: Session) -> list[str]:
         """Resume command for a native session."""
         raise NotImplementedError

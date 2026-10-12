@@ -23,6 +23,7 @@ from .base import (
     clean_title,
     iter_jsonl,
     parse_ts,
+    read_small,
     unreadable,
     warn,
 )
@@ -55,6 +56,11 @@ _ENCODED = re.compile(r"[A-Za-z0-9-]+")  # all ``encode_cwd`` can give
 _HEAD = 65536  # the tool itself reads this much for cheap fields
 _ID_KEPT = 128  # characters of a message id that are kept as they are
 _VERSION_MAX = 64  # characters; a longer "version" is not one
+_CONFIG = ".claude.json"  # beside the store directory
+# The largest ``.claude.json`` read whole. The one of this machine is 109 kB;
+# versions of the tool that kept the prompt history in it let it grow to
+# megabytes. 16 MB is what the other adapters allow a file they read whole.
+_CONFIG_MAX = 16 * 1024 * 1024
 _BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 
@@ -331,6 +337,26 @@ class Claude(Provider):
             files=files,
             note=f"continued in {scan.continued_in}" if scan.continued_in else None,
         )
+
+    def evidence_files(self, store: Store) -> list[str]:
+        """``.claude.json``, which sits beside the store directory, not in
+        it (FORMATS "Claude Code" section 2)."""
+        return [os.path.join(os.path.dirname(store.root), _CONFIG)]
+
+    def path_evidence(self, store: Store) -> list[str]:
+        """The keys of the ``projects`` object of ``.claude.json``: every
+        folder the tool was ever started in, sessions kept or not (FORMATS
+        "Q7"). Nothing when the file is missing, too large, not JSON, not
+        an object, or has no such object."""
+        raw = read_small(self.evidence_files(store)[0], _CONFIG_MAX)
+        if raw is None:
+            return []
+        try:
+            config = json.loads(raw.decode("utf-8-sig", "replace"))
+        except (ValueError, RecursionError):
+            return []
+        projects = config.get("projects") if isinstance(config, dict) else None
+        return sorted(projects) if isinstance(projects, dict) else []
 
     def resume_argv(self, s: Session) -> list[str]:
         return [self.binary, "--resume", s.id]
