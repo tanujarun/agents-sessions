@@ -9,14 +9,16 @@ imported: an engine that lacks one gives a status-line message, not a crash.
 from __future__ import annotations
 
 import importlib
+import os
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import threading
     from collections.abc import Callable, Iterator
 
+    from ..api import ContinueOptions, ImportOptions, UnimportReport
     from ..index import Index
-    from ..launch import LaunchPlan
+    from ..launch import ContinuePlan, LaunchPlan
     from ..model import Session
     from ..providers.base import Turn
 
@@ -73,11 +75,33 @@ class Engine:
     def find_session(self, ref: Session | str, index: Index | None = None) -> Session:
         return self._call("find_session", ref, index=index)
 
-    def can_import(self, session: Session | str, index: Index | None = None) -> tuple[bool, str]:
-        return self._call("can_import", session, index=index)
+    def import_options(
+        self, ref: Session | str, index: Index | None = None, target: str | None = None
+    ) -> ImportOptions:
+        return self._call("import_options", ref, index=index, target=target)
+
+    def continue_options(self, ref: Session | str, index: Index | None = None) -> ContinueOptions:
+        return self._call("continue_options", ref, index=index)
+
+    def volumes(self, index: Index | None = None) -> list[dict]:
+        return self._call("volumes", index=index)
 
     def transcript(self, ref: Session | str, index: Index | None = None) -> Iterator[Turn]:
         return self._call("transcript", ref, index=index)
+
+    def list_folder(self, directory: str) -> list[tuple[str, bool]]:
+        """The entries of a directory as ``(name, is a directory)``, for the
+        completion of a folder the user types. Listed the engine's way,
+        which leaves the directory's access time alone (it may be on
+        another drive); raises ``OSError`` when it cannot be listed."""
+        try:
+            fsutil = importlib.import_module("agent_sessions.fsutil")
+        except ImportError as exc:
+            raise EngineError(f"the engine could not be loaded: {exc}") from exc
+        return [
+            (name, os.path.isdir(os.path.join(directory, name)))
+            for name in fsutil.listdir_ro(directory)
+        ]
 
     # --- acting ----------------------------------------------------------
 
@@ -94,8 +118,45 @@ class Engine:
         ref: Session | str,
         progress: Callable[[int, int], None] | None = None,
         index: Index | None = None,
+        target: str | None = None,
+        experimental: bool = False,
     ) -> Session:
-        return self._call("import_session", ref, progress=progress, index=index)
+        return self._call(
+            "import_session",
+            ref,
+            progress=progress,
+            index=index,
+            target=target,
+            experimental=experimental,
+        )
+
+    def unimport(
+        self,
+        ref: Session | str,
+        force: bool = False,
+        dry_run: bool = False,
+        index: Index | None = None,
+    ) -> UnimportReport:
+        return self._call("unimport", ref, force=force, dry_run=dry_run, index=index)
+
+    def mount_drive(
+        self,
+        ref: str,
+        progress: Callable[[str, int], None] | None = None,
+        cancel: threading.Event | None = None,
+    ) -> dict:
+        return self._call("mount_drive", ref, progress=progress, cancel=cancel)
+
+    def continue_session(
+        self,
+        ref: Session | str,
+        tool: str | None = None,
+        folder: str | None = None,
+        index: Index | None = None,
+    ) -> ContinuePlan:
+        """Always in a new window: the engine's ``here`` would replace this
+        process, so it is not forwarded."""
+        return self._call("continue_session", ref, tool=tool, folder=folder, index=index)
 
     def open_session(
         self,

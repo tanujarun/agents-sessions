@@ -6,7 +6,9 @@ Needs Textual, so the whole module skips on a Python without it
 (``make test-tui`` runs it under ``.venv``)."""
 
 import asyncio
+import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -20,7 +22,18 @@ for _path in (str(REPO / "src"), str(REPO / "tests")):
         sys.path.insert(0, _path)
 
 import tui_support as support  # noqa: E402
-from tui_support import FakeEngine, FakeError, Turn, make_session, screen_text, settle  # noqa: E402
+from tui_support import (  # noqa: E402
+    ContinueOptions,
+    FakeEngine,
+    FakeError,
+    ImportOptions,
+    Turn,
+    make_session,
+    screen_text,
+    settle,
+)
+
+from agent_sessions.errors import MountFailed, UndoFailed  # noqa: E402
 
 try:
     import textual
@@ -48,6 +61,21 @@ IMPORTED_COPY = "claude:aaaaaaaa:cln-0090"
 OFFLINE = "claude:bbbbbbbb:clf-0070"  # foreign, its drive is not mounted
 OFFLINE_IMPORTED = "claude:bbbbbbbb:clf-0091"  # the same, and imported before
 OFFLINE_COPY = "claude:aaaaaaaa:cln-0091"
+AGY = "antigravity:bbbbbbbb:anf-0000"  # foreign, on C:; no tool of its own is installed
+POSSIBLE_PROMPT = (
+    "On C: [i] import and resume  [I] import only  [t] into another folder  "
+    "[c] continue as new  [v] view  [Esc] cancel"
+)
+NEEDS_FOLDER = ImportOptions(
+    False, "the project folder C:\\Work\\project-12 was not found on any mounted drive", True
+)
+WARNING = (
+    "Experimental: no imported Antigravity conversation has been resumed by hand yet, "
+    "and agy starts a new conversation without an error when it cannot read a copy. "
+    "After the first resume, check that the old turns are on the screen."
+)
+EXPERIMENTAL = ImportOptions(False, "experimental, done only when asked for", False, True, WARNING)
+IMPOSSIBLE = ImportOptions(False, "Gemini chats cannot be imported")
 
 
 async def until(condition, timeout: float = 5.0, what: str = "condition") -> None:
@@ -108,11 +136,36 @@ class TuiCase(unittest.IsolatedAsyncioTestCase):
     def imported(self) -> list:
         return self.engine.called("import_session")
 
+    def mounted(self) -> list:
+        return self.engine.called("mount_drive")
+
+    def continued(self) -> list:
+        return self.engine.called("continue_session")
+
+    def undone(self) -> list:
+        return self.engine.called("unimport")
+
+    def acted(self) -> list:
+        """Everything the engine was asked to do to the machine."""
+        undone = [call for call in self.undone() if not call[2]]  # a dry run removes nothing
+        return self.opened() + self.imported() + self.mounted() + self.continued() + undone
+
     def exited(self) -> bool:
         return self.app.return_code is not None
 
+    def prompt(self) -> str:
+        """The prompt's text, or "" when none is shown."""
+        widget = self.main.query_one("#prompt")
+        return str(widget.render()) if widget.display else ""
+
+    @property
+    def folder(self):
+        return self.main.folder_input
+
     async def select(self, pilot, key):
-        """Put the selection on a session by key (All tab if need be)."""
+        """Put the selection on a session by key (All tab if need be). For a
+        row that can be asked about, the detail pane has its answer on
+        return, as it has for a user who looks before pressing a key."""
         keys = [row.key for row in self.rows.rows]
         if key not in keys:
             await pilot.press("0")
@@ -120,9 +173,37 @@ class TuiCase(unittest.IsolatedAsyncioTestCase):
         self.rows.select(keys.index(key))
         await settle(pilot)
         self.assertEqual(self.selected(), key)
+        session = self.main.snapshot.sessions[key]
+        if session.origin != "native" and not session.imported_as and app_mod.VERDICT_DELAY < 1:
+            await until(lambda: key in self.main._verdicts, what="the import verdict")
+            await pilot.pause()
+
+    async def mode_is(self, pilot, mode, timeout=5.0):
+        """Wait for a prompt (or the list) that a worker's answer brings."""
+        deadline = time.monotonic() + timeout
+        while self.main.mode != mode:
+            if time.monotonic() > deadline:
+                raise AssertionError(f"mode is {self.main.mode!r}, not {mode!r}: {self.status()}")
+            await asyncio.sleep(0.01)
+        await pilot.pause()
+
+    async def type_folder(self, pilot, text):
+        """Replace what the folder input holds, as typing over it would."""
+        self.assertEqual(self.main.mode, "folder")
+        self.folder.value = text
+        self.folder.cursor_position = len(text)
+        await pilot.pause()
 
     async def message(self, fragment, timeout=5.0):
         await until(lambda: fragment in self.status(), timeout, f"status line with {fragment!r}")
+
+    def check_frame(self, width, height):
+        """The screen is exactly the terminal: its lines, and none wider."""
+        lines = self.text().splitlines()
+        self.assertEqual(len(lines), height)
+        for line in lines:
+            self.assertLessEqual(cell_len(line), width)
+        return lines
 
 
 class StartTest(TuiCase):
@@ -247,6 +328,10 @@ class StartTest(TuiCase):
                 "enter",
                 "o",
                 "i",
+                "t",
+                "c",
+                "u",
+                "m",
                 "v",
                 "0",
                 "3",
@@ -262,7 +347,7 @@ class StartTest(TuiCase):
             await settle(pilot)
             self.assertIn("No sessions found", self.text())
             self.assertIsNone(self.selected())
-            self.assertEqual(self.opened() + self.imported(), [])
+            self.assertEqual(self.acted() + self.undone(), [])
             self.assertEqual(self.engine.called("transcript"), [])
             self.assertFalse(self.exited())
             self.assertIs(self.app.screen, self.main)
@@ -417,7 +502,7 @@ class MoveTest(TuiCase):
             self.assertIn("recorded folder is gone", text)
 
     async def test_import_verdict_is_fetched_off_thread_and_cached(self):
-        self.engine.verdicts[FOREIGN] = (False, "this format cannot be imported safely")
+        self.engine.options[FOREIGN] = ImportOptions(False, "this format cannot be imported safely")
         async with self.started() as pilot:
             await settle(pilot)
             await self.select(pilot, FOREIGN)
@@ -427,15 +512,32 @@ class MoveTest(TuiCase):
             await pilot.press("up", "down", "up", "down")
             await asyncio.sleep(0.1)
             await settle(pilot)
-            self.assertEqual(self.engine.called("can_import").count(FOREIGN), 1)
+            self.assertEqual(self.engine.called("import_options").count(FOREIGN), 1)
             # A native row and an already-imported row never ask.
             await self.select(pilot, NATIVE)
             await self.select(pilot, IMPORTED)
             await asyncio.sleep(0.1)
             await settle(pilot)
             self.assertIn("already imported", self.text())
-            self.assertNotIn(NATIVE, self.engine.called("can_import"))
-            self.assertNotIn(IMPORTED, self.engine.called("can_import"))
+            self.assertNotIn(NATIVE, self.engine.called("import_options"))
+            self.assertNotIn(IMPORTED, self.engine.called("import_options"))
+
+    async def test_the_detail_pane_says_what_the_import_can_be(self):
+        self.engine.options[FOREIGN] = NEEDS_FOLDER
+        self.engine.options[AGY] = EXPERIMENTAL
+
+        def detail() -> str:
+            return str(self.main.query_one("#detail-import").render())
+
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, FOREIGN)
+            self.assertEqual(detail(), "possible into a folder you choose")
+            await self.select(pilot, AGY)
+            self.assertEqual(detail(), "experimental only")
+            await self.select(pilot, "codex:bbbbbbbb:cof-0004")
+            self.assertEqual(detail(), "possible")
+            self.assertEqual(self.acted(), [])
 
     async def test_click_selects_and_the_wheel_scrolls(self):
         from textual.events import MouseScrollDown, MouseScrollUp
@@ -651,10 +753,9 @@ class ForeignTest(TuiCase):
         await settle(pilot)
         await self.select(pilot, FOREIGN)
         await pilot.press(key)
-        self.assertEqual(self.main.mode, "foreign")
-        self.assertIn(
-            "On C: [i] import and resume  [I] import only  [v] view  [Esc] cancel", self.text()
-        )
+        await self.mode_is(pilot, "foreign")
+        self.assertEqual(self.prompt(), POSSIBLE_PROMPT)
+        self.assertIn(POSSIBLE_PROMPT, self.text())
         self.assertEqual(self.opened() + self.imported(), [])
 
     async def test_enter_shows_the_prompt_over_the_hints(self):
@@ -666,7 +767,7 @@ class ForeignTest(TuiCase):
             self.assertLess(at, hints)
             self.assertLessEqual(hints - at, 2)
             # Other keys mean nothing while it is up.
-            await pilot.press("j", "q", "enter", "o", "r", "2", "y")
+            await pilot.press("j", "q", "enter", "o", "r", "2", "y", "m", "u", "slash")
             self.assertEqual(self.main.mode, "foreign")
             self.assertEqual(self.selected(), FOREIGN)
             self.assertEqual(self.engine.called("scan"), [None])
@@ -787,7 +888,7 @@ class ImportKeyTest(TuiCase):
             await settle(pilot)
             await self.select(pilot, FOREIGN)
             await pilot.press("i")
-            self.assertEqual(self.main.mode, "confirm")
+            await self.mode_is(pilot, "confirm")
             self.assertIn(
                 'Import "claude session 12" from C: to Linux?  [y] yes  [n] no', self.text()
             )
@@ -821,10 +922,10 @@ class ImportKeyTest(TuiCase):
         gate = threading.Event()
         real_import = self.engine.import_session
 
-        def slow_import(ref, progress=None, index=None):
+        def slow_import(ref, progress=None, index=None, **how):
             progress(3_100_000, 12_000_000)
             gate.wait(5)
-            return real_import(ref, progress=None, index=index)
+            return real_import(ref, progress=None, index=index, **how)
 
         self.engine.import_session = slow_import
         async with self.started() as pilot:
@@ -860,7 +961,9 @@ class ImportKeyTest(TuiCase):
             await self.message("imported claude session 12")
 
     async def test_known_verdict_refuses_without_asking(self):
-        self.engine.verdicts[FOREIGN] = (False, "the mapped folder has characters Grok cannot use")
+        self.engine.options[FOREIGN] = ImportOptions(
+            False, "the mapped folder has characters Grok cannot use"
+        )
         async with self.started() as pilot:
             await settle(pilot)
             await self.select(pilot, FOREIGN)
@@ -1224,7 +1327,7 @@ class ErrorTest(TuiCase):
             "status",
             "list_sessions",
             "scan",
-            "can_import",
+            "import_options",
             "open_session",
             "import_session",
             "transcript",
@@ -1249,6 +1352,48 @@ class ErrorTest(TuiCase):
                 self.assertFalse(self.exited(), name)
                 self.assertTrue(self.app.is_running, name)
                 self.assertIs(self.app.screen, self.main, name)
+
+    async def test_the_calls_of_the_new_keys_can_fail_too_and_say_so(self):
+        """An exception nobody planned for, in each call the mount, folder,
+        continue and undo keys make: its words in the status line, the app
+        alive, the list back."""
+        with tempfile.TemporaryDirectory() as tmp:
+            flows = (  # (the call that fails, the row, the keys that lead to it)
+                ("import_options", FOREIGN, ("enter",)),
+                ("import_options", FOREIGN, ("t",)),
+                ("import_session", FOREIGN, ("t", "enter")),
+                ("list_folder", FOREIGN, ("t", "tab")),
+                ("continue_options", NATIVE, ("c",)),
+                ("continue_session", NATIVE, ("c", "enter", "enter", "y")),
+                ("unimport", IMPORTED_COPY, ("u",)),
+                ("volumes", OFFLINE, ("enter",)),
+                ("mount_drive", OFFLINE, ("m",)),
+                ("mount_drive", OFFLINE, ("enter", "m")),
+            )
+            for name, key, keys in flows:
+                engine = FakeEngine()
+                engine.continue_folder = tmp
+                engine.sessions.append(make_session("claude", 70, foreign=True, offline=True))
+                with mock.patch.dict(os.environ, {"HOME": tmp}):
+                    async with self.started(engine=engine) as pilot:
+                        await settle(pilot)
+                        await self.select(pilot, key)
+                        engine.fail[name] = RuntimeError(f"{name} blew up")
+                        self.main._verdicts.clear()  # so that the engine is asked again
+                        for press in keys:
+                            await pilot.press(press)
+                            await settle(pilot)
+                        await self.message(f"{name} blew up")
+                        error = self.main.query_one("#status-message").has_class("-error")
+                        self.assertTrue(error, (name, keys))
+                        await pilot.press("escape", "escape")
+                        await settle(pilot)
+                        self.assertEqual(self.main.mode, "list", (name, keys))
+                        self.assertFalse(self.exited(), (name, keys))
+                        self.assertTrue(self.app.is_running, (name, keys))
+                        self.assertIs(self.app.screen, self.main, (name, keys))
+                        self.assertEqual(self.selected(), key)
+                        self.assertIs(self.app.focused, self.rows)
 
     async def test_engine_without_the_new_functions(self):
         """The default engine against a module that lacks open/import/…:
@@ -1284,9 +1429,20 @@ class ErrorTest(TuiCase):
             await self.select(pilot, FOREIGN)
             await until(lambda: FOREIGN in self.main._verdicts, what="verdict")
             await pilot.pause()
-            self.assertIn("unknown: this build of the engine has no `can_import` yet", self.text())
-            await pilot.press("i", "y")
-            await self.message("this build of the engine has no `import_session` yet")
+            self.assertIn(
+                "unknown: this build of the engine has no `import_options` yet", self.text()
+            )
+            for key, function in (
+                ("i", "import_options"),
+                ("enter", "import_options"),
+                ("t", "import_options"),
+                ("c", "continue_options"),
+                ("u", "unimport"),
+            ):
+                await pilot.press(key)
+                await self.message(f"this build of the engine has no `{function}` yet")
+                self.assertEqual(self.main.mode, "list")
+                await pilot.press("escape")
             await pilot.press("v")
             await settle(pilot)
             await until(lambda: "has no `transcript` yet" in self.text(), what="pager error")
@@ -1296,13 +1452,6 @@ class ErrorTest(TuiCase):
 
 
 class SizeTest(TuiCase):
-    def check_frame(self, width, height):
-        lines = self.text().splitlines()
-        self.assertEqual(len(lines), height)
-        for line in lines:
-            self.assertLessEqual(cell_len(line), width)
-        return lines
-
     async def test_120x40(self):
         async with self.started(size=(120, 40)) as pilot:
             await settle(pilot)
@@ -1322,7 +1471,9 @@ class SizeTest(TuiCase):
             self.assertTrue(self.main.query_one("#detail").display)
             self.assertIn("1 Claude 20", lines[1])
             self.assertIn("0 All 34", lines[1])
-            self.assertIn("/ filter  r rescan  R full rescan  ? help  q quit", lines[-1])
+            self.assertEqual(lines[-2].strip(), view.HINTS_MEDIUM[0])  # every key still
+            self.assertEqual(lines[-1].strip(), view.HINTS_MEDIUM[1])
+            self.assertIn("c continue  u undo  m mount", lines[-1])
             self.assertGreaterEqual(self.rows.size.height, 8)
             await pilot.press("0")
             self.assertEqual(
@@ -1359,10 +1510,13 @@ class SizeTest(TuiCase):
             await pilot.press("escape")
             await self.select(pilot, FOREIGN)
             await pilot.press("enter")
-            self.assertIn("[i] resume [I] import [v] view [Esc]", self.text())
+            await self.mode_is(pilot, "foreign")
+            self.assertIn("[i] [I] [t] [c] [v] [Esc]", self.text())
             await pilot.resize_terminal(60, 10)
-            self.assertIn("On C: [i] import+resume  [I] import  [v] view  [Esc]", self.text())
+            await pilot.pause()
+            self.assertIn("[i] resume [I] import [t] folder [c] new [v] view [Esc]", self.text())
             await pilot.resize_terminal(40, 10)
+            await pilot.pause()
             await pilot.press("v")
             await settle(pilot)
             self.check_frame(40, 10)
@@ -1427,6 +1581,7 @@ class SizeTest(TuiCase):
             self.assertIs(self.app.screen, self.main)
             await self.select(pilot, FOREIGN)
             await pilot.press("i")
+            await self.mode_is(pilot, "confirm")
             await pilot.resize_terminal(40, 10)
             await settle(pilot)
             self.assertEqual(self.main.mode, "confirm")
@@ -1472,11 +1627,19 @@ class HelpAndQuitTest(TuiCase):
                 "rescan every drive",
                 "quit",
                 "double-click resumes",
+                "import it into a folder you choose",
+                "continue as a new session",
+                "undo an import",
+                "mount the drive of an offline session",
             ):
                 self.assertIn(fragment, text)
-            await pilot.press("o", "i", "r", "1")  # no meaning here
+            for key in ("t", "c", "u", "m"):
+                self.assertRegex(text, rf"(?m)^\W*{key}  +\w")
+            await pilot.press("o", "i", "r", "1", "t", "c", "u", "m")  # no meaning here
+            await settle(pilot)
             self.assertIsInstance(self.app.screen, HelpScreen)
             self.assertEqual(self.engine.called("scan"), [None])
+            self.assertEqual(self.acted() + self.undone(), [])
             await pilot.press("escape")
             await settle(pilot)
             self.assertIs(self.app.screen, self.main)
@@ -1499,7 +1662,16 @@ class HelpAndQuitTest(TuiCase):
         self.assertEqual(self.opened(), [])
 
     async def test_ctrl_c_quits_from_anywhere(self):
-        for keys in ((), ("slash", "a"), ("question_mark",), ("v",), ("end", "enter")):
+        for keys in (
+            (),
+            ("slash", "a"),
+            ("question_mark",),
+            ("v",),
+            ("end", "enter"),
+            ("end", "t"),  # the folder input
+            ("c",),  # the choice of a tool
+            ("u",),
+        ):
             async with self.started() as pilot:
                 await settle(pilot)
                 await pilot.press("0", *keys)
@@ -1507,7 +1679,7 @@ class HelpAndQuitTest(TuiCase):
                 await pilot.press("ctrl+c")
                 await until(self.exited, what=f"exit after {keys}")
             self.assertEqual(self.app.return_code, 0)
-            self.assertEqual(self.opened() + self.imported(), [])
+            self.assertEqual(self.acted(), [])
 
     async def test_nothing_launches_without_a_key_press(self):
         async with self.started() as pilot:
@@ -1562,11 +1734,8 @@ class HelpAndQuitTest(TuiCase):
                 self.assertEqual(rules, set(), widget)
 
 
-class OfflineTest(TuiCase):
-    """Sessions whose drive is not mounted: listed from the engine's cache.
-    The keys and prompts for mounting are not here yet; what is: the rows
-    are dimmed like foreign rows and say where they are, Enter, ``o``, ``v``
-    and ``i`` show the engine's refusal, and the status line counts them."""
+class OfflineCase(TuiCase):
+    """The usual sessions, and four on a drive that is not mounted."""
 
     def setUp(self):
         super().setUp()
@@ -1591,6 +1760,13 @@ class OfflineTest(TuiCase):
         self.engine = FakeEngine(sessions)
         self.total = len(sessions)
 
+
+class OfflineTest(OfflineCase):
+    """Sessions whose drive is not mounted: listed from the engine's cache.
+    The rows are dimmed like foreign rows and say where they are, the status
+    line counts them, ``v`` and ``i`` show the engine's refusal, and Enter
+    asks whether to mount the drive (``MountTest`` has the mounting)."""
+
     def row(self, key) -> "view.Row":
         return next(row for row in self.rows.rows if row.key == key)
 
@@ -1601,7 +1777,7 @@ class OfflineTest(TuiCase):
         return next(iter(strip)).style
 
     def nothing_was_started(self) -> None:
-        self.assertEqual(self.opened() + self.imported(), [])
+        self.assertEqual(self.acted(), [])
         self.assertEqual(self.main.mode, "list")
         self.assertFalse(self.main.query_one("#prompt").display)
         self.assertIsInstance(self.app.screen, MainScreen)
@@ -1648,28 +1824,22 @@ class OfflineTest(TuiCase):
             self.assertIn(f"{self.total} sessions", self.status())
             self.assertNotIn("offline", self.status())
 
-    async def test_enter_shows_the_refusal_and_asks_nothing(self):
+    async def test_enter_asks_about_the_drive_not_about_an_import(self):
         async with self.started() as pilot:
             await settle(pilot)
-            await self.select(pilot, OFFLINE)
-            await pilot.press("enter")
-            await self.message(support.NOT_MOUNTED)
-            self.assertTrue(self.main.query_one("#status-message").has_class("-error"))
-            self.nothing_was_started()
-            # The engine was asked, in a way that could not have opened a window.
-            self.assertEqual(self.engine.called("open_dry_run"), [OFFLINE])
-            self.assertNotIn("[i] import and resume", self.text())
-            await pilot.press("down")  # a key clears it, as any message
-            self.assertNotIn(support.NOT_MOUNTED, self.status())
-
-    async def test_o_shows_the_refusal_too(self):
-        async with self.started() as pilot:
-            await settle(pilot)
-            await self.select(pilot, OFFLINE)
-            await pilot.press("o")
-            await self.message(support.NOT_MOUNTED)
-            self.nothing_was_started()
-            self.assertEqual(self.selected(), OFFLINE)
+            for key in ("enter", "o"):
+                await self.select(pilot, OFFLINE)
+                await pilot.press(key)
+                await self.mode_is(pilot, "mount")
+                self.assertEqual(self.prompt(), "C: is not mounted: [m] mount  [Esc] cancel")
+                self.assertNotIn("[i] import and resume", self.text())
+                self.assertEqual(self.acted(), [])
+                await pilot.press("escape")
+                self.nothing_was_started()
+                self.assertEqual(self.selected(), OFFLINE)
+            # No window could have opened: the engine was not asked to open at all.
+            self.assertEqual(self.engine.called("open_dry_run"), [])
+            self.assertEqual(self.engine.called("volumes"), [None, None])
 
     async def test_v_shows_the_refusal_and_opens_no_pager(self):
         async with self.started() as pilot:
@@ -1684,12 +1854,14 @@ class OfflineTest(TuiCase):
         async with self.started() as pilot:
             await settle(pilot)
             await self.select(pilot, OFFLINE)
-            await pilot.press("i")
-            await self.message(support.NOT_MOUNTED)
-            self.nothing_was_started()
-            self.assertNotIn("Import", self.text())
-            await pilot.press("y")  # there is no question to answer
-            await settle(pilot)
+            for key in ("i", "t"):  # into a folder or not: its files are not there
+                await pilot.press(key)
+                await self.message(support.NOT_MOUNTED)
+                self.nothing_was_started()
+                self.assertNotIn("Import", self.text())
+                await pilot.press("y")  # there is no question to answer
+                await settle(pilot)
+                await pilot.press("escape")
             self.assertEqual(self.imported(), [])
 
     async def test_i_before_the_detail_pane_has_its_answer(self):
@@ -1710,8 +1882,8 @@ class OfflineTest(TuiCase):
             await self.select(pilot, OFFLINE)
             y = [row.key for row in self.rows.rows].index(OFFLINE) - self.rows.top
             await pilot.click("#list", offset=(3, y), times=2)
-            await self.message(support.NOT_MOUNTED)
-            self.nothing_was_started()
+            await self.mode_is(pilot, "mount")
+            self.assertEqual(self.acted(), [])
 
     async def test_one_that_was_imported_resumes_its_linux_copy(self):
         async with self.started() as pilot:
@@ -1740,21 +1912,23 @@ class OfflineTest(TuiCase):
 
     async def test_an_engine_that_does_not_refuse_still_starts_nothing(self):
         """A listing that is behind the engine, say. The TUI itself never
-        opens, views or imports a row it shows as offline: it passes on what
-        the engine answers, and what the row says when that is nothing."""
+        opens, views, imports or continues a row it shows as offline: it
+        passes on what the engine answers, and what the row says when that
+        is nothing."""
         self.engine.by_key(OFFLINE).offline = False  # to the engine it is an ordinary foreign one
         async with self.started() as pilot:
             await settle(pilot)
             self.main.snapshot.sessions[OFFLINE].offline = True  # the list still has it offline
+            self.main.snapshot.sessions[OFFLINE].note = "drive not mounted"
             await self.select(pilot, OFFLINE)
-            for key, answer in (
-                ("enter", "import first"),  # the fake engine's word for any foreign session
-                ("v", "drive not mounted"),  # no refusal at all: the row's own note
-            ):
+            for key in ("v", "c"):  # no refusal at all: the row's own note
                 await pilot.press(key)
-                await self.message(answer)
+                await self.message("drive not mounted")
                 self.nothing_was_started()
                 await pilot.press("escape")
+            await pilot.press("enter")  # the drive is asked about, nothing else
+            await self.mode_is(pilot, "mount")
+            self.assertEqual(self.acted(), [])
 
     async def test_the_filter_and_the_tabs_treat_them_like_any_row(self):
         async with self.started() as pilot:
@@ -1764,6 +1938,1530 @@ class OfflineTest(TuiCase):
             await pilot.press("slash", *"offline one", "enter")
             await settle(pilot)
             self.assertEqual([row.key for row in self.rows.rows], [OFFLINE])
+
+
+class MountTest(OfflineCase):
+    """``m``: mount the drive of a session that is offline. Nothing is
+    mounted here: the fake engine's ``mount_drive`` only changes what it
+    lists, as a scan after a mount would."""
+
+    def gated(self) -> threading.Event:
+        self.engine.mount_gate = threading.Event()
+        return self.engine.mount_gate
+
+    async def test_m_in_the_prompt_mounts_and_the_list_refreshes(self):
+        gate = self.gated()
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+            await pilot.press("enter")
+            await self.mode_is(pilot, "mount")
+            await pilot.press("j", "q", "enter", "i", "y", "r", "u", "c")  # not answers
+            self.assertEqual(self.main.mode, "mount")
+            self.assertEqual(self.selected(), OFFLINE)
+            self.assertEqual(self.mounted(), [])
+            await pilot.press("m")
+            await until(lambda: self.mounted() == [support.WINDOWS], what="the mount")
+            self.assertEqual(self.main.mode, "list")
+            self.assertEqual(self.prompt(), "")
+            await self.message("mounting C: answer the password prompt…")
+            self.assertTrue(self.main.query_one("#status-summary").has_class("-busy"))
+            # The rest stays usable while the desktop asks for the password.
+            await pilot.press("k")
+            self.assertNotEqual(self.selected(), OFFLINE)
+            await pilot.press("j", "question_mark")
+            await pilot.pause()
+            self.assertIsInstance(self.app.screen, HelpScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.press("escape")  # no scan yet: Esc has nothing to stop
+            self.assertFalse(self.main._mount["cancel"].is_set())
+            self.assertIn("mounting C:", self.status())
+            gate.set()
+            await self.message("C: mounted")
+            self.assertIsNone(self.main._mount)
+            self.assertNotIn("mounting", self.status())
+            self.assertFalse(self.main.query_one("#status-message").has_class("-error"))
+            # The same session is selected, and it is not offline any more.
+            self.assertEqual(self.selected(), OFFLINE)
+            self.assertEqual(self.rows.current.where, "C:")
+            self.assertEqual(self.main.snapshot.offline, 0)
+            await pilot.press("escape")
+            self.assertNotIn("offline", self.status())
+            self.assertEqual(self.mounted(), [support.WINDOWS])
+            self.assertEqual(self.opened() + self.imported(), [])
+            self.assertFalse(self.exited())
+
+    async def test_m_on_the_row_mounts_without_asking(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+            await pilot.press("m")
+            await self.message("C: mounted")
+            self.assertEqual(self.mounted(), [support.WINDOWS])
+            self.assertEqual(self.engine.called("volumes"), [])
+            self.assertEqual(self.selected(), OFFLINE)
+            # Mounted now: `m` has nothing to do, and Enter asks about the import.
+            await pilot.press("m")
+            await self.message("this session's drive is mounted")
+            await pilot.press("enter")
+            await self.mode_is(pilot, "foreign")
+            self.assertEqual(self.mounted(), [support.WINDOWS])
+
+    async def test_m_on_an_offline_row_that_was_imported(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE_IMPORTED)
+            await pilot.press("m")
+            await self.message("C: mounted")
+            self.assertEqual(self.mounted(), [support.WINDOWS])
+            self.assertEqual(self.opened(), [])
+
+    async def test_m_on_a_row_whose_drive_is_mounted(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            for key in (NATIVE, FOREIGN, IMPORTED):
+                await self.select(pilot, key)
+                await pilot.press("m")
+                await self.message("this session's drive is mounted")
+                self.assertFalse(self.main.query_one("#status-message").has_class("-error"))
+                self.assertEqual(self.main.mode, "list")
+                await pilot.press("escape")
+            await settle(pilot)
+            self.assertEqual(self.mounted(), [])
+            self.assertEqual(self.engine.called("volumes"), [])
+
+    async def test_the_selection_stays_where_the_user_went(self):
+        gate = self.gated()
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+            await pilot.press("m")
+            await until(lambda: self.mounted() == [support.WINDOWS], what="the mount")
+            keys = [row.key for row in self.rows.rows]
+            self.rows.select(keys.index(NATIVE))
+            await pilot.pause()
+            gate.set()
+            await self.message("C: mounted")
+            self.assertEqual(self.selected(), NATIVE)
+
+    async def test_a_drive_that_is_not_attached_gets_no_prompt(self):
+        self.engine.volume_state = "absent"
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+            for key in ("enter", "o"):
+                await pilot.press(key)
+                await self.message("C: is not attached")
+                self.assertTrue(self.main.query_one("#status-message").has_class("-error"))
+                self.assertEqual(self.main.mode, "list")
+                self.assertEqual(self.prompt(), "")
+                await pilot.press("escape")
+            self.assertEqual(self.mounted(), [])
+            # `m` itself asks the engine, whose reason is shown.
+            self.engine.fail["mount_drive"] = MountFailed(
+                "no drive with this volume id is attached"
+            )
+            await pilot.press("m")
+            await self.message("no drive with this volume id is attached")
+
+    async def test_a_drive_the_engine_does_not_list_can_still_be_asked_about(self):
+        self.engine.volumes = lambda index=None: []
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+            await pilot.press("enter")
+            await self.mode_is(pilot, "mount")
+
+    async def test_the_drives_cannot_be_asked_about(self):
+        self.engine.fail["volumes"] = FakeError("the index file is damaged")
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+            await pilot.press("enter")
+            await self.message("the index file is damaged")
+            self.assertTrue(self.main.query_one("#status-message").has_class("-error"))
+            self.assertEqual(self.main.mode, "list")
+            self.assertFalse(self.exited())
+            del self.engine.fail["volumes"]
+            await pilot.press("enter")
+            await self.mode_is(pilot, "mount")
+            self.assertEqual(self.mounted(), [])
+
+    async def test_a_mount_that_fails_says_why(self):
+        reason = "no answer after 120 s (was the password prompt answered?)"
+        self.engine.fail["mount_drive"] = MountFailed(reason)
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+            await pilot.press("m")
+            await self.message(reason)
+            self.assertTrue(self.main.query_one("#status-message").has_class("-error"))
+            self.assertIsNone(self.main._mount)
+            self.assertNotIn("mounting", self.status())
+            self.assertFalse(self.main.query_one("#status-summary").has_class("-busy"))
+            self.assertEqual(self.rows.current.where, "C: · offline")
+            self.assertEqual(self.selected(), OFFLINE)
+            self.assertFalse(self.exited())
+            # Through the prompt it is the same, and it can be tried again.
+            await pilot.press("enter")
+            await self.mode_is(pilot, "mount")
+            await pilot.press("m")
+            await self.message(reason)
+            del self.engine.fail["mount_drive"]
+            await pilot.press("m")
+            await self.message("C: mounted")
+            self.assertEqual(self.mounted(), [support.WINDOWS] * 3)
+
+    async def test_only_one_mount_at_a_time(self):
+        gate = self.gated()
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, IMPORTED_COPY)
+            await self.select(pilot, FOREIGN)
+            await self.select(pilot, OFFLINE)
+            await pilot.press("m")
+            await until(lambda: self.mounted() == [support.WINDOWS], what="the mount")
+            await pilot.press("m")
+            await self.message("already mounting C:")
+            self.assertFalse(self.main.query_one("#status-message").has_class("-error"))
+            await pilot.press("enter")  # and through the prompt
+            await self.mode_is(pilot, "mount")
+            await pilot.press("m")
+            await self.message("already mounting C:")
+            self.assertEqual(self.mounted(), [support.WINDOWS])
+            # What else ends in a scan waits for the mount.
+            for key in ("r", "R"):
+                await pilot.press(key)
+                await self.message("a mount is running; rescan when it has finished")
+            self.assertEqual(self.engine.called("scan"), [None])
+            keys = [row.key for row in self.rows.rows]
+            self.rows.select(keys.index(FOREIGN))
+            await pilot.pause()
+            await pilot.press("i")
+            await self.mode_is(pilot, "confirm")
+            await pilot.press("y")
+            await self.message("a mount is running; import when it has finished")
+            self.assertEqual(self.imported(), [])
+            self.rows.select(keys.index(IMPORTED_COPY))
+            await pilot.pause()
+            await pilot.press("u")
+            await self.mode_is(pilot, "undo")
+            await pilot.press("y")
+            await self.message("a mount is running; undo when it has finished")
+            self.assertEqual(self.undone(), [(IMPORTED_COPY, False, True)])
+            self.assertIn("mounting C:", self.status())
+            gate.set()
+            await self.message("C: mounted")
+            await pilot.press("r")
+            await until(lambda: len(self.engine.called("scan")) == 2, what="a scan again")
+
+    async def test_a_mount_waits_for_a_scan(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+            self.engine.scan_gate = threading.Event()
+            await pilot.press("r")
+            await until(lambda: len(self.engine.called("scan")) == 2, what="scan start")
+            await pilot.press("m")
+            await self.message("a scan is running; mount when it has finished")
+            self.assertEqual(self.mounted(), [])
+            self.assertIsNone(self.main._mount)
+            self.engine.scan_gate.set()
+            await until(lambda: self.main._scan is None, what="scan end")
+            await pilot.press("m")
+            await self.message("C: mounted")
+
+    async def test_the_scan_after_the_mount_shows_and_esc_stops_it(self):
+        seen = {}
+
+        def slow_mount(ref, progress=None, cancel=None):
+            self.engine.calls.append(("mount_drive", ref))
+            seen["cancel"] = cancel
+            progress("WINVOL", 41234)
+            cancel.wait(5)
+            return {"mount_point": ref, "scan": {"mode": "deep", "cancelled": cancel.is_set()}}
+
+        self.engine.mount_drive = slow_mount
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+            await pilot.press("m")
+            await self.message("scanning WINVOL… 41k dirs")
+            self.assertTrue(self.main._mount["scanning"])
+            self.assertFalse(seen["cancel"].is_set())
+            await pilot.press("j")  # still responsive
+            await pilot.press("escape")
+            self.assertTrue(seen["cancel"].is_set())
+            await self.message("C: mounted")
+            self.assertIsNone(self.main._mount)
+            self.assertNotIn("scanning", self.status())
+
+    async def test_quitting_does_not_wait_for_the_scan_after_a_mount(self):
+        gate = self.gated()
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+            await pilot.press("m")
+            await until(lambda: self.main._mount is not None, what="the mount")
+            cancel = self.main._mount["cancel"]
+            await pilot.press("q")
+            await until(self.exited, what="exit")
+        # The mount was still waiting when the screen went: it was told to stop.
+        self.assertTrue(cancel.is_set())
+        self.assertEqual(self.app.return_code, 0)
+        gate.set()
+
+    async def test_the_prompt_does_not_come_up_on_a_row_that_was_left(self):
+        gate = threading.Event()
+        real = self.engine.volumes
+
+        def slow(index=None):
+            gate.wait(5)
+            return real(index)
+
+        self.engine.volumes = slow
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, OFFLINE)
+            await pilot.press("enter")
+            await pilot.press("k")  # on to another row before the engine has answered
+            gate.set()
+            await settle(pilot)
+            self.assertEqual(self.main.mode, "list")
+            self.assertEqual(self.prompt(), "")
+            await pilot.press("j", "enter")  # asked again, it is answered
+            await self.mode_is(pilot, "mount")
+            self.assertEqual(self.selected(), OFFLINE)
+
+
+OTHER = "claude:bbbbbbbb:clf-0013"  # another foreign session on C:
+AGY_COPY = "antigravity:aaaaaaaa:anf-0000"
+EXPERIMENTAL_CHOICES = (
+    "[i] import and resume (experimental)  [I] import only (experimental)  "
+    "[c] continue as new  [v] view  [Esc] cancel"
+)
+
+
+class ImportOptionsTest(TuiCase):
+    """Enter, ``i`` and ``t`` on a foreign row, for each answer the engine's
+    ``import_options`` can give."""
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.target = os.path.join(os.path.realpath(tmp.name), "chosen folder")
+        os.mkdir(self.target)
+
+    async def ask(self, pilot, key, mode, session=FOREIGN):
+        await self.select(pilot, session)
+        await pilot.press(key)
+        await self.mode_is(pilot, mode)
+
+    async def give_folder(self, pilot, text=None):
+        """The folder input is open: type the folder and press Enter."""
+        self.assertEqual(self.main.mode, "folder")
+        self.assertIs(self.app.focused, self.folder)
+        line = next(line for line in self.text().splitlines() if "Import into:" in line)
+        self.assertEqual(line.split(), ["Import", "into:", "~/"])
+        await self.type_folder(pilot, self.target if text is None else text)
+        await pilot.press("enter")
+
+    async def test_possible_t_asks_for_a_folder_and_imports_into_it(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, "enter", "foreign")
+            self.assertEqual(self.prompt(), POSSIBLE_PROMPT)  # one line: nothing to explain
+            await pilot.press("t")
+            self.assertEqual(self.prompt(), "")  # the input is in the prompt's place
+            await self.give_folder(pilot, self.target + "/")
+            await self.message("imported claude session 12")
+            self.assertEqual(self.engine.import_args, [(FOREIGN, self.target, False)])
+            self.assertEqual(self.opened(), [])  # into a folder: imported, not resumed
+            self.assertFalse(self.exited())
+            self.assertEqual(self.selected(), FOREIGN_COPY)
+            self.assertEqual(self.main.mode, "list")
+            self.assertFalse(self.main.query_one("#folderbar").display)
+            self.assertIs(self.app.focused, self.rows)
+
+    async def test_possible_t_in_the_list_asks_for_a_folder_too(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, "t", "folder")
+            await self.give_folder(pilot)
+            await self.message("imported claude session 12")
+            self.assertEqual(self.engine.import_args, [(FOREIGN, self.target, False)])
+            self.assertEqual(self.opened(), [])
+
+    async def test_needs_a_folder(self):
+        self.engine.options[FOREIGN] = NEEDS_FOLDER
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, "enter", "foreign_folder")
+            self.assertEqual(
+                self.prompt().splitlines(),
+                [
+                    NEEDS_FOLDER.reason,
+                    "[t] import into another folder  [c] continue as new  [v] view  [Esc] cancel",
+                ],
+            )
+            lines = self.text().splitlines()
+            at = next(n for n, line in enumerate(lines) if NEEDS_FOLDER.reason in line and n > 30)
+            self.assertIn("[t] import into another folder", lines[at + 1])  # reason, then choices
+            self.assertIn("↑↓ move", lines[at + 3])  # over the key hints
+            await pilot.press("i", "I", "y", "enter", "j", "m")  # not offered: nothing
+            self.assertEqual(self.main.mode, "foreign_folder")
+            self.assertEqual(self.imported(), [])
+            await pilot.press("t")
+            await self.give_folder(pilot)
+            await self.message("imported claude session 12")
+            self.assertEqual(self.engine.import_args, [(FOREIGN, self.target, False)])
+            self.assertEqual(self.selected(), FOREIGN_COPY)
+
+    async def test_needs_a_folder_i_and_t_in_the_list_open_the_input(self):
+        self.engine.options[FOREIGN] = NEEDS_FOLDER
+        async with self.started() as pilot:
+            await settle(pilot)
+            for key in ("i", "t"):
+                await self.ask(pilot, key, "folder")
+                self.assertIn("Import into: ~/", self.text())
+                await pilot.press("escape")
+                self.assertEqual(self.main.mode, "list")
+            self.assertEqual(self.imported(), [])
+            await self.ask(pilot, "i", "folder")
+            await self.give_folder(pilot)
+            await self.message("imported claude session 12")
+            self.assertEqual(self.engine.import_args, [(FOREIGN, self.target, False)])
+
+    async def test_experimental_asks_again_with_the_warning(self):
+        self.engine.options[AGY] = EXPERIMENTAL
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, "enter", "foreign_experimental", AGY)
+            self.assertEqual(
+                self.prompt().splitlines(), [EXPERIMENTAL.reason, EXPERIMENTAL_CHOICES]
+            )
+            await pilot.press("t", "y", "enter")  # not offered: nothing
+            self.assertEqual(self.main.mode, "foreign_experimental")
+            await pilot.press("I")
+            self.assertEqual(self.main.mode, "warn")
+            lines = self.prompt().splitlines()
+            self.assertEqual(len(lines), 3)
+            self.assertEqual(" ".join(lines[:-1]), WARNING)  # whole at this width
+            self.assertEqual(lines[-1], "Import anyway? y/n")
+            await pilot.press("enter", "i", "I", "j")  # not answers
+            self.assertEqual(self.main.mode, "warn")
+            self.assertEqual(self.imported(), [])
+            await pilot.press("n")
+            self.assertEqual(self.main.mode, "list")
+            self.assertEqual(self.prompt(), "")
+            await settle(pilot)
+            self.assertEqual(self.imported(), [])
+            # Again, and yes this time: import only.
+            await pilot.press("enter")
+            await self.mode_is(pilot, "foreign_experimental")
+            await pilot.press("I", "y")
+            await self.message("imported antigravity session 0")
+            self.assertEqual(self.engine.import_args, [(AGY, None, True)])
+            self.assertEqual(self.opened(), [])
+            self.assertFalse(self.exited())
+            self.assertEqual(self.selected(), AGY_COPY)
+
+    async def test_experimental_i_resumes_after_the_warning(self):
+        self.engine.options[AGY] = EXPERIMENTAL
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, "enter", "foreign_experimental", AGY)
+            await pilot.press("i")
+            self.assertEqual(self.main.mode, "warn")
+            self.assertEqual(self.imported(), [])
+            await pilot.press("y")
+            await until(self.exited, what="exit")
+        self.assertEqual(self.engine.import_args, [(AGY, None, True)])
+        self.assertEqual(self.opened(), [AGY_COPY])
+
+    async def test_experimental_with_o_resumes_and_stays(self):
+        self.engine.options[AGY] = EXPERIMENTAL
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, "o", "foreign_experimental", AGY)
+            await pilot.press("i", "y")
+            await self.message("imported and opened antigravity session 0")
+            self.assertEqual(self.opened(), [AGY_COPY])
+            self.assertFalse(self.exited())
+
+    async def test_experimental_i_in_the_list_warns_and_never_resumes(self):
+        self.engine.options[AGY] = EXPERIMENTAL
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, "i", "warn", AGY)
+            self.assertIn("Import anyway? y/n", self.text())
+            self.assertNotIn("to Linux?", self.text())  # the warning, not the plain y/n
+            await pilot.press("escape")
+            self.assertEqual(self.main.mode, "list")
+            await self.ask(pilot, "i", "warn", AGY)
+            await pilot.press("y")
+            await self.message("imported antigravity session 0")
+            self.assertEqual(self.engine.import_args, [(AGY, None, True)])
+            self.assertEqual(self.opened(), [])
+
+    async def test_experimental_t_in_the_list_warns_after_the_folder(self):
+        self.engine.options[AGY] = EXPERIMENTAL
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, "t", "folder", AGY)
+            await self.give_folder(pilot)
+            await self.mode_is(pilot, "warn")
+            self.assertFalse(self.main.query_one("#folderbar").display)
+            self.assertEqual(self.imported(), [])
+            await pilot.press("y")
+            await self.message("imported antigravity session 0")
+            self.assertEqual(self.engine.import_args, [(AGY, self.target, True)])
+
+    async def test_a_folder_and_experimental_both(self):
+        self.engine.options[FOREIGN] = ImportOptions(False, "no folder", True, True, WARNING)
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, "enter", "foreign_folder")
+            self.assertIn("experimental only, into a folder you choose", self.text())
+            await pilot.press("t")
+            await self.give_folder(pilot)
+            await self.mode_is(pilot, "warn")
+            await pilot.press("y")
+            await self.message("imported claude session 12")
+            self.assertEqual(self.engine.import_args, [(FOREIGN, self.target, True)])
+
+    async def test_not_possible(self):
+        self.engine.options[FOREIGN] = IMPOSSIBLE
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, "enter", "foreign_none")
+            self.assertEqual(
+                self.prompt().splitlines(),
+                [IMPOSSIBLE.reason, "[c] continue as new  [v] view  [Esc] cancel"],
+            )
+            await pilot.press("i", "I", "t", "y", "enter")  # nothing to import with
+            self.assertEqual(self.main.mode, "foreign_none")
+            await pilot.press("v")
+            await settle(pilot)
+            self.assertIsInstance(self.app.screen, TranscriptScreen)
+            await pilot.press("q")
+            await settle(pilot)
+            self.assertEqual(self.main.mode, "list")
+            # In the list, `i` and `t` say why and ask nothing.
+            for key in ("i", "t"):
+                await pilot.press(key)
+                await self.message(IMPOSSIBLE.reason)
+                self.assertTrue(self.main.query_one("#status-message").has_class("-error"))
+                self.assertEqual(self.main.mode, "list")
+                await pilot.press("escape")
+            self.assertEqual(self.imported(), [])
+
+    async def test_c_in_any_foreign_prompt_starts_the_continue(self):
+        for options, mode in (
+            (None, "foreign"),
+            (NEEDS_FOLDER, "foreign_folder"),
+            (EXPERIMENTAL, "foreign_experimental"),
+            (IMPOSSIBLE, "foreign_none"),
+        ):
+            engine = FakeEngine()
+            if options is not None:
+                engine.options[FOREIGN] = options
+            async with self.started(engine=engine) as pilot:
+                await settle(pilot)
+                await self.ask(pilot, "enter", mode)
+                await pilot.press("c")
+                await self.mode_is(pilot, "tool")
+                self.assertEqual(engine.called("continue_options"), [FOREIGN])
+                self.assertEqual(self.imported(), [])  # a continue needs no import
+
+    async def test_t_has_nothing_to_do_on_a_native_or_an_imported_row(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            for key, said in ((NATIVE, "already on Linux"), (IMPORTED, "already imported")):
+                await self.select(pilot, key)
+                await pilot.press("t")
+                await self.message(said)
+                self.assertEqual(self.main.mode, "list")
+                await pilot.press("escape")
+            self.assertEqual(self.engine.called("import_options"), [])
+
+    async def test_escape_at_every_step(self):
+        self.engine.options[AGY] = EXPERIMENTAL
+        self.engine.options[OTHER] = NEEDS_FOLDER
+        steps = (
+            (FOREIGN, ("enter",), "foreign"),
+            (FOREIGN, ("enter", "t"), "folder"),
+            (FOREIGN, ("i",), "confirm"),
+            (FOREIGN, ("t",), "folder"),
+            (OTHER, ("enter",), "foreign_folder"),
+            (OTHER, ("enter", "t"), "folder"),
+            (OTHER, ("i",), "folder"),
+            (AGY, ("enter",), "foreign_experimental"),
+            (AGY, ("enter", "i"), "warn"),
+            (AGY, ("enter", "I"), "warn"),
+            (AGY, ("i",), "warn"),
+            (AGY, ("t",), "folder"),
+        )
+        async with self.started() as pilot:
+            await settle(pilot)
+            for key, keys, mode in steps:
+                await self.select(pilot, key)
+                await pilot.press(keys[0])
+                await until(lambda: self.main.mode != "list", what=f"a prompt for {keys}")
+                await pilot.press(*keys[1:])
+                await self.mode_is(pilot, mode)
+                await pilot.press("escape")
+                await settle(pilot)
+                self.assertEqual(self.main.mode, "list", (key, keys))
+                self.assertEqual(self.prompt(), "")
+                self.assertFalse(self.main.query_one("#folderbar").display)
+                self.assertIs(self.app.focused, self.rows)
+                await pilot.press("k", "j")  # the list has its keys back
+                self.assertEqual(self.selected(), key)
+            self.assertEqual(self.acted(), [])
+            self.assertFalse(self.exited())
+
+    async def test_asking_the_engine_fails_and_is_tried_again(self):
+        self.engine.fail["import_options"] = FakeError("the store cannot be read")
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, FOREIGN)
+            self.assertIn("unknown: the store cannot be read", self.text())
+            for key in ("enter", "i", "t"):
+                await pilot.press(key)
+                await self.message("the store cannot be read")
+                self.assertTrue(self.main.query_one("#status-message").has_class("-error"))
+                self.assertEqual(self.main.mode, "list")
+                self.assertEqual(self.prompt(), "")
+                await pilot.press("escape")
+            self.assertEqual(self.engine.called("import_options").count(FOREIGN), 4)  # asked anew
+            del self.engine.fail["import_options"]
+            await pilot.press("enter")
+            await self.mode_is(pilot, "foreign")
+            self.assertEqual(self.imported(), [])
+            self.assertFalse(self.exited())
+
+    async def test_enter_before_the_detail_pane_has_its_answer(self):
+        with mock.patch.object(app_mod, "VERDICT_DELAY", 60):
+            async with self.started() as pilot:
+                await settle(pilot)
+                await self.select(pilot, FOREIGN)
+                self.assertEqual(self.engine.called("import_options"), [])
+                await pilot.press("enter")
+                await self.mode_is(pilot, "foreign")  # asked at once, not after the delay
+                self.assertEqual(self.engine.called("import_options"), [FOREIGN])
+                self.assertEqual(self.prompt(), POSSIBLE_PROMPT)
+
+    async def test_the_answer_for_a_row_that_was_left_opens_nothing(self):
+        gate = threading.Event()
+        real = self.engine.import_options
+
+        def slow(ref, index=None, target=None):
+            gate.wait(5)
+            return real(ref, index=index, target=target)
+
+        self.engine.import_options = slow
+        with mock.patch.object(app_mod, "VERDICT_DELAY", 60):
+            async with self.started() as pilot:
+                await settle(pilot)
+                await self.select(pilot, FOREIGN)
+                for key in ("enter", "i", "t"):
+                    # On to another row before the engine has answered, or Esc on this one.
+                    for then, back in (("j", "k"), ("escape", "escape")):
+                        gate.clear()
+                        self.main._verdicts.clear()  # not known yet, each time
+                        await pilot.press(key)
+                        await pilot.press(then)
+                        gate.set()
+                        await settle(pilot)
+                        self.assertEqual(self.main.mode, "list", (key, then))
+                        self.assertEqual(self.prompt(), "")
+                        await pilot.press(back)
+                self.assertEqual(self.selected(), FOREIGN)
+                self.assertEqual(self.acted(), [])
+
+    async def test_an_import_that_the_engine_refuses_after_all(self):
+        self.engine.options[FOREIGN] = NEEDS_FOLDER
+        self.engine.fail["import_session"] = FakeError(
+            "the folder to import into is not a directory"
+        )
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, "t", "folder")
+            await self.give_folder(pilot)
+            await self.message("the folder to import into is not a directory")
+            self.assertEqual(self.main.mode, "list")
+            self.assertFalse(self.main._importing)
+            self.assertEqual(self.selected(), FOREIGN)
+            self.assertFalse(self.exited())
+
+
+class FolderInputTest(TuiCase):
+    """The one-line folder input: completion in real temp directories, what
+    Enter takes, and that no key reaches the list while it is open."""
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = os.path.realpath(tmp.name)
+        for name in ("projects-site", "projects-tools", "pictures", ".hidden", ".hoard", "work"):
+            os.mkdir(os.path.join(self.tmp, name))
+        os.mkdir(os.path.join(self.tmp, "work", "inner"))
+        for name in ("plain.txt", "wrong"):
+            Path(self.tmp, name).write_text("a file", encoding="utf-8")
+        home = mock.patch.dict(os.environ, {"HOME": self.tmp})  # what ``~`` means here
+        home.start()
+        self.addCleanup(home.stop)
+
+    def below(self, *parts) -> str:
+        return os.path.join(self.tmp, *parts)
+
+    async def opened_input(self, pilot):
+        await settle(pilot)
+        await self.select(pilot, FOREIGN)
+        await pilot.press("t")
+        await self.mode_is(pilot, "folder")
+
+    async def tab(self, pilot, text) -> str:
+        """Type ``text``, press Tab and wait for the answer; what the input
+        holds then."""
+        await self.type_folder(pilot, text)
+        await pilot.press("tab")
+        await settle(pilot)
+        self.assertEqual(self.main.mode, "folder")
+        self.assertIs(self.app.focused, self.folder)  # Tab did not move the focus
+        return self.folder.value
+
+    async def test_one_match_is_completed_with_a_slash(self):
+        async with self.started() as pilot:
+            await self.opened_input(pilot)
+            self.assertEqual(await self.tab(pilot, self.below("pi")), self.below("pictures") + "/")
+            self.assertEqual(self.folder.cursor_position, len(self.folder.value))
+            self.assertIn("agent-sessions", self.status())  # nothing to say
+            self.assertEqual(await self.tab(pilot, self.below("wo")), self.below("work") + "/")
+            self.assertEqual(await self.tab(pilot, self.folder.value), self.below("work", "inner/"))
+            self.assertEqual(self.imported(), [])
+
+    async def test_several_matches_go_as_far_as_they_agree_and_are_named(self):
+        async with self.started() as pilot:
+            await self.opened_input(pilot)
+            self.assertEqual(await self.tab(pilot, self.below("pro")), self.below("projects-"))
+            self.assertIn("projects-site  projects-tools", self.status())
+            self.assertFalse(self.main.query_one("#status-message").has_class("-error"))
+            self.assertEqual(self.folder.cursor_position, len(self.folder.value))
+            await pilot.press("s")  # typing on takes the names away
+            await pilot.pause()
+            self.assertEqual(self.folder.value, self.below("projects-s"))
+            self.assertNotIn("projects-tools", self.status())
+            await pilot.press("tab")
+            await settle(pilot)
+            self.assertEqual(self.folder.value, self.below("projects-site") + "/")
+            # Nothing more to add: the names again, the text as it was.
+            self.assertEqual(await self.tab(pilot, self.below("p")), self.below("p"))
+            self.assertIn("pictures  projects-site  projects-tools", self.status())
+
+    async def test_hidden_folders_only_after_a_dot_and_files_never(self):
+        async with self.started() as pilot:
+            await self.opened_input(pilot)
+            self.assertEqual(await self.tab(pilot, self.tmp + "/"), self.tmp + "/")
+            self.assertIn("pictures  projects-site  projects-tools  work", self.status())
+            self.assertNotIn(".hidden", self.status())
+            self.assertNotIn("plain.txt", self.status())
+            self.assertEqual(await self.tab(pilot, self.below(".")), self.below(".h"))
+            self.assertIn(".hidden  .hoard", self.status())
+            self.assertEqual(await self.tab(pilot, self.below(".hi")), self.below(".hidden") + "/")
+
+    async def test_no_match_and_a_file_change_nothing(self):
+        async with self.started() as pilot:
+            await self.opened_input(pilot)
+            for text in (
+                self.below("zzz"),
+                self.below("pla"),
+                self.below("wrong"),
+                "relative/x",
+                "",
+            ):
+                self.assertEqual(await self.tab(pilot, text), text)
+                self.assertIn("agent-sessions", self.status())  # no message, no error
+
+    async def test_tilde_is_the_home_folder(self):
+        async with self.started() as pilot:
+            await self.opened_input(pilot)
+            self.assertEqual(self.folder.value, "~/")
+            self.assertEqual(await self.tab(pilot, "~"), "~/")
+            self.assertEqual(await self.tab(pilot, "~/"), "~/")
+            self.assertIn("pictures  projects-site  projects-tools  work", self.status())
+            self.assertEqual(await self.tab(pilot, "~/pi"), "~/pictures/")
+            self.assertEqual(self.engine.called("list_folder"), [self.tmp + "/"] * 2)
+            await pilot.press("enter")
+            await self.message("imported claude session 12")
+            self.assertEqual(self.engine.import_args, [(FOREIGN, self.below("pictures"), False)])
+
+    async def test_tilde_alone_is_accepted_as_the_home_folder(self):
+        async with self.started() as pilot:
+            await self.opened_input(pilot)
+            await self.type_folder(pilot, "~")
+            await pilot.press("enter")
+            await self.message("imported claude session 12")
+            self.assertEqual(self.engine.import_args, [(FOREIGN, self.tmp, False)])
+
+    async def test_a_folder_that_cannot_be_listed_is_said(self):
+        async with self.started() as pilot:
+            await self.opened_input(pilot)
+            text = self.below("nowhere", "x")
+            self.assertEqual(await self.tab(pilot, text), text)
+            self.assertIn(
+                f"cannot list {self.below('nowhere')}/: No such file or directory", self.status()
+            )
+            self.assertTrue(self.main.query_one("#status-message").has_class("-error"))
+            # The engine's listing failing in any other way is a message too.
+            self.engine.fail["list_folder"] = RuntimeError("the listing blew up")
+            self.assertEqual(await self.tab(pilot, self.below("pi")), self.below("pi"))
+            self.assertIn("the listing blew up", self.status())
+            self.assertFalse(self.exited())
+
+    async def test_the_listing_never_runs_on_the_ui_thread(self):
+        ui = threading.current_thread()
+        async with self.started() as pilot:
+            await self.opened_input(pilot)
+            await self.tab(pilot, self.below("pi"))
+            await self.tab(pilot, self.tmp + "/")
+            await self.tab(pilot, "~/")
+        self.assertEqual(len(self.engine.listing_threads), 3)
+        for thread in self.engine.listing_threads:
+            self.assertIsNot(thread, ui)
+
+    async def test_an_answer_to_a_text_that_was_typed_over_is_dropped(self):
+        gate = threading.Event()
+        real = self.engine.list_folder
+
+        def slow(directory):
+            gate.wait(5)
+            return real(directory)
+
+        self.engine.list_folder = slow
+        async with self.started() as pilot:
+            await self.opened_input(pilot)
+            await self.type_folder(pilot, self.below("pi"))
+            await pilot.press("tab")
+            await pilot.press("x")  # typed on while the folder is listed
+            gate.set()
+            await settle(pilot)
+            self.assertEqual(self.folder.value, self.below("pix"))
+            # Or the input is gone by then.
+            gate.clear()
+            await self.type_folder(pilot, self.below("pi"))
+            await pilot.press("tab", "escape")
+            gate.set()
+            await settle(pilot)
+            self.assertEqual(self.main.mode, "list")
+            self.assertFalse(self.main.query_one("#folderbar").display)
+
+    async def test_enter_takes_only_a_folder_that_exists(self):
+        refused = (
+            (self.below("nope"), f"not an existing folder: {self.below('nope')}"),
+            (self.below("plain.txt"), f"not an existing folder: {self.below('plain.txt')}"),
+            ("relative/path", "not an existing folder: relative/path"),
+            ("~/nope", f"not an existing folder: {self.below('nope')}"),
+            ("", "type a folder"),
+            ("   ", "type a folder"),
+        )
+        async with self.started() as pilot:
+            await self.opened_input(pilot)
+            for text, said in refused:
+                await self.type_folder(pilot, text)
+                await pilot.press("enter")
+                await self.message(said)
+                self.assertTrue(self.main.query_one("#status-message").has_class("-error"))
+                self.assertEqual(self.main.mode, "folder")  # and the input stays open
+                self.assertTrue(self.main.query_one("#folderbar").display)
+                self.assertIs(self.app.focused, self.folder)
+                self.assertEqual(self.folder.value, text)
+            self.assertEqual(self.imported(), [])
+            await self.type_folder(pilot, self.below("work") + "//")
+            await pilot.press("enter")
+            await self.message("imported claude session 12")
+            self.assertEqual(self.engine.import_args, [(FOREIGN, self.below("work"), False)])
+
+    async def test_escape_cancels_and_returns_to_the_list(self):
+        async with self.started() as pilot:
+            await self.opened_input(pilot)
+            await self.type_folder(pilot, self.below("work"))
+            await pilot.press("escape")
+            await settle(pilot)
+            self.assertEqual(self.main.mode, "list")
+            self.assertFalse(self.main.query_one("#folderbar").display)
+            self.assertIs(self.app.focused, self.rows)
+            self.assertEqual(self.imported(), [])
+            await pilot.press("j")
+            self.assertNotEqual(self.selected(), FOREIGN)
+            # Opened again it starts afresh.
+            await pilot.press("k", "t")
+            await self.mode_is(pilot, "folder")
+            self.assertEqual(self.folder.value, "~/")
+
+    async def test_no_key_reaches_the_list_while_it_is_open(self):
+        typed = "jkqoimcuvrRtGgIhl?/0123 y"
+        async with self.started() as pilot:
+            await self.opened_input(pilot)
+            tab = self.main.tab_name
+            await pilot.press(*typed)
+            await pilot.pause()
+            self.assertEqual(self.folder.value, "~/" + typed)  # all of it is text
+            await pilot.press("up", "down", "pageup", "pagedown", "shift+tab", "home", "left")
+            await pilot.press("right", "end")
+            await settle(pilot)
+            self.assertEqual(self.folder.value, "~/" + typed)
+            self.assertEqual(self.main.mode, "folder")
+            self.assertIs(self.app.focused, self.folder)
+            self.assertIs(self.app.screen, self.main)  # no help, no pager
+            self.assertEqual(self.selected(), FOREIGN)
+            self.assertEqual(self.main.tab_name, tab)
+            self.assertEqual(self.main.needle, "")
+            self.assertFalse(self.main.query_one("#filterbar").display)
+            self.assertEqual(self.engine.called("scan"), [None])
+            self.assertEqual(self.acted() + self.undone(), [])
+            self.assertEqual(self.engine.called("continue_options"), [])
+            self.assertFalse(self.exited())
+            # The keys that edit still do.
+            await pilot.press("backspace", "backspace", "home", "delete")
+            await pilot.pause()
+            self.assertEqual(self.folder.value, ("~/" + typed)[1:-2])
+
+    async def test_a_click_inside_keeps_it_and_one_elsewhere_cancels(self):
+        async with self.started() as pilot:
+            await self.opened_input(pilot)
+            await self.type_folder(pilot, self.below("work"))
+            await pilot.click("#folder", offset=(3, 0))
+            await pilot.pause()
+            self.assertEqual(self.main.mode, "folder")
+            self.assertIs(self.app.focused, self.folder)
+            self.assertEqual(self.folder.value, self.below("work"))
+            await pilot.click("#list", offset=(10, 2))
+            await settle(pilot)
+            self.assertEqual(self.main.mode, "list")
+            self.assertFalse(self.main.query_one("#folderbar").display)
+            self.assertEqual(self.rows.cursor, 2)
+            self.assertEqual(self.imported(), [])
+            # A tab clicked does the same.
+            await self.select(pilot, FOREIGN)
+            await pilot.press("t")
+            await self.mode_is(pilot, "folder")
+            await pilot.click("#tab-codex")
+            await settle(pilot)
+            self.assertEqual(self.main.mode, "list")
+            self.assertEqual(self.main.tab_name, "codex")
+
+    async def test_the_terminal_losing_the_focus_does_not_cancel(self):
+        async with self.started() as pilot:
+            await self.opened_input(pilot)
+            await self.type_folder(pilot, self.below("wo"))
+            self.app.app_focus = False  # another window has the keyboard
+            await pilot.pause()
+            self.assertEqual(self.main.mode, "folder")
+            self.assertTrue(self.main.query_one("#folderbar").display)
+            self.app.app_focus = True
+            await pilot.pause()
+            self.assertIs(self.app.focused, self.folder)
+            self.assertEqual(await self.tab(pilot, self.folder.value), self.below("work") + "/")
+
+    async def test_resize_while_it_is_open(self):
+        async with self.started() as pilot:
+            await self.opened_input(pilot)
+            await self.type_folder(pilot, self.below("projects-site"))
+            for width, height in ((80, 24), (40, 10), (20, 5), (1, 1), (120, 40)):
+                await pilot.resize_terminal(width, height)
+                await settle(pilot)
+                self.check_frame(width, height)
+                self.assertEqual(self.main.mode, "folder", (width, height))
+                self.assertEqual(self.folder.value, self.below("projects-site"))
+                self.assertIs(self.app.focused, self.folder)
+            self.assertIn(f"Import into: {self.below('projects-site')}", self.text())
+            await pilot.press("enter")
+            await self.message("imported claude session 12")
+
+    async def test_the_session_going_away_closes_it(self):
+        async with self.started() as pilot:
+            await self.opened_input(pilot)
+            self.engine.on_scan = lambda engine: engine.sessions.remove(engine.by_key(FOREIGN))
+            self.main.start_scan(False)
+            await until(lambda: self.main.mode == "list", what="the input to close")
+            await settle(pilot)
+            self.assertFalse(self.main.query_one("#folderbar").display)
+            self.assertIs(self.app.focused, self.rows)
+            await pilot.press("j", "k")
+            self.assertFalse(self.exited())
+
+
+class ContinueTest(TuiCase):
+    """``c``: continue a session as a new session of a tool, in three steps.
+    The fake engine starts nothing; it records what it was asked to start."""
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = os.path.realpath(tmp.name)
+        self.engine.continue_folder = self.tmp
+        self.marks = view.TOOL_MARKS if textual else ("", "")
+
+    def chosen(self, label) -> str:
+        return f"{self.marks[0]} {label} {self.marks[1]}"
+
+    async def to(self, pilot, step, key=NATIVE):
+        """Go to a step of the continue: ``tool``, ``folder`` or ``start``."""
+        await self.select(pilot, key)
+        await pilot.press("c")
+        await self.mode_is(pilot, "tool")
+        if step != "tool":
+            await pilot.press("enter")
+            self.assertEqual(self.main.mode, "folder")
+        if step == "start":
+            await pilot.press("enter")
+            await self.mode_is(pilot, "start")
+
+    async def test_three_steps_then_the_tool_is_started(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.to(pilot, "tool")
+            self.assertEqual(self.engine.called("continue_options"), [NATIVE])
+            self.assertEqual(
+                self.prompt(),
+                f"Continue with: {self.chosen('Claude')}   ←→ change  Enter next  Esc cancel",
+            )
+            turns = (("right", "Codex"), ("right", "Grok"), ("right", "Claude"), ("left", "Grok"))
+            for key, label in turns + (("left", "Codex"),):
+                await pilot.press(key)
+                self.assertIn(self.chosen(label), self.prompt())
+            await pilot.press("j", "y", "c", "q", "tab", "2")  # nothing here
+            self.assertEqual(self.main.mode, "tool")
+            self.assertEqual(self.selected(), NATIVE)
+            self.assertEqual(self.main.tab_name, "claude")
+            await pilot.press("enter")
+            self.assertEqual(self.main.mode, "folder")
+            self.assertIs(self.app.focused, self.folder)
+            self.assertEqual(self.folder.value, self.tmp)  # the session's own folder
+            self.assertIn(f"Start in: {self.tmp}", self.text())
+            self.assertEqual(self.prompt(), "")
+            await pilot.press("enter")
+            await self.mode_is(pilot, "start")
+            self.assertEqual(
+                self.prompt(),
+                f"Start Codex in {self.tmp} and send a first message to the model? y/n",
+            )
+            self.assertFalse(self.main.query_one("#folderbar").display)
+            await pilot.press("enter", "j", "c", "right")  # not answers
+            self.assertEqual(self.main.mode, "start")
+            self.assertEqual(self.continued(), [])  # nothing before the yes
+            await pilot.press("y")
+            await self.message("started Codex in a new window")
+            self.assertEqual(self.continued(), [(NATIVE, "codex", self.tmp)])
+            self.assertFalse(self.exited())  # the TUI stays open
+            self.assertEqual(self.main.mode, "list")
+            self.assertEqual(self.selected(), NATIVE)
+            self.assertFalse(self.main.query_one("#status-message").has_class("-error"))
+            self.assertEqual(self.opened() + self.imported(), [])
+
+    async def test_no_default_tool_starts_at_the_first(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.to(pilot, "tool", AGY)  # its own tool is not installed
+            self.assertIn(self.chosen("Claude"), self.prompt())
+            await pilot.press("left")  # round the other way
+            self.assertIn(self.chosen("Grok"), self.prompt())
+
+    async def test_a_single_tool_has_nothing_to_change_to(self):
+        self.engine.continue_answers[NATIVE] = ContinueOptions(
+            True, "", (("grok", "Grok"),), "grok", self.tmp
+        )
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.to(pilot, "tool")
+            await pilot.press("right", "left", "left")
+            self.assertIn(self.chosen("Grok"), self.prompt())
+            await pilot.press("enter", "enter")
+            await self.mode_is(pilot, "start")
+            await pilot.press("y")
+            await self.message("started Grok in a new window")
+            self.assertEqual(self.continued(), [(NATIVE, "grok", self.tmp)])
+
+    async def test_without_a_folder_of_its_own_the_input_starts_at_home(self):
+        self.engine.continue_folder = None
+        with mock.patch.dict(os.environ, {"HOME": self.tmp}):
+            async with self.started() as pilot:
+                await settle(pilot)
+                await self.to(pilot, "folder")
+                self.assertEqual(self.folder.value, "~/")
+                await pilot.press("enter")
+                await self.mode_is(pilot, "start")
+                self.assertIn(f"Start Claude in {self.tmp} and send", self.prompt())
+                await pilot.press("y")
+                await self.message("started Claude in a new window")
+                self.assertEqual(self.continued(), [(NATIVE, "claude", self.tmp)])
+
+    async def test_another_folder_can_be_typed(self):
+        other = os.path.join(self.tmp, "another")
+        os.mkdir(other)
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.to(pilot, "folder")
+            await self.type_folder(pilot, os.path.join(self.tmp, "nope"))
+            await pilot.press("enter")
+            await self.message("not an existing folder")
+            self.assertEqual(self.main.mode, "folder")  # and the input stays open
+            self.assertEqual(self.continued(), [])
+            await self.type_folder(pilot, os.path.join(self.tmp, "an"))
+            await pilot.press("tab")
+            await settle(pilot)
+            self.assertEqual(self.folder.value, other + "/")
+            await pilot.press("enter")
+            await self.mode_is(pilot, "start")
+            await pilot.press("y")
+            await self.message("started Claude in a new window")
+            self.assertEqual(self.continued(), [(NATIVE, "claude", other)])
+
+    async def test_a_foreign_session_is_continued_without_an_import(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.to(pilot, "start", FOREIGN)
+            await pilot.press("y")
+            await self.message("started Claude in a new window")
+            self.assertEqual(self.continued(), [(FOREIGN, "claude", self.tmp)])
+            self.assertEqual(self.imported(), [])
+            self.assertEqual(self.selected(), FOREIGN)
+
+    async def test_escape_at_every_step_starts_nothing(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            for step, answer in (("tool", "escape"), ("folder", "escape"), ("start", "escape")) + (
+                ("start", "n"),
+                ("start", "N"),
+            ):
+                await self.to(pilot, step)
+                await pilot.press(answer)
+                await settle(pilot)
+                self.assertEqual(self.main.mode, "list", (step, answer))
+                self.assertEqual(self.prompt(), "")
+                self.assertFalse(self.main.query_one("#folderbar").display)
+                self.assertIs(self.app.focused, self.rows)
+                await pilot.press("j", "k")  # the list has its keys back
+                self.assertEqual(self.selected(), NATIVE)
+            self.assertEqual(self.continued(), [])
+            self.assertEqual(self.acted(), [])
+            self.assertFalse(self.exited())
+
+    async def test_what_cannot_be_continued_says_why(self):
+        no_tool = "no tool that can start a new session is installed"
+        self.engine.continue_answers[NATIVE] = ContinueOptions(False, no_tool)
+        self.engine.continue_answers[FOREIGN] = ContinueOptions(True, "")  # and no tools at all
+        self.engine.sessions.append(make_session("claude", 70, foreign=True, offline=True, age=3))
+        async with self.started() as pilot:
+            await settle(pilot)
+            for key, said in (
+                (NATIVE, no_tool),
+                (FOREIGN, "cannot be continued"),
+                (OFFLINE, support.NOT_MOUNTED),
+            ):
+                await self.select(pilot, key)
+                await pilot.press("c")
+                await self.message(said)
+                self.assertTrue(self.main.query_one("#status-message").has_class("-error"))
+                self.assertEqual(self.main.mode, "list")
+                self.assertEqual(self.prompt(), "")
+                await pilot.press("escape")
+            self.assertEqual(self.continued(), [])
+
+    async def test_an_engine_error_at_every_step(self):
+        self.engine.fail["continue_options"] = FakeError("the index file is damaged")
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, NATIVE)
+            await pilot.press("c")
+            await self.message("the index file is damaged")
+            self.assertEqual(self.main.mode, "list")
+            del self.engine.fail["continue_options"]
+            refusal = "codex is not installed; the installed tools are: claude"
+            self.engine.fail["continue_session"] = FakeError(refusal)
+            await self.to(pilot, "start")
+            await pilot.press("y")
+            await self.message(refusal)
+            self.assertTrue(self.main.query_one("#status-message").has_class("-error"))
+            self.assertFalse(self.main._continuing)
+            self.assertFalse(self.exited())
+            del self.engine.fail["continue_session"]
+            await self.to(pilot, "start")  # and it can be tried again
+            await pilot.press("y")
+            await self.message("started Claude in a new window")
+            self.assertEqual(len(self.continued()), 2)
+
+    async def test_a_second_start_while_the_first_is_under_way_is_ignored(self):
+        gate = threading.Event()
+        real = self.engine.continue_session
+
+        def slow(ref, tool=None, folder=None, index=None):
+            gate.wait(5)
+            return real(ref, tool=tool, folder=folder, index=index)
+
+        self.engine.continue_session = slow
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.to(pilot, "start")
+            await pilot.press("y")
+            await pilot.press("c")  # once more, while the first is still starting
+            await self.mode_is(pilot, "tool")
+            await pilot.press("enter", "enter")
+            await self.mode_is(pilot, "start")
+            await pilot.press("y")
+            self.assertEqual(self.main.mode, "list")
+            gate.set()
+            await self.message("started Claude in a new window")
+            await settle(pilot)
+            self.assertEqual(self.continued(), [(NATIVE, "claude", self.tmp)])
+
+    async def test_the_answer_for_a_row_that_was_left_opens_nothing(self):
+        gate = threading.Event()
+        real = self.engine.continue_options
+
+        def slow(ref, index=None):
+            gate.wait(5)
+            return real(ref, index=index)
+
+        self.engine.continue_options = slow
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, NATIVE)
+            await pilot.press("c")
+            await pilot.press("j")
+            gate.set()
+            await settle(pilot)
+            self.assertEqual(self.main.mode, "list")
+            self.assertEqual(self.prompt(), "")
+            # Esc while the engine is asked takes the key back, on the same row too.
+            gate.clear()
+            await pilot.press("k", "c")
+            await pilot.press("escape")
+            gate.set()
+            await settle(pilot)
+            self.assertEqual((self.main.mode, self.selected()), ("list", NATIVE))
+            self.assertEqual(self.continued(), [])
+
+
+class UndoTest(OfflineCase):
+    """``u``: take an import back. The fake engine removes nothing: it stops
+    listing the copy. Its refusals are the engine's own ``UndoFailed``."""
+
+    def row(self, key) -> "view.Row":
+        return next(row for row in self.rows.rows if row.key == key)
+
+    async def ask(self, pilot, key, mode):
+        await self.select(pilot, key)
+        await pilot.press("u")
+        await self.mode_is(pilot, mode)
+
+    async def test_u_on_the_copy_asks_then_removes_it(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, IMPORTED_COPY, "undo")
+            self.assertEqual(self.undone(), [(IMPORTED_COPY, False, True)])  # a dry run
+            self.assertEqual(self.prompt(), "Remove the imported copy (2 files, 12.0 MB)? y/n")
+            await pilot.press("enter", "u", "j", "i")  # not answers
+            self.assertEqual(self.main.mode, "undo")
+            await pilot.press("n")
+            await settle(pilot)
+            self.assertEqual(self.main.mode, "list")
+            self.assertEqual(self.undone(), [(IMPORTED_COPY, False, True)])
+            self.assertTrue(self.row(IMPORTED).imported)
+            await self.ask(pilot, IMPORTED_COPY, "undo")
+            await pilot.press("y")
+            await self.message("removed 2 files")
+            self.assertNotIn("left in place", self.status())
+            self.assertFalse(self.main.query_one("#status-message").has_class("-error"))
+            self.assertEqual(self.undone()[-1], (IMPORTED_COPY, False, False))
+            # The list was read again: the copy is gone, its source is plain foreign.
+            self.assertNotIn(IMPORTED_COPY, [row.key for row in self.rows.rows])
+            self.assertEqual((self.row(IMPORTED).where, self.row(IMPORTED).imported), ("C:", False))
+            self.assertFalse(self.main._undoing)
+            self.assertFalse(self.exited())
+            self.assertEqual(self.opened() + self.imported() + self.mounted(), [])
+
+    async def test_u_on_the_foreign_row_it_was_imported_from(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, IMPORTED, "undo")
+            await pilot.press("Y")
+            await self.message("removed 2 files")
+            self.assertEqual(self.undone(), [(IMPORTED, False, True), (IMPORTED, False, False)])
+            self.assertEqual(self.selected(), IMPORTED)  # still listed, and selected
+            self.assertFalse(self.rows.current.imported)
+
+    async def test_u_on_a_row_whose_drive_is_away(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, OFFLINE_IMPORTED, "undo")
+            await pilot.press("y")
+            await self.message("removed 2 files")
+            self.assertEqual(self.row(OFFLINE_IMPORTED).where, "C: · offline")
+            self.assertNotIn(OFFLINE_COPY, [row.key for row in self.rows.rows])
+
+    async def test_what_is_left_in_place_is_counted(self):
+        self.engine.undo_left = [("/home/user/.codex/session_index.jsonl", "a line was added")]
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, IMPORTED_COPY, "undo")
+            await pilot.press("y")
+            await self.message("removed 2 files, 1 left in place")
+
+    async def test_no_import_recorded_is_an_answer_not_a_question(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            for key in (NATIVE, FOREIGN, OFFLINE):
+                await self.select(pilot, key)
+                await pilot.press("u")
+                await self.message(support.NO_RECORD)
+                self.assertFalse(self.main.query_one("#status-message").has_class("-error"))
+                self.assertEqual(self.main.mode, "list")
+                self.assertEqual(self.prompt(), "")
+                await pilot.press("y")  # there is nothing to say yes to
+                await settle(pilot)
+            self.assertEqual(
+                self.undone(), [(key, False, True) for key in (NATIVE, FOREIGN, OFFLINE)]
+            )
+
+    async def test_a_copy_that_was_used_since_asks_whether_to_lose_it(self):
+        self.engine.used_since[IMPORTED_COPY] = ["a.jsonl was modified", "b.json is gone"]
+        used = (
+            "The copy was used since the import (2 files differ). "
+            "Remove it and lose its new turns? y/n"
+        )
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, IMPORTED_COPY, "undo_used")
+            self.assertEqual(self.prompt(), used)
+            self.assertEqual(self.undone(), [(IMPORTED_COPY, False, True)])
+            for answer in ("n", "escape"):
+                await pilot.press(answer)
+                await settle(pilot)
+                self.assertEqual(self.main.mode, "list")
+                self.assertTrue(self.row(IMPORTED).imported)
+                await self.ask(pilot, IMPORTED_COPY, "undo_used")
+            self.assertEqual([call for call in self.undone() if not call[2]], [])
+            await pilot.press("y")
+            await self.message("removed 2 files")
+            self.assertEqual(self.undone()[-1], (IMPORTED_COPY, True, False))  # forced
+            self.assertNotIn(IMPORTED_COPY, [row.key for row in self.rows.rows])
+
+    async def test_any_other_refusal_is_shown_and_asks_nothing(self):
+        refusals = (
+            UndoFailed("the import record is damaged (its manifest); nothing was removed"),
+            # The words of a copy that was used, without the engine's mark: not a question.
+            UndoFailed(support.USED_SINCE),
+            FakeError("the import journal cannot be read: Permission denied"),
+            RuntimeError("boom"),
+        )
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, IMPORTED_COPY)
+            for refusal in refusals:
+                self.engine.fail["unimport"] = refusal
+                await pilot.press("u")
+                await self.message(str(refusal)[:60])
+                self.assertTrue(self.main.query_one("#status-message").has_class("-error"))
+                self.assertEqual(self.main.mode, "list")
+                self.assertEqual(self.prompt(), "")
+                await pilot.press("escape")
+            self.assertTrue(self.row(IMPORTED).imported)
+            self.assertFalse(self.exited())
+
+    async def test_the_removal_itself_fails(self):
+        real = self.engine.unimport
+        busy = "an import or another undo is still running (process 7); nothing was removed"
+
+        def refused(ref, force=False, dry_run=False, index=None):
+            if dry_run:
+                return real(ref, force=force, dry_run=True, index=index)
+            self.engine.calls.append(("unimport", (ref, force, dry_run)))
+            raise UndoFailed(busy)
+
+        self.engine.unimport = refused
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, IMPORTED_COPY, "undo")
+            await pilot.press("y")
+            await self.message(busy)
+            self.assertTrue(self.main.query_one("#status-message").has_class("-error"))
+            self.assertFalse(self.main._undoing)
+            self.assertTrue(self.row(IMPORTED).imported)
+            self.assertEqual(self.selected(), IMPORTED_COPY)
+            self.engine.unimport = real
+            await self.ask(pilot, IMPORTED_COPY, "undo")  # and it can be tried again
+            await pilot.press("y")
+            await self.message("removed 2 files")
+
+    async def test_an_undo_waits_for_a_scan(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.ask(pilot, IMPORTED_COPY, "undo")
+            self.engine.scan_gate = threading.Event()
+            self.main.start_scan(False)
+            await until(lambda: len(self.engine.called("scan")) == 2, what="scan start")
+            await pilot.press("y")
+            await self.message("a scan is running; undo when it has finished")
+            self.assertEqual(self.undone(), [(IMPORTED_COPY, False, True)])
+            self.engine.scan_gate.set()
+            await until(lambda: self.main._scan is None, what="scan end")
+
+    async def test_the_answer_for_a_row_that_was_left_opens_nothing(self):
+        gate = threading.Event()
+        real = self.engine.unimport
+
+        def slow(ref, force=False, dry_run=False, index=None):
+            gate.wait(5)
+            return real(ref, force=force, dry_run=dry_run, index=index)
+
+        self.engine.unimport = slow
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, IMPORTED_COPY)
+            await pilot.press("u")
+            await pilot.press("j")
+            gate.set()
+            await settle(pilot)
+            self.assertEqual(self.main.mode, "list")
+            self.assertEqual(self.prompt(), "")
+            self.assertEqual(self.undone(), [(IMPORTED_COPY, False, True)])
+            # Esc while the engine is asked takes the key back, on the same row too.
+            gate.clear()
+            await pilot.press("k", "u")
+            await pilot.press("escape")
+            gate.set()
+            await settle(pilot)
+            self.assertEqual((self.main.mode, self.selected()), ("list", IMPORTED_COPY))
+            self.assertEqual(self.undone(), [(IMPORTED_COPY, False, True)] * 2)  # dry runs
+
+
+class PromptSizeTest(OfflineCase):
+    """Every prompt and the folder input at every size and across a resize:
+    no crash, no line wider than the terminal, the question still there."""
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.engine.continue_folder = os.path.realpath(tmp.name)
+        self.engine.options[OTHER] = NEEDS_FOLDER
+        self.engine.options[AGY] = EXPERIMENTAL
+        self.engine.options["codex:bbbbbbbb:cof-0004"] = IMPOSSIBLE
+        self.engine.used_since[OFFLINE_COPY] = ["a was modified"]
+
+    # (the mode it ends in, the row, the keys that lead there)
+    prompts = (
+        ("mount", OFFLINE, ("enter",)),
+        ("foreign", FOREIGN, ("enter",)),
+        ("foreign_folder", OTHER, ("enter",)),
+        ("foreign_experimental", AGY, ("enter",)),
+        ("foreign_none", "codex:bbbbbbbb:cof-0004", ("enter",)),
+        ("confirm", FOREIGN, ("i",)),
+        ("warn", AGY, ("enter", "i")),
+        ("folder", FOREIGN, ("t",)),
+        ("tool", NATIVE, ("c",)),
+        ("folder", NATIVE, ("c", "enter")),
+        ("start", NATIVE, ("c", "enter", "enter")),
+        ("undo", IMPORTED_COPY, ("u",)),
+        ("undo_used", OFFLINE_COPY, ("u",)),
+    )
+
+    async def open_prompt(self, pilot, mode, key, keys):
+        await self.select(pilot, key)
+        for press in keys:
+            before = self.main.mode
+            await pilot.press(press)
+            await until(
+                lambda before=before: self.main.mode != before,
+                what=f"{press!r} on the way to {mode}",
+            )
+            await pilot.pause()
+        self.assertEqual(self.main.mode, mode)
+
+    def test_every_prompt_is_in_the_table(self):
+        self.assertEqual(
+            {mode for mode, _key, _keys in self.prompts}, {*view.MODAL_MODES, "folder"}
+        )
+
+    async def at_size(self, width, height):
+        async with self.started(size=(width, height)) as pilot:
+            await settle(pilot)
+            for mode, key, keys in self.prompts:
+                await self.open_prompt(pilot, mode, key, keys)
+                lines = self.check_frame(width, height)
+                if mode != "folder":
+                    shown = self.prompt().splitlines()
+                    self.assertTrue(shown, mode)
+                    for line in shown:  # the prompt is on screen, whole
+                        self.assertIn(line.strip(), "\n".join(lines), (mode, width))
+                await pilot.press("escape")
+                await settle(pilot)
+                self.assertEqual(self.main.mode, "list", mode)
+            await pilot.press("j", "k", "question_mark", "escape")
+            self.assertEqual(self.acted(), [])
+            self.assertFalse(self.exited())
+
+    async def test_120x40(self):
+        await self.at_size(120, 40)
+
+    async def test_80x24(self):
+        await self.at_size(80, 24)
+
+    async def test_40x10(self):
+        await self.at_size(40, 10)
+
+    async def test_resize_with_each_open(self):
+        sizes = ((80, 24), (40, 10), (10, 3), (120, 40))
+        async with self.started() as pilot:
+            await settle(pilot)
+            for mode, key, keys in self.prompts:
+                await self.open_prompt(pilot, mode, key, keys)
+                for width, height in sizes:
+                    await pilot.resize_terminal(width, height)
+                    await settle(pilot)
+                    self.check_frame(width, height)
+                    self.assertEqual(self.main.mode, mode, (mode, width, height))
+                    self.assertEqual(self.selected(), key)
+                await pilot.press("escape")
+                await settle(pilot)
+                self.assertEqual(self.main.mode, "list", mode)
+            self.assertEqual(self.acted(), [])
+            self.assertFalse(self.exited())
+
+    async def test_the_prompt_is_worded_again_for_the_new_width(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.open_prompt(pilot, "foreign_experimental", AGY, ("enter",))
+            self.assertEqual(self.prompt().splitlines()[1], EXPERIMENTAL_CHOICES)
+            await pilot.resize_terminal(80, 24)
+            await settle(pilot)
+            self.assertEqual(
+                self.prompt().splitlines()[1],
+                "[i] import+resume (exp.)  [I] import (exp.)  [c] continue  [v] view  [Esc]",
+            )
+            await pilot.resize_terminal(60, 24)
+            await settle(pilot)
+            self.assertEqual(
+                self.prompt().splitlines()[1], "[i] resume [I] import [c] new [v] view [Esc]"
+            )
+            await pilot.press("i")  # the warning takes the lines it needs, three at most
+            await pilot.pause()
+            lines = self.prompt().splitlines()
+            self.assertEqual((len(lines), lines[-1]), (4, "Import anyway? y/n"))
+            self.assertTrue(lines[-2].endswith("…"))
+            await pilot.resize_terminal(40, 10)
+            await settle(pilot)
+            lines = self.prompt().splitlines()
+            self.assertEqual((len(lines), lines[-1]), (4, "Import anyway? y/n"))
+            self.check_frame(40, 10)
+            self.assertIn("Import anyway? y/n", self.text())
 
 
 if __name__ == "__main__":

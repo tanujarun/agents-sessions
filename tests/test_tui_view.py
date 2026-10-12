@@ -1,6 +1,7 @@
 """The TUI's pure view logic, its engine wrapper and its entry point. Runs on
 the system Python: nothing here needs Textual."""
 
+import os
 import subprocess
 import sys
 import unittest
@@ -22,6 +23,13 @@ from agent_sessions.tui import view  # noqa: E402
 
 NOW = support.NOW
 PROVIDERS = support.PROVIDERS
+Verdict = view.Verdict
+POSSIBLE = Verdict(True)
+NEEDS_FOLDER = Verdict(False, "the project folder C:\\Work\\site was not found", needs_folder=True)
+EXPERIMENTAL = Verdict(
+    False, "experimental, only when asked for", experimental=True, warning="Not resumed yet."
+)
+IMPOSSIBLE = Verdict(False, "Gemini chats cannot be imported")
 
 
 def ago(**delta) -> str:
@@ -462,7 +470,7 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(big.hints, view.HINTS_FULL)
         standard = view.layout_for(80, 24, hint_gutter=2)
         self.assertTrue(standard.show_project and standard.show_detail)
-        self.assertEqual(standard.hints, view.HINTS_FULL)
+        self.assertEqual(standard.hints, view.HINTS_MEDIUM)  # every key, in shorter words
         narrow = view.layout_for(79, 24, hint_gutter=2)
         self.assertFalse(narrow.show_project)  # PROJECT goes first
         self.assertTrue(narrow.show_detail)
@@ -486,8 +494,31 @@ class LayoutTest(unittest.TestCase):
                 if not roomy:
                     self.assertEqual(len(lines), 1)
         self.assertEqual(view.hint_lines(200, roomy=True), view.HINTS_FULL)
-        self.assertEqual(view.hint_lines(60), (view.HINTS_SHORT[0],))
+        self.assertEqual(view.hint_lines(60), (view.HINTS_SHORT[1],))
         self.assertEqual(view.hint_lines(3), ("? help  q quit",))
+
+    def test_hints_name_the_new_keys(self):
+        full = "  ".join(view.HINTS_FULL)
+        for hint in ("m mount", "c continue", "u undo import", "t import into folder"):
+            self.assertIn(hint, full)
+        # Both two-line versions hold every key of the full one.
+        keys = [part.split()[0] for part in full.split("  ")]
+        medium = " ".join(view.HINTS_MEDIUM).split()
+        self.assertEqual(len(keys), 15)
+        for key in keys:
+            self.assertIn(key, medium)
+        # Where each begins: the full lines from 95 columns, the shorter two from 73.
+        widest = max(view.text_width(line) for line in view.HINTS_FULL)
+        self.assertEqual(view.hint_lines(widest), view.HINTS_FULL)
+        self.assertEqual(view.hint_lines(widest - 1), view.HINTS_MEDIUM)
+        self.assertEqual(max(view.text_width(line) for line in view.HINTS_MEDIUM), 73)
+        self.assertEqual(view.hint_lines(73), view.HINTS_MEDIUM)
+        self.assertEqual(view.hint_lines(72), (view.HINTS_SHORT[0],))
+        # One line, however wide, on a short terminal; the essential keys to the last.
+        self.assertEqual(view.hint_lines(200, roomy=False), (view.HINTS_SHORT[0],))
+        self.assertIn("c continue", view.HINTS_SHORT[0])
+        for line in view.HINTS_SHORT:
+            self.assertIn("? help  q quit", line)
 
 
 class StatusTest(unittest.TestCase):
@@ -692,29 +723,45 @@ class DetailTest(unittest.TestCase):
     def test_import_verdict(self):
         session = support.make_session("grok", 4, foreign=True)
         self.assertEqual(view.verdict_text(session, None), "checking…")
-        self.assertEqual(view.verdict_text(session, (True, "")), "possible")
+        self.assertEqual(view.verdict_text(session, POSSIBLE), "possible")
         self.assertEqual(
-            view.verdict_text(session, (True, "cwd is rewritten")), "possible · cwd is rewritten"
+            view.verdict_text(session, NEEDS_FOLDER), "possible into a folder you choose"
+        )
+        self.assertEqual(view.verdict_text(session, EXPERIMENTAL), "experimental only")
+        self.assertEqual(
+            view.verdict_text(session, Verdict(False, "x", True, True)),
+            "experimental only, into a folder you choose",
         )
         self.assertEqual(
-            view.verdict_text(session, (False, "Antigravity cannot be imported")),
-            "not possible: Antigravity cannot be imported",
+            view.verdict_text(session, IMPOSSIBLE), "not possible: Gemini chats cannot be imported"
         )
-        self.assertEqual(view.verdict_text(session, (False, "")), "not possible")
+        self.assertEqual(view.verdict_text(session, Verdict(False)), "not possible")
         self.assertEqual(
-            view.verdict_text(session, (None, "engine has no can_import")),
-            "unknown: engine has no can_import",
+            view.verdict_text(session, Verdict(reason="engine has no import_options", known=False)),
+            "unknown: engine has no import_options",
         )
+        self.assertEqual(view.verdict_text(session, Verdict(known=False)), "unknown")
         session.imported_as = "grok:aaaaaaaa:x"
         self.assertEqual(
-            view.verdict_text(session, (False, "x")),
+            view.verdict_text(session, IMPOSSIBLE),
             "already imported; Enter resumes the Linux copy",
         )
-        self.assertEqual(view.verdict_text(support.make_session("grok", 1), (False, "x")), "-")
+        self.assertEqual(view.verdict_text(support.make_session("grok", 1), IMPOSSIBLE), "-")
+
+    def test_the_verdict_is_read_from_the_engines_answer(self):
+        options = support.ImportOptions(False, "no\x1b[31m folder\n", True, True, "careful\nnow")
+        self.assertEqual(
+            view.make_verdict(options), Verdict(False, "no [31m folder", True, True, "careful\nnow")
+        )
+        self.assertEqual(view.make_verdict(support.ImportOptions(True)), POSSIBLE)
+        self.assertEqual(view.make_verdict(object()), Verdict(False))  # an answer with no fields
+        failed = view.failed_verdict(support.FakeError("the index is gone"))
+        self.assertEqual(failed, Verdict(reason="the index is gone", known=False))
+        self.assertEqual(view.failed_verdict(KeyError()).reason, "KeyError")
 
     def test_offline(self):
         session = support.make_session("claude", 7, foreign=True, offline=True)
-        refusal = (False, support.NOT_MOUNTED)
+        refusal = Verdict(False, support.NOT_MOUNTED)
         fields = view.detail_fields(session, refusal, self.tz)
         self.assertEqual(fields["cwd"], "C:\\Work\\project-7")
         self.assertEqual(fields["local"], "(not found)")
@@ -737,12 +784,42 @@ class PromptAndKeyTest(unittest.TestCase):
         self.assertEqual(view.drive_of("Zephyro"), "Zephyro")
         self.assertEqual(view.drive_of(""), "another drive")
         self.assertEqual(
-            view.foreign_prompt("C:"),
-            "On C: [i] import and resume  [I] import only  [v] view  [Esc] cancel",
+            view.foreign_prompt("C:", POSSIBLE),
+            [
+                "On C: [i] import and resume  [I] import only  [t] into another folder  "
+                "[c] continue as new  [v] view  [Esc] cancel"
+            ],
         )
         self.assertEqual(
-            view.foreign_prompt("Zephyro"),
-            "On Zephyro: [i] import and resume  [I] import only  [v] view  [Esc] cancel",
+            view.foreign_prompt("Zephyro · offline", POSSIBLE)[0][:32],
+            "On Zephyro: [i] import and resum",
+        )
+        self.assertEqual(
+            view.foreign_prompt("C:", NEEDS_FOLDER),
+            [
+                "the project folder C:\\Work\\site was not found",
+                "[t] import into another folder  [c] continue as new  [v] view  [Esc] cancel",
+            ],
+        )
+        self.assertEqual(
+            view.foreign_prompt("C:", EXPERIMENTAL),
+            [
+                "experimental, only when asked for",
+                "[i] import and resume (experimental)  [I] import only (experimental)  "
+                "[c] continue as new  [v] view  [Esc] cancel",
+            ],
+        )
+        self.assertEqual(
+            view.foreign_prompt("C:", IMPOSSIBLE),
+            ["Gemini chats cannot be imported", "[c] continue as new  [v] view  [Esc] cancel"],
+        )
+        # No reason given: the choices alone. A reason is one clean line.
+        self.assertEqual(
+            view.foreign_prompt("C:", Verdict(False)),
+            ["[c] continue as new  [v] view  [Esc] cancel"],
+        )
+        self.assertEqual(
+            view.foreign_prompt("C:", Verdict(False, "two\nlines\x07"))[0], "two lines"
         )
         self.assertEqual(
             view.confirm_prompt("Site copy pass", "C:"),
@@ -751,16 +828,38 @@ class PromptAndKeyTest(unittest.TestCase):
         self.assertIn("x" * 39 + "…", view.confirm_prompt("x" * 100, "C:"))
 
     def test_prompts_keep_every_choice_on_a_narrow_terminal(self):
-        full = view.foreign_prompt("C:")
-        self.assertEqual(view.foreign_prompt("C:", 200), full)
-        self.assertEqual(view.foreign_prompt("C:", len(full)), full)
+        (full,) = view.foreign_prompt("C:", POSSIBLE)
+        self.assertEqual(view.foreign_prompt("C:", POSSIBLE, 200), [full])
+        self.assertEqual(view.foreign_prompt("C:", POSSIBLE, len(full)), [full])
         self.assertEqual(
-            view.foreign_prompt("C:", len(full) - 1),
-            "On C: [i] import+resume  [I] import  [v] view  [Esc]",
+            view.foreign_prompt("C:", POSSIBLE, len(full) - 1),
+            ["On C: [i] import+resume  [I] import  [t] folder  [c] continue  [v] view  [Esc]"],
         )
-        self.assertEqual(view.foreign_prompt("C:", 40), "[i] resume [I] import [v] view [Esc]")
-        self.assertEqual(view.foreign_prompt("C:", 20), "[i] [I] [v] [Esc]")
-        self.assertEqual(view.foreign_prompt("C:", 6), "[i] […")
+        self.assertEqual(
+            view.foreign_prompt("C:", POSSIBLE, 60),
+            ["[i] resume [I] import [t] folder [c] new [v] view [Esc]"],
+        )
+        self.assertEqual(view.foreign_prompt("C:", POSSIBLE, 40), ["[i] [I] [t] [c] [v] [Esc]"])
+        self.assertEqual(view.foreign_prompt("C:", POSSIBLE, 6), ["[i] […"])
+        self.assertEqual(
+            view.foreign_prompt("C:", NEEDS_FOLDER, 60),
+            [
+                "the project folder C:\\Work\\site was not found",
+                "[t] import into folder  [c] continue  [v] view  [Esc]",
+            ],
+        )
+        self.assertEqual(
+            view.foreign_prompt("C:", NEEDS_FOLDER, 40),
+            ["the project folder C:\\Work\\site was not…", "[t] folder [c] new [v] view [Esc]"],
+        )
+        self.assertEqual(
+            view.foreign_prompt("C:", EXPERIMENTAL, 78)[1],
+            "[i] import+resume (exp.)  [I] import (exp.)  [c] continue  [v] view  [Esc]",
+        )
+        self.assertEqual(
+            view.foreign_prompt("C:", IMPOSSIBLE, 20),
+            ["Gemini chats cannot…", "[c] [v] [Esc]"],
+        )
         self.assertEqual(
             view.confirm_prompt("Site copy pass", "C:", 45),
             "Import from C: to Linux?  [y] yes  [n] no",
@@ -769,15 +868,254 @@ class PromptAndKeyTest(unittest.TestCase):
             view.confirm_prompt("Site copy pass", "C:", 30), "Import?  [y] yes  [n] no"
         )
         self.assertEqual(view.confirm_prompt("Site copy pass", "C:", 16), "Import? [y] [n]")
-        for width in range(1, 90):
+        choices = {
+            POSSIBLE: ("[i]", "[I]", "[t]", "[c]", "[v]", "[Esc]"),
+            NEEDS_FOLDER: ("[t]", "[c]", "[v]", "[Esc]"),
+            EXPERIMENTAL: ("[i]", "[I]", "[c]", "[v]", "[Esc]"),
+            IMPOSSIBLE: ("[c]", "[v]", "[Esc]"),
+        }
+        for width in range(1, 130):
+            texts = [view.confirm_prompt("日本語 title", "No Other Way", width)]
+            for verdict, keys in choices.items():
+                lines = view.foreign_prompt("No Other Way", verdict, width)
+                self.assertEqual(len(lines), 1 if verdict.possible else 2)
+                texts += lines
+                if width >= 25:  # from here on no choice is cut off
+                    self.assertEqual(lines[-1].count("["), len(keys), (width, lines[-1]))
+                    for key in keys:
+                        self.assertIn(key, lines[-1])
+            for text in texts:
+                self.assertLessEqual(view.text_width(text), width)
+
+    def test_which_prompt_and_which_step(self):
+        for verdict, mode in (
+            (POSSIBLE, "foreign"),
+            (NEEDS_FOLDER, "foreign_folder"),
+            (EXPERIMENTAL, "foreign_experimental"),
+            (IMPOSSIBLE, "foreign_none"),
+            (Verdict(False, "x", True, True), "foreign_folder"),  # the folder first
+            (Verdict(known=False), "foreign_none"),
+        ):
+            self.assertEqual(view.foreign_mode(verdict), mode)
+            self.assertIn(mode, view.KEYMAPS)
+        steps = {
+            (POSSIBLE, "import"): "confirm",
+            (POSSIBLE, "folder"): "folder",
+            (NEEDS_FOLDER, "import"): "folder",
+            (NEEDS_FOLDER, "folder"): "folder",
+            (EXPERIMENTAL, "import"): "warn",
+            (EXPERIMENTAL, "folder"): "folder",
+            (IMPOSSIBLE, "import"): "refuse",
+            (IMPOSSIBLE, "folder"): "refuse",
+        }
+        for (verdict, key), step in steps.items():
+            self.assertEqual(view.import_step(verdict, key), step, (verdict, key))
+
+    def test_the_warning_is_wrapped_to_three_lines(self):
+        warning = (
+            "Experimental: no imported Antigravity conversation has been resumed by hand yet, "
+            "and agy starts a new conversation without an error when it cannot read a copy. "
+            "After the first resume, check that the old turns are on the screen."
+        )
+        self.assertEqual(view.warning_lines("short", 40), ["short"])
+        self.assertEqual(view.warning_lines("", 40), [])
+        self.assertEqual(len(view.warning_lines(warning, 118)), 2)  # fits: no ellipsis
+        self.assertTrue(view.warning_lines(warning, 118)[-1].endswith("on the screen."))
+        self.assertEqual(
+            view.warning_lines(warning, 38),
+            [
+                "Experimental: no imported Antigravity",
+                "conversation has been resumed by hand",
+                "yet, and agy starts a new conversatio…",
+            ],
+        )
+        # The ellipsis is added when the third line has room for it, too.
+        self.assertEqual(view.warning_lines("aa bb cc dd", 3), ["aa", "bb", "cc…"])
+        self.assertEqual(view.warning_lines("a\n\nb\x1b[2J\nc\nd", 20), ["a", "b [2J", "c…"])
+        self.assertEqual(view.warning_lines("one\ntwo", None), ["one", "two"])
+        for width in range(1, 130):
+            lines = view.warn_prompt(warning, width)
+            self.assertLessEqual(len(lines), view.WARNING_LINES + 1)
+            for line in lines:
+                self.assertLessEqual(view.text_width(line), width)
+        self.assertEqual(view.warn_prompt(warning, 60)[-1], "Import anyway? y/n")
+        self.assertEqual(view.warn_prompt("", 60), ["Import anyway? y/n"])
+        self.assertEqual(view.warn_prompt("w", 12), ["w", "Import? y/n"])
+
+    def test_mount_texts(self):
+        self.assertEqual(
+            view.mount_prompt("C: · offline"), "C: is not mounted: [m] mount  [Esc] cancel"
+        )
+        self.assertEqual(
+            view.mount_prompt("Zephyro · offline", 44),
+            "Zephyro is not mounted: [m] mount  [Esc]",
+        )
+        self.assertEqual(view.mount_prompt("Zephyro · offline", 20), "[m] mount [Esc]")
+        self.assertEqual(view.mount_prompt("Zephyro · offline", 10), "[m] [Esc]")
+        for width in range(1, 60):
+            self.assertLessEqual(view.text_width(view.mount_prompt("Zephyro", width)), width)
+        self.assertEqual(
+            view.mount_activity_text("Zephyro"), "mounting Zephyro: answer the password prompt…"
+        )
+        self.assertEqual(view.mount_activity_text("C:"), "mounting C: answer the password prompt…")
+        self.assertEqual(view.mounted_text("C:"), "C: mounted")
+        self.assertEqual(view.already_mounting_text("Zephyro"), "already mounting Zephyro")
+        self.assertEqual(view.not_attached_text("C:"), "C: is not attached")
+        self.assertEqual(view.DRIVE_IS_MOUNTED, "this session's drive is mounted")
+
+    def test_volume_state(self):
+        volumes = [
+            {"path": "/run/media/me/A", "state": "attached"},
+            {"path": "/run/media/me/B", "state": "absent"},
+            {"path": "/run/media/me/C"},
+            {"path": "/run/media/me/D", "state": 7},
+        ]
+        self.assertEqual(view.volume_state(volumes, "/run/media/me/A"), "attached")
+        self.assertEqual(view.volume_state(volumes, "/run/media/me/B"), view.VOLUME_ABSENT)
+        for mount in ("/run/media/me/C", "/run/media/me/D", "/elsewhere", None):
+            self.assertIsNone(view.volume_state(volumes, mount))
+        self.assertIsNone(view.volume_state(None, "/run/media/me/A"))
+        from agent_sessions import mounts
+
+        self.assertEqual(view.VOLUME_ABSENT, mounts.ABSENT)  # the engine's word
+
+    def test_busy_texts(self):
+        # The four the app said before, word for word.
+        self.assertEqual(view.busy_text("scan", "scan"), "a scan is already running")
+        self.assertEqual(view.busy_text("import", "import"), "an import is already running")
+        self.assertEqual(
+            view.busy_text("scan", "import"), "a scan is running; import when it has finished"
+        )
+        self.assertEqual(
+            view.busy_text("import", "scan"), "an import is running; rescan when it has finished"
+        )
+        self.assertEqual(
+            view.busy_text("mount", "scan"), "a mount is running; rescan when it has finished"
+        )
+        self.assertEqual(
+            view.busy_text("scan", "mount"), "a scan is running; mount when it has finished"
+        )
+        self.assertEqual(
+            view.busy_text("undo", "import"), "an undo is running; import when it has finished"
+        )
+        self.assertEqual(
+            view.busy_text("mount", "undo"), "a mount is running; undo when it has finished"
+        )
+
+    def test_continue_texts(self):
+        left, right = view.TOOL_MARKS
+        self.assertEqual((left, right), ("\u2039", "\u203a"))
+        self.assertEqual(
+            view.tool_prompt("Claude"),
+            f"Continue with: {left} Claude {right}   ←→ change  Enter next  Esc cancel",
+        )
+        self.assertEqual(
+            view.tool_prompt("Claude", 50),
+            f"{left} Claude {right}  ←→ change  Enter next  Esc cancel",
+        )
+        self.assertEqual(view.tool_prompt("Claude", 30), f"{left} Claude {right} ←→ Enter Esc")
+        self.assertEqual(view.tool_prompt("Claude", 12), f"{left} Claude {right}")
+        self.assertEqual(view.tool_prompt("a\nb", None)[15:22], f"{left} a b {right}")
+        tools = (("codex", "Codex"), ("claude", "Claude"))
+        self.assertEqual(view.tool_start(tools, "claude"), 1)
+        self.assertEqual(view.tool_start(tools, None), 0)  # no default: the first
+        self.assertEqual(view.tool_start(tools, "grok"), 0)
+        self.assertEqual(view.tool_start((), "grok"), 0)
+        folder = "/home/me/Projects/website/landing"
+        full = f"Start Codex in {folder} and send a first message to the model? y/n"
+        self.assertEqual(view.start_prompt("Codex", folder), full)
+        self.assertEqual(view.start_prompt("Codex", folder, len(full)), full)
+        self.assertEqual(
+            view.start_prompt("Codex", folder, len(full) - 1),
+            "Start Codex in …ome/me/Projects/website/landing and send a first message to the "
+            "model? y/n",
+        )
+        self.assertEqual(
+            view.start_prompt("Codex", folder, 70),
+            "Start Codex in …ite/landing and send a first message to the model? y/n",
+        )
+        self.assertEqual(
+            view.start_prompt("Codex", folder, 69),
+            "Start Codex and send a first message to the model? y/n",
+        )
+        self.assertEqual(
+            view.start_prompt("Codex", folder, 50), "Start Codex and send a first message? y/n"
+        )
+        self.assertEqual(view.start_prompt("Codex", folder, 30), "Start Codex? y/n")
+        self.assertEqual(view.start_prompt("Codex", folder, 12), "Start? y/n")
+        for width in range(1, 130):
             for text in (
-                view.foreign_prompt("No Other Way", width),
-                view.confirm_prompt("日本語 title", "No Other Way", width),
+                view.tool_prompt("Antigravity", width),
+                view.start_prompt("Antigravity", "/home/me/日本語/プロジェクト", width),
             ):
                 self.assertLessEqual(view.text_width(text), width)
-            if width >= 17:
-                for choice in ("[i]", "[I]", "[v]", "[Esc]"):
-                    self.assertIn(choice, view.foreign_prompt("No Other Way", width))
+            if width >= 41:  # the model call is said as long as there is room at all
+                self.assertIn("first message", view.start_prompt("Codex", folder, width))
+        self.assertEqual(view.started_text("Codex"), "started Codex in a new window")
+        self.assertEqual(view.clip_left("abcdef", 4), "…def")
+        self.assertEqual(view.clip_left("abcdef", 6), "abcdef")
+        self.assertEqual(view.clip_left("abcdef", 0), "")
+        self.assertEqual(view.clip_left("日本語のテキスト", 6), "…スト")
+
+    def test_undo_texts(self):
+        self.assertEqual(
+            view.undo_prompt(12, 3_100_000), "Remove the imported copy (12 files, 3.1 MB)? y/n"
+        )
+        self.assertEqual(view.undo_prompt(1, 812), "Remove the imported copy (1 file, 812 B)? y/n")
+        self.assertEqual(view.undo_prompt(12, 3_100_000, 40), "Remove the imported copy? y/n")
+        self.assertEqual(view.undo_prompt(12, 3_100_000, 24), "Remove the copy? y/n")
+        self.assertEqual(view.undo_prompt(12, 3_100_000, 12), "Remove? y/n")
+        self.assertEqual(
+            view.undo_used_prompt(3),
+            "The copy was used since the import (3 files differ). "
+            "Remove it and lose its new turns? y/n",
+        )
+        self.assertIn("(1 file differs)", view.undo_used_prompt(1))
+        self.assertEqual(
+            view.undo_used_prompt(3, 78),
+            "The copy was used since the import. Remove it and lose its new turns? y/n",
+        )
+        self.assertEqual(
+            view.undo_used_prompt(3, 60),
+            "Used since the import. Remove it and lose its new turns? y/n",
+        )
+        self.assertEqual(view.undo_used_prompt(3, 38), "Used since the import. Remove it? y/n")
+        self.assertEqual(view.undo_used_prompt(3, 20), "Remove it? y/n")
+        for width in range(1, 100):
+            for text in (view.undo_prompt(1234, 5e9, width), view.undo_used_prompt(40, width)):
+                self.assertLessEqual(view.text_width(text), width)
+        self.assertEqual(view.undo_message(12), "removed 12 files")
+        self.assertEqual(view.undo_message(1, 0), "removed 1 file")
+        self.assertEqual(view.undo_message(12, 2), "removed 12 files, 2 left in place")
+
+    def test_undo_refusals_are_told_apart_by_what_the_engine_marked(self):
+        from agent_sessions.errors import UndoFailed
+
+        # The same words on all three: the text is never what decides.
+        words = "the imported copy was used since the import; no import of this session is recorded"
+        self.assertEqual(view.undo_refusal(UndoFailed(words, no_record=True)), ("none", 0))
+        self.assertEqual(
+            view.undo_refusal(UndoFailed(words, differences=["a is gone", "b was modified"])),
+            ("used", 2),
+        )
+        self.assertEqual(view.undo_refusal(UndoFailed(words)), ("other", 0))
+        self.assertEqual(view.undo_refusal(support.FakeError(words)), ("other", 0))
+        self.assertEqual(view.undo_refusal(RuntimeError("boom")), ("other", 0))
+        odd = support.FakeError("x")
+        odd.differences, odd.no_record = "not a list", "yes"  # marks of the wrong type
+        self.assertEqual(view.undo_refusal(odd), ("other", 0))
+
+    def test_undo_counts(self):
+        report = support.UnimportReport(
+            "claude", "x", "k", "s", removed=["a", "b", "d"], files=2, left=[("c", "why")], bytes=9
+        )
+        self.assertEqual(view.undo_counts(report), (2, 9, 1))
+
+        class Older:  # a report that does not count its files: everything it removes
+            removed = ["a", "b", "d"]
+
+        self.assertEqual(view.undo_counts(Older()), (3, 0, 0))
+        self.assertEqual(view.undo_counts(object()), (0, 0, 0))
 
     def test_list_keys(self):
         expected = {
@@ -800,6 +1138,10 @@ class PromptAndKeyTest(unittest.TestCase):
             ("enter", "\r"): "resume",
             ("o", "o"): "resume_stay",
             ("i", "i"): "import",
+            ("t", "t"): "import_folder",
+            ("c", "c"): "continue",
+            ("u", "u"): "undo",
+            ("m", "m"): "mount",
             ("v", "v"): "view",
             ("slash", "/"): "filter",
             ("r", "r"): "rescan",
@@ -819,9 +1161,11 @@ class PromptAndKeyTest(unittest.TestCase):
     def test_prompt_keys(self):
         self.assertEqual(view.key_action("foreign", "i", "i"), "prompt_import_resume")
         self.assertEqual(view.key_action("foreign", "I", "I"), "prompt_import_only")
+        self.assertEqual(view.key_action("foreign", "t", "t"), "prompt_folder")
+        self.assertEqual(view.key_action("foreign", "c", "c"), "prompt_continue")
         self.assertEqual(view.key_action("foreign", "v", "v"), "prompt_view")
         self.assertEqual(view.key_action("foreign", "escape"), "prompt_cancel")
-        for key in ("enter", "o", "q", "j", "r", "R", "y"):
+        for key in ("enter", "o", "q", "j", "r", "R", "y", "m", "u"):
             self.assertIsNone(view.key_action("foreign", key, key if len(key) == 1 else None))
         self.assertEqual(view.key_action("confirm", "y", "y"), "confirm_yes")
         self.assertEqual(view.key_action("confirm", "n", "n"), "confirm_no")
@@ -830,6 +1174,101 @@ class PromptAndKeyTest(unittest.TestCase):
         self.assertIsNone(view.key_action("confirm", "i", "i"))
         self.assertIn("foreign", view.MODAL_MODES)
         self.assertIn("confirm", view.MODAL_MODES)
+
+    def test_each_foreign_prompt_takes_the_keys_it_shows_and_no_other(self):
+        tables = {
+            "foreign": {
+                "i": "prompt_import_resume",
+                "I": "prompt_import_only",
+                "t": "prompt_folder",
+                "c": "prompt_continue",
+                "v": "prompt_view",
+                "escape": "prompt_cancel",
+            },
+            "foreign_folder": {
+                "t": "prompt_folder",
+                "c": "prompt_continue",
+                "v": "prompt_view",
+                "escape": "prompt_cancel",
+            },
+            "foreign_experimental": {
+                "i": "prompt_warn_resume",  # the warning first
+                "I": "prompt_warn_only",
+                "c": "prompt_continue",
+                "v": "prompt_view",
+                "escape": "prompt_cancel",
+            },
+            "foreign_none": {
+                "c": "prompt_continue",
+                "v": "prompt_view",
+                "escape": "prompt_cancel",
+            },
+        }
+        verdicts = {
+            "foreign": POSSIBLE,
+            "foreign_folder": NEEDS_FOLDER,
+            "foreign_experimental": EXPERIMENTAL,
+            "foreign_none": IMPOSSIBLE,
+        }
+        for mode, table in tables.items():
+            self.assertEqual(view.KEYMAPS[mode], table, mode)
+            shown = view.foreign_prompt("C:", verdicts[mode])[-1]
+            caps = {f"[{'Esc' if key == 'escape' else key}]" for key in table}
+            self.assertEqual({word for word in shown.split() if word.startswith("[")}, caps, mode)
+
+    def test_question_keys(self):
+        for mode, yes in (
+            ("confirm", "confirm_yes"),
+            ("warn", "warn_yes"),
+            ("start", "start_yes"),
+            ("undo", "undo_yes"),
+            ("undo_used", "undo_force_yes"),
+        ):
+            self.assertEqual(
+                view.KEYMAPS[mode],
+                {"y": yes, "Y": yes, "n": "confirm_no", "N": "confirm_no", "escape": "confirm_no"},
+            )
+            self.assertIsNone(view.key_action(mode, "enter", "\r"), mode)  # Enter is not a yes
+        self.assertEqual(view.KEYMAPS["mount"], {"m": "prompt_mount", "escape": "prompt_cancel"})
+        self.assertEqual(
+            view.KEYMAPS["tool"],
+            {
+                "left": "tool_prev",
+                "right": "tool_next",
+                "enter": "tool_accept",
+                "escape": "prompt_cancel",
+            },
+        )
+        self.assertEqual(
+            view.KEYMAPS["folder"],
+            {
+                "escape": "folder_cancel",
+                "enter": "folder_accept",
+                "tab": "folder_complete",
+                "shift+tab": "folder_stay",
+            },
+        )
+        self.assertEqual(view.key_action("folder", "tab", "\t"), "folder_complete")
+        for key in ("q", "j", "i", "m", "c", "u", "/"):  # typed into the box
+            self.assertIsNone(view.key_action("folder", key, key))
+
+    def test_every_prompt_is_modal_and_the_folder_input_is_not(self):
+        prompts = set(view.KEYMAPS) - {"list", "filter", "folder", "help", "pager"}
+        self.assertEqual(set(view.MODAL_MODES), prompts)
+        self.assertEqual(len(view.MODAL_MODES), len(prompts))
+        # A list key means nothing in any of them: nothing leaks through a prompt.
+        for mode in prompts:
+            for key, action in view.KEYMAPS["list"].items():
+                self.assertNotEqual(view.KEYMAPS[mode].get(key), action, (mode, key))
+            self.assertIn("escape", view.KEYMAPS[mode])
+
+    def test_the_app_has_a_handler_for_every_action(self):
+        source = (REPO / "src" / "agent_sessions" / "tui" / "app.py").read_text(encoding="utf-8")
+        for mode, table in view.KEYMAPS.items():
+            if mode in ("help", "pager"):  # their screens name their own actions
+                continue
+            for action in set(table.values()):
+                self.assertIn(f"    def do_{action}(self", source, (mode, action))
 
     def test_filter_pager_and_unknown_modes(self):
         self.assertEqual(view.key_action("filter", "escape"), "filter_clear")
@@ -865,6 +1304,10 @@ class PromptAndKeyTest(unittest.TestCase):
                 "resume",
                 "resume_stay",
                 "import",
+                "import_folder",
+                "continue",
+                "undo",
+                "mount",
                 "view",
                 "filter",
                 "rescan",
@@ -885,6 +1328,165 @@ class PromptAndKeyTest(unittest.TestCase):
         joined = " ".join(" ".join(view.help_lines(40)).split())
         for _keys, action in view.HELP:
             self.assertIn(action, joined)
+        keys = [keys for keys, _action in view.HELP]
+        for key, word in (
+            ("t", "folder you choose"),
+            ("c", "continue"),
+            ("u", "undo"),
+            ("m", "mount"),
+        ):
+            self.assertIn(key, keys)
+            self.assertIn(word, dict(view.HELP)[key])
+        # Every key of the list has its line (the movement and tab keys share theirs).
+        named = " ".join(keys)
+        for key in ("i", "t", "c", "u", "m", "v", "o", "r", "R", "/", "?", "q", "Enter"):
+            self.assertIn(key, named.replace(",", " ").split(), key)
+
+
+class FolderTest(unittest.TestCase):
+    """The folder the user types: ``~``, Tab completion, what Enter refuses.
+    The listing is a callable the test hands in; nothing here reads a disk."""
+
+    home = "/home/me"
+    tree = {
+        "/home/me/": [
+            ("Projects", True),
+            ("Pictures", True),
+            ("Public", True),
+            ("notes.txt", False),
+            (".config", True),
+            (".cache", True),
+            (".profile", False),
+            ("work", True),
+        ],
+        "/home/me/Projects/": [("site", True), ("site-old", True), ("tools", True)],
+        "/srv/": [("data", True), ("日本語", True)],
+        "/empty/": [],
+    }
+
+    def setUp(self):
+        self.listed = []
+
+    def listing(self, directory):
+        self.listed.append(directory)
+        if directory not in self.tree:
+            raise FileNotFoundError(2, "No such file or directory", directory)
+        return list(self.tree[directory])
+
+    def complete(self, text):
+        return view.complete_folder(text, self.listing, self.home)
+
+    def test_expand(self):
+        self.assertEqual(view.expand_folder("~", self.home), "/home/me")
+        self.assertEqual(view.expand_folder("~/", self.home), "/home/me/")
+        self.assertEqual(view.expand_folder("~/a b/c", self.home), "/home/me/a b/c")
+        self.assertEqual(view.expand_folder("~/x", "/home/me/"), "/home/me/x")
+        self.assertEqual(view.expand_folder("~/x", "/"), "/x")  # a home that is the root
+        for text in ("", "/abs/olute", "rel/ative", "~other/x", "a~/b", "/a/~"):
+            self.assertEqual(view.expand_folder(text, self.home), text)
+
+    def test_empty_input(self):
+        self.assertEqual(self.complete(""), view.Completion(""))
+        self.assertEqual(self.listed, [])  # nothing to list
+
+    def test_tilde(self):
+        self.assertEqual(self.complete("~"), view.Completion("~" + os.sep))
+        self.assertEqual(self.listed, [])
+        # Then the home is listed like any folder, and the text keeps its ``~``.
+        several = self.complete("~/P")
+        self.assertEqual(several.text, "~/P")
+        self.assertEqual(several.matches, ("Pictures", "Projects", "Public"))
+        self.assertEqual(self.complete("~/Pr"), view.Completion("~/Projects/", ("Projects",)))
+        self.assertEqual(self.listed, ["/home/me/", "/home/me/"])
+        self.assertEqual(self.complete("~/Projects/t").text, "~/Projects/tools/")
+
+    def test_no_match(self):
+        self.assertEqual(self.complete("/home/me/zzz"), view.Completion("/home/me/zzz"))
+        self.assertEqual(self.complete("/empty/"), view.Completion("/empty/"))
+        self.assertEqual(self.complete("/home/me/p"), view.Completion("/home/me/p"))  # case counts
+
+    def test_one_match_gets_a_separator(self):
+        self.assertEqual(
+            self.complete("/home/me/w"), view.Completion("/home/me/work" + os.sep, ("work",))
+        )
+        self.assertEqual(self.complete("/srv/d").text, "/srv/data/")
+        self.assertEqual(self.complete("/srv/日").text, "/srv/日本語/")
+        # A name that is whole already still gets its separator.
+        self.assertEqual(self.complete("/home/me/work").text, "/home/me/work/")
+
+    def test_several_matches_go_as_far_as_they_agree(self):
+        done = self.complete("/home/me/Projects/s")
+        self.assertEqual(done, view.Completion("/home/me/Projects/site", ("site", "site-old")))
+        again = self.complete(done.text)  # nothing more to add: the names again
+        self.assertEqual(again, done)
+        nothing_in_common = self.complete("/home/me/Projects/")
+        self.assertEqual(nothing_in_common.text, "/home/me/Projects/")
+        self.assertEqual(nothing_in_common.matches, ("site", "site-old", "tools"))
+        self.assertEqual(self.complete("/home/me/P").text, "/home/me/P")
+        self.assertEqual(self.complete("/home/me/Pu").text, "/home/me/Public/")
+
+    def test_hidden_folders_only_when_a_dot_is_typed(self):
+        everything = self.complete("/home/me/")
+        self.assertEqual(everything.matches, ("Pictures", "Projects", "Public", "work"))
+        self.assertEqual(everything.text, "/home/me/")
+        hidden = self.complete("/home/me/.")
+        self.assertEqual(hidden.matches, (".cache", ".config"))  # and not the file .profile
+        self.assertEqual(hidden.text, "/home/me/.c")
+        self.assertEqual(self.complete("/home/me/.co").text, "/home/me/.config/")
+
+    def test_a_file_among_the_folders_is_not_a_match(self):
+        self.assertEqual(self.complete("/home/me/n"), view.Completion("/home/me/n"))
+        self.assertEqual(self.complete("/home/me/notes.txt").matches, ())
+        self.assertEqual(self.complete("/home/me/.p").matches, ())
+
+    def test_a_listing_error_is_said_and_the_text_stays(self):
+        done = self.complete("/nowhere/at/all")
+        self.assertEqual(done.text, "/nowhere/at/all")
+        self.assertEqual(done.matches, ())
+        self.assertEqual(done.error, "cannot list /nowhere/at/: No such file or directory")
+
+        def denied(directory):
+            raise PermissionError(13, "Permission denied", directory)
+
+        self.assertEqual(
+            view.complete_folder("/root/x", denied, self.home).error,
+            "cannot list /root/: Permission denied",
+        )
+
+        def odd(directory):
+            raise OSError("no errno, only words")
+
+        self.assertEqual(
+            view.complete_folder("/x/y", odd, self.home).error,
+            "cannot list /x/: no errno, only words",
+        )
+        # A name that would break the status line is cleaned.
+        self.assertNotIn("\n", view.complete_folder("/a\nb/c", self.listing, self.home).error)
+
+    def test_a_relative_text_is_not_completed(self):
+        for text in ("Projects", "Projects/s", "./x", "~other/x", "~x"):
+            self.assertEqual(self.complete(text), view.Completion(text), text)
+        self.assertEqual(self.listed, [])
+
+    def test_the_names_shown_when_several_match(self):
+        self.assertEqual(view.completions_text(("a", "b", "c")), "a  b  c")
+        names = [f"dir{n}" for n in range(10)]
+        self.assertEqual(
+            view.completions_text(names), "dir0  dir1  dir2  dir3  dir4  dir5  … 4 more"
+        )
+        self.assertEqual(view.completions_text(names[:6]), "  ".join(names[:6]))
+        self.assertEqual(view.completions_text(names, shown=2), "dir0  dir1  … 8 more")
+        self.assertEqual(view.completions_text(("a\x1b[2Jb", "c\nd")), "a [2Jb  c d")
+        self.assertEqual(view.COMPLETIONS_SHOWN, 6)
+
+    def test_labels_and_refusal(self):
+        self.assertEqual(view.FOLDER_LABELS, {"import": "Import into:", "continue": "Start in:"})
+        self.assertEqual(view.FOLDER_START, "~/")
+        self.assertEqual(
+            view.folder_error("/home/me/nope"), "not an existing folder: /home/me/nope"
+        )
+        self.assertEqual(view.folder_error("a\nb"), "not an existing folder: a b")
+        self.assertEqual(view.folder_error(""), "type a folder")
 
 
 class TranscriptTest(unittest.TestCase):
@@ -999,18 +1601,82 @@ class EngineTest(unittest.TestCase):
             engine.list_sessions(index="I")
             engine.status("I")
             engine.find_session("k", index="I")
-            engine.can_import("S", index="I")
+            engine.import_options("S", index="I")
+            engine.continue_options("k", index="I")
+            engine.volumes(index="I")
             engine.transcript("k", index="I")
             engine.import_session("k", progress="P", index="I")
+            engine.import_session("k2", index="I", target="/t", experimental=True)
+            engine.unimport("k", dry_run=True, index="I")
+            engine.unimport("k", force=True, index="I")
+            engine.mount_drive("/run/media/me/V", progress="P", cancel="C")
+            engine.continue_session("k", tool="codex", folder="/f", index="I")
             engine.open_session("k", index="I")
         fake_api.scan.assert_called_once_with(deep=True, progress="P", cancel="C")
         fake_api.list_sessions.assert_called_once_with(None, index="I")
         fake_api.status.assert_called_once_with(index="I")
         fake_api.find_session.assert_called_once_with("k", index="I")
-        fake_api.can_import.assert_called_once_with("S", index="I")
+        fake_api.import_options.assert_called_once_with("S", index="I", target=None)
+        fake_api.continue_options.assert_called_once_with("k", index="I")
+        fake_api.volumes.assert_called_once_with(index="I")
         fake_api.transcript.assert_called_once_with("k", index="I")
-        fake_api.import_session.assert_called_once_with("k", progress="P", index="I")
+        self.assertEqual(
+            fake_api.import_session.call_args_list,
+            [
+                mock.call("k", progress="P", index="I", target=None, experimental=False),
+                mock.call("k2", progress=None, index="I", target="/t", experimental=True),
+            ],
+        )
+        self.assertEqual(
+            fake_api.unimport.call_args_list,
+            [
+                mock.call("k", force=False, dry_run=True, index="I"),
+                mock.call("k", force=True, dry_run=False, index="I"),
+            ],
+        )
+        fake_api.mount_drive.assert_called_once_with("/run/media/me/V", progress="P", cancel="C")
+        # Never ``here``: that would replace the TUI's own process.
+        fake_api.continue_session.assert_called_once_with("k", tool="codex", folder="/f", index="I")
         fake_api.open_session.assert_called_once_with("k", here=False, dry_run=False, index="I")
+
+    def test_the_fake_engine_has_every_method_of_the_real_one(self):
+        import inspect
+
+        real = {
+            name: inspect.signature(member)
+            for name, member in inspect.getmembers(engine_mod.Engine, inspect.isfunction)
+            if not name.startswith("_")
+        }
+        self.assertIn("mount_drive", real)
+        self.assertNotIn("can_import", real)  # the TUI asks import_options now
+        for name, signature in real.items():
+            fake = inspect.signature(getattr(support.FakeEngine, name))
+            self.assertEqual(list(fake.parameters), list(signature.parameters), name)
+
+    def test_list_folder_says_what_is_a_directory(self):
+        import tempfile
+
+        engine = engine_mod.Engine()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, "folder"))
+            os.mkdir(os.path.join(tmp, ".hidden"))
+            Path(tmp, "file.txt").write_text("x", encoding="utf-8")
+            os.symlink(os.path.join(tmp, "folder"), os.path.join(tmp, "link"))
+            os.symlink(os.path.join(tmp, "nowhere"), os.path.join(tmp, "broken"))
+            self.assertEqual(
+                sorted(engine.list_folder(tmp)),
+                [
+                    (".hidden", True),
+                    ("broken", False),
+                    ("file.txt", False),
+                    ("folder", True),
+                    ("link", True),  # a link to a folder can be completed like one
+                ],
+            )
+            with self.assertRaises(OSError):
+                engine.list_folder(os.path.join(tmp, "nowhere"))
+            with self.assertRaises(OSError):
+                engine.list_folder(os.path.join(tmp, "file.txt"))
 
     def test_where_and_providers(self):
         engine = engine_mod.Engine()
@@ -1028,7 +1694,12 @@ class EngineTest(unittest.TestCase):
             lambda e: e.open_session("k"),
             lambda e: e.import_session("k"),
             lambda e: e.transcript("k"),
-            lambda e: e.can_import("s"),
+            lambda e: e.import_options("s"),
+            lambda e: e.continue_options("k"),
+            lambda e: e.continue_session("k", "claude", "/f"),
+            lambda e: e.unimport("k", dry_run=True),
+            lambda e: e.mount_drive("/run/media/me/V"),
+            lambda e: e.volumes(),
             lambda e: e.scan(),
         ):
             with self.assertRaises(engine_mod.EngineError) as caught:
