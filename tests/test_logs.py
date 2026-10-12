@@ -259,6 +259,9 @@ class DebugTest(LogCase):
         self.assertEqual(len(logged), 1)
         self.assertTrue(logged[0].startswith("scan quick: "))
         self.assertEqual(len(self.messages()), 2)  # both scans are in the file
+        # The flag held for that command only: the next one is quiet again.
+        self.assertEqual(run("scan")[2], "")
+        self.assertEqual(len(logging.getLogger(logs.NAME).handlers), 2)  # the null one, the file
         self.assertIn("--debug", run("--help")[1])
 
     def test_debug_with_a_log_that_cannot_be_written_still_shows_on_stderr(self):

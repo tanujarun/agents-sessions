@@ -490,10 +490,15 @@ def _make_dirs(path: str, made: list[str], mode: int = DIR_MODE) -> None:
             break
         current = parent
     for directory in reversed(missing):
-        # Remembered first: an interrupt between the two lines then costs a
-        # failed rmdir in the roll back, not a directory left behind.
+        # Remembered first: an interrupt between the two steps then costs a
+        # failed rmdir in the roll back, not a directory left behind. One
+        # that could not be made is not ours and is forgotten again.
         made.append(directory)
-        os.mkdir(directory, mode)
+        try:
+            os.mkdir(directory, mode)
+        except OSError:
+            made.pop()
+            raise
 
 
 def _copy(item: FileCopy, target: str, tick: Callable[[int], None]) -> None:
@@ -553,9 +558,9 @@ def _place(target: str, dst: str, is_dir: bool) -> None:
     directory guarantees: on POSIX it fails when the name is a file, a link
     or a directory with anything in it, and replaces only an *empty*
     directory; on Windows it fails whenever the name exists. So nothing that
-    holds data is ever replaced, and ``execute`` has looked for the name
-    just before (the standard library has no rename that refuses an empty
-    directory too).
+    holds data is ever replaced, and the name is looked for just before
+    (the standard library has no rename that refuses an empty directory
+    too).
     """
     if os.path.lexists(dst):
         raise Exists([dst])

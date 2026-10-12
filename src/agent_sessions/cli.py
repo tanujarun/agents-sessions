@@ -643,6 +643,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run one command; the exit status is 0, 1 (failure), 2 (usage) or,
     after an interrupt, 130 (Ctrl-C) or 128 + the signal (SIGTERM, SIGHUP)."""
     command = None
+    debugging = False
     try:
         parser = build_parser()
         args = parser.parse_args(argv)
@@ -652,6 +653,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         command = args.command
         if args.debug:
             logs.debug()
+            debugging = True
         with _signals():
             code = _COMMANDS.get(args.command, _not_implemented)(args)
             sys.stdout.flush()
@@ -679,3 +681,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         details = f" (details in {where})" if where is not None else ""
         _err(f"internal error: {type(exc).__name__}: {exc}{details}")
         return 1
+    finally:
+        if debugging:
+            logs.debug(False)  # for this command only, should the process run another

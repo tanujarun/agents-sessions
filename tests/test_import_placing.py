@@ -213,6 +213,35 @@ class NoReplaceTest(PlacingCase):
         self.assertFalse(self.native.exists())
         self.nothing_left()
 
+    def test_a_directory_that_could_not_be_made_is_not_taken_for_ours(self):
+        """``projects`` appears between the look and the mkdir (the tool
+        made it): the import fails, and the roll back leaves that directory
+        alone, empty as it is."""
+        real = os.mkdir
+        projects = str(self.native / "projects")
+
+        def late(path, mode=0o777):
+            if path == projects:
+                real(path, 0o700)  # someone else, first
+            return real(path, mode)
+
+        plan = self.plan()
+        with (
+            mock.patch.object(importer.os, "mkdir", late),
+            self.assertRaises(importer.ImportFailed) as caught,
+        ):
+            importer.execute(plan)
+        self.assertIn("File exists", caught.exception.reason)
+        self.assertEqual(os.listdir(self.native), ["projects"])
+        self.assertEqual(os.listdir(projects), [])
+        made: list[str] = []
+        with (
+            mock.patch.object(importer.os, "mkdir", side_effect=KeyboardInterrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            importer._make_dirs(str(self.w.box.root / "x" / "y"), made)
+        self.assertEqual(made, [str(self.w.box.root / "x")])  # an interrupt: maybe made, so kept
+
     def test_arrived(self):
         base = self.w.box.root
         staged, dst = base / "staged", base / "dst"
