@@ -50,4 +50,5 @@ Textual, from the project `.venv` (`./install.sh` creates it).
 ## Docs
 
 `docs/SPEC.md` (what and why), `docs/PLAN.md` (tasks), `docs/FORMATS.md`
-(per-provider on-disk formats), `filemap.md` (where things are).
+(per-provider on-disk formats), `docs/JSON.md` (the `--json` outputs; a test
+holds the code to it, so change both together), `filemap.md` (where things are).

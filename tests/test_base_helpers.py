@@ -325,7 +325,103 @@ class ParseTsTest(unittest.TestCase):
         self.assertEqual(parse_ts("1790000000"), "2026-09-21T14:13:20.000000Z")
         self.assertEqual(parse_ts(1790000000123456), "2026-09-21T14:13:20.123456Z")  # us
         self.assertEqual(parse_ts(1790000000123456789), "2026-09-21T14:13:20.123456Z")  # ns
-        self.assertEqual(parse_ts(0), "1970-01-01T00:00:00.000000Z")
+        self.assertEqual(parse_ts("1790000000.25"), "2026-09-21T14:13:20.250000Z")
+
+    def test_a_time_outside_1990_to_2100_is_not_a_time(self):
+        """docs/REVIEW.md R-11: whatever the form, and whatever unit a
+        number was taken for."""
+        self.assertEqual(parse_ts("1990-01-01T00:00:00Z"), "1990-01-01T00:00:00.000000Z")
+        self.assertEqual(parse_ts("2100-12-31T23:59:59.999999Z"), "2100-12-31T23:59:59.999999Z")
+        self.assertEqual(parse_ts(631152000), "1990-01-01T00:00:00.000000Z")
+        for value in (
+            "1989-12-31T23:59:59.999999Z",
+            "2101-01-01T00:00:00Z",
+            "0001-01-01T00:00:00Z",
+            "9999-12-31T23:59:59Z",
+            "1990-01-01T00:00:30+00:01",  # the offset is applied first: 1989 in UTC
+            "2101-01-01T00:30:00+01:00",  # 2100 in UTC ...
+            0,
+            1,
+            -1,
+            631151999,  # one second before 1990
+            4133980800,  # 2101-01-01
+            -1790000000,
+            99999999999,  # seconds: the year 5138
+            100000000000,  # milliseconds: 1973
+            99999999999999,  # milliseconds: 5138
+            100000000000000,  # microseconds: 1973
+            99999999999999999,  # microseconds: 5138
+            100000000000000000,  # nanoseconds: 1973
+            9223372036854775807,  # nanoseconds: 2262
+            "0",
+            "100000000000",
+            (0, 0),
+            (-1, 0),
+            {1: 4133980800},
+            {1: 253402300800, 2: 0},
+            (10**18, 0),
+        ):
+            with self.subTest(value=value):
+                if value == "2101-01-01T00:30:00+01:00":
+                    self.assertEqual(parse_ts(value), "2100-12-31T23:30:00.000000Z")
+                else:
+                    self.assertIsNone(parse_ts(value))
+
+    def test_the_guessed_unit_cannot_be_a_wrong_one(self):
+        """For a number that is a time between 1990 and 2100 in one unit,
+        no other unit gives a time in that range: the magnitude names the
+        unit, and the range catches what it gets wrong."""
+        scales = {"s": 1, "ms": 10**3, "us": 10**6, "ns": 10**9}
+        for seconds in (631152000, 1790000000, 4133980799):  # 1990, 2026, the end of 2100
+            expected = parse_ts(seconds, unit="s")
+            self.assertIsNotNone(expected)
+            for unit, scale in scales.items():
+                number = seconds * scale
+                self.assertEqual(parse_ts(number), expected, (seconds, unit))  # guessed
+                self.assertEqual(parse_ts(number, unit=unit), expected)  # told
+                for other in scales:
+                    if other != unit:
+                        self.assertIsNone(parse_ts(number, unit=other), (number, unit, other))
+
+    def test_a_unit_that_the_source_fixes_is_used(self):
+        self.assertEqual(parse_ts(1790000000.5, unit="s"), "2026-09-21T14:13:20.500000Z")
+        self.assertEqual(parse_ts(1790000000123, unit="ms"), "2026-09-21T14:13:20.123000Z")
+        self.assertEqual(parse_ts(1790000000123456, unit="us"), "2026-09-21T14:13:20.123456Z")
+        self.assertEqual(parse_ts(1790000000123456789, unit="ns"), "2026-09-21T14:13:20.123456Z")
+        self.assertEqual(parse_ts("1790000000123", unit="ms"), "2026-09-21T14:13:20.123000Z")
+        # A number that is no time in that unit is none, however plausible in another.
+        self.assertIsNone(parse_ts(1790000000123, unit="s"))
+        self.assertIsNone(parse_ts(1790000000, unit="ms"))  # 1970-01-21
+        # The unit is for numbers; text in a date form is read as before.
+        self.assertEqual(parse_ts("2026-10-03T14:25:33Z", unit="s"), "2026-10-03T14:25:33.000000Z")
+        self.assertIsNone(parse_ts(None, unit="s"))
+        with self.assertRaises(ValueError):
+            parse_ts(1790000000, unit="minutes")
+
+    def test_a_files_modification_time_is_seconds(self):
+        """Every adapter's fallback time is a file's mtime, and says so."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "f"
+            path.write_text("x", encoding="utf-8")
+            from agent_sessions.providers import antigravity, claude, codex, gemini, grok
+
+            for module in (antigravity, claude, codex, gemini, grok):
+                os.utime(path, (1790000000, 1790000000))
+                self.assertEqual(module._mtime(str(path)), "2026-09-21T14:13:20.000000Z")
+                # A clock that was at zero when the file was written: no time, not 1970.
+                os.utime(path, (5, 5))
+                self.assertIsNone(module._mtime(str(path)))
+                # A damaged time far in the future is seconds too, and so no
+                # time: taken for milliseconds it would read as the year 2026.
+                try:
+                    os.utime(path, (1790000000123, 1790000000123))
+                except (OSError, OverflowError):
+                    continue  # this filesystem cannot hold such a time
+                if os.stat(path).st_mtime == 1790000000123:
+                    self.assertIsNone(module._mtime(str(path)))
+                    self.assertEqual(
+                        parse_ts(os.stat(path).st_mtime), "2026-09-21T14:13:20.123000Z"
+                    )
 
     def test_protobuf_pair(self):
         self.assertEqual(parse_ts({1: 1790000000, 2: 987654321}), "2026-09-21T14:13:20.987654Z")

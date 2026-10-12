@@ -684,6 +684,34 @@ class CodexImportTest(ImportCase):
         self.assertEqual(native.title, "Site révision")
         self.assertEqual(self.records()[0]["appended"], [str(index)])
 
+    def test_an_index_the_import_creates_is_private(self):
+        """docs/REVIEW.md R-10: thread names are session data like the rest."""
+        own = self.w.profile / ".codex" / "session_index.jsonl"
+        own.write_bytes(
+            b'{"id":"%s","thread_name":"from the store","updated_at":"t"}\n' % CODEX_WIN.encode()
+        )
+        self.w.scan()
+        index = self.home / ".codex" / "session_index.jsonl"
+        self.assertFalse(index.exists())
+        native = api.import_session(CODEX_WIN)
+        self.assertEqual(native.title, "from the store")
+        self.assertEqual(stat.S_IMODE(os.stat(index).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(self.copy).st_mode), 0o600)
+
+    def test_an_index_that_exists_keeps_its_mode(self):
+        own = self.w.profile / ".codex" / "session_index.jsonl"
+        own.write_bytes(
+            b'{"id":"%s","thread_name":"from the store","updated_at":"t"}\n' % CODEX_WIN.encode()
+        )
+        index = self.home / ".codex" / "session_index.jsonl"
+        index.parent.mkdir(parents=True)
+        index.write_bytes(b'{"id":"mine","thread_name":"kept","updated_at":"z"}\n')
+        os.chmod(index, 0o640)
+        self.w.scan()
+        api.import_session(CODEX_WIN)
+        self.assertEqual(read(index).count(b"\n"), 2)
+        self.assertEqual(stat.S_IMODE(os.stat(index).st_mode), 0o640)
+
     def test_a_name_the_native_index_already_has_is_not_appended_again(self):
         own = self.w.profile / ".codex" / "session_index.jsonl"
         own.write_bytes(

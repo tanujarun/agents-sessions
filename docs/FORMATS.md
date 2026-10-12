@@ -48,6 +48,24 @@ Throwaway scripts that produced the numbers are in `scratch/` (git-ignored): `wa
   `~/.cache/agent-sessions/` and open the copy.
 - Mounts are `relatime`: reading a file can update its atime on the NTFS drive. Open with
   `os.O_NOATIME` where the platform has it (ignore `PermissionError`).
+- **Size caps.** A file on another drive can hold anything, so every read is bounded; what is
+  over a cap is skipped with a warning (a title, a folder and a note are cut or left out).
+
+  | what | cap | constant |
+  |---|---|---|
+  | one line of a JSONL file (with its line break) | 32 MiB | `providers.base.JSONL_LINE_MAX` |
+  | a Gemini chat file (`.jsonl`, and the older `.json`) | 64 MiB | `providers.gemini._CHAT_MAX`, `_LEGACY_MAX` |
+  | the Codex `session_index.jsonl` | 64 MiB | `providers.codex._INDEX_MAX` |
+  | the text a title is made from | 64 Ki characters | `providers.base.TITLE_SOURCE_MAX` |
+  | a recorded working directory | 32,767 characters | `index.CWD_MAX` |
+  | a session's note | 200 characters | `index.NOTE_MAX` |
+
+  The longest real line is 2.74 MB; the caps are far above anything seen and exist for what
+  was not.
+- A time before 1990 or after 2100 is not a time (`parse_ts` gives none): a damaged or made-up
+  value, or a file written while the clock was unset. An epoch number is read in the unit its
+  source fixes (a file's modification time: seconds); only a number in a field documented as
+  text has its unit taken from its magnitude, and then only a result inside that range counts.
 
 ---
 
@@ -980,9 +998,11 @@ the parsed count on both stores.)
   refused (the slug-and-hash naming is documented but was never seen). Sub-agent child sessions
   of an imported session are not copied (none exists).
 - **Every import**: files are staged in `<native store>/.agent-sessions-import-<pid>-<n>/` and
-  renamed into place; a hard kill can leave that directory behind (it is inert). Copies keep the
-  source's modification time, are created `0600` (directories `0700`), and symbolic links and
-  special files in a session directory are left out.
+  moved into place (a file is hard-linked under its name and the staged name removed, so an
+  existing name is never replaced; a directory is renamed); a hard kill can leave that directory
+  behind (it is inert). Copies keep the source's modification time, are created `0600`
+  (directories `0700`, and so is a `session_index.jsonl` the import has to create), and symbolic
+  links and special files in a session directory are left out.
 - **SQLite**: a database up to 64 MB is now read through `open_ro` and loaded into an in-memory
   connection with `Connection.deserialize` (header bytes 18 and 19 set from 2 to 1 in the copy,
   `PRAGMA query_only`), so SQLite never opens the file and its access time cannot move. Larger

@@ -124,7 +124,7 @@ class FileCopy:
 @dataclass
 class Unit:
     """One file or one directory that appears in the native store in a single
-    rename."""
+    step (``_place``)."""
 
     dst: str
     src: str = ""  # the source file or directory, for reports
@@ -621,7 +621,9 @@ def _remove(path: str) -> None:
 
 def _append(item: Append) -> None:
     """Add the bytes in one write; start on a fresh line when the file does
-    not end with one."""
+    not end with one. A file that is not there yet is created private, like
+    everything else an import puts into the store; one that exists keeps its
+    mode."""
     data = item.data
     try:
         with open(item.path, "rb") as fh:
@@ -633,7 +635,7 @@ def _append(item: Append) -> None:
     except FileNotFoundError:
         pass
     fd = os.open(
-        item.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o644
+        item.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), FILE_MODE
     )
     try:
         os.write(fd, data)

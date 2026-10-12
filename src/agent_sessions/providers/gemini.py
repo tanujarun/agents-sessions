@@ -229,7 +229,7 @@ def _load(path: Path) -> tuple[dict, list[dict]] | None:
 
 def _mtime(path: StrPath) -> str | None:
     try:
-        return parse_ts(os.stat(path).st_mtime)
+        return parse_ts(os.stat(path).st_mtime, unit="s")
     except OSError:
         return None
 

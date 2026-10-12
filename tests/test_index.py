@@ -738,7 +738,7 @@ class VerifyTest(IndexCase):
     def test_candidate_missing_from_the_index(self):
         data = json.loads(cache_file().read_text())
         del data["parsed"][f"fake:{self.foreign}"]["candidates"]["f"]
-        data["last_quick"] = "2999-01-01T00:00:00Z"
+        data["last_quick"] = "2099-01-01T00:00:00Z"
         cache_file().write_text(json.dumps(data))
         result = api.verify()
         self.assertEqual(
