@@ -12,7 +12,7 @@ Textual, from the project `.venv` (`./install.sh` creates it).
   both suites. These need the tools in `.venv`: `make dev` (installs `.[tui,dev]` editable)
 - Run: `bin/agent-sessions` (TUI) or `bin/agent-sessions <scan|list|open|import|unimport|export|continue|show|status|verify|mount|forget|map>`
 - TUI tests: `make test-tui` (needs `.venv`; about 3 minutes)
-- Install: `./install.sh` (creates `.venv` with Textual, symlinks into
+- Install: `./install.sh` (`--dev` adds the tools; `./uninstall.sh` takes it back; creates `.venv` with Textual, symlinks into
   `~/.local/bin`, installs the desktop launcher)
 
 ## Rules
@@ -46,7 +46,10 @@ Textual, from the project `.venv` (`./install.sh` creates it).
 - Do not send keyboard or mouse input to the desktop session.
 - Platform-specific code only in `mounts.py` and `launch.py`; everything else
   must also run on Windows later (pathlib, no shelling out). `textual` is
-  imported only under `tui/`, and no engine module imports `tui`.
+  imported only under `tui/`, and no engine module imports `tui` (the one exception: the lazy
+  import in `cli._tui`).
+- Engine messages name no command-line flag: set `ApiError.remedy`, `cli` adds the hint.
+- Every test module imports `support` (it points the state directory at a temp dir) before `agent_sessions`.
 - Formats come from `docs/FORMATS.md`. If the files disagree with it, fix the
   doc in the same change; never guess a field.
 - Output order is deterministic: sort everything you emit.
@@ -54,6 +57,7 @@ Textual, from the project `.venv` (`./install.sh` creates it).
 
 ## Docs
 
-`docs/SPEC.md` (what and why), `docs/PLAN.md` (tasks), `docs/FORMATS.md`
+`README.md` (for users), `CHANGELOG.md`, `docs/SECURITY.md` (threat model, what is defended),
+`docs/ADDING_A_PROVIDER.md`, `docs/SPEC.md` (what and why), `docs/PLAN.md` (tasks), `docs/FORMATS.md`
 (per-provider on-disk formats), `docs/JSON.md` (the `--json` outputs; a test
 holds the code to it, so change both together), `filemap.md` (where things are).
