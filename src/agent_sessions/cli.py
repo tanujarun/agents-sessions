@@ -653,6 +653,12 @@ def _import(args: argparse.Namespace) -> int:
     # ``~`` is expanded here: the engine takes an absolute path and nothing else.
     target = os.path.expanduser(args.to) if args.to is not None else None
     index = api.load_index()
+    if args.experimental:
+        # Said before anything is copied, and in a dry run too. Only when
+        # the flag is what makes this import possible.
+        options = api.import_options(args.key, index=index, target=target)
+        if options.experimental:
+            _err(options.warning)
     if args.dry_run:
         plan = api.import_plan(args.key, index=index, target=target, experimental=args.experimental)
         if plan["already"]:

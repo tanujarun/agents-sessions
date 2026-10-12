@@ -156,6 +156,9 @@
   table of FORMATS Q5: refused unless asked for, the three pieces and their order, every collision, every
   precondition (a `-wal` that is not empty, a sub-agent, no steps, an unreadable database, the IDE store),
   no folder needed, nothing written to an index, the read-back, the command
+- `tests/test_import_options.py` — `api.import_options` for every kind of session (native, offline, imported,
+  importable, folder gone or not recorded, Antigravity, Gemini, a bad id, no free space, a bad folder), that
+  asking writes nothing, `can_import` held to the same answer, the warning `import --experimental` prints
 - `tests/test_hostile_files.py` — named pipes, devices and directories named like session files (`open_ro`,
   whole scans in a child process under a timeout), over-long lines and the 200 MB line's memory ceiling, size
   caps of files read whole, deeply nested JSON

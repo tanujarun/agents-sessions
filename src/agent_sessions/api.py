@@ -12,6 +12,7 @@ reports (``ApiError``), with its traceback.
 from __future__ import annotations
 
 import functools
+import os
 import re
 import shlex
 import time
@@ -25,13 +26,13 @@ from . import index as index_mod
 from . import mounts as mounts_mod
 from . import providers as registry
 from .errors import ApiError, ImportFailed, LaunchFailed, MountFailed, NotFound, Offline
-from .fsutil import cache_file, log_file
+from .fsutil import cache_file, home, log_file
 from .index import Index
 from .launch import LaunchPlan
 from .model import Session, make_key
 from .mounts import NATIVE_LABEL, MountsError, list_mounts
 from .providers import all_providers
-from .providers.base import NotSupported, Provider, Turn, parse_ts
+from .providers.base import ExperimentalOnly, NotSupported, Provider, Turn, parse_ts
 
 if TYPE_CHECKING:
     import threading
@@ -544,18 +545,89 @@ def can_import(
     mounted, its project folder is not on any mounted drive, its id is
     already in the native store, or there is too little free space.
     ``target`` and ``experimental`` ask about an import with them. Reads
-    only; writes nothing."""
+    only; writes nothing. ``import_options`` says more."""
+    options = import_options(session, index, target)
+    if options.possible or (experimental and options.experimental and not options.needs_folder):
+        return True, ""
+    return False, options.reason
+
+
+@dataclass(frozen=True)
+class ImportOptions:
+    """What an import of one session can be (``import_options``): what a
+    front end builds its prompt from."""
+
+    # ``import_session`` would copy the session as it was asked about, with
+    # no flag and no folder beyond the ``target`` that was given.
+    possible: bool
+    # Why not, in plain words; "" when ``possible``. With ``needs_folder``
+    # or ``experimental`` it is what an import without them answers.
+    reason: str = ""
+    # It would work with a folder the user chooses (``target``): the
+    # session's own folder is not on this machine, or was not recorded.
+    needs_folder: bool = False
+    # It works only as an experimental import (``experimental=True``).
+    experimental: bool = False
+    # What must be shown before an experimental import; "" otherwise.
+    warning: str = ""
+
+
+def _some_folder() -> str:
+    """A directory that exists, to ask whether an import would work with a
+    chosen folder before one is chosen: the home, else the root."""
+    here = os.path.abspath(home())
+    return here if os.path.isdir(here) else os.path.abspath(os.sep)
+
+
+@_logged
+def import_options(
+    ref: Session | str, index: Index | None = None, target: str | None = None
+) -> ImportOptions:
+    """What an import of this session can be: possible as it is, possible
+    with a chosen folder (``needs_folder``), possible only as an
+    experimental import (``experimental``, with the ``warning`` to show
+    first), or not at all, with the ``reason``. ``target`` asks about an
+    import into that folder. Never raises for a session that cannot be
+    imported or found: that is an answer. Reads only; writes nothing.
+
+    ``needs_folder`` and ``experimental`` are set only when the import would
+    then go through: the plan is made again with what it asked for (with a
+    stand-in for the folder that is still to be chosen) and has to pass
+    every check, free space included."""
     try:
         if target is not None:
             importer.chosen_folder(target)
         index = index if index is not None else load_index()
-        session = find_session(session, index)
+        session = find_session(ref, index)
         if _native_copy(session, index) is not None:
-            return False, "already imported"
-        importer.check(_plan(session, index, target, experimental))
+            return ImportOptions(False, "already imported")
+        if session.origin == "native":
+            raise ImportFailed(f"this session is already on {NATIVE_LABEL}")
+        _need_files(session)
+        provider = _provider(session)
     except ApiError as exc:
-        return False, exc.reason
-    return True, ""
+        return ImportOptions(False, exc.reason)
+    reason = warning = ""  # of the import as it was asked about
+    needs_folder = experimental = False
+    folder = target
+    while True:  # as it is; then with what it turned out to need
+        try:
+            importer.check(provider.import_plan(session, index.pathmap, folder, experimental))
+        except ExperimentalOnly as exc:
+            if experimental:  # asked for and still not enough: an adapter's fault
+                return ImportOptions(False, exc.reason)
+            experimental, warning = True, exc.warning
+            reason = reason or exc.reason
+        except importer.NoFolder as exc:
+            if folder is not None:
+                return ImportOptions(False, exc.reason)
+            needs_folder, folder = True, _some_folder()
+            reason = reason or exc.reason
+        except (ApiError, NotSupported) as exc:
+            return ImportOptions(False, exc.reason)
+        else:
+            possible = not (needs_folder or experimental)
+            return ImportOptions(possible, reason, needs_folder, experimental, warning)
 
 
 @_logged
@@ -875,6 +947,7 @@ __all__ = [
     "NO_READER_TOOLS",
     "ApiError",
     "ImportFailed",
+    "ImportOptions",
     "ImportReport",
     "LaunchFailed",
     "LaunchPlan",
@@ -887,6 +960,7 @@ __all__ = [
     "find_session",
     "find_volume",
     "forget_drive",
+    "import_options",
     "import_plan",
     "import_report",
     "import_session",
