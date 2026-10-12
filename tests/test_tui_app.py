@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 import unittest
-from datetime import timezone
+from datetime import UTC
 from pathlib import Path
 from unittest import mock
 
@@ -23,21 +23,27 @@ import tui_support as support  # noqa: E402
 from tui_support import FakeEngine, FakeError, Turn, make_session, screen_text, settle  # noqa: E402
 
 try:
-    import textual  # noqa: F401
+    import textual
 except ImportError:
-    textual = None
+    textual = None  # type: ignore[assignment]  # the suite then skips itself
 
 if textual is not None:
     from rich.cells import cell_len
+
     from agent_sessions.tui import app as app_mod
     from agent_sessions.tui import view
-    from agent_sessions.tui.app import (HelpScreen, MainScreen, SessionList, SessionsApp,
-                                        TranscriptScreen)
+    from agent_sessions.tui.app import (
+        HelpScreen,
+        MainScreen,
+        SessionList,
+        SessionsApp,
+        TranscriptScreen,
+    )
 
-NATIVE = "claude:aaaaaaaa:cln-0000"         # "claude session 0", third row of Claude
-FOREIGN = "claude:bbbbbbbb:clf-0012"        # "claude session 12", on C:
-FOREIGN_COPY = "claude:aaaaaaaa:clf-0012"   # what importing FOREIGN makes
-IMPORTED = "claude:bbbbbbbb:clf-0090"       # foreign, already imported
+NATIVE = "claude:aaaaaaaa:cln-0000"  # "claude session 0", third row of Claude
+FOREIGN = "claude:bbbbbbbb:clf-0012"  # "claude session 12", on C:
+FOREIGN_COPY = "claude:aaaaaaaa:clf-0012"  # what importing FOREIGN makes
+IMPORTED = "claude:bbbbbbbb:clf-0090"  # foreign, already imported
 IMPORTED_COPY = "claude:aaaaaaaa:cln-0090"
 
 
@@ -64,7 +70,7 @@ class TuiCase(unittest.IsolatedAsyncioTestCase):
     def make_app(self, engine=None):
         if engine is not None:
             self.engine = engine
-        self.app = SessionsApp(engine=self.engine, clock=lambda: support.NOW, tz=timezone.utc)
+        self.app = SessionsApp(engine=self.engine, clock=lambda: support.NOW, tz=UTC)
         return self.app
 
     def started(self, size=None, engine=None):
@@ -118,7 +124,7 @@ class TuiCase(unittest.IsolatedAsyncioTestCase):
 
 class StartTest(TuiCase):
     async def test_cached_sessions_show_before_the_scan_finishes(self):
-        self.engine.scan_gate = threading.Event()     # the startup scan hangs
+        self.engine.scan_gate = threading.Event()  # the startup scan hangs
         async with self.started() as pilot:
             await until(lambda: self.main.loaded and self.rows.rows, what="cached rows")
             await pilot.pause()
@@ -126,12 +132,15 @@ class StartTest(TuiCase):
             self.assertIn("Already imported", text)
             self.assertIn("claude session 0", text)
             self.assertIn("scanning", text.splitlines()[0])
-            self.assertEqual(self.engine.called("scan"), [None])     # the engine picks the depth; running
+            self.assertEqual(
+                self.engine.called("scan"), [None]
+            )  # the engine picks the depth; running
             self.assertIsNotNone(self.main._scan)
             self.assertEqual(len(self.rows.rows), 20)
             # Now the scan ends, having found a new session.
             self.engine.on_scan = lambda e: e.sessions.append(
-                make_session("claude", 500, title="Brand new session", age=0))
+                make_session("claude", 500, title="Brand new session", age=0)
+            )
             self.engine.scan_gate.set()
             await until(lambda: self.main._scan is None, what="scan end")
             await settle(pilot)
@@ -139,7 +148,7 @@ class StartTest(TuiCase):
             self.assertEqual(len(self.rows.rows), 21)
             self.assertIn("scanned just now", self.status())
             self.assertNotIn("scanning", self.status())
-            self.assertNotIn("rescan", self.status())     # the startup scan is silent
+            self.assertNotIn("rescan", self.status())  # the startup scan is silent
             self.assertEqual(self.opened(), [])
 
     async def test_layout_regions_top_to_bottom(self):
@@ -149,9 +158,29 @@ class StartTest(TuiCase):
             self.assertEqual(len(lines), 40)
             self.assertTrue(lines[0].strip().startswith("agent-sessions"))
             self.assertIn("2 drives · 34 sessions · scanned", lines[0])
-            self.assertEqual(lines[1].split(),
-                             "1 Claude 20 2 Codex 7 3 Grok 5 4 Antigravity 2 5 Gemini 0 0 All 34"
-                             .split())
+            self.assertEqual(
+                lines[1].split(),
+                [
+                    "1",
+                    "Claude",
+                    "20",
+                    "2",
+                    "Codex",
+                    "7",
+                    "3",
+                    "Grok",
+                    "5",
+                    "4",
+                    "Antigravity",
+                    "2",
+                    "5",
+                    "Gemini",
+                    "0",
+                    "0",
+                    "All",
+                    "34",
+                ],
+            )
             self.assertEqual(lines[3].split(), ["TITLE", "PROJECT", "AGE", "WHERE"])
             self.assertEqual(lines[4].split(), ["Already", "imported", "project-90", "1m", "Linux"])
             self.assertEqual(lines[5].split()[-4:], ["2m", "C:", "·", "imported"])
@@ -174,7 +203,7 @@ class StartTest(TuiCase):
             flags = [row.foreign for row in self.rows.rows]
             self.assertIn(True, flags)
             self.assertIn(False, flags)
-            self.assertNotEqual(flags, sorted(flags))     # really interleaved
+            self.assertNotEqual(flags, sorted(flags))  # really interleaved
 
     async def test_list_is_one_widget_however_many_rows(self):
         sessions = [make_session("claude", n, foreign=n % 3 == 0, age=n) for n in range(5000)]
@@ -205,9 +234,27 @@ class StartTest(TuiCase):
             line = next(line for line in text.splitlines() if "No sessions found" in line)
             left = len(line) - len(line.lstrip())
             right = len(line) - len(line.rstrip())
-            self.assertLessEqual(abs(left - right), 1)      # centred
-            for key in ("down", "up", "G", "g", "pagedown", "enter", "o", "i", "v", "0", "3",
-                        "left", "right", "tab", "escape", "slash", "x", "escape"):
+            self.assertLessEqual(abs(left - right), 1)  # centred
+            for key in (
+                "down",
+                "up",
+                "G",
+                "g",
+                "pagedown",
+                "enter",
+                "o",
+                "i",
+                "v",
+                "0",
+                "3",
+                "left",
+                "right",
+                "tab",
+                "escape",
+                "slash",
+                "x",
+                "escape",
+            ):
                 await pilot.press(key)
             await settle(pilot)
             self.assertIn("No sessions found", self.text())
@@ -234,18 +281,28 @@ class TabTest(TuiCase):
                 await pilot.press(key)
                 order.append(order.pop(0))
                 self.assertEqual(self.main.tab_name, order[0], key)
-            self.assertEqual(self.main.tab_name, "claude")        # wrapped round
-            for key, expected in (("left", "all"), ("h", "gemini"), ("shift+tab", "antigravity"),
-                                  ("left", "grok")):
+            self.assertEqual(self.main.tab_name, "claude")  # wrapped round
+            for key, expected in (
+                ("left", "all"),
+                ("h", "gemini"),
+                ("shift+tab", "antigravity"),
+                ("left", "grok"),
+            ):
                 await pilot.press(key)
                 self.assertEqual(self.main.tab_name, expected, key)
-            self.assertIs(self.app.focused, self.rows)    # Tab did not move the focus
+            self.assertIs(self.app.focused, self.rows)  # Tab did not move the focus
 
     async def test_number_keys(self):
         async with self.started() as pilot:
             await settle(pilot)
-            counts = {"1": ("claude", 20), "2": ("codex", 7), "3": ("grok", 5),
-                      "4": ("antigravity", 2), "5": ("gemini", 0), "0": ("all", 34)}
+            counts = {
+                "1": ("claude", 20),
+                "2": ("codex", 7),
+                "3": ("grok", 5),
+                "4": ("antigravity", 2),
+                "5": ("gemini", 0),
+                "0": ("all", 34),
+            }
             for key in ("3", "5", "0", "2", "4", "1"):
                 await pilot.press(key)
                 name, count = counts[key]
@@ -253,7 +310,7 @@ class TabTest(TuiCase):
                 self.assertEqual(len(self.rows.rows), count)
                 if name != "all":
                     self.assertTrue(all(row.provider == name for row in self.rows.rows))
-            await pilot.press("7")       # no such tab
+            await pilot.press("7")  # no such tab
             self.assertEqual(self.main.tab_name, "claude")
 
     async def test_click_a_tab(self):
@@ -274,8 +331,9 @@ class TabTest(TuiCase):
     async def test_all_tab_adds_a_provider_column(self):
         async with self.started() as pilot:
             await settle(pilot)
-            self.assertEqual(self.text().splitlines()[3].split(),
-                             ["TITLE", "PROJECT", "AGE", "WHERE"])
+            self.assertEqual(
+                self.text().splitlines()[3].split(), ["TITLE", "PROJECT", "AGE", "WHERE"]
+            )
             await pilot.press("0")
             lines = self.text().splitlines()
             self.assertEqual(lines[3].split(), ["TITLE", "PROVIDER", "PROJECT", "AGE", "WHERE"])
@@ -294,7 +352,7 @@ class TabTest(TuiCase):
             self.assertEqual(self.selected(), claude_key)
             await pilot.press("2")
             self.assertEqual(self.selected(), codex_key)
-            await pilot.press("0")          # All shows the same session selected
+            await pilot.press("0")  # All shows the same session selected
             self.assertEqual(self.selected(), codex_key)
 
 
@@ -307,11 +365,27 @@ class MoveTest(TuiCase):
             await pilot.press("0")
             count = len(self.rows.rows)
             page = self.rows.size.height - 1
-            self.assertGreater(count, self.rows.size.height)     # the list scrolls
-            steps = [("down", 1), ("j", 2), ("j", 3), ("up", 2), ("k", 1), ("k", 0), ("k", 0),
-                     ("pagedown", page), ("pagedown", 2 * page), ("pageup", page),
-                     ("end", count - 1), ("down", count - 1), ("home", 0), ("G", count - 1),
-                     ("g", 0), ("pageup", 0), ("G", count - 1), ("pagedown", count - 1)]
+            self.assertGreater(count, self.rows.size.height)  # the list scrolls
+            steps = [
+                ("down", 1),
+                ("j", 2),
+                ("j", 3),
+                ("up", 2),
+                ("k", 1),
+                ("k", 0),
+                ("k", 0),
+                ("pagedown", page),
+                ("pagedown", 2 * page),
+                ("pageup", page),
+                ("end", count - 1),
+                ("down", count - 1),
+                ("home", 0),
+                ("G", count - 1),
+                ("g", 0),
+                ("pageup", 0),
+                ("G", count - 1),
+                ("pagedown", count - 1),
+            ]
             for key, expected in steps:
                 await pilot.press(key)
                 self.assertEqual(self.rows.cursor, expected, key)
@@ -330,7 +404,7 @@ class MoveTest(TuiCase):
             self.assertIn(session.id, text)
             self.assertIn("/home/user/code/project-0   (exists)", text)
             self.assertIn("/home/user/.claude", text)
-            self.assertIn(view.local_time(session.updated, timezone.utc), text)
+            self.assertIn(view.local_time(session.updated, UTC), text)
             self.assertEqual(str(self.main.query_one("#detail-import").render()), "-")
             await self.select(pilot, FOREIGN)
             text = self.text()
@@ -362,6 +436,7 @@ class MoveTest(TuiCase):
 
     async def test_click_selects_and_the_wheel_scrolls(self):
         from textual.events import MouseScrollDown, MouseScrollUp
+
         async with self.started() as pilot:
             await settle(pilot)
             await pilot.press("0")
@@ -374,15 +449,15 @@ class MoveTest(TuiCase):
             top = self.rows.top
             self.assertGreater(top, 0)
             self.assertEqual(self.rows.cursor, 3)
-            self.assertNotIn("Already imported", self.text())      # the first rows are gone
-            await pilot.click("#list", offset=(10, 2))             # rows under the pointer
+            self.assertNotIn("Already imported", self.text())  # the first rows are gone
+            await pilot.click("#list", offset=(10, 2))  # rows under the pointer
             self.assertEqual(self.rows.cursor, top + 2)
             for _ in range(10):
                 await pilot._post_mouse_events([MouseScrollUp], "#list", offset=(10, 2))
             await pilot.pause()
             self.assertEqual(self.rows.top, 0)
             self.assertEqual(self.rows.cursor, top + 2)
-            await pilot.press("k")                                 # keys bring it back in view
+            await pilot.press("k")  # keys bring it back in view
             visible = range(self.rows.top, self.rows.top + self.rows.size.height)
             self.assertIn(self.rows.cursor, visible)
             self.assertEqual(self.opened(), [])
@@ -410,8 +485,9 @@ class FilterTest(TuiCase):
             self.assertTrue(self.main.query_one("#filterbar").display)
             await pilot.press(*"session 1")
             await pilot.pause()
-            self.assertEqual(self.titles(), ["claude session 1"] +
-                             [f"claude session {n}" for n in range(10, 18)])
+            self.assertEqual(
+                self.titles(), ["claude session 1"] + [f"claude session {n}" for n in range(10, 18)]
+            )
             # Letters that are commands elsewhere are just text here.
             await pilot.press("backspace", "backspace", "q", "o", "i", "r")
             await pilot.pause()
@@ -428,27 +504,29 @@ class FilterTest(TuiCase):
 
     async def test_filter_matches_project_and_cwd_and_keeps_selection(self):
         self.engine.sessions.append(
-            make_session("claude", 77, title="Hero section", cwd="/srv/Website Works/landing",
-                         age=400))
+            make_session(
+                "claude", 77, title="Hero section", cwd="/srv/Website Works/landing", age=400
+            )
+        )
         async with self.started() as pilot:
             await settle(pilot)
             await self.select(pilot, NATIVE)
             await pilot.press("1", "slash", *"LANDING")
             await pilot.pause()
-            self.assertEqual(self.titles(), ["Hero section"])       # project, any case
+            self.assertEqual(self.titles(), ["Hero section"])  # project, any case
             await pilot.press("escape", "slash", *"website w")
             await pilot.pause()
-            self.assertEqual(self.titles(), ["Hero section"])       # cwd
+            self.assertEqual(self.titles(), ["Hero section"])  # cwd
             await pilot.press("escape")
             self.assertEqual(len(self.rows.rows), 21)
             await pilot.press("slash", *"session")
             await pilot.pause()
-            await pilot.press("down", "down")                       # arrows still move
+            await pilot.press("down", "down")  # arrows still move
             key = self.selected()
             await pilot.press(*" 1")
             await pilot.pause()
             self.assertIn(key, [row.key for row in self.rows.rows])
-            self.assertEqual(self.selected(), key)                  # same session, new place
+            self.assertEqual(self.selected(), key)  # same session, new place
 
     async def test_enter_keeps_the_filter_and_returns_to_the_list(self):
         async with self.started() as pilot:
@@ -458,10 +536,11 @@ class FilterTest(TuiCase):
             self.assertIs(self.app.focused, self.rows)
             self.assertEqual(self.titles(), ["claude session 3"])
             self.assertTrue(self.main.query_one("#filterbar").display)
-            self.assertEqual(self.opened(), [])      # that Enter was not "resume"
-            await pilot.press("0")                   # the filter applies to the new tab too
-            self.assertEqual(sorted(self.titles()), ["claude session 3", "codex session 3",
-                                                     "grok session 3"])
+            self.assertEqual(self.opened(), [])  # that Enter was not "resume"
+            await pilot.press("0")  # the filter applies to the new tab too
+            self.assertEqual(
+                sorted(self.titles()), ["claude session 3", "codex session 3", "grok session 3"]
+            )
             await pilot.press("j", "k", "escape")
             self.assertEqual(self.main.needle, "")
             self.assertEqual(len(self.rows.rows), 34)
@@ -513,7 +592,7 @@ class ResumeTest(TuiCase):
             self.assertEqual(self.opened(), [NATIVE])
             self.assertFalse(self.exited())
             self.assertEqual(self.selected(), NATIVE)
-            await pilot.press("down")                       # a key clears the message
+            await pilot.press("down")  # a key clears the message
             self.assertNotIn("opened", self.status())
             self.assertIn("agent-sessions", self.status())
             await pilot.press("o")
@@ -538,8 +617,8 @@ class ResumeTest(TuiCase):
     async def test_double_click_is_enter(self):
         async with self.started() as pilot:
             await settle(pilot)
-            await pilot.click("#list", offset=(10, 2))            # single: select only
-            await asyncio.sleep(0.7)                               # not a double-click pair
+            await pilot.click("#list", offset=(10, 2))  # single: select only
+            await asyncio.sleep(0.7)  # not a double-click pair
             self.assertEqual(self.selected(), NATIVE)
             self.assertEqual(self.opened(), [])
             await pilot.double_click("#list", offset=(10, 2))
@@ -548,7 +627,8 @@ class ResumeTest(TuiCase):
 
     async def test_launch_failure_is_shown_and_the_app_lives(self):
         self.engine.fail["open_session"] = FakeError(
-            "the folder /home/user/code/project-0 no longer exists")
+            "the folder /home/user/code/project-0 no longer exists"
+        )
         async with self.started() as pilot:
             await settle(pilot)
             await self.select(pilot, NATIVE)
@@ -569,8 +649,9 @@ class ForeignTest(TuiCase):
         await self.select(pilot, FOREIGN)
         await pilot.press(key)
         self.assertEqual(self.main.mode, "foreign")
-        self.assertIn("On C: [i] import and resume  [I] import only  [v] view  [Esc] cancel",
-                      self.text())
+        self.assertIn(
+            "On C: [i] import and resume  [I] import only  [v] view  [Esc] cancel", self.text()
+        )
         self.assertEqual(self.opened() + self.imported(), [])
 
     async def test_enter_shows_the_prompt_over_the_hints(self):
@@ -597,7 +678,7 @@ class ForeignTest(TuiCase):
             self.assertNotIn("[I] import only", self.text())
             self.assertFalse(self.main.query_one("#prompt").display)
             self.assertEqual(self.opened() + self.imported(), [])
-            await pilot.press("j")                    # the list has its keys back
+            await pilot.press("j")  # the list has its keys back
             self.assertNotEqual(self.selected(), FOREIGN)
 
     async def test_i_imports_then_resumes_and_quits(self):
@@ -608,7 +689,9 @@ class ForeignTest(TuiCase):
         self.assertEqual(self.imported(), [FOREIGN])
         self.assertEqual(self.opened(), [FOREIGN_COPY])
         self.assertEqual(self.app.return_code, 0)
-        calls = [name for name, _ in self.engine.calls if name in ("import_session", "open_session")]
+        calls = [
+            name for name, _ in self.engine.calls if name in ("import_session", "open_session")
+        ]
         self.assertEqual(calls, ["import_session", "open_session"])
 
     async def test_capital_i_imports_only_and_selects_the_copy(self):
@@ -624,8 +707,8 @@ class ForeignTest(TuiCase):
             row = next(row for row in self.rows.rows if row.key == FOREIGN)
             self.assertEqual(row.where, "C: · imported")
             self.assertEqual(self.main.mode, "list")
-            self.assertEqual(self.engine.called("scan"), [None])   # the engine indexes the copy
-            self.assertGreaterEqual(len(self.engine.called("load_index")), 3)   # and is re-read
+            self.assertEqual(self.engine.called("scan"), [None])  # the engine indexes the copy
+            self.assertGreaterEqual(len(self.engine.called("load_index")), 3)  # and is re-read
 
     async def test_v_views(self):
         async with self.started() as pilot:
@@ -657,7 +740,7 @@ class ForeignTest(TuiCase):
             await pilot.press("o")
             await self.message("opened Already imported")
             self.assertEqual(self.opened(), [IMPORTED_COPY])
-            self.assertEqual(self.main.mode, "list")           # no prompt
+            self.assertEqual(self.main.mode, "list")  # no prompt
             await pilot.press("enter")
             await until(self.exited, what="exit")
         self.assertEqual(self.opened(), [IMPORTED_COPY, IMPORTED_COPY])
@@ -665,7 +748,8 @@ class ForeignTest(TuiCase):
 
     async def test_import_refused_shows_the_reason(self):
         self.engine.fail["import_session"] = FakeError(
-            "Antigravity conversations cannot be imported")
+            "Antigravity conversations cannot be imported"
+        )
         async with self.started() as pilot:
             await self.prompt_on(pilot)
             await pilot.press("i")
@@ -701,16 +785,17 @@ class ImportKeyTest(TuiCase):
             await self.select(pilot, FOREIGN)
             await pilot.press("i")
             self.assertEqual(self.main.mode, "confirm")
-            self.assertIn('Import "claude session 12" from C: to Linux?  [y] yes  [n] no',
-                          self.text())
+            self.assertIn(
+                'Import "claude session 12" from C: to Linux?  [y] yes  [n] no', self.text()
+            )
             self.assertEqual(self.imported(), [])
-            await pilot.press("enter", "i", "j")          # not answers
+            await pilot.press("enter", "i", "j")  # not answers
             self.assertEqual(self.main.mode, "confirm")
             self.assertEqual(self.imported(), [])
             await pilot.press("y")
             await self.message("imported claude session 12")
             self.assertEqual(self.imported(), [FOREIGN])
-            self.assertEqual(self.opened(), [])            # `i` never resumes
+            self.assertEqual(self.opened(), [])  # `i` never resumes
             self.assertEqual(self.selected(), FOREIGN_COPY)
             self.assertFalse(self.exited())
             self.assertNotIn("to Linux?", self.text())
@@ -757,7 +842,8 @@ class ImportKeyTest(TuiCase):
 
     async def test_failure_reason_is_shown_as_is(self):
         self.engine.fail["import_session"] = FakeError(
-            "a session with this id already exists on Linux")
+            "a session with this id already exists on Linux"
+        )
         async with self.started() as pilot:
             await settle(pilot)
             await self.select(pilot, FOREIGN)
@@ -767,7 +853,7 @@ class ImportKeyTest(TuiCase):
             self.assertFalse(self.exited())
             self.assertEqual(self.selected(), FOREIGN)
             del self.engine.fail["import_session"]
-            await pilot.press("i", "y")                 # and it can be tried again
+            await pilot.press("i", "y")  # and it can be tried again
             await self.message("imported claude session 12")
 
     async def test_known_verdict_refuses_without_asking(self):
@@ -822,7 +908,7 @@ class PagerTest(TuiCase):
             await settle(pilot)
             self.assertIs(self.app.screen, self.main)
             self.assertEqual(self.selected(), NATIVE)
-            self.assertFalse(self.exited())                 # q closed the pager, not the app
+            self.assertFalse(self.exited())  # q closed the pager, not the app
             await pilot.press("v")
             await settle(pilot)
             await pilot.press("escape")
@@ -831,10 +917,11 @@ class PagerTest(TuiCase):
             self.assertEqual(self.opened() + self.imported(), [])
 
     async def test_scrolling_and_wrapping(self):
-        long = "wrap me " * 40          # 320 characters: several lines at 80 columns
+        long = "wrap me " * 40  # 320 characters: several lines at 80 columns
         self.engine.turns[NATIVE] = [
             Turn("user" if n % 2 == 0 else "assistant", f"turn {n} {long}", None)
-            for n in range(200)]
+            for n in range(200)
+        ]
         async with self.started() as pilot:
             await settle(pilot)
             await self.select(pilot, NATIVE)
@@ -855,10 +942,21 @@ class PagerTest(TuiCase):
                 return int(body.scroll_offset.y)
 
             page = body.size.height
-            for key, expected in (("j", 1), ("down", 2), ("k", 1), ("up", 0), ("up", 0),
-                                  ("pagedown", page), ("space", 2 * page), ("pageup", page),
-                                  ("end", len(body.lines) - page), ("G", len(body.lines) - page),
-                                  ("home", 0), ("G", len(body.lines) - page), ("g", 0)):
+            for key, expected in (
+                ("j", 1),
+                ("down", 2),
+                ("k", 1),
+                ("up", 0),
+                ("up", 0),
+                ("pagedown", page),
+                ("space", 2 * page),
+                ("pageup", page),
+                ("end", len(body.lines) - page),
+                ("G", len(body.lines) - page),
+                ("home", 0),
+                ("G", len(body.lines) - page),
+                ("g", 0),
+            ):
                 await pilot.press(key)
                 await pilot.pause()
                 self.assertEqual(top(), expected, key)
@@ -867,8 +965,9 @@ class PagerTest(TuiCase):
             self.assertIn("turn 199", self.text())
 
     async def test_resize_rewraps_and_keeps_the_place(self):
-        self.engine.turns[NATIVE] = [Turn("assistant", f"turn {n} " + "word " * 60, None)
-                                     for n in range(120)]
+        self.engine.turns[NATIVE] = [
+            Turn("assistant", f"turn {n} " + "word " * 60, None) for n in range(120)
+        ]
         async with self.started() as pilot:
             await settle(pilot)
             await self.select(pilot, NATIVE)
@@ -880,16 +979,18 @@ class PagerTest(TuiCase):
             body.scroll_to(y=body._starts[60], animate=False, force=True, immediate=True)
             await pilot.pause()
             await pilot.resize_terminal(40, 12)
-            await until(lambda: len(body._starts) == 120 and body._anchor is None,
-                        what="re-wrapped")
+            await until(
+                lambda: len(body._starts) == 120 and body._anchor is None, what="re-wrapped"
+            )
             await pilot.pause()
             self.assertGreater(len(body.lines), before)
             self.assertTrue(all(cell_len(text) <= body.size.width for _kind, text in body.lines))
             self.assertEqual(int(body.scroll_offset.y), body._starts[60])
             self.assertIn("turn 60", self.text())
             await pilot.resize_terminal(120, 40)
-            await until(lambda: len(body._starts) == 120 and body._anchor is None,
-                        what="re-wrapped")
+            await until(
+                lambda: len(body._starts) == 120 and body._anchor is None, what="re-wrapped"
+            )
             await pilot.press("q")
             await settle(pilot)
             self.assertIs(self.app.screen, self.main)
@@ -899,7 +1000,7 @@ class PagerTest(TuiCase):
 
         def endless(ref, index=None):
             n = 0
-            while True:                     # a 100 MB session, as far as the pager knows
+            while True:  # a 100 MB session, as far as the pager knows
                 produced.append(n)
                 yield Turn("assistant", f"turn {n}", None)
                 n += 1
@@ -913,9 +1014,9 @@ class PagerTest(TuiCase):
                 await settle(pilot)
                 await until(lambda: "showing first 120 turns" in self.text(), what="cap notice")
                 self.assertEqual(self.app.screen.turn_count, 120)
-                self.assertLessEqual(len(produced), 121)      # read lazily, then stopped
+                self.assertLessEqual(len(produced), 121)  # read lazily, then stopped
                 self.assertGreater(app_mod.PAGER_BATCH, 0)
-                self.assertLess(app_mod.PAGER_BATCH, 120)     # so it arrived in batches
+                self.assertLess(app_mod.PAGER_BATCH, 120)  # so it arrived in batches
                 await pilot.press("q")
 
     async def test_closing_stops_the_reader(self):
@@ -935,7 +1036,7 @@ class PagerTest(TuiCase):
             await self.select(pilot, NATIVE)
             await pilot.press("v")
             await until(lambda: len(produced) >= 6, what="reader started")
-            await pilot.press("j", "k")                 # the pager answers while it reads
+            await pilot.press("j", "k")  # the pager answers while it reads
             await pilot.press("q")
             await pilot.pause()
             self.assertIs(self.app.screen, self.main)
@@ -950,8 +1051,9 @@ class PagerTest(TuiCase):
             await self.select(pilot, NATIVE)
             await pilot.press("v")
             await settle(pilot)
-            await until(lambda: "stopped: the session file is gone" in self.text(),
-                        what="pager error")
+            await until(
+                lambda: "stopped: the session file is gone" in self.text(), what="pager error"
+            )
             self.assertFalse(self.exited())
             await pilot.press("q")
             await settle(pilot)
@@ -991,21 +1093,21 @@ class ScanTest(TuiCase):
             await settle(pilot)
             self.engine.scan_gate = threading.Event()
             self.engine.scan_progress = [("WINVOL", 41234)]
-            await pilot.press("slash", *"session", "enter")       # a filter is active too
+            await pilot.press("slash", *"session", "enter")  # a filter is active too
             await pilot.press("R")
             await self.message("scanning WINVOL… 41k dirs")
             self.assertTrue(self.main._scan["deep"])
             cancel = self.main._scan["cancel"]
             self.assertFalse(cancel.is_set())
-            await pilot.press("j")                                 # still responsive
+            await pilot.press("j")  # still responsive
             self.assertEqual(self.rows.cursor, 1)
             await pilot.press("escape")
-            self.assertTrue(cancel.is_set())                       # the scan, not the filter
+            self.assertTrue(cancel.is_set())  # the scan, not the filter
             self.assertEqual(self.main.needle, "session")
             await self.message("full rescan cancelled")
             self.assertIsNone(self.main._scan)
             self.assertNotIn("scanning", self.status())
-            await pilot.press("escape")                            # now the filter goes
+            await pilot.press("escape")  # now the filter goes
             self.assertEqual(self.main.needle, "")
             self.assertFalse(self.exited())
 
@@ -1038,7 +1140,7 @@ class ScanTest(TuiCase):
             self.assertEqual(self.rows.cursor, 4)
 
             def reorder(engine):
-                engine.by_key(key).updated = support.stamp(days=400)      # now the oldest
+                engine.by_key(key).updated = support.stamp(days=400)  # now the oldest
                 engine.sessions.append(make_session("claude", 300, title="Newer", age=0))
                 engine.sessions.append(make_session("claude", 301, title="Newest", age=0))
 
@@ -1050,7 +1152,7 @@ class ScanTest(TuiCase):
             self.assertEqual(self.rows.cursor, 21)
             top = self.rows.top
             self.assertTrue(top <= self.rows.cursor < top + self.rows.size.height)
-            self.assertIn(self.engine.by_key(key).id, self.text())      # detail pane too
+            self.assertIn(self.engine.by_key(key).id, self.text())  # detail pane too
 
     async def test_selection_stays_in_place_when_its_session_goes(self):
         async with self.started() as pilot:
@@ -1115,8 +1217,15 @@ class ErrorTest(TuiCase):
             self.assertFalse(self.exited())
 
     async def test_every_engine_call_can_fail_without_killing_the_app(self):
-        for name in ("status", "list_sessions", "scan", "can_import", "open_session",
-                     "import_session", "transcript"):
+        for name in (
+            "status",
+            "list_sessions",
+            "scan",
+            "can_import",
+            "open_session",
+            "import_session",
+            "transcript",
+        ):
             engine = FakeEngine()
             async with self.started(engine=engine) as pilot:
                 await settle(pilot)
@@ -1146,7 +1255,7 @@ class ErrorTest(TuiCase):
         fake = self.engine
 
         class Partial(Engine):
-            module = "agent_sessions.model"     # has none of the api functions
+            module = "agent_sessions.model"  # has none of the api functions
 
             def providers(self):
                 return fake.providers()
@@ -1213,8 +1322,10 @@ class SizeTest(TuiCase):
             self.assertIn("/ filter  r rescan  R full rescan  ? help  q quit", lines[-1])
             self.assertGreaterEqual(self.rows.size.height, 8)
             await pilot.press("0")
-            self.assertEqual(self.check_frame(80, 24)[3].split(),
-                             ["TITLE", "PROVIDER", "PROJECT", "AGE", "WHERE"])
+            self.assertEqual(
+                self.check_frame(80, 24)[3].split(),
+                ["TITLE", "PROVIDER", "PROJECT", "AGE", "WHERE"],
+            )
 
     async def test_79_columns_drops_project_only(self):
         async with self.started(size=(79, 24)) as pilot:
@@ -1263,8 +1374,19 @@ class SizeTest(TuiCase):
             await settle(pilot)
             await pilot.press("0")
             await self.select(pilot, FOREIGN)
-            sizes = [(80, 24), (40, 10), (120, 40), (20, 5), (10, 3), (1, 1), (200, 60),
-                     (79, 19), (60, 20), (59, 20), (80, 24)]
+            sizes = [
+                (80, 24),
+                (40, 10),
+                (120, 40),
+                (20, 5),
+                (10, 3),
+                (1, 1),
+                (200, 60),
+                (79, 19),
+                (60, 20),
+                (59, 20),
+                (80, 24),
+            ]
             for width, height in sizes:
                 await pilot.resize_terminal(width, height)
                 await settle(pilot)
@@ -1272,15 +1394,18 @@ class SizeTest(TuiCase):
                 self.assertEqual(self.selected(), FOREIGN, (width, height))
                 if self.rows.size.height > 0:
                     top = self.rows.top
-                    self.assertTrue(top <= self.rows.cursor < top + self.rows.size.height,
-                                    (width, height))
+                    self.assertTrue(
+                        top <= self.rows.cursor < top + self.rows.size.height, (width, height)
+                    )
                 layout = view.layout_for(width, height)
                 self.assertEqual(self.main.query_one("#detail").display, layout.show_detail)
                 names = [column.name for column in self.rows.columns]
                 self.assertEqual("project" in names, width >= 80, (width, height))
                 await pilot.press("j", "k")
-            self.assertEqual(self.text().splitlines()[3].split(),
-                             ["TITLE", "PROVIDER", "PROJECT", "AGE", "WHERE"])
+            self.assertEqual(
+                self.text().splitlines()[3].split(),
+                ["TITLE", "PROVIDER", "PROJECT", "AGE", "WHERE"],
+            )
             self.assertFalse(self.exited())
             self.assertEqual(self.opened() + self.imported(), [])
 
@@ -1314,8 +1439,9 @@ class SizeTest(TuiCase):
             make_session("claude", 1, title="日本語のタイトルがとても長い場合のテスト" * 4, age=1),
             make_session("claude", 2, title="🚀 ship it 🚀 emoji title", age=2),
             make_session("claude", 3, title="plain ascii", age=3),
-            make_session("claude", 4, title="é combining e\u0301 marks", age=4,
-                         cwd="/home/user/プロジェクト"),
+            make_session(
+                "claude", 4, title="é combining e\u0301 marks", age=4, cwd="/home/user/プロジェクト"
+            ),
         ]
         for size in ((120, 40), (80, 24), (40, 10)):
             async with self.started(size=size, engine=FakeEngine(sessions)) as pilot:
@@ -1323,8 +1449,8 @@ class SizeTest(TuiCase):
                 lines = self.check_frame(*size)
                 rows = [line for line in lines if "Linux" in line]
                 self.assertEqual(len(rows), 4, size)
-                where = {cell_len(line[:line.rindex("Linux")]) for line in rows}
-                self.assertEqual(len(where), 1, (size, where))      # WHERE starts in one column
+                where = {cell_len(line[: line.rindex("Linux")]) for line in rows}
+                self.assertEqual(len(where), 1, (size, where))  # WHERE starts in one column
                 self.assertIn("…", rows[0])
 
 
@@ -1336,10 +1462,16 @@ class HelpAndQuitTest(TuiCase):
             await settle(pilot)
             self.assertIsInstance(self.app.screen, HelpScreen)
             text = self.text()
-            for fragment in ("move the selection", "switch provider", "view the transcript",
-                             "rescan every drive", "quit", "double-click resumes"):
+            for fragment in (
+                "move the selection",
+                "switch provider",
+                "view the transcript",
+                "rescan every drive",
+                "quit",
+                "double-click resumes",
+            ):
                 self.assertIn(fragment, text)
-            await pilot.press("o", "i", "r", "1")          # no meaning here
+            await pilot.press("o", "i", "r", "1")  # no meaning here
             self.assertIsInstance(self.app.screen, HelpScreen)
             self.assertEqual(self.engine.called("scan"), [None])
             await pilot.press("escape")
@@ -1383,14 +1515,31 @@ class HelpAndQuitTest(TuiCase):
             for tab in ("#tab-codex", "#tab-all"):
                 await pilot.click(tab)
                 await pilot.click("#list", offset=(8, 1))
-                await asyncio.sleep(0.6)                    # so no two clicks pair up
+                await asyncio.sleep(0.6)  # so no two clicks pair up
                 await pilot.click("#list", offset=(8, 3))
                 await asyncio.sleep(0.6)
             await pilot.click("#header")
             await pilot.click("#detail")
             await pilot.click("#hints")
-            for key in ("down", "up", "j", "k", "G", "g", "pagedown", "left", "right", "tab",
-                        "1", "0", "slash", "escape", "question_mark", "escape", "r"):
+            for key in (
+                "down",
+                "up",
+                "j",
+                "k",
+                "G",
+                "g",
+                "pagedown",
+                "left",
+                "right",
+                "tab",
+                "1",
+                "0",
+                "slash",
+                "escape",
+                "question_mark",
+                "escape",
+                "r",
+            ):
                 await pilot.press(key)
             await settle(pilot)
             self.assertEqual(self.opened(), [])

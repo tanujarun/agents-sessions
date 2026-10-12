@@ -1,0 +1,114 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-sessions"
+description = "Find, list and resume saved AI coding-agent sessions."
+dynamic = ["version"]
+requires-python = ">=3.11"
+# The engine is standard library only; Textual is needed by the TUI alone.
+dependencies = []
+
+[project.optional-dependencies]
+# The same pin as requirements-tui.txt (what install.sh installs);
+# tests/test_tui_view.py checks that the two agree.
+tui = ["textual==8.2.8"]
+dev = [
+    "ruff==0.17.0",
+    "mypy==2.4.0",
+    "coverage==7.16.2",
+]
+
+[project.scripts]
+agent-sessions = "agent_sessions.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "agent_sessions.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"agent_sessions.tui" = ["app.tcss"]
+
+# ---------------------------------------------------------------- ruff
+
+[tool.ruff]
+target-version = "py311"
+# Measured on the code as it stood: 15 of about 19 000 lines were longer.
+line-length = 100
+src = ["src", "tests"]
+# The launcher is Python without a .py suffix.
+extend-include = ["bin/agent-sessions"]
+extend-exclude = ["scratch", "tests/fixtures"]
+
+[tool.ruff.lint]
+# No PTH: the code uses `os` calls on purpose (trace-free reads, O_NOATIME).
+select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM", "RUF", "S"]
+ignore = [
+    "RUF005",  # `a + [b]` keeps the operand types visible; unpacking is no clearer
+    "SIM105",  # try/except/pass with its comment is the house form; suppress() hides the comment's place
+    "SIM108",  # an if/else block is kept where a ternary would run long
+]
+
+[tool.ruff.lint.isort]
+# The test helpers put <repo>/src on sys.path when imported, so they must come
+# before the first `agent_sessions` import: their own section, ahead of it.
+section-order = ["future", "standard-library", "third-party", "test-support", "first-party", "local-folder"]
+
+[tool.ruff.lint.isort.sections]
+test-support = ["support", "tui_support", "fixture_world"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",    # asserts are what tests are made of
+    "S108",    # literal /tmp-looking paths are data for the path mapping, never opened
+    "S603",    # the suites run our own launcher with a fixed argv
+    "S607",    # same: fixed argv, no shell
+    "S608",    # SQL built from the suite's own constants, against temp copies
+    "B007",    # table-driven loops unpack every column by name, used or not
+    "C408",    # dict(key=...) tables of keyword arguments read better than literals
+    "RUF012",  # class-level tables of cases are constants, never mutated
+]
+# Verbatim /proc/self/mountinfo lines inside one string.
+"tests/test_mounts.py" = ["E501"]
+
+# ---------------------------------------------------------------- mypy
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/agent_sessions", "tests"]
+mypy_path = ["src", "tests"]
+# tests/ is both a package (unittest discovery) and a path entry (the suites
+# import `support` and friends by bare name): treat it as a base, not a package.
+explicit_package_bases = true
+# Lenient by default (the tests: unannotated test methods are not checked)...
+no_implicit_optional = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[[tool.mypy.overrides]]
+# ...strict for the package, tui/ included (Textual ships its types).
+module = ["agent_sessions", "agent_sessions.*"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_return_any = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# tui/engine.py forwards to agent_sessions.api by name, looked up at call time
+# (a missing function becomes a status line, not a crash): what comes back is
+# Any at that one boundary. Its methods are annotated with the real types.
+module = ["agent_sessions.tui.engine"]
+warn_return_any = false
+
+# ------------------------------------------------------------ coverage
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true

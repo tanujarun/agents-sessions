@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from .engine import Engine
 
 
 def _repo() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def main(argv=None, engine=None) -> int:
+def main(argv: Sequence[str] | None = None, engine: Engine | None = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv:
         print("usage: agent-sessions [tui]", file=sys.stderr)
@@ -21,6 +27,7 @@ def main(argv=None, engine=None) -> int:
         if (exc.name or "").split(".")[0] not in ("textual", "rich"):
             raise
         from . import INSTALL_HINT
+
         print(INSTALL_HINT.format(repo=_repo()), file=sys.stderr)
         return 1
     app = SessionsApp(engine=engine)

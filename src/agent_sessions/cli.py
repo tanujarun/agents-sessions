@@ -8,11 +8,18 @@ import os
 import re
 import shlex
 import sys
-from datetime import datetime, timezone
+from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from . import __version__, api
 from .mounts import MountsError
 from .providers import all_providers
+
+if TYPE_CHECKING:
+    from .index import Index
+    from .launch import LaunchPlan
+    from .model import Session
 
 PROG = "agent-sessions"
 
@@ -32,8 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="JSON output")
 
     p = sub.add_parser("list", help="sessions, newest first")
-    p.add_argument("--provider", metavar="P", help="only this provider",
-                   choices=[provider.name for provider in all_providers()])
+    p.add_argument(
+        "--provider",
+        metavar="P",
+        help="only this provider",
+        choices=[provider.name for provider in all_providers()],
+    )
     p.add_argument("--json", action="store_true", help="JSON output")
     p.add_argument("--keys", action="store_true", help="add the session key as a last column")
 
@@ -41,14 +52,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("open", help="native: resume. foreign: import first")
     p.add_argument("key", help=key_help)
     p.add_argument("--dry-run", action="store_true", help="print the command, do not run it")
-    p.add_argument("--here", action="store_true",
-                   help="resume in this terminal instead of a new window")
+    p.add_argument(
+        "--here", action="store_true", help="resume in this terminal instead of a new window"
+    )
 
     p = sub.add_parser("import", help="import; optionally resume after")
     p.add_argument("key", help=key_help)
     p.add_argument("--open", action="store_true", help="resume after import")
-    p.add_argument("--dry-run", action="store_true",
-                   help="print what would be copied and rewritten, write nothing")
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print what would be copied and rewritten, write nothing",
+    )
 
     p = sub.add_parser("show", help="plain-text transcript to stdout")
     p.add_argument("key", help=key_help)
@@ -62,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 # --- output -----------------------------------------------------------------
 
+
 def _out(text: str) -> None:
     """Print; a path with bytes that are not UTF-8 is escaped, not fatal."""
     try:
@@ -71,18 +87,18 @@ def _out(text: str) -> None:
         sys.stdout.write(text.encode(encoding, "backslashreplace").decode(encoding) + "\n")
 
 
-def _json(value) -> None:
+def _json(value: object) -> None:
     _out(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False))
 
 
-def _table(rows, indent: str = "") -> None:
+def _table(rows: Iterable[Iterable[object]], indent: str = "") -> None:
     """Print rows of cells in aligned columns."""
-    rows = [[str(cell) for cell in row] for row in rows]
-    if not rows:
+    table = [[str(cell) for cell in row] for row in rows]
+    if not table:
         return
-    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
-    for row in rows:
-        cells = [cell.ljust(width) for cell, width in zip(row, widths)]
+    widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
+    for row in table:
+        cells = [cell.ljust(width) for cell, width in zip(row, widths, strict=False)]
         _out((indent + "  ".join(cells)).rstrip())
 
 
@@ -130,26 +146,36 @@ def _project(cwd: str | None) -> str:
     return parts[-1] if parts else "-"
 
 
-def _walk_rows(mounts, walks) -> list[list[str]]:
+def _walk_rows(mounts: list[dict], walks: dict | None) -> list[list[str]]:
     rows = []
     for mount in mounts:
         walk = walks.get(mount["path"]) if walks else None
         if not walk:
             continue
-        rows.append([mount["label"], mount["path"], _count(walk["dirs"], "dir"),
-                     f"{walk['pruned']:,} pruned", f"{walk['errors']:,} unreadable",
-                     f"{walk['seconds']:.2f} s"])
+        rows.append(
+            [
+                mount["label"],
+                mount["path"],
+                _count(walk["dirs"], "dir"),
+                f"{walk['pruned']:,} pruned",
+                f"{walk['errors']:,} unreadable",
+                f"{walk['seconds']:.2f} s",
+            ]
+        )
     return rows
 
 
 # --- commands ---------------------------------------------------------------
 
-def _scan(args) -> int:
+
+def _scan(args: argparse.Namespace) -> int:
     progress = None
     if sys.stderr.isatty() and not args.json:
-        def progress(label, dirs):
+
+        def progress(label: str, dirs: int) -> None:
             sys.stderr.write(f"\r\033[Kscanning {label}… {dirs:,} dirs")
             sys.stderr.flush()
+
     summary = api.scan(deep=True if args.deep else None, progress=progress)
     if progress is not None and summary["walk"] is not None:
         sys.stderr.write("\r\033[K")
@@ -157,8 +183,10 @@ def _scan(args) -> int:
     if args.json:
         _json(summary)
         return 0
-    _out(f"scan: {summary['mode']}, {_count(len(summary['mounts']), 'mount')}, "
-         f"{summary['seconds']:.2f} s")
+    _out(
+        f"scan: {summary['mode']}, {_count(len(summary['mounts']), 'mount')}, "
+        f"{summary['seconds']:.2f} s"
+    )
     _table(_walk_rows(summary["mounts"], summary["walk"]), "  ")
     extra = []
     if summary["stores_not_mounted"]:
@@ -166,17 +194,24 @@ def _scan(args) -> int:
     if summary["skipped_stores"]:
         extra.append(f"{summary['skipped_stores']} skipped")
     _out(f"stores: {summary['stores']}" + (f" ({', '.join(extra)})" if extra else ""))
-    _table([[name, _count(row["stores"], "store"), _count(row["sessions"], "session")]
-            for name, row in sorted(summary["by_provider"].items())], "  ")
-    _out(f"sessions: {summary['sessions']:,} listed of "
-         f"{_count(summary['candidates'], 'candidate')} "
-         f"({summary['parsed']:,} parsed, {summary['cached']:,} from cache)")
+    _table(
+        [
+            [name, _count(row["stores"], "store"), _count(row["sessions"], "session")]
+            for name, row in sorted(summary["by_provider"].items())
+        ],
+        "  ",
+    )
+    _out(
+        f"sessions: {summary['sessions']:,} listed of "
+        f"{_count(summary['candidates'], 'candidate')} "
+        f"({summary['parsed']:,} parsed, {summary['cached']:,} from cache)"
+    )
     if summary["warnings"]:
         _out(f"warnings: {len(summary['warnings'])} (see `{PROG} status`)")
     return 0
 
 
-def _list(args) -> int:
+def _list(args: argparse.Namespace) -> int:
     index = api.load_index()
     if index.load_error is not None:
         # No cache, or one that cannot be used: an empty listing would look
@@ -190,21 +225,33 @@ def _list(args) -> int:
         return 0
     if index.last_quick is None:
         print(f"{PROG}: no index yet; run `{PROG} scan`", file=sys.stderr)
-    now = datetime.now(timezone.utc)
-    _table([[_age(s.updated or s.started, now), index.where(s), s.provider,
-             s.title or "-", _project(s.cwd)] + ([s.key] if args.keys else [])
-            for s in sessions])
+    now = datetime.now(UTC)
+    _table(
+        [
+            [
+                _age(s.updated or s.started, now),
+                index.where(s),
+                s.provider,
+                s.title or "-",
+                _project(s.cwd),
+            ]
+            + ([s.key] if args.keys else [])
+            for s in sessions
+        ]
+    )
     return 0
 
 
-def _status(args) -> int:
+def _status(args: argparse.Namespace) -> int:
     status = api.status()
     if args.json:
         _json(status)
         return 0
     _out(f"index: {status['cache']}")
-    _out(f"last scan: {status['last_quick'] or 'never'}; "
-         f"last deep scan: {status['last_deep'] or 'never'}")
+    _out(
+        f"last scan: {status['last_quick'] or 'never'}; "
+        f"last deep scan: {status['last_deep'] or 'never'}"
+    )
 
     _out("\nmounts")
     rows = []
@@ -213,12 +260,13 @@ def _status(args) -> int:
         if not mount["mounted"]:
             detail = "not mounted"
         elif walk:
-            detail = (f"{_count(walk['dirs'], 'dir')}, {walk['pruned']:,} pruned, "
-                      f"{walk['errors']:,} unreadable, {walk['seconds']:.2f} s")
+            detail = (
+                f"{_count(walk['dirs'], 'dir')}, {walk['pruned']:,} pruned, "
+                f"{walk['errors']:,} unreadable, {walk['seconds']:.2f} s"
+            )
         else:
             detail = "not walked yet"
-        rows.append([mount["letter"] or "", mount["label"], mount["path"],
-                     mount["fstype"], detail])
+        rows.append([mount["letter"] or "", mount["label"], mount["path"], mount["fstype"], detail])
     _table(rows, "  ")
     for mount in status["mounts"]:
         for path in (mount["walk"] or {}).get("error_paths", []):
@@ -234,34 +282,67 @@ def _status(args) -> int:
             flags.append("reader not implemented")
         if store["duplicates"]:
             flags.append(f"{store['duplicates']} duplicate")
-        rows.append([store["provider"], store["origin"], store["root"],
-                     f"{store['listed']} listed / {store['candidates']} candidates / "
-                     f"{store['skipped']} skipped", ", ".join(flags)])
+        rows.append(
+            [
+                store["provider"],
+                store["origin"],
+                store["root"],
+                f"{store['listed']} listed / {store['candidates']} candidates / "
+                f"{store['skipped']} skipped",
+                ", ".join(flags),
+            ]
+        )
     _table(rows, "  ")
     if not rows:
         _out("  none")
 
     _out("\nproviders")
-    _table([[p["name"], _count(p["stores"], "store"), _count(p["sessions"], "session"),
-             (p["installed"] or f"{p['binary']} not installed")
-             + ("" if p["resumable"] else " (not resumable)")]
-            for p in status["providers"]], "  ")
+    _table(
+        [
+            [
+                p["name"],
+                _count(p["stores"], "store"),
+                _count(p["sessions"], "session"),
+                (p["installed"] or f"{p['binary']} not installed")
+                + ("" if p["resumable"] else " (not resumable)"),
+            ]
+            for p in status["providers"]
+        ],
+        "  ",
+    )
 
     if status["skipped_stores"]:
         _out("\nskipped stores")
-        _table([[s["provider"], s["reason"] + ("" if s["mounted"] else ", not mounted"),
-                 s["root"]] for s in status["skipped_stores"]], "  ")
+        _table(
+            [
+                [s["provider"], s["reason"] + ("" if s["mounted"] else ", not mounted"), s["root"]]
+                for s in status["skipped_stores"]
+            ],
+            "  ",
+        )
 
     _out("\ndrive letters")
-    rows = [[row["letter"], "->", row["mount"],
-             f"{row['how']}, {_count(row['paths'], 'path')}"
-             + (f", recorded on {row['source_mount']}" if row["source_mount"] else "")]
-            for row in status["letters"]]
-    rows += [[row["letter"], "->", "unresolved",
-              f"{row['reason']}, {_count(row['paths'], 'path')}, "
-              f"recorded on {row['source_mount']}"
-              + (f", candidates: {', '.join(row['candidates'])}" if row["candidates"] else "")]
-             for row in status["unresolved_letters"]]
+    rows = [
+        [
+            row["letter"],
+            "->",
+            row["mount"],
+            f"{row['how']}, {_count(row['paths'], 'path')}"
+            + (f", recorded on {row['source_mount']}" if row["source_mount"] else ""),
+        ]
+        for row in status["letters"]
+    ]
+    rows += [
+        [
+            row["letter"],
+            "->",
+            "unresolved",
+            f"{row['reason']}, {_count(row['paths'], 'path')}, "
+            f"recorded on {row['source_mount']}"
+            + (f", candidates: {', '.join(row['candidates'])}" if row["candidates"] else ""),
+        ]
+        for row in status["unresolved_letters"]
+    ]
     _table(rows, "  ")
     if not rows:
         _out("  none recorded")
@@ -276,27 +357,33 @@ def _status(args) -> int:
     return 0
 
 
-def _verify(args) -> int:
+def _verify(args: argparse.Namespace) -> int:
     progress = None
     if sys.stderr.isatty():
-        def progress(label, dirs):
+
+        def progress(label: str, dirs: int) -> None:
             sys.stderr.write(f"\r\033[Kwalking {label}… {dirs:,} dirs")
             sys.stderr.flush()
+
     result = api.verify(progress=progress)
     if progress is not None:
         sys.stderr.write("\r\033[K")
         sys.stderr.flush()
     dirs = sum(walk["dirs"] for walk in result["walk"].values())
-    _out(f"verify: walked {_count(len(result['walk']), 'mount')}, {_count(dirs, 'dir')}, "
-         f"{result['seconds']:.2f} s; {_count(result['stores'], 'store')}, "
-         f"{_count(result['sessions'], 'session')} on disk")
+    _out(
+        f"verify: walked {_count(len(result['walk']), 'mount')}, {_count(dirs, 'dir')}, "
+        f"{result['seconds']:.2f} s; {_count(result['stores'], 'store')}, "
+        f"{_count(result['sessions'], 'session')} on disk"
+    )
     for line in result["nested"]:
         _out(f"note: store inside another store, not listed by design: {line}")
     for line in result["stale"]:
         _out(f"stale: {line}")
     if result["stale"]:
-        _out(f"{_count(len(result['stale']), 'candidate')} changed on disk after the last "
-             f"scan; run `{PROG} scan`")
+        _out(
+            f"{_count(len(result['stale']), 'candidate')} changed on disk after the last "
+            f"scan; run `{PROG} scan`"
+        )
     for line in result["differences"]:
         _out(f"DIFFERENT: {line}")
     if result["differences"]:
@@ -306,32 +393,32 @@ def _verify(args) -> int:
     return 0
 
 
-def _print_plan(plan) -> None:
+def _print_plan(plan: LaunchPlan) -> None:
     """A launch plan as a line a shell could run, and its note."""
     _out(f"cd {shlex.quote(plan.cwd)} && {shlex.join(plan.command)}")
     if plan.note:
         _out(f"note: {plan.note}")
 
 
-def _resume(ref, here: bool, dry_run: bool, index=None) -> int:
+def _resume(ref: Session | str, here: bool, dry_run: bool, index: Index | None = None) -> int:
     if here and not dry_run:
         # exec replaces this process: say what runs before it does.
         try:
             _print_plan(api.open_session(ref, here=True, dry_run=True, index=index))
             sys.stdout.flush()
         except api.LaunchFailed:
-            pass   # the real call below fails the same way, and notifies
+            pass  # the real call below fails the same way, and notifies
     plan = api.open_session(ref, here=here, dry_run=dry_run, index=index)
     if not here or dry_run:
         _print_plan(plan)
     return 0
 
 
-def _open(args) -> int:
+def _open(args: argparse.Namespace) -> int:
     return _resume(args.key, args.here, args.dry_run)
 
 
-def _import(args) -> int:
+def _import(args: argparse.Namespace) -> int:
     index = api.load_index()
     if args.dry_run:
         plan = api.import_plan(args.key, index=index)
@@ -344,8 +431,10 @@ def _import(args) -> int:
         for copy in plan["copies"]:
             size = _size(copy["bytes"])
             if copy["dir"]:
-                _out(f"copy {copy['from']}{os.sep} -> {copy['to']}{os.sep} "
-                     f"({_count(copy['files'], 'file')}, {size})")
+                _out(
+                    f"copy {copy['from']}{os.sep} -> {copy['to']}{os.sep} "
+                    f"({_count(copy['files'], 'file')}, {size})"
+                )
             else:
                 _out(f"copy {copy['from']} -> {copy['to']} ({size})")
         for rewrite in plan["rewrites"]:
@@ -354,17 +443,20 @@ def _import(args) -> int:
                 _out(f"  {change}")
         for append in plan["appends"]:
             _out(f"append to {append['file']}: {append['what']}")
-        _out(f"free space on {plan['free_on']}: {_size(plan['free'])}; "
-             f"{_size(plan['needed'])} needed")
+        _out(
+            f"free space on {plan['free_on']}: {_size(plan['free'])}; "
+            f"{_size(plan['needed'])} needed"
+        )
         _out("dry run: nothing was written")
         return 0
     progress = None
     if sys.stderr.isatty():
-        def progress(done, total):
+
+        def progress(done: int, total: int) -> None:
             share = 100 * done // total if total else 100
-            sys.stderr.write(f"\r\033[Kcopying… {share}% of "
-                             f"{_size(total)}")
+            sys.stderr.write(f"\r\033[Kcopying… {share}% of {_size(total)}")
             sys.stderr.flush()
+
     try:
         report = api.import_report(args.key, progress=progress, index=index)
     finally:
@@ -372,9 +464,11 @@ def _import(args) -> int:
             sys.stderr.write("\r\033[K")
             sys.stderr.flush()
     if report.created:
-        print(f"{PROG}: imported {_count(len(report.files), 'item')} "
-              f"({_size(report.bytes)}) into {report.session.store}",
-              file=sys.stderr)
+        print(
+            f"{PROG}: imported {_count(len(report.files), 'item')} "
+            f"({_size(report.bytes)}) into {report.session.store}",
+            file=sys.stderr,
+        )
     else:
         print(f"{PROG}: already imported; nothing was copied", file=sys.stderr)
     _out(report.session.key)
@@ -383,18 +477,24 @@ def _import(args) -> int:
     return 0
 
 
-def _show(args) -> int:
+def _show(args: argparse.Namespace) -> int:
     index = api.load_index()
     session = api.find_session(args.key, index=index)
-    label = next((p.label for p in all_providers() if p.name == session.provider),
-                 session.provider)
-    rows = [["title", session.title or "-"], ["provider", label],
-            ["where", index.where(session)], ["cwd", session.cwd or "-"]]
+    label = next((p.label for p in all_providers() if p.name == session.provider), session.provider)
+    rows: list[list[object]] = [
+        ["title", session.title or "-"],
+        ["provider", label],
+        ["where", index.where(session)],
+        ["cwd", session.cwd or "-"],
+    ]
     if session.cwd_local and session.cwd_local != session.cwd:
         rows.append(["local", session.cwd_local])
-    rows += [["started", session.started or "-"], ["updated", session.updated or "-"],
-             ["messages", "-" if session.messages is None else session.messages],
-             ["key", session.key]]
+    rows += [
+        ["started", session.started or "-"],
+        ["updated", session.updated or "-"],
+        ["messages", "-" if session.messages is None else session.messages],
+        ["key", session.key],
+    ]
     _table(rows)
     last = None
     for turn in api.transcript(session):
@@ -425,11 +525,18 @@ def _quiet_stdout() -> None:
         pass
 
 
-_COMMANDS = {"scan": _scan, "list": _list, "status": _status, "verify": _verify,
-             "open": _open, "import": _import, "show": _show}
+_COMMANDS = {
+    "scan": _scan,
+    "list": _list,
+    "status": _status,
+    "verify": _verify,
+    "open": _open,
+    "import": _import,
+    "show": _show,
+}
 
 
-def main(argv=None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command is None:
@@ -440,7 +547,7 @@ def main(argv=None) -> int:
         sys.stdout.flush()
         return code
     except BrokenPipeError:
-        _quiet_stdout()   # the reader (head, less) went away: not an error
+        _quiet_stdout()  # the reader (head, less) went away: not an error
         return 0
     except api.ApiError as exc:
         print(f"{PROG}: {exc.reason}", file=sys.stderr)

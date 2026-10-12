@@ -5,25 +5,29 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, ClassVar
 
 from .. import importer
 from ..fsutil import home, listdir_ro, open_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
-from .base import (NotSupported, Provider, Turn, clean_title, iter_jsonl, parse_ts,
-                   unreadable, warn)
+from .base import NotSupported, Provider, Turn, clean_title, iter_jsonl, parse_ts, unreadable, warn
 
-_TRANSCRIPT = re.compile(
-    r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
+if TYPE_CHECKING:
+    from ..fsutil import StrPath
+    from ..pathmap import PathMap
+
+_TRANSCRIPT = re.compile(r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
 
 # The tool's own first-prompt rule (FORMATS "Real prompt").
 _COMMAND = re.compile(r"<command-name>(.*?)</command-name>")
 _COMMAND_ARGS = re.compile(r"<command-args>(.*?)</command-args>")
 _BASH = re.compile(r"<bash-input>([\s\S]*?)</bash-input>")
 _NOT_A_PROMPT = re.compile(
-    r"^(?:\s*<[a-z][A-Za-z0-9_-]*[\s>]|\[Request interrupted by user[^\]]*\])")
+    r"^(?:\s*<[a-z][A-Za-z0-9_-]*[\s>]|\[Request interrupted by user[^\]]*\])"
+)
 
 # Title records, in the tool's order of preference: record type -> field.
 _TITLE_FIELDS = (
@@ -34,8 +38,8 @@ _TITLE_FIELDS = (
 )
 _TITLE_FIELD = dict(_TITLE_FIELDS)
 
-ENCODED_MAX = 200           # longer directory names are cut and get a hash
-_HEAD = 65536               # the tool itself reads this much for cheap fields
+ENCODED_MAX = 200  # longer directory names are cut and get a hash
+_HEAD = 65536  # the tool itself reads this much for cheap fields
 _BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 
@@ -49,9 +53,8 @@ def encode_cwd(cwd: str) -> str:
     over the original text.
     """
     raw = cwd.encode("utf-16-le", "surrogatepass")
-    units = [int.from_bytes(raw[i:i + 2], "little") for i in range(0, len(raw), 2)]
-    encoded = "".join(
-        chr(unit) if unit < 128 and chr(unit).isalnum() else "-" for unit in units)
+    units = [int.from_bytes(raw[i : i + 2], "little") for i in range(0, len(raw), 2)]
+    encoded = "".join(chr(unit) if unit < 128 and chr(unit).isalnum() else "-" for unit in units)
     if len(encoded) <= ENCODED_MAX:
         return encoded
     total = 0
@@ -69,7 +72,7 @@ def encode_cwd(cwd: str) -> str:
     return f"{encoded[:ENCODED_MAX]}-{digits}"
 
 
-def _recorded_version(path) -> str | None:
+def _recorded_version(path: StrPath) -> str | None:
     """The tool version of the first record that names one, looking only at
     the head of the transcript."""
     try:
@@ -82,8 +85,9 @@ def _recorded_version(path) -> str | None:
             record = json.loads(line.decode("utf-8", "replace"))
         except (ValueError, RecursionError):
             continue
-        if isinstance(record, dict) and isinstance(record.get("version"), str):
-            return record["version"]
+        version = record.get("version") if isinstance(record, dict) else None
+        if isinstance(version, str):
+            return version
     return None
 
 
@@ -95,8 +99,11 @@ def _prompts(record: dict) -> tuple[list[str], str | None]:
     command fallback is the first ``<command-name>`` of the record, with its
     ``<command-args>`` when they are not empty.
     """
-    if (record.get("type") != "user" or record.get("isMeta") is True
-            or record.get("isCompactSummary") is True):
+    if (
+        record.get("type") != "user"
+        or record.get("isMeta") is True
+        or record.get("isCompactSummary") is True
+    ):
         return [], None
     message = record.get("message")
     content = message.get("content") if isinstance(message, dict) else None
@@ -119,8 +126,8 @@ def _prompts(record: dict) -> tuple[list[str], str | None]:
         found = _COMMAND.search(flat)
         if found:
             if command is None:
-                args = _COMMAND_ARGS.search(flat)
-                args = args.group(1).strip() if args else ""
+                found_args = _COMMAND_ARGS.search(flat)
+                args = found_args.group(1).strip() if found_args else ""
                 command = f"{found.group(1)} {args}" if args else found.group(1)
             continue
         found = _BASH.search(raw)
@@ -134,17 +141,17 @@ def _prompts(record: dict) -> tuple[list[str], str | None]:
 class _Scan:
     """What one pass over a transcript collects."""
 
-    def __init__(self):
-        self.has_message = False     # a record with a parentUuid key
-        self.sidechain = False       # the first such record is a sidechain one
-        self.prompts = 0             # real prompt records
-        self.assistants = 0          # assistant records
+    def __init__(self) -> None:
+        self.has_message = False  # a record with a parentUuid key
+        self.sidechain = False  # the first such record is a sidechain one
+        self.prompts = 0  # real prompt records
+        self.assistants = 0  # assistant records
         self.assistant_ids: set[str] = set()
         self.assistant_anonymous = 0  # assistant records without message.id
-        self.titles: dict[str, str] = {}   # record type -> last value
+        self.titles: dict[str, str] = {}  # record type -> last value
         self.first_prompt: str | None = None
         self.command: str | None = None
-        self.cwd: str | None = None        # first recorded
+        self.cwd: str | None = None  # first recorded
         self.relocated: str | None = None  # last recorded
         self.started: str | None = None
         self.updated: str | None = None
@@ -155,7 +162,7 @@ class _Scan:
         return self.prompts + len(self.assistant_ids) + self.assistant_anonymous
 
 
-def _scan(path) -> _Scan:
+def _scan(path: StrPath) -> _Scan:
     """Read a transcript once, line by line."""
     scan = _Scan()
     for record in iter_jsonl(path):
@@ -226,7 +233,7 @@ def _title(scan: _Scan, session_id: str) -> tuple[str, str]:
     return session_id[:8], "id"
 
 
-def _mtime(path) -> str | None:
+def _mtime(path: StrPath) -> str | None:
     try:
         return parse_ts(os.stat(path).st_mtime)
     except OSError:
@@ -240,9 +247,9 @@ class Claude(Provider):
     binary = "claude"
     app_id = "org.omarchy.claude"
     resumable = True
-    dir_names = {".claude"}
+    dir_names: ClassVar[set[str]] = {".claude"}
 
-    def native_store(self) -> Path | None:
+    def native_store(self) -> Path:
         return home() / ".claude"
 
     def is_store(self, path: Path) -> bool:
@@ -270,8 +277,7 @@ class Claude(Provider):
             for entry in entries:
                 match = _TRANSCRIPT.match(entry)
                 if match:
-                    found.setdefault(match.group(1), []).append(
-                        os.path.join(projects, name, entry))
+                    found.setdefault(match.group(1), []).append(os.path.join(projects, name, entry))
         return [Candidate(ident, sorted(paths)) for ident, paths in sorted(found.items())]
 
     def parse(self, store: Store, c: Candidate) -> Session | None:
@@ -285,24 +291,28 @@ class Claude(Provider):
         session_id = match.group(1) if match else c.id_hint
         scan = _scan(path)
         if not scan.has_message or scan.sidechain:
-            return None   # bookkeeping-only, or a sidechain at top level
+            return None  # bookkeeping-only, or a sidechain at top level
         if not scan.prompts and not scan.assistants:
-            return None   # empty session
+            return None  # empty session
         title, _source = _title(scan, session_id)
         files = [path]
-        side = path[:-len(".jsonl")] if path.endswith(".jsonl") else ""
+        side = path[: -len(".jsonl")] if path.endswith(".jsonl") else ""
         if side and os.path.isdir(side):
             files.append(side)
         fallback = None
         if scan.started is None or scan.updated is None:
             fallback = _mtime(path)
         return Session.for_store(
-            store, id=session_id, title=title,
+            store,
+            id=session_id,
+            title=title,
             cwd=scan.relocated or scan.cwd,
             started=scan.started or fallback,
             updated=scan.updated or fallback,
-            messages=scan.messages, files=files,
-            note=f"continued in {scan.continued_in}" if scan.continued_in else None)
+            messages=scan.messages,
+            files=files,
+            note=f"continued in {scan.continued_in}" if scan.continued_in else None,
+        )
 
     def resume_argv(self, s: Session) -> list[str]:
         return [self.binary, "--resume", s.id]
@@ -335,7 +345,7 @@ class Claude(Provider):
                         if isinstance(tool, str) and tool:
                             yield Turn("tool", tool, moment)
 
-    def import_plan(self, s: Session, pathmap) -> importer.ImportPlan:
+    def import_plan(self, s: Session, pathmap: PathMap) -> importer.ImportPlan:
         """Copy only (FORMATS section 6): the ``<id>/`` side directory first,
         the transcript last, into ``projects/<encoded mapped cwd>/``. Nothing
         is rewritten and nothing else is copied."""
@@ -349,16 +359,21 @@ class Claude(Provider):
             dirs = sorted(subdirs(projects))
         except OSError:
             dirs = []
-        plan.existing = [path for path in (os.path.join(projects, d, name) for d in dirs)
-                         if os.path.lexists(path)]
+        plan.existing = [
+            path
+            for path in (os.path.join(projects, d, name) for d in dirs)
+            if os.path.lexists(path)
+        ]
         target = os.path.join(projects, encode_cwd(plan.cwd_local))
-        side = transcript[:-len(".jsonl")]
+        side = transcript[: -len(".jsonl")]
         if os.path.isdir(side) and not os.path.islink(side):
             sub, files = importer.tree(side)
-            plan.units.append(importer.Unit(
-                os.path.join(target, os.path.basename(side)), side, files, True, sub))
-        plan.units.append(importer.Unit(
-            os.path.join(target, name), transcript, [importer.file_copy(transcript)]))
+            plan.units.append(
+                importer.Unit(os.path.join(target, os.path.basename(side)), side, files, True, sub)
+            )
+        plan.units.append(
+            importer.Unit(os.path.join(target, name), transcript, [importer.file_copy(transcript)])
+        )
         version = _recorded_version(transcript)
         if version:
             plan.info["source_tool_version"] = version

@@ -6,8 +6,12 @@ Everything here is portable: the flags that only Linux has are looked up with
 
 from __future__ import annotations
 
+import io
 import os
+from collections.abc import Callable
 from pathlib import Path
+
+StrPath = str | os.PathLike[str]
 
 _NOATIME = getattr(os, "O_NOATIME", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_BINARY", 0)
@@ -44,7 +48,7 @@ def config_dir() -> Path:
     return home() / ".config" / "agent-sessions"
 
 
-def open_ro(path):
+def open_ro(path: StrPath) -> io.BufferedReader:
     """Open ``path`` for binary reading without updating its access time.
 
     O_NOATIME is refused (EPERM) for files the caller does not own; the plain
@@ -58,7 +62,7 @@ def open_ro(path):
     return os.fdopen(os.open(path, _FILE_FLAGS), "rb")
 
 
-def _entries(path, pick):
+def _entries(path: StrPath, pick: Callable[[os.DirEntry[str]], bool]) -> list[str]:
     if _DIR_FD:
         try:
             fd = os.open(path, _DIR_FLAGS)
@@ -76,19 +80,19 @@ def _entries(path, pick):
         return [e.name for e in it if pick(e)]
 
 
-def _real_dir(entry) -> bool:
+def _real_dir(entry: os.DirEntry[str]) -> bool:
     try:
         return entry.is_dir(follow_symlinks=False)
     except OSError:
         return False
 
 
-def subdirs(path) -> list[str]:
+def subdirs(path: StrPath) -> list[str]:
     """Names of the real sub-directories of ``path`` (symlinks left out),
     unsorted. Raises OSError when ``path`` cannot be listed."""
     return _entries(path, _real_dir)
 
 
-def listdir_ro(path) -> list[str]:
+def listdir_ro(path: StrPath) -> list[str]:
     """Like ``os.listdir`` without updating the directory's access time."""
     return _entries(path, lambda entry: True)

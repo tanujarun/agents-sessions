@@ -5,29 +5,53 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, ClassVar
 
 from ..fsutil import home, listdir_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
-from .base import (NotSupported, Provider, Turn, clean_title, iter_jsonl, open_ro,
-                   parse_ts, unreadable, warn)
+from .base import (
+    NotSupported,
+    Provider,
+    Turn,
+    clean_title,
+    iter_jsonl,
+    open_ro,
+    parse_ts,
+    unreadable,
+    warn,
+)
+
+if TYPE_CHECKING:
+    from .. import importer
+    from ..fsutil import StrPath
+    from ..pathmap import PathMap
 
 # The verdict of FORMATS section 6, shown to the user as it is.
-IMPORT_UNSAFE = ("Gemini CLI is not installed on this machine, and no resumable Gemini "
-                 "session exists to import")
+IMPORT_UNSAFE = (
+    "Gemini CLI is not installed on this machine, and no resumable Gemini session exists to import"
+)
 
 _CHAT_NAME = re.compile(r"^session-.*\.jsonl?$")
 # The tool names a chat file ``session-<time>-<first 8 of the session id>``.
 _ID_PART = re.compile(r"-([^-]{1,8})\.jsonl?$")
-_FIXED_PATHS = 3            # the chat file, .project_root, projects.json
+_FIXED_PATHS = 3  # the chat file, .project_root, projects.json
 _SMALL_FILE = 16 * 1024 * 1024
 _LEGACY_MAX = 64 * 1024 * 1024
 _IGNORED_STARTS = ("/", "?", "<session_context>", "<hook_context>")
 # Parts that are not text; the tool renders each as a non-empty marker.
-_PART_MARKERS = ("videoMetadata", "thought", "codeExecutionResult", "executableCode",
-                 "fileData", "functionCall", "functionResponse", "inlineData")
+_PART_MARKERS = (
+    "videoMetadata",
+    "thought",
+    "codeExecutionResult",
+    "executableCode",
+    "fileData",
+    "functionCall",
+    "functionResponse",
+    "inlineData",
+)
 
 
 def _id_group(name: str) -> str:
@@ -36,7 +60,7 @@ def _id_group(name: str) -> str:
     return found.group(1) if found else name
 
 
-def _content_string(value) -> str:
+def _content_string(value: object) -> str:
     """A message ``content`` as the tool's own listing rule sees it: text,
     with a marker for every part that is not text."""
     if not value:
@@ -53,7 +77,7 @@ def _content_string(value) -> str:
     return value["text"] if isinstance(value.get("text"), str) else ""
 
 
-def _plain_text(value) -> str:
+def _plain_text(value: object) -> str:
     """The text parts of a message ``content``, nothing else."""
     if isinstance(value, str):
         return value
@@ -71,7 +95,7 @@ def _is_ignored(text: str) -> bool:
     return not text or text.startswith(_IGNORED_STARTS)
 
 
-def _has_items(value) -> bool:
+def _has_items(value: object) -> bool:
     return isinstance(value, (list, str)) and len(value) > 0
 
 
@@ -81,8 +105,11 @@ def _is_resumable(message: dict) -> bool:
     if message.get("type") == "user":
         return not _is_ignored(content)
     if message.get("type") == "gemini":
-        return (bool(content.strip()) or _has_items(message.get("toolCalls"))
-                or _has_items(message.get("thoughts")))
+        return (
+            bool(content.strip())
+            or _has_items(message.get("toolCalls"))
+            or _has_items(message.get("thoughts"))
+        )
     return False
 
 
@@ -94,16 +121,19 @@ _META_TIME = ("startTime", "lastUpdated")
 
 
 def _usable_meta(patch: dict) -> dict:
-    return {key: value for key, value in patch.items()
-            if (key not in _META_TEXT or isinstance(value, str))
-            and (key not in _META_TIME or parse_ts(value) is not None)}
+    return {
+        key: value
+        for key, value in patch.items()
+        if (key not in _META_TEXT or isinstance(value, str))
+        and (key not in _META_TIME or parse_ts(value) is not None)
+    }
 
 
-def _is_message(record) -> bool:
+def _is_message(record: object) -> bool:
     return isinstance(record, dict) and isinstance(record.get("id"), str)
 
 
-def apply_records(records) -> tuple[dict, list[dict]]:
+def apply_records(records: Iterable[object]) -> tuple[dict, list[dict]]:
     """Replay a chat file's records in order; returns ``(metadata, messages)``.
 
     A ``$rewindTo`` drops that message and every later one (all of them when
@@ -122,7 +152,7 @@ def apply_records(records) -> tuple[dict, list[dict]]:
             target = record["$rewindTo"]
             if target in messages:
                 ids = list(messages)
-                for message_id in ids[ids.index(target):]:
+                for message_id in ids[ids.index(target) :]:
                     del messages[message_id]
             else:
                 messages.clear()
@@ -134,8 +164,9 @@ def apply_records(records) -> tuple[dict, list[dict]]:
                 messages.clear()
                 messages.update((m["id"], m) for m in patch["messages"] if _is_message(m))
             meta.update(_usable_meta(patch))
-        elif (isinstance(record.get("sessionId"), str)
-              and isinstance(record.get("projectHash"), str)):
+        elif isinstance(record.get("sessionId"), str) and isinstance(
+            record.get("projectHash"), str
+        ):
             meta.update(_usable_meta(record))
             if isinstance(record.get("messages"), list):
                 messages.update((m["id"], m) for m in record["messages"] if _is_message(m))
@@ -158,9 +189,9 @@ def _load(path: Path) -> tuple[dict, list[dict]] | None:
         with open_ro(path) as fh:
             raw = fh.read(_LEGACY_MAX + 1)
     except OSError:
-        return None             # iter_jsonl has recorded why
+        return None  # iter_jsonl has recorded why
     if not raw.strip():
-        return None             # created, nothing written yet
+        return None  # created, nothing written yet
     if len(raw) > _LEGACY_MAX:
         warn("no session metadata record; too large to try as one JSON object", path)
         return None
@@ -175,14 +206,14 @@ def _load(path: Path) -> tuple[dict, list[dict]] | None:
     return legacy, [m for m in found if isinstance(m, dict)] if isinstance(found, list) else []
 
 
-def _mtime(path) -> str | None:
+def _mtime(path: StrPath) -> str | None:
     try:
         return parse_ts(os.stat(path).st_mtime)
     except OSError:
         return None
 
 
-def _read_text(path) -> str:
+def _read_text(path: StrPath) -> str:
     try:
         with open_ro(path) as fh:
             return fh.read(_SMALL_FILE).decode("utf-8-sig", "replace").strip()
@@ -200,9 +231,9 @@ class Gemini(Provider):
     resumable = False
     # Resume searches only the chats of the process cwd's project (section 5).
     resume_needs_cwd = True
-    dir_names = {".gemini"}
+    dir_names: ClassVar[set[str]] = {".gemini"}
 
-    def native_store(self) -> Path | None:
+    def native_store(self) -> Path:
         return home() / ".gemini"
 
     def is_store(self, path: Path) -> bool:
@@ -237,10 +268,12 @@ class Gemini(Provider):
             for name in names:
                 groups.setdefault(_id_group(name), []).append(name)
             for name in names:
-                paths = [str(chats / name), str(chats.parent / ".project_root"),
-                         str(root / "projects.json")]
-                paths += [str(chats / other) for other in groups[_id_group(name)]
-                          if other != name]
+                paths = [
+                    str(chats / name),
+                    str(chats.parent / ".project_root"),
+                    str(root / "projects.json"),
+                ]
+                paths += [str(chats / other) for other in groups[_id_group(name)] if other != name]
                 out.append(Candidate(f"tmp/{slug}/chats/{name}", paths))
         return out
 
@@ -271,15 +304,23 @@ class Gemini(Provider):
             if newer or (same and Path(other_path).name < path.name):
                 return None
         slug_dir = path.parent.parent
+        cwd: str | None
         cwd, cwd_source = _read_text(slug_dir / ".project_root"), ".project_root"
         if not cwd:
             cwd, cwd_source = self._registered(Path(c.paths[2]), slug_dir.name), "projects.json"
         if not cwd:
             cwd, cwd_source = None, "none"
-        return {"id": own["id"], "title": own["title"], "cwd": cwd, "started": own["started"],
-                "updated": own["updated"], "messages": len(own["messages"]),
-                "files": [str(path)], "note": None,
-                "sources": {"title": own["title_source"], "cwd": cwd_source}}
+        return {
+            "id": own["id"],
+            "title": own["title"],
+            "cwd": cwd,
+            "started": own["started"],
+            "updated": own["updated"],
+            "messages": len(own["messages"]),
+            "files": [str(path)],
+            "note": None,
+            "sources": {"title": own["title_source"], "cwd": cwd_source},
+        }
 
     @staticmethod
     def _read(path: Path) -> dict | None:
@@ -309,9 +350,14 @@ class Gemini(Provider):
         if not title:
             title, title_source = session_id[:8], "id"
         start, last = parse_ts(meta.get("startTime")), parse_ts(meta.get("lastUpdated"))
-        return {"id": session_id, "title": title, "title_source": title_source,
-                "started": start or last or _mtime(path),
-                "updated": last or start or _mtime(path), "messages": messages}
+        return {
+            "id": session_id,
+            "title": title,
+            "title_source": title_source,
+            "started": start or last or _mtime(path),
+            "updated": last or start or _mtime(path),
+            "messages": messages,
+        }
 
     @staticmethod
     def _registered(projects_json: Path, slug: str) -> str | None:
@@ -358,5 +404,5 @@ class Gemini(Provider):
                     if isinstance(name, str) and name:
                         yield Turn("tool", name, parse_ts(call.get("timestamp")) or ts)
 
-    def import_plan(self, s: Session, pathmap):
+    def import_plan(self, s: Session, pathmap: PathMap) -> importer.ImportPlan:
         raise NotSupported(IMPORT_UNSAFE)

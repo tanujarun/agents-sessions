@@ -7,7 +7,12 @@
   drive letters, ground-truth counts, open questions
 - `bin/agent-sessions` — launcher script; no logic
 - `install.sh` — symlink the launcher into `~/.local/bin`
-- `Makefile` — `test`, `lint`
+- `Makefile` — `test`, `test-tui`, `lint`, `format`, `typecheck`, `coverage`, `dev` (creates `.venv` with
+  Textual and the development tools), `check` (lint, typecheck and both suites)
+- `pyproject.toml` — packaging (setuptools, `src` layout, extras `tui` and `dev`, the `agent-sessions`
+  entry point) and the ruff, mypy and coverage configuration
+- `.github/workflows/ci.yml` — CI: lint, typecheck and both suites on Python 3.11 to 3.14 (Linux); engine
+  suite on Windows, allowed to fail until the port is done
 - `src/agent_sessions/__init__.py` — package marker, `__version__`
 - `src/agent_sessions/model.py` — `Session` (`for_store`, `from_dict`), `Store`, `Candidate`, `make_key`
 - `src/agent_sessions/fsutil.py` — our own locations (`home`, `cache_file`, `cache_dir`, `state_dir`, `config_dir`, env overrides)

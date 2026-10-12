@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 from collections import namedtuple
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 _SRC = str(Path(__file__).resolve().parent.parent / "src")
@@ -16,9 +16,14 @@ if _SRC not in sys.path:
 
 from agent_sessions.model import Session  # noqa: E402
 
-NOW = datetime(2026, 10, 12, 12, 0, 0, tzinfo=timezone.utc)
-PROVIDERS = [("antigravity", "Antigravity"), ("claude", "Claude"), ("codex", "Codex"),
-             ("gemini", "Gemini"), ("grok", "Grok")]
+NOW = datetime(2026, 10, 12, 12, 0, 0, tzinfo=UTC)
+PROVIDERS = [
+    ("antigravity", "Antigravity"),
+    ("claude", "Claude"),
+    ("codex", "Codex"),
+    ("gemini", "Gemini"),
+    ("grok", "Grok"),
+]
 WINDOWS = "/run/media/user/WINVOL"
 NATIVE_HASH = "aaaaaaaa"
 FOREIGN_HASH = "bbbbbbbb"
@@ -39,8 +44,18 @@ def stamp(**ago) -> str:
     return (NOW - timedelta(**ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def make_session(provider, n, *, foreign=False, title=None, age=None, imported_as=None,
-                 cwd=None, note=None, messages=12) -> Session:
+def make_session(
+    provider,
+    n,
+    *,
+    foreign=False,
+    title=None,
+    age=None,
+    imported_as=None,
+    cwd=None,
+    note=None,
+    messages=12,
+) -> Session:
     """A fake session; ``n`` makes it distinct. Newer for smaller ``age``
     (minutes ago)."""
     sid = f"{provider[:2]}{'f' if foreign else 'n'}-{n:04d}"
@@ -56,13 +71,25 @@ def make_session(provider, n, *, foreign=False, title=None, age=None, imported_a
         local = recorded
         key = f"{provider}:{NATIVE_HASH}:{sid}"
     return Session(
-        provider=provider, id=sid, key=key,
+        provider=provider,
+        id=sid,
+        key=key,
         title=title if title is not None else f"{provider} session {n}",
-        cwd=recorded, cwd_local=local, cwd_exists=True,
-        started=stamp(minutes=age + 30), updated=stamp(minutes=age), messages=messages,
-        store=store, origin="foreign" if foreign else "native",
-        mount=WINDOWS if foreign else "/", mount_label="WINVOL" if foreign else "Linux",
-        files=[], launchable=not foreign, imported_as=imported_as, note=note)
+        cwd=recorded,
+        cwd_local=local,
+        cwd_exists=True,
+        started=stamp(minutes=age + 30),
+        updated=stamp(minutes=age),
+        messages=messages,
+        store=store,
+        origin="foreign" if foreign else "native",
+        mount=WINDOWS if foreign else "/",
+        mount_label="WINVOL" if foreign else "Linux",
+        files=[],
+        launchable=not foreign,
+        imported_as=imported_as,
+        note=note,
+    )
 
 
 def default_sessions() -> list:
@@ -84,8 +111,11 @@ def default_sessions() -> list:
     # A foreign session that already has a native copy.
     copy = make_session("claude", 90, title="Already imported", age=1)
     sessions.append(copy)
-    sessions.append(make_session("claude", 90, foreign=True, title="Already imported",
-                                 age=2, imported_as=copy.key))
+    sessions.append(
+        make_session(
+            "claude", 90, foreign=True, title="Already imported", age=2, imported_as=copy.key
+        )
+    )
     return sessions
 
 
@@ -105,15 +135,17 @@ class FakeEngine:
         self.provider_list = list(providers)
         self.calls = []
         self.fail = {}
-        self.verdicts = {}             # key -> (bool, reason); default (True, "")
-        self.turns = {}                # key -> list of Turn
-        self.default_turns = [Turn("user", "hello there", stamp(minutes=5)),
-                              Turn("tool", "Read", None),
-                              Turn("assistant", "general reply", stamp(minutes=4))]
+        self.verdicts = {}  # key -> (bool, reason); default (True, "")
+        self.turns = {}  # key -> list of Turn
+        self.default_turns = [
+            Turn("user", "hello there", stamp(minutes=5)),
+            Turn("tool", "Read", None),
+            Turn("assistant", "general reply", stamp(minutes=4)),
+        ]
         self.last_quick = stamp(minutes=2)
         self.scan_progress = [("WINVOL", 41000)]
-        self.scan_gate = None          # an Event: scan waits for it (or for cancel)
-        self.on_scan = None            # called with the engine during a scan
+        self.scan_gate = None  # an Event: scan waits for it (or for cancel)
+        self.on_scan = None  # called with the engine during a scan
         self.plan_note = None
         self.import_bytes = 12_000_000
         self.lock = threading.Lock()
@@ -141,8 +173,11 @@ class FakeEngine:
         reloaded index gives."""
         rows = sorted(self.sessions, key=lambda s: s.key)
         rows.sort(key=lambda s: s.updated or "", reverse=True)
-        return [Session.from_dict(s.to_dict()) for s in rows
-                if provider is None or s.provider == provider]
+        return [
+            Session.from_dict(s.to_dict())
+            for s in rows
+            if provider is None or s.provider == provider
+        ]
 
     # --- the engine interface ---
 
@@ -159,11 +194,15 @@ class FakeEngine:
 
     def status(self, index=None):
         self._record("status")
-        return {"last_quick": self.last_quick, "mounts": [
-            {"path": "/", "label": "Linux", "mounted": True},
-            {"path": "/home", "label": "Linux", "mounted": True},
-            {"path": WINDOWS, "label": "WINVOL", "mounted": True},
-            {"path": "/run/media/user/GONE", "label": "GONE", "mounted": False}]}
+        return {
+            "last_quick": self.last_quick,
+            "mounts": [
+                {"path": "/", "label": "Linux", "mounted": True},
+                {"path": "/home", "label": "Linux", "mounted": True},
+                {"path": WINDOWS, "label": "WINVOL", "mounted": True},
+                {"path": "/run/media/user/GONE", "label": "GONE", "mounted": False},
+            ],
+        }
 
     def where(self, session, index):
         return index.where(session)
@@ -196,13 +235,18 @@ class FakeEngine:
         if self.on_scan is not None and not cancelled:
             self.on_scan(self)
         self.last_quick = stamp(seconds=1)
-        return {"mode": "deep" if deep else "quick", "cancelled": cancelled,
-                "seconds": 0.25, "sessions": len(self.sessions), "warnings": []}
+        return {
+            "mode": "deep" if deep else "quick",
+            "cancelled": cancelled,
+            "seconds": 0.25,
+            "sessions": len(self.sessions),
+            "warnings": [],
+        }
 
     def import_session(self, ref, progress=None, index=None):
         self._record("import_session", ref)
         source = self.by_key(ref)
-        if source.imported_as:       # a second import reports the existing copy
+        if source.imported_as:  # a second import reports the existing copy
             return self.by_key(source.imported_as)
         if progress is not None:
             progress(0, self.import_bytes)
@@ -221,19 +265,34 @@ class FakeEngine:
         session = self.by_key(ref)
         if session.origin != "native":
             raise FakeError("import first")
-        return Plan(session.cwd, ["tool", "--resume", session.id],
-                    ["omarchy-launch-tui", "tool", "--resume", session.id], self.plan_note)
+        return Plan(
+            session.cwd,
+            ["tool", "--resume", session.id],
+            ["omarchy-launch-tui", "tool", "--resume", session.id],
+            self.plan_note,
+        )
 
 
 def screen_text(app) -> str:
     """The current screen as plain text, one line per terminal row."""
     from rich.console import Console
+
     width, height = app.size
-    console = Console(width=width, height=height, file=io.StringIO(), force_terminal=True,
-                      color_system="truecolor", record=True, legacy_windows=False,
-                      safe_box=False)
-    console.print(app.screen._compositor.render_update(
-        full=True, screen_stack=app._background_screens, simplify=True))
+    console = Console(
+        width=width,
+        height=height,
+        file=io.StringIO(),
+        force_terminal=True,
+        color_system="truecolor",
+        record=True,
+        legacy_windows=False,
+        safe_box=False,
+    )
+    console.print(
+        app.screen._compositor.render_update(
+            full=True, screen_stack=app._background_screens, simplify=True
+        )
+    )
     return console.export_text()
 
 

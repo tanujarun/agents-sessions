@@ -14,6 +14,12 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from .fsutil import StrPath
 
 ENV = "AGENT_SESSIONS_MOUNTS"
 MOUNTINFO = "/proc/self/mountinfo"
@@ -21,11 +27,32 @@ NATIVE_LABEL = "Linux"
 
 # Filesystems that hold a user's files on a disk. Everything else (proc,
 # sysfs, tmpfs, overlay, squashfs, FUSE portals, network shares) is skipped.
-REAL_FSTYPES = frozenset({
-    "apfs", "bcachefs", "btrfs", "exfat", "ext2", "ext3", "ext4", "f2fs",
-    "fuseblk", "hfs", "hfsplus", "jfs", "msdos", "nilfs2", "ntfs", "ntfs3",
-    "reiserfs", "udf", "ufs", "vfat", "xfs", "zfs",
-})
+REAL_FSTYPES = frozenset(
+    {
+        "apfs",
+        "bcachefs",
+        "btrfs",
+        "exfat",
+        "ext2",
+        "ext3",
+        "ext4",
+        "f2fs",
+        "fuseblk",
+        "hfs",
+        "hfsplus",
+        "jfs",
+        "msdos",
+        "nilfs2",
+        "ntfs",
+        "ntfs3",
+        "reiserfs",
+        "udf",
+        "ufs",
+        "vfat",
+        "xfs",
+        "zfs",
+    }
+)
 # Boot and EFI partitions never hold sessions.
 SKIP_TREES = ("/boot", "/efi")
 # The only mountpoints kept when a device is mounted more than once
@@ -60,8 +87,7 @@ def _entries(text: str) -> dict[str, tuple[str, str, str, str]]:
         head, tail = left.split(" "), right.split(" ")
         if len(head) < 5 or len(tail) < 2:
             continue
-        found[_unescape(head[4])] = (head[2], _unescape(head[3]), tail[0],
-                                     _unescape(tail[1]))
+        found[_unescape(head[4])] = (head[2], _unescape(head[3]), tail[0], _unescape(tail[1]))
     return found
 
 
@@ -107,11 +133,17 @@ def _override() -> list[Mount] | None:
     try:
         items = json.loads(raw)
         return sorted(
-            (Mount(str(i["path"]).rstrip("/") or "/", str(i.get("label") or
-                   _label(str(i["path"]).rstrip("/") or "/")),
-                   str(i.get("fstype", "")), str(i.get("device", "")))
-             for i in items),
-            key=lambda m: m.path)
+            (
+                Mount(
+                    str(i["path"]).rstrip("/") or "/",
+                    str(i.get("label") or _label(str(i["path"]).rstrip("/") or "/")),
+                    str(i.get("fstype", "")),
+                    str(i.get("device", "")),
+                )
+                for i in items
+            ),
+            key=lambda m: m.path,
+        )
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         raise MountsError(f"{ENV} is not a JSON list of {{path, label}}: {exc}") from exc
 
@@ -142,13 +174,13 @@ def mount_points() -> set[str]:
     return set(_entries(_read_mountinfo()))
 
 
-def find_mount(path, mounts) -> Mount | None:
+def find_mount(path: StrPath, mounts: Iterable[Mount]) -> Mount | None:
     """The mount that holds ``path``: the longest mountpoint that is a prefix."""
     text = os.fspath(path)
     best = None
     for mount in mounts:
         base = mount.path.rstrip("/")
-        if text == mount.path or text.startswith(base + "/"):
+        if text == mount.path or text.startswith(base + "/"):  # noqa: SIM102  (two questions)
             if best is None or len(mount.path) > len(best.path):
                 best = mount
     return best

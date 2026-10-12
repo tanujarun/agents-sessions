@@ -13,33 +13,38 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from support import FIXTURES, Sandbox  # noqa: E402
+from support import FIXTURES, Sandbox
 
-from agent_sessions import api, launch  # noqa: E402
-from agent_sessions.fsutil import listdir_ro  # noqa: E402
-from agent_sessions.providers.antigravity import Antigravity  # noqa: E402
-from agent_sessions.providers.claude import Claude  # noqa: E402
-from agent_sessions.providers.codex import Codex  # noqa: E402
-from agent_sessions.providers.gemini import Gemini  # noqa: E402
-from agent_sessions.providers.grok import Grok  # noqa: E402
+from agent_sessions import api, launch
+from agent_sessions.fsutil import listdir_ro
+from agent_sessions.providers.antigravity import Antigravity
+from agent_sessions.providers.claude import Claude
+from agent_sessions.providers.codex import Codex
+from agent_sessions.providers.gemini import Gemini
+from agent_sessions.providers.grok import Grok
 
-REAL = {"antigravity": Antigravity, "claude": Claude, "codex": Codex,
-        "gemini": Gemini, "grok": Grok}
+REAL = {
+    "antigravity": Antigravity,
+    "claude": Claude,
+    "codex": Codex,
+    "gemini": Gemini,
+    "grok": Grok,
+}
 TOOLS = ("agy", "claude", "codex", "grok", launch.LAUNCHER)
 
 # Listed sessions of the Windows fixtures (tests/fixtures/README.md).
-CLAUDE_WIN = "214de9ed-5aa4-4788-8a9f-cec8d18b3a3d"      # has a side directory
+CLAUDE_WIN = "214de9ed-5aa4-4788-8a9f-cec8d18b3a3d"  # has a side directory
 CLAUDE_WIN_PLAIN = "69669cf3-d7ae-4ba4-a028-c6abfd2bd622"
 CODEX_WIN = "01a04ca1-6e27-7817-9f54-07105f962073"
 GROK_WIN = "01a0a4c9-5206-7636-8fb7-5bef47aa8954"
-AGY_WIN = "1ca54b8b-127f-4f86-9cf4-98d04217f5ce"         # cwd F:\Proj\My Site
+AGY_WIN = "1ca54b8b-127f-4f86-9cf4-98d04217f5ce"  # cwd F:\Proj\My Site
 AGY_NO_CWD = "45184a9e-8a4e-4f3f-8c4c-f0e85aeecaaf"
 GEMINI_WIN = "5b0c3e6a-1f2d-4c7b-9a8e-0d1c2b3a4f5e"
 # Listed sessions of the native fixtures.
-CLAUDE_NATIVE = "3f47bd5d-9d03-4733-9887-2452632e5d1a"   # cwd /home/user/My Proj
+CLAUDE_NATIVE = "3f47bd5d-9d03-4733-9887-2452632e5d1a"  # cwd /home/user/My Proj
 CODEX_SEGMENTED = "01a0e538-c7bb-77dd-885b-0c4d54663241"  # base file + one segment
 CODEX_NATIVE = "01a0e914-cf2b-7dcd-a58f-cb54c3f3e8c7"
-GROK_NATIVE = "01a0ec08-671b-72e4-b2fb-47b426cf36e6"     # cwd /home/user/proj
+GROK_NATIVE = "01a0ec08-671b-72e4-b2fb-47b426cf36e6"  # cwd /home/user/proj
 
 
 class World:
@@ -71,10 +76,12 @@ class World:
         which = mock.patch("shutil.which", side_effect=self._which)
         which.start()
         case.addCleanup(which.stop)
-        self.started: list[tuple[list[str], str]] = []    # (command, cwd) of each launch
+        self.started: list[tuple[list[str], str]] = []  # (command, cwd) of each launch
         self.notified: list[str] = []
-        for name, hook in (("starter", lambda command, cwd: self.started.append((command, cwd))),
-                           ("notifier", self.notified.append)):
+        for name, hook in (
+            ("starter", lambda command, cwd: self.started.append((command, cwd))),
+            ("notifier", self.notified.append),
+        ):
             patch = mock.patch.object(launch, name, hook)
             patch.start()
             case.addCleanup(patch.stop)
@@ -96,8 +103,7 @@ class World:
     def session(self, session_id, origin=None, index=None):
         """The listed session with this id (and origin, when given)."""
         index = index if index is not None else api.load_index()
-        found = [s for s in index.sessions
-                 if s.id == session_id and origin in (None, s.origin)]
+        found = [s for s in index.sessions if s.id == session_id and origin in (None, s.origin)]
         self.case.assertEqual(len(found), 1, f"{session_id} {origin}: {found}")
         return found[0]
 
@@ -113,8 +119,12 @@ def tree_state(root) -> dict:
             path = os.path.join(current, name)
             st = os.lstat(path)
             is_dir = os.path.isdir(path) and not os.path.islink(path)
-            state[path] = ("d" if is_dir else "f", 0 if is_dir else st.st_size,
-                           st.st_mtime_ns, st.st_atime_ns)
+            state[path] = (
+                "d" if is_dir else "f",
+                0 if is_dir else st.st_size,
+                st.st_mtime_ns,
+                st.st_atime_ns,
+            )
             if is_dir:
                 stack.append(path)
     return state

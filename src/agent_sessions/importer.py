@@ -33,24 +33,32 @@ import re
 import shutil
 import stat
 import time
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Iterator
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, BinaryIO
 
 from . import __version__
 from .errors import ImportFailed
 from .fsutil import listdir_ro, open_ro, state_dir
 from .model import make_key
 
+if TYPE_CHECKING:
+    from .fsutil import StrPath
+    from .model import Session
+    from .pathmap import PathMap
+
+Progress = Callable[[int, int], None]  # progress(done_bytes, total_bytes)
+
 CHUNK = 1024 * 1024
-HEADROOM = 10            # per cent of the copy size that must stay free on top
+HEADROOM = 10  # per cent of the copy size that must stay free on top
 PROVENANCE = "imports.json"
 PROVENANCE_VERSION = 1
 STAGING_PREFIX = ".agent-sessions-import-"
 # What ``execute`` names its staging directory: prefix, pid, hex time.
 _STAGING_NAME = re.compile(re.escape(STAGING_PREFIX) + r"([0-9]+)-[0-9a-f]+")
-STAGING_MAX_AGE = 3600   # seconds; a younger staging directory is never swept
-FILE_MODE = 0o600        # sessions are private; never wider than the tools write
+STAGING_MAX_AGE = 3600  # seconds; a younger staging directory is never swept
+FILE_MODE = 0o600  # sessions are private; never wider than the tools write
 DIR_MODE = 0o700
 
 
@@ -58,11 +66,12 @@ class Exists(ImportFailed):
     """The session id, or a destination path, is already in the native
     store. ``paths`` are what was found. Nothing was written."""
 
-    def __init__(self, paths):
+    def __init__(self, paths: Iterable[str]) -> None:
         self.paths = sorted(paths)
         more = f" (and {len(self.paths) - 1} more)" if len(self.paths) > 1 else ""
         super().__init__(
-            f"already in the native store: {self.paths[0]}{more}; nothing was overwritten")
+            f"already in the native store: {self.paths[0]}{more}; nothing was overwritten"
+        )
 
 
 class Rewrite:
@@ -75,13 +84,13 @@ class Rewrite:
 
     label = ""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.changes: list[str] = []
 
-    def apply(self, reader) -> Iterator[bytes]:
+    def apply(self, reader: BinaryIO) -> Iterator[bytes]:
         raise NotImplementedError
 
-    def preview(self, src) -> list[str]:
+    def preview(self, src: StrPath) -> list[str]:
         """What ``apply`` would change in ``src``; writes nothing."""
         try:
             with open_ro(src) as reader:
@@ -95,9 +104,9 @@ class Rewrite:
 @dataclass
 class FileCopy:
     src: str
-    rel: str = ""                    # path below the unit; "" when the unit is this file
+    rel: str = ""  # path below the unit; "" when the unit is this file
     size: int = 0
-    rewrite: Rewrite | None = None   # None: byte for byte
+    rewrite: Rewrite | None = None  # None: byte for byte
 
 
 @dataclass
@@ -106,10 +115,10 @@ class Unit:
     rename."""
 
     dst: str
-    src: str = ""                    # the source file or directory, for reports
+    src: str = ""  # the source file or directory, for reports
     files: list[FileCopy] = field(default_factory=list)
     is_dir: bool = False
-    dirs: list[str] = field(default_factory=list)   # sub-directories, parents first
+    dirs: list[str] = field(default_factory=list)  # sub-directories, parents first
 
     @property
     def size(self) -> int:
@@ -134,12 +143,12 @@ class ImportPlan:
     source_mount: str
     source_files: list[str]
     native_root: str
-    cwd: str | None                  # as recorded
-    cwd_local: str                   # where that folder is on this machine
-    units: list[Unit] = field(default_factory=list)      # put in place in this order
+    cwd: str | None  # as recorded
+    cwd_local: str  # where that folder is on this machine
+    units: list[Unit] = field(default_factory=list)  # put in place in this order
     appends: list[Append] = field(default_factory=list)  # after the units
-    existing: list[str] = field(default_factory=list)    # native paths that hold this id
-    info: dict = field(default_factory=dict)             # extra provenance fields
+    existing: list[str] = field(default_factory=list)  # native paths that hold this id
+    info: dict = field(default_factory=dict)  # extra provenance fields
 
     @property
     def total_bytes(self) -> int:
@@ -156,25 +165,30 @@ class ImportPlan:
 
 # --- helpers for adapters ---------------------------------------------------
 
-def start_plan(session, native_root, pathmap) -> ImportPlan:
+
+def start_plan(session: Session, native_root: StrPath, pathmap: PathMap) -> ImportPlan:
     """A plan with everything but the copies filled in. Raises ``ImportFailed``
     when the session's project folder is not on any mounted drive: an import
     without it would resume in the wrong place."""
-    local, exists = (pathmap.to_local(session.cwd, session.mount)
-                     if session.cwd else (None, False))
+    local, exists = pathmap.to_local(session.cwd, session.mount) if session.cwd else (None, False)
     if not exists or not local:
         if not session.cwd:
             raise ImportFailed("the project folder of this session is not recorded")
-        raise ImportFailed(
-            f"the project folder {session.cwd} was not found on any mounted drive")
+        raise ImportFailed(f"the project folder {session.cwd} was not found on any mounted drive")
     return ImportPlan(
-        provider=session.provider, session_id=session.id, source_key=session.key,
-        source_store=session.store, source_mount=session.mount,
-        source_files=list(session.files), native_root=str(native_root),
-        cwd=session.cwd, cwd_local=local)
+        provider=session.provider,
+        session_id=session.id,
+        source_key=session.key,
+        source_store=session.store,
+        source_mount=session.mount,
+        source_files=list(session.files),
+        native_root=str(native_root),
+        cwd=session.cwd,
+        cwd_local=local,
+    )
 
 
-def file_copy(src, rel: str = "", rewrite: Rewrite | None = None) -> FileCopy:
+def file_copy(src: StrPath, rel: str = "", rewrite: Rewrite | None = None) -> FileCopy:
     """A copy of one regular file. Raises ``ImportFailed`` when it is not one."""
     src = os.fspath(src)
     try:
@@ -186,7 +200,9 @@ def file_copy(src, rel: str = "", rewrite: Rewrite | None = None) -> FileCopy:
     return FileCopy(src, rel, st.st_size, rewrite)
 
 
-def tree(src_dir, skip=None) -> tuple[list[str], list[FileCopy]]:
+def tree(
+    src_dir: StrPath, skip: Callable[[str], bool] | None = None
+) -> tuple[list[str], list[FileCopy]]:
     """``(sub-directories, files)`` below ``src_dir``, as relative paths in
     sorted order, parents before children. Symbolic links and special files
     are left out, and so is every file whose name ``skip(name)`` accepts.
@@ -219,11 +235,12 @@ def tree(src_dir, skip=None) -> tuple[list[str], list[FileCopy]]:
     return dirs, files
 
 
-def only_changed(before, after, allowed) -> bool:
+def only_changed(before: object, after: object, allowed: Iterable[tuple[str, ...]]) -> bool:
     """True when two parsed JSON values are equal once the values at the
     ``allowed`` key paths are left out. A path is a tuple of object keys; a
     list on the way stands for each of its elements."""
-    def blank(value, path):
+
+    def blank(value: object, path: tuple[str, ...]) -> object:
         if not path:
             return None
         if isinstance(value, dict):
@@ -239,11 +256,12 @@ def only_changed(before, after, allowed) -> bool:
     return _text(before) == _text(after)
 
 
-def _text(value) -> str:
+def _text(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 # --- checks -----------------------------------------------------------------
+
 
 def human_size(count: int) -> str:
     size = float(count)
@@ -310,7 +328,8 @@ def check(plan: ImportPlan) -> None:
     if free < need:
         raise ImportFailed(
             f"not enough free space on {where}: {human_size(need)} needed "
-            f"(the copy plus {HEADROOM} %), {human_size(free)} free")
+            f"(the copy plus {HEADROOM} %), {human_size(free)} free"
+        )
     read_provenance()
 
 
@@ -319,28 +338,49 @@ def describe(plan: ImportPlan) -> dict:
     would be rewritten to say what would change; writes nothing."""
     copies, rewrites = [], []
     for unit in plan.units:
-        copies.append({"from": unit.src, "to": unit.dst, "dir": unit.is_dir,
-                       "files": len(unit.files), "bytes": unit.size})
+        copies.append(
+            {
+                "from": unit.src,
+                "to": unit.dst,
+                "dir": unit.is_dir,
+                "files": len(unit.files),
+                "bytes": unit.size,
+            }
+        )
         for item in unit.files:
             if item.rewrite is not None:
                 target = os.path.join(unit.dst, item.rel) if item.rel else unit.dst
-                rewrites.append({"file": target, "what": item.rewrite.label,
-                                 "changes": item.rewrite.preview(item.src)})
+                rewrites.append(
+                    {
+                        "file": target,
+                        "what": item.rewrite.label,
+                        "changes": item.rewrite.preview(item.src),
+                    }
+                )
     need, free, where = free_space(plan)
     return {
-        "provider": plan.provider, "id": plan.session_id,
-        "source_key": plan.source_key, "native_key": plan.native_key,
-        "native_store": plan.native_root, "cwd": plan.cwd, "cwd_local": plan.cwd_local,
-        "copies": copies, "rewrites": rewrites,
+        "provider": plan.provider,
+        "id": plan.session_id,
+        "source_key": plan.source_key,
+        "native_key": plan.native_key,
+        "native_store": plan.native_root,
+        "cwd": plan.cwd,
+        "cwd_local": plan.cwd_local,
+        "copies": copies,
+        "rewrites": rewrites,
         "appends": [{"file": a.path, "what": a.label} for a in plan.appends],
-        "bytes": plan.total_bytes, "needed": need, "free": free, "free_on": where,
+        "bytes": plan.total_bytes,
+        "needed": need,
+        "free": free,
+        "free_on": where,
     }
 
 
 # --- execution --------------------------------------------------------------
 
+
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _make_dirs(path: str, made: list[str]) -> None:
@@ -358,20 +398,21 @@ def _make_dirs(path: str, made: list[str]) -> None:
         made.append(directory)
 
 
-def _copy(item: FileCopy, target: str, tick) -> None:
+def _copy(item: FileCopy, target: str, tick: Callable[[int], None]) -> None:
     """Write one staged file: the source's bytes, or what its rewrite yields;
     flushed to disk, with the source's modification time."""
     with open_ro(item.src) as reader:
         source = os.fstat(reader.fileno())
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
-                     FILE_MODE)
+        fd = os.open(
+            target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), FILE_MODE
+        )
         with os.fdopen(fd, "wb") as writer:
             if item.rewrite is not None:
                 chunks = item.rewrite.apply(reader)
                 while True:
                     try:
                         chunk = next(chunks, None)
-                    except ValueError as exc:   # text the rewrite cannot carry over
+                    except ValueError as exc:  # text the rewrite cannot carry over
                         raise ImportFailed(f"{item.src} cannot be rewritten: {exc}") from exc
                     if chunk is None:
                         break
@@ -412,8 +453,9 @@ def _append(item: Append) -> None:
                     data = b"\n" + data
     except FileNotFoundError:
         pass
-    fd = os.open(item.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0),
-                 0o644)
+    fd = os.open(
+        item.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o644
+    )
     try:
         os.write(fd, data)
         os.fsync(fd)
@@ -460,14 +502,14 @@ def _pid_alive(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    except OverflowError:      # not a process id on this system
+    except OverflowError:  # not a process id on this system
         return False
-    except OSError:            # it exists and belongs to someone else
+    except OSError:  # it exists and belongs to someone else
         return True
     return True
 
 
-def sweep_staging(native_root) -> list[str]:
+def sweep_staging(native_root: StrPath) -> list[str]:
     """Remove the staging directories an import that died left at the root
     of a native store; returns the paths it removed.
 
@@ -475,7 +517,7 @@ def sweep_staging(native_root) -> list[str]:
     staging directory, whose process is gone and which was last changed over
     an hour ago. Anything that cannot be listed or removed is left alone."""
     native_root = os.fspath(native_root)
-    removed = []
+    removed: list[str] = []
     try:
         names = sorted(os.listdir(native_root))
     except OSError:
@@ -500,7 +542,7 @@ def sweep_staging(native_root) -> list[str]:
     return removed
 
 
-def execute(plan: ImportPlan, progress=None) -> dict:
+def execute(plan: ImportPlan, progress: Progress | None = None) -> dict:
     """Carry out a plan and return its provenance record.
 
     ``progress(done_bytes, total_bytes)`` is called as the copy advances.
@@ -509,7 +551,7 @@ def execute(plan: ImportPlan, progress=None) -> dict:
     """
     sweep_staging(plan.native_root)
     check(plan)
-    records = read_provenance()    # read again below the checks: this is what gets extended
+    records = read_provenance()  # read again below the checks: this is what gets extended
     total = plan.total_bytes
     done = 0
 
@@ -519,15 +561,16 @@ def execute(plan: ImportPlan, progress=None) -> dict:
         if progress is not None:
             progress(min(done, total), total)
 
-    made_dirs: list[str] = []    # created by this run, outermost first
-    placed: list[str] = []       # units already renamed into the store
+    made_dirs: list[str] = []  # created by this run, outermost first
+    placed: list[str] = []  # units already renamed into the store
     staging = None
     record_tmp = None
     finished = False
     try:
         _make_dirs(plan.native_root, made_dirs)
-        staging = os.path.join(plan.native_root,
-                               f"{STAGING_PREFIX}{os.getpid()}-{time.time_ns():x}")
+        staging = os.path.join(
+            plan.native_root, f"{STAGING_PREFIX}{os.getpid()}-{time.time_ns():x}"
+        )
         os.mkdir(staging, DIR_MODE)
         staged = []
         for number, unit in enumerate(plan.units):
@@ -549,28 +592,33 @@ def execute(plan: ImportPlan, progress=None) -> dict:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         record_tmp = f"{path}.{os.getpid()}.tmp"
         with open(record_tmp, "w", encoding="utf-8") as fh:
-            json.dump({"version": PROVENANCE_VERSION, "imports": records + [record]}, fh,
-                      ensure_ascii=False, indent=1)
+            json.dump(
+                {"version": PROVENANCE_VERSION, "imports": records + [record]},
+                fh,
+                ensure_ascii=False,
+                indent=1,
+            )
             fh.write("\n")
             fh.flush()
             os.fsync(fh.fileno())
 
-        for unit, target in zip(plan.units, staged):
+        for unit, target in zip(plan.units, staged, strict=False):
             _make_dirs(os.path.dirname(unit.dst), made_dirs)
             if os.path.lexists(unit.dst):
                 raise Exists([unit.dst])
             os.replace(target, unit.dst)
             placed.append(unit.dst)
-        for item in plan.appends:
-            _append(item)
+        for addition in plan.appends:
+            _append(addition)
         os.replace(record_tmp, path)
         record_tmp = None
         finished = True
         return record
     except OSError as exc:
         where = f" ({exc.filename})" if exc.filename else ""
-        raise ImportFailed(f"import failed: {exc.strerror or exc}{where}; "
-                           "nothing was left in the native store") from exc
+        raise ImportFailed(
+            f"import failed: {exc.strerror or exc}{where}; nothing was left in the native store"
+        ) from exc
     finally:
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
@@ -581,12 +629,29 @@ def execute(plan: ImportPlan, progress=None) -> dict:
                 _remove(path)
             for directory in reversed(made_dirs):
                 try:
-                    os.rmdir(directory)     # only when nothing else is in it
+                    os.rmdir(directory)  # only when nothing else is in it
                 except OSError:
                     pass
 
 
-__all__ = ["Append", "Exists", "FileCopy", "ImportFailed", "ImportPlan", "Rewrite", "Unit",
-           "check", "describe", "execute", "file_copy", "free_space", "human_size",
-           "only_changed", "provenance_file", "read_provenance", "start_plan", "sweep_staging",
-           "tree"]
+__all__ = [
+    "Append",
+    "Exists",
+    "FileCopy",
+    "ImportFailed",
+    "ImportPlan",
+    "Rewrite",
+    "Unit",
+    "check",
+    "describe",
+    "execute",
+    "file_copy",
+    "free_space",
+    "human_size",
+    "only_changed",
+    "provenance_file",
+    "read_provenance",
+    "start_plan",
+    "sweep_staging",
+    "tree",
+]

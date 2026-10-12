@@ -18,37 +18,59 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from support import FIXTURES, Sandbox  # noqa: E402
+from support import FIXTURES, Sandbox
 
-from agent_sessions import api  # noqa: E402
-from agent_sessions.model import Candidate, Session, Store  # noqa: E402
-from agent_sessions.providers.antigravity import (  # noqa: E402
-    IDE_NOTE, Antigravity, _pbtxt_title, pb_all, pb_fields, pb_first, pb_text,
-    pb_timestamp, uri_to_path)
-from agent_sessions.providers.base import (  # noqa: E402
-    Turn, collect_warnings, open_sqlite_ro, parse_ts)
+from agent_sessions import api
+from agent_sessions.model import Candidate, Session, Store
+from agent_sessions.providers.antigravity import (
+    IDE_NOTE,
+    Antigravity,
+    _pbtxt_title,
+    pb_all,
+    pb_fields,
+    pb_first,
+    pb_text,
+    pb_timestamp,
+    uri_to_path,
+)
+from agent_sessions.providers.base import (
+    Turn,
+    collect_warnings,
+    open_sqlite_ro,
+    parse_ts,
+)
 
 NATIVE = FIXTURES / "antigravity" / "native" / ".gemini" / "antigravity-cli"
 WINDOWS = FIXTURES / "antigravity" / "windows" / ".gemini" / "antigravity-cli"
 IDE = FIXTURES / "antigravity" / "windows" / ".gemini" / "antigravity-ide"
 
-NATIVE_EMPTY = "d3936295-e998-4e42-bb0d-b8ecbb30fed3"     # excluded: 0 steps
-HEADLESS = "1410b3e9-0fcb-4606-81b1-301f7a833e1a"         # cwd from last_conversations.json
-WORKSPACE = "1ca54b8b-127f-4f86-9cf4-98d04217f5ce"        # cwd from workspace_uris
-NO_CWD = "45184a9e-8a4e-4f3f-8c4c-f0e85aeecaaf"           # no recoverable cwd
+NATIVE_EMPTY = "d3936295-e998-4e42-bb0d-b8ecbb30fed3"  # excluded: 0 steps
+HEADLESS = "1410b3e9-0fcb-4606-81b1-301f7a833e1a"  # cwd from last_conversations.json
+WORKSPACE = "1ca54b8b-127f-4f86-9cf4-98d04217f5ce"  # cwd from workspace_uris
+NO_CWD = "45184a9e-8a4e-4f3f-8c4c-f0e85aeecaaf"  # no recoverable cwd
 
 # id: (title, cwd, started, updated, messages)
 LISTED = {
-    HEADLESS: ("title-15", "C:\\Users\\user\\sub1\\sub2\\sub3\\sub4",
-               "2026-08-29T09:14:43.040448Z", "2026-08-29T09:15:05.079779Z", 3),
-    WORKSPACE: ("title-1", "F:/Proj/My Site",
-                "2026-08-29T08:11:33.927210Z", "2026-08-29T08:57:26.263722Z", 7),
-    NO_CWD: ("title-26", None,
-             "2026-08-29T09:10:34.699091Z", "2026-08-29T09:11:11.228914Z", 3),
+    HEADLESS: (
+        "title-15",
+        "C:\\Users\\user\\sub1\\sub2\\sub3\\sub4",
+        "2026-08-29T09:14:43.040448Z",
+        "2026-08-29T09:15:05.079779Z",
+        3,
+    ),
+    WORKSPACE: (
+        "title-1",
+        "F:/Proj/My Site",
+        "2026-08-29T08:11:33.927210Z",
+        "2026-08-29T08:57:26.263722Z",
+        7,
+    ),
+    NO_CWD: ("title-26", None, "2026-08-29T09:10:34.699091Z", "2026-08-29T09:11:11.228914Z", 3),
 }
 
 
 # --- hand-built protobuf ----------------------------------------------------
+
 
 def varint(number: int) -> bytes:
     out = bytearray()
@@ -76,20 +98,29 @@ def pb_time(seconds: int, nanos: int = 0) -> bytes:
 
 class ProtobufReaderTest(unittest.TestCase):
     def test_wire_types(self):
-        data = (b"\x08\x96\x01"                              # 1: varint 150
-                + b"\x12\x07testing"                         # 2: length-delimited
-                + b"\x2d\x01\x02\x03\x04"                    # 5: fixed32
-                + b"\x49\x01\x02\x03\x04\x05\x06\x07\x08"    # 9: fixed64
-                + b"\xa2\x06\x02hi")                         # 100: two-byte key
-        self.assertEqual(pb_fields(data), [
-            (1, 0, 150), (2, 2, b"testing"), (5, 5, b"\x01\x02\x03\x04"),
-            (9, 1, b"\x01\x02\x03\x04\x05\x06\x07\x08"), (100, 2, b"hi")])
+        data = (
+            b"\x08\x96\x01"  # 1: varint 150
+            + b"\x12\x07testing"  # 2: length-delimited
+            + b"\x2d\x01\x02\x03\x04"  # 5: fixed32
+            + b"\x49\x01\x02\x03\x04\x05\x06\x07\x08"  # 9: fixed64
+            + b"\xa2\x06\x02hi"
+        )  # 100: two-byte key
+        self.assertEqual(
+            pb_fields(data),
+            [
+                (1, 0, 150),
+                (2, 2, b"testing"),
+                (5, 5, b"\x01\x02\x03\x04"),
+                (9, 1, b"\x01\x02\x03\x04\x05\x06\x07\x08"),
+                (100, 2, b"hi"),
+            ],
+        )
 
     def test_varints(self):
         self.assertEqual(pb_fields(b"\x08\x00"), [(1, 0, 0)])
         self.assertEqual(pb_fields(b"\x08\x7f"), [(1, 0, 127)])
         self.assertEqual(pb_fields(b"\x08\x80\x01"), [(1, 0, 128)])
-        self.assertEqual(pb_fields(b"\x08" + b"\xff" * 9 + b"\x01"), [(1, 0, 2 ** 64 - 1)])
+        self.assertEqual(pb_fields(b"\x08" + b"\xff" * 9 + b"\x01"), [(1, 0, 2**64 - 1)])
         self.assertEqual(pb_fields(pb_int(3, 1_787_994_883)), [(3, 0, 1_787_994_883)])
 
     def test_empty_and_not_bytes(self):
@@ -100,45 +131,50 @@ class ProtobufReaderTest(unittest.TestCase):
 
     def test_stops_at_what_it_cannot_read_and_keeps_the_rest(self):
         good = b"\x08\x05"
-        for tail in (b"\x12\x0aabc",            # length 10, 3 bytes left
-                     b"\x12",                   # key, no length
-                     b"\x10\x80",               # varint cut off
-                     b"\x80",                   # key cut off
-                     b"\x2d\x01\x02",           # fixed32 cut off
-                     b"\x49\x01\x02\x03",       # fixed64 cut off
-                     b"\x1b\x08\x01\x1c",       # group (wire type 3)
-                     b"\x00\x01",               # field number 0
-                     b"\x10" + b"\xff" * 11,    # varint longer than ten bytes
-                     b"\x0f"):                  # wire type 7
+        for tail in (
+            b"\x12\x0aabc",  # length 10, 3 bytes left
+            b"\x12",  # key, no length
+            b"\x10\x80",  # varint cut off
+            b"\x80",  # key cut off
+            b"\x2d\x01\x02",  # fixed32 cut off
+            b"\x49\x01\x02\x03",  # fixed64 cut off
+            b"\x1b\x08\x01\x1c",  # group (wire type 3)
+            b"\x00\x01",  # field number 0
+            b"\x10" + b"\xff" * 11,  # varint longer than ten bytes
+            b"\x0f",
+        ):  # wire type 7
             with self.subTest(tail=tail):
                 self.assertEqual(pb_fields(good + tail), [(1, 0, 5)])
         self.assertEqual(pb_fields(b"\xff\xff\xff"), [])
 
     def test_nested_paths_and_repeated_fields(self):
-        call = lambda name: pb_bytes(7, pb_bytes(1, "id") + pb_bytes(2, name))     # noqa: E731
+        call = lambda name: pb_bytes(7, pb_bytes(1, "id") + pb_bytes(2, name))  # noqa: E731
         payload = pb_int(1, 15) + pb_bytes(20, pb_bytes(1, "reply") + call("read") + call("grep"))
         self.assertEqual(pb_text(pb_first(payload, 20, 1)), "reply")
         self.assertEqual([pb_text(v) for v in pb_all(payload, 20, 7, 2)], ["read", "grep"])
         self.assertEqual(pb_first(payload, 1), 15)
         self.assertIsNone(pb_first(payload, 20, 9))
-        self.assertIsNone(pb_first(payload, 1, 1))          # a varint has no fields
+        self.assertIsNone(pb_first(payload, 1, 1))  # a varint has no fields
         self.assertEqual(pb_all(payload, 99), [])
         self.assertIsNone(pb_first(None, 1))
         self.assertIsNone(pb_text(15))
         self.assertEqual(pb_text(b"caf\xc3\xa9 \xff"), "café \ufffd")
 
     def test_timestamp(self):
-        self.assertEqual(pb_timestamp(pb_time(1_787_994_883, 40_448_000)),
-                         (1_787_994_883, 40_448_000))
-        self.assertEqual(parse_ts(pb_timestamp(pb_time(1_787_994_883, 40_448_000))),
-                         "2026-08-29T09:14:43.040448Z")
+        self.assertEqual(
+            pb_timestamp(pb_time(1_787_994_883, 40_448_000)), (1_787_994_883, 40_448_000)
+        )
+        self.assertEqual(
+            parse_ts(pb_timestamp(pb_time(1_787_994_883, 40_448_000))),
+            "2026-08-29T09:14:43.040448Z",
+        )
         self.assertEqual(pb_timestamp(pb_int(1, 1_787_994_883)), (1_787_994_883, 0))
         self.assertEqual(pb_timestamp(pb_time(5, 2_000_000_000)), (5, 0))
-        self.assertIsNone(pb_timestamp(pb_time(-62_135_596_800)))      # Go's zero time
+        self.assertIsNone(pb_timestamp(pb_time(-62_135_596_800)))  # Go's zero time
         self.assertIsNone(pb_timestamp(pb_int(2, 5)))
         self.assertIsNone(pb_timestamp(b""))
         self.assertIsNone(pb_timestamp(None))
-        self.assertIsNone(pb_timestamp(pb_time(1_787_994_883)[:3]))    # cut inside the seconds
+        self.assertIsNone(pb_timestamp(pb_time(1_787_994_883)[:3]))  # cut inside the seconds
 
     def test_fixture_blobs(self):
         con = open_sqlite_ro(WINDOWS / "conversations" / f"{WORKSPACE}.db")
@@ -149,23 +185,28 @@ class ProtobufReaderTest(unittest.TestCase):
         self.assertEqual(pb_text(pb_first(blob, 6)), WORKSPACE)
         self.assertEqual(parse_ts(pb_timestamp(pb_first(blob, 2))), LISTED[WORKSPACE][2])
         metadata = con.execute("SELECT metadata FROM steps ORDER BY idx LIMIT 1").fetchone()[0]
-        self.assertEqual(parse_ts(pb_timestamp(pb_first(metadata, 1))),
-                         "2026-08-29T08:37:05.396470Z")
+        self.assertEqual(
+            parse_ts(pb_timestamp(pb_first(metadata, 1))), "2026-08-29T08:37:05.396470Z"
+        )
 
 
 class SmallValuesTest(unittest.TestCase):
     def test_uri_to_path(self):
         for uri, path in (
-                ("file:///F:/AI%20Projects/Website%20Works", "F:/AI Projects/Website Works"),
-                ("file:///c:/Users/user", "c:/Users/user"),
-                ("file:///home/user/My%20Proj", "/home/user/My Proj"),
-                ("file:///home/user/100%25%23x", "/home/user/100%#x"),
-                ("file://localhost/home/user", "/home/user"),
-                ("file://server/share/dir", "//server/share/dir"),
-                ("/already/a/path", "/already/a/path"),
-                ("C:\\Users\\user", "C:\\Users\\user"),
-                ("vscode-remote://ssh/host/dir", None),
-                ("", None), ("   ", None), (None, None), (5, None)):
+            ("file:///F:/AI%20Projects/Website%20Works", "F:/AI Projects/Website Works"),
+            ("file:///c:/Users/user", "c:/Users/user"),
+            ("file:///home/user/My%20Proj", "/home/user/My Proj"),
+            ("file:///home/user/100%25%23x", "/home/user/100%#x"),
+            ("file://localhost/home/user", "/home/user"),
+            ("file://server/share/dir", "//server/share/dir"),
+            ("/already/a/path", "/already/a/path"),
+            ("C:\\Users\\user", "C:\\Users\\user"),
+            ("vscode-remote://ssh/host/dir", None),
+            ("", None),
+            ("   ", None),
+            (None, None),
+            (5, None),
+        ):
             with self.subTest(uri=uri):
                 self.assertEqual(uri_to_path(uri), path)
 
@@ -174,14 +215,17 @@ class SmallValuesTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         path = tmp / "a.pbtxt"
         for raw, title in (
-                (b'title:"Plain title"', "Plain title"),
-                (b'other: 1\n  title : "second line"\n', "second line"),
-                (b'title:"say \\"hi\\" \\\\ \\n\\tend"', 'say "hi" \\ \n\tend'),
-                (b'title:"caf\\303\\251 \\x41\\101"', "café AA"),
-                (b'title:"caf\xc3\xa9"', "café"),
-                (b'title:"odd \\8 \\x"', "odd 8 x"),
-                (b'title:""', ""), (b"", ""), (b"\x00\x01garbage", ""),
-                (b'title:"never closed', "")):
+            (b'title:"Plain title"', "Plain title"),
+            (b'other: 1\n  title : "second line"\n', "second line"),
+            (b'title:"say \\"hi\\" \\\\ \\n\\tend"', 'say "hi" \\ \n\tend'),
+            (b'title:"caf\\303\\251 \\x41\\101"', "café AA"),
+            (b'title:"caf\xc3\xa9"', "café"),
+            (b'title:"odd \\8 \\x"', "odd 8 x"),
+            (b'title:""', ""),
+            (b"", ""),
+            (b"\x00\x01garbage", ""),
+            (b'title:"never closed', ""),
+        ):
             with self.subTest(raw=raw):
                 path.write_bytes(raw)
                 self.assertEqual(_pbtxt_title(path), title)
@@ -189,6 +233,7 @@ class SmallValuesTest(unittest.TestCase):
 
 
 # --- the adapter -------------------------------------------------------------
+
 
 def fixture_store(root) -> Store:
     return Store("antigravity", str(root), origin="native" if root == NATIVE else "foreign")
@@ -261,13 +306,23 @@ class CandidatesTest(AgyCase):
                 found = self.provider.candidates(fixture_store(root))
                 self.assertEqual([c.id_hint for c in found], ids)
                 for c in found:
-                    self.assertEqual(c.paths, [
-                        str(root / "conversations" / f"{c.id_hint}.db"),
-                        str(root / "conversation_summaries.db"),
-                        str(root / "annotations" / f"{c.id_hint}.pbtxt"),
-                        str(root / "cache" / "last_conversations.json"),
-                        str(root / "brain" / c.id_hint / ".system_generated" / "logs"
-                            / "transcript.jsonl")])
+                    self.assertEqual(
+                        c.paths,
+                        [
+                            str(root / "conversations" / f"{c.id_hint}.db"),
+                            str(root / "conversation_summaries.db"),
+                            str(root / "annotations" / f"{c.id_hint}.pbtxt"),
+                            str(root / "cache" / "last_conversations.json"),
+                            str(
+                                root
+                                / "brain"
+                                / c.id_hint
+                                / ".system_generated"
+                                / "logs"
+                                / "transcript.jsonl"
+                            ),
+                        ],
+                    )
 
     def test_counts_match_the_readme(self):
         for root, listed, count in ((NATIVE, 0, 1), (WINDOWS, 3, 3), (IDE, 0, 0)):
@@ -277,8 +332,8 @@ class CandidatesTest(AgyCase):
 
     def test_paths_are_listed_even_when_absent(self):
         paths = self.candidate(fixture_store(NATIVE), NATIVE_EMPTY).paths
-        self.assertFalse(os.path.exists(paths[2]))      # no annotations/ in the native store
-        self.assertFalse(os.path.exists(paths[4]))      # no brain log
+        self.assertFalse(os.path.exists(paths[2]))  # no annotations/ in the native store
+        self.assertFalse(os.path.exists(paths[4]))  # no brain log
 
     def test_sidecars_lock_files_and_dot_files_are_not_candidates(self):
         store = self.copy()
@@ -298,18 +353,25 @@ class FixtureParseTest(AgyCase):
                 s = sessions[ident]
                 self.assertEqual((s.title, s.cwd, s.messages), (title, cwd, messages))
                 self.assertEqual((s.started, s.updated), (started, updated))
-                self.assertEqual(s.files, [
-                    str(WINDOWS / "conversations" / f"{ident}.db"),
-                    str(WINDOWS / "brain" / ident),
-                    str(WINDOWS / "annotations" / f"{ident}.pbtxt")])
+                self.assertEqual(
+                    s.files,
+                    [
+                        str(WINDOWS / "conversations" / f"{ident}.db"),
+                        str(WINDOWS / "brain" / ident),
+                        str(WINDOWS / "annotations" / f"{ident}.pbtxt"),
+                    ],
+                )
                 self.assertIsNone(s.note)
-                self.assertEqual((s.provider, s.store, s.origin),
-                                 ("antigravity", str(WINDOWS), "foreign"))
+                self.assertEqual(
+                    (s.provider, s.store, s.origin), ("antigravity", str(WINDOWS), "foreign")
+                )
 
     def test_where_cwd_and_title_came_from(self):
         store = fixture_store(WINDOWS)
-        self.assertEqual(self.sources(store, WORKSPACE),
-                         {"title": "conversation_summaries.title", "cwd": "workspace_uris"})
+        self.assertEqual(
+            self.sources(store, WORKSPACE),
+            {"title": "conversation_summaries.title", "cwd": "workspace_uris"},
+        )
         self.assertEqual(self.sources(store, HEADLESS)["cwd"], "last_conversations.json")
         self.assertEqual(self.sources(store, NO_CWD)["cwd"], "none")
 
@@ -329,6 +391,7 @@ class FixtureParseTest(AgyCase):
         """FORMATS section 6. More in tests/test_importer.py."""
         from agent_sessions.providers import antigravity as module
         from agent_sessions.providers.base import NotSupported
+
         for call in (self.provider.import_plan, self.provider.import_session):
             with self.assertRaises(NotSupported) as caught:
                 call(None, None)
@@ -338,8 +401,10 @@ class FixtureParseTest(AgyCase):
 class ReadOnlyTest(AgyCase):
     def test_fixture_databases_are_wal_mode_files_at_rest(self):
         for root in (NATIVE, WINDOWS):
-            for path in [root / "conversation_summaries.db",
-                         *(root / "conversations").glob("*.db")]:
+            for path in [
+                root / "conversation_summaries.db",
+                *(root / "conversations").glob("*.db"),
+            ]:
                 with open(path, "rb") as fh:
                     self.assertEqual(fh.read(20)[18:20], b"\x02\x02", path)
             self.assertEqual(sidecars(root), [])
@@ -357,9 +422,15 @@ class ReadOnlyTest(AgyCase):
                     sessions = [s for s in sessions if s is not None]
                     for s in sessions:
                         list(self.provider.transcript(s))
-                        os.unlink(Path(store.root) / "brain" / s.id / ".system_generated"
-                                  / "logs" / "transcript.jsonl")
-                        list(self.provider.transcript(s))       # the steps table this time
+                        os.unlink(
+                            Path(store.root)
+                            / "brain"
+                            / s.id
+                            / ".system_generated"
+                            / "logs"
+                            / "transcript.jsonl"
+                        )
+                        list(self.provider.transcript(s))  # the steps table this time
                 self.assertEqual(collected.items, [])
                 self.assertEqual(len(sessions), 3 if source == WINDOWS else 0)
                 after = tree_state(store.root)
@@ -384,20 +455,29 @@ class ReadOnlyTest(AgyCase):
         with mock.patch.object(sqlite3, "connect", connect):
             sessions = self.provider.list_sessions(store)
             for s in sessions:
-                os.unlink(Path(store.root) / "brain" / s.id / ".system_generated" / "logs"
-                          / "transcript.jsonl")
+                os.unlink(
+                    Path(store.root)
+                    / "brain"
+                    / s.id
+                    / ".system_generated"
+                    / "logs"
+                    / "transcript.jsonl"
+                )
                 list(self.provider.transcript(s))
         self.assertEqual(len(sessions), 3)
-        self.assertGreaterEqual(len(opened), 9)     # conversation + summaries + steps, each
+        self.assertGreaterEqual(len(opened), 9)  # conversation + summaries + steps, each
         for con in opened:
-            with self.assertRaises(sqlite3.ProgrammingError):   # closed
+            with self.assertRaises(sqlite3.ProgrammingError):  # closed
                 con.execute("SELECT 1")
 
 
 class DamagedStoreTest(AgyCase):
     def test_garbage_database_is_a_warning(self):
-        for data in (b"this is not a database, just bytes " * 40, b"",
-                     b"SQLite format 3\x00" + b"\x00" * 200):
+        for data in (
+            b"this is not a database, just bytes " * 40,
+            b"",
+            b"SQLite format 3\x00" + b"\x00" * 200,
+        ):
             with self.subTest(size=len(data)):
                 self.setUp()
                 store = self.copy()
@@ -406,8 +486,10 @@ class DamagedStoreTest(AgyCase):
                 self.assertIsNone(session)
                 self.assertEqual(len(warnings), 1)
                 self.assertIn(f"{HEADLESS}.db", warnings[0])
-                self.assertEqual(sorted(s.id for s in self.provider.list_sessions(store)),
-                                 sorted([WORKSPACE, NO_CWD]))
+                self.assertEqual(
+                    sorted(s.id for s in self.provider.list_sessions(store)),
+                    sorted([WORKSPACE, NO_CWD]),
+                )
                 self.assertEqual(sidecars(store.root), [])
 
     def test_database_that_vanished_is_a_warning(self):
@@ -437,25 +519,26 @@ class DamagedStoreTest(AgyCase):
         sessions = {s.id: s for s in self.provider.list_sessions(store)}
         self.assertEqual(sorted(sessions), sorted(LISTED))
         s = sessions[WORKSPACE]
-        self.assertEqual(s.title, "title-1")                        # annotations/<id>.pbtxt
-        self.assertEqual(s.cwd, "F:/Proj/My Site")                  # metadata blob field 7
-        self.assertEqual(s.started, LISTED[WORKSPACE][2])           # metadata blob field 2
+        self.assertEqual(s.title, "title-1")  # annotations/<id>.pbtxt
+        self.assertEqual(s.cwd, "F:/Proj/My Site")  # metadata blob field 7
+        self.assertEqual(s.started, LISTED[WORKSPACE][2])  # metadata blob field 2
         self.assertEqual(s.updated, "2026-08-29T08:57:22.335249Z")  # last step metadata
         self.assertEqual(s.messages, 7)
-        self.assertEqual(self.sources(store, WORKSPACE),
-                         {"title": "annotations", "cwd": "metadata blob field 7"})
-        self.assertEqual(sessions[HEADLESS].cwd, LISTED[HEADLESS][1])   # last_conversations.json
+        self.assertEqual(
+            self.sources(store, WORKSPACE), {"title": "annotations", "cwd": "metadata blob field 7"}
+        )
+        self.assertEqual(sessions[HEADLESS].cwd, LISTED[HEADLESS][1])  # last_conversations.json
         self.assertIsNone(sessions[NO_CWD].cwd)
 
     def test_title_fallback_chain(self):
         store = self.copy()
         summaries = Path(store.root) / "conversation_summaries.db"
         self.edit(summaries, "UPDATE conversation_summaries SET title = ''")
-        self.assertEqual(self.listed(store, WORKSPACE).title, "title-1")       # annotation
+        self.assertEqual(self.listed(store, WORKSPACE).title, "title-1")  # annotation
         os.unlink(Path(store.root) / "annotations" / f"{WORKSPACE}.pbtxt")
-        self.assertEqual(self.listed(store, WORKSPACE).title, "text-2")        # preview
+        self.assertEqual(self.listed(store, WORKSPACE).title, "text-2")  # preview
         self.edit(summaries, "UPDATE conversation_summaries SET preview = ''")
-        self.assertEqual(self.listed(store, WORKSPACE).title, "text-3")        # first USER_INPUT
+        self.assertEqual(self.listed(store, WORKSPACE).title, "text-3")  # first USER_INPUT
         self.assertEqual(self.sources(store, WORKSPACE)["title"], "first user input")
         shutil.rmtree(Path(store.root) / "brain" / WORKSPACE)
         s = self.listed(store, WORKSPACE)
@@ -466,26 +549,34 @@ class DamagedStoreTest(AgyCase):
         store = self.copy()
         (Path(store.root) / "conversation_summaries.db").write_bytes(b"garbage " * 100)
         session, warnings = self.parse(store, WORKSPACE)
-        self.assertEqual((session.title, session.cwd, session.messages),
-                         ("title-1", "F:/Proj/My Site", 7))
+        self.assertEqual(
+            (session.title, session.cwd, session.messages), ("title-1", "F:/Proj/My Site", 7)
+        )
         self.assertEqual(len(warnings), 1)
         self.assertIn("conversation_summaries.db", warnings[0])
 
     def test_conversation_without_a_summaries_row(self):
         store = self.copy()
-        self.edit(Path(store.root) / "conversation_summaries.db",
-                  "DELETE FROM conversation_summaries WHERE conversation_id = ?", (NO_CWD,))
+        self.edit(
+            Path(store.root) / "conversation_summaries.db",
+            "DELETE FROM conversation_summaries WHERE conversation_id = ?",
+            (NO_CWD,),
+        )
         s = self.listed(store, NO_CWD)
         self.assertEqual((s.title, s.cwd, s.messages), ("title-26", None, 3))
-        self.assertEqual(s.updated, "2026-08-29T09:11:11.117676Z")     # last step metadata
+        self.assertEqual(s.updated, "2026-08-29T09:11:11.117676Z")  # last step metadata
 
     def test_empty_workspace_uris(self):
         store = self.copy()
         summaries = Path(store.root) / "conversation_summaries.db"
         for value in ("", "[]", "not json", '["vscode-remote://x/y"]', "{}"):
             with self.subTest(workspace_uris=value):
-                self.edit(summaries, "UPDATE conversation_summaries SET workspace_uris = ? "
-                                     "WHERE conversation_id = ?", (value, WORKSPACE))
+                self.edit(
+                    summaries,
+                    "UPDATE conversation_summaries SET workspace_uris = ? "
+                    "WHERE conversation_id = ?",
+                    (value, WORKSPACE),
+                )
                 s = self.listed(store, WORKSPACE)
                 self.assertEqual(s.cwd, "F:/Proj/My Site")
                 self.assertEqual(self.sources(store, WORKSPACE)["cwd"], "metadata blob field 7")
@@ -493,7 +584,7 @@ class DamagedStoreTest(AgyCase):
         self.assertEqual(self.listed(store, HEADLESS).cwd, LISTED[HEADLESS][1])
         cache = Path(store.root) / "cache" / "last_conversations.json"
         cache.write_text(json.dumps({"D:\\b": HEADLESS, "D:\\a": HEADLESS, "E:\\other": NO_CWD}))
-        self.assertEqual(self.listed(store, HEADLESS).cwd, "D:\\a")        # sorted: deterministic
+        self.assertEqual(self.listed(store, HEADLESS).cwd, "D:\\a")  # sorted: deterministic
         self.assertEqual(self.listed(store, NO_CWD).cwd, "E:\\other")
         cache.write_text("{broken")
         session, warnings = self.parse(store, HEADLESS)
@@ -505,8 +596,11 @@ class DamagedStoreTest(AgyCase):
     def test_native_uri(self):
         store = self.copy(NATIVE)
         db = self.conv(store, NATIVE_EMPTY)
-        self.edit(db, "INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 14, 3, ?)",
-                  (pb_bytes(1, pb_time(1_790_000_000, 5_000)),))
+        self.edit(
+            db,
+            "INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 14, 3, ?)",
+            (pb_bytes(1, pb_time(1_790_000_000, 5_000)),),
+        )
         s = self.listed(store, NATIVE_EMPTY)
         self.assertEqual((s.cwd, s.title, s.messages), ("/home/user", NATIVE_EMPTY[:8], 1))
         self.assertEqual(s.started, "2026-09-27T22:36:20.053832Z")
@@ -544,14 +638,23 @@ class DamagedStoreTest(AgyCase):
     def test_sub_agent_conversations_are_excluded(self):
         store = self.copy()
         summaries = Path(store.root) / "conversation_summaries.db"
-        self.edit(summaries, "UPDATE conversation_summaries SET parent_conversation_id = ? "
-                             "WHERE conversation_id = ?", (WORKSPACE, HEADLESS))
-        self.edit(summaries, "UPDATE conversation_summaries SET nesting_depth = 1 "
-                             "WHERE conversation_id = ?", (NO_CWD,))
+        self.edit(
+            summaries,
+            "UPDATE conversation_summaries SET parent_conversation_id = ? "
+            "WHERE conversation_id = ?",
+            (WORKSPACE, HEADLESS),
+        )
+        self.edit(
+            summaries,
+            "UPDATE conversation_summaries SET nesting_depth = 1 WHERE conversation_id = ?",
+            (NO_CWD,),
+        )
         self.assertEqual(self.parse(store, HEADLESS), (None, []))
         self.assertEqual(self.parse(store, NO_CWD), (None, []))
-        self.edit(self.conv(store, WORKSPACE),
-                  "INSERT INTO parent_references (idx, data) VALUES (0, x'0a00')")
+        self.edit(
+            self.conv(store, WORKSPACE),
+            "INSERT INTO parent_references (idx, data) VALUES (0, x'0a00')",
+        )
         self.assertEqual(self.parse(store, WORKSPACE), (None, []))
         self.assertEqual(self.provider.list_sessions(store), [])
 
@@ -560,16 +663,20 @@ class DamagedStoreTest(AgyCase):
         store = self.copy()
         self.edit(self.conv(store, HEADLESS), "DELETE FROM steps")
         s = self.listed(store, HEADLESS)
-        self.assertEqual((s.messages, s.title), (4, "title-15"))        # step_count
-        self.edit(Path(store.root) / "conversation_summaries.db",
-                  "UPDATE conversation_summaries SET step_count = 0 WHERE conversation_id = ?",
-                  (HEADLESS,))
+        self.assertEqual((s.messages, s.title), (4, "title-15"))  # step_count
+        self.edit(
+            Path(store.root) / "conversation_summaries.db",
+            "UPDATE conversation_summaries SET step_count = 0 WHERE conversation_id = ?",
+            (HEADLESS,),
+        )
         self.assertEqual(self.parse(store, HEADLESS), (None, []))
 
     def test_messages_count_only_user_and_planner_steps(self):
         store = self.copy()
-        self.edit(self.conv(store, NO_CWD),
-                  "INSERT INTO steps (idx, step_type, status) VALUES (9, 132, 3), (10, 99, 3)")
+        self.edit(
+            self.conv(store, NO_CWD),
+            "INSERT INTO steps (idx, step_type, status) VALUES (9, 132, 3), (10, 99, 3)",
+        )
         self.assertEqual(self.listed(store, NO_CWD).messages, 3)
 
 
@@ -587,8 +694,9 @@ class IdeStoreTest(AgyCase):
         (conversations / "8a21c259-0000-4000-8000-000000000000.pb").write_bytes(b"\x0a\x03abc")
         (conversations / "a-directory").mkdir()
         hints = [c.id_hint for c in self.provider.candidates(store)]
-        self.assertEqual(hints, ["unknown:8a21c259-0000-4000-8000-000000000000.pb",
-                                 "unknown:a-directory"])
+        self.assertEqual(
+            hints, ["unknown:8a21c259-0000-4000-8000-000000000000.pb", "unknown:a-directory"]
+        )
         with collect_warnings() as collected:
             self.assertEqual(self.provider.list_sessions(store), [])
         self.assertEqual(len(collected.items), 2)
@@ -598,52 +706,104 @@ class IdeStoreTest(AgyCase):
 class TranscriptTest(AgyCase):
     def test_fixture_transcripts_from_the_brain_log(self):
         store = fixture_store(WINDOWS)
-        self.assertEqual(list(self.provider.transcript(self.listed(store, HEADLESS))), [
-            Turn("user", "text-17", "2026-08-29T09:14:43.000000Z"),
-            Turn("tool", "name-19", "2026-08-29T09:14:43.000000Z"),
-            Turn("assistant", "text-25", "2026-08-29T09:15:02.000000Z")])
+        self.assertEqual(
+            list(self.provider.transcript(self.listed(store, HEADLESS))),
+            [
+                Turn("user", "text-17", "2026-08-29T09:14:43.000000Z"),
+                Turn("tool", "name-19", "2026-08-29T09:14:43.000000Z"),
+                Turn("assistant", "text-25", "2026-08-29T09:15:02.000000Z"),
+            ],
+        )
         turns = list(self.provider.transcript(self.listed(store, WORKSPACE)))
-        self.assertEqual([(t.role, t.text) for t in turns], [
-            ("user", "text-3"), ("tool", "list_dir"), ("assistant", "text-9"),
-            ("user", "text-11"), ("assistant", "text-12"),
-            ("user", "text-13"), ("assistant", "text-14")])
+        self.assertEqual(
+            [(t.role, t.text) for t in turns],
+            [
+                ("user", "text-3"),
+                ("tool", "list_dir"),
+                ("assistant", "text-9"),
+                ("user", "text-11"),
+                ("assistant", "text-12"),
+                ("user", "text-13"),
+                ("assistant", "text-14"),
+            ],
+        )
         self.assertEqual([t.ts for t in turns], sorted(t.ts for t in turns))
         self.assertEqual(
             [(t.role, t.text) for t in self.provider.transcript(self.listed(store, NO_CWD))],
-            [("user", "text-28"), ("tool", "name-19"), ("tool", "name-35")])
+            [("user", "text-28"), ("tool", "name-19"), ("tool", "name-35")],
+        )
 
     def test_log_content_and_order(self):
         store = self.copy()
-        log = (Path(store.root) / "brain" / HEADLESS / ".system_generated" / "logs"
-               / "transcript.jsonl")
+        log = (
+            Path(store.root)
+            / "brain"
+            / HEADLESS
+            / ".system_generated"
+            / "logs"
+            / "transcript.jsonl"
+        )
         records = [
-            {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT",
-             "created_at": "2026-08-29T09:00:00Z",
-             "content": "<USER_REQUEST>\nmake it blue\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\n"
-                        "local time\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nx\n"
-                        "</USER_SETTINGS_CHANGE>"},
-            {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE",
-             "created_at": "2026-08-29T09:00:01Z", "thinking": "private reasoning",
-             "content": "On it.",
-             "tool_calls": [{"name": "view_file", "args": {"p": "secret"}},
-                            {"name": "run_command", "args": {}}, {"args": {}}]},
-            {"step_index": 2, "source": "MODEL", "type": "GENERIC",
-             "created_at": "2026-08-29T09:00:02Z", "content": "tool output"},
-            {"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE",
-             "created_at": "2026-08-29T09:00:03Z", "thinking": "only thinking"},
-            {"step_index": 4, "source": "USER_EXPLICIT", "type": "USER_INPUT",
-             "created_at": "2026-08-29T09:00:04Z", "content": "no wrapper"},
+            {
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "2026-08-29T09:00:00Z",
+                "content": "<USER_REQUEST>\nmake it blue\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\n"
+                "local time\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nx\n"
+                "</USER_SETTINGS_CHANGE>",
+            },
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-08-29T09:00:01Z",
+                "thinking": "private reasoning",
+                "content": "On it.",
+                "tool_calls": [
+                    {"name": "view_file", "args": {"p": "secret"}},
+                    {"name": "run_command", "args": {}},
+                    {"args": {}},
+                ],
+            },
+            {
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "created_at": "2026-08-29T09:00:02Z",
+                "content": "tool output",
+            },
+            {
+                "step_index": 3,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-08-29T09:00:03Z",
+                "thinking": "only thinking",
+            },
+            {
+                "step_index": 4,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "2026-08-29T09:00:04Z",
+                "content": "no wrapper",
+            },
             {"step_index": 5, "type": "SOMETHING_NEW", "content": "x"},
         ]
-        log.write_bytes(b"".join(json.dumps(r).encode() + b"\n" for r in records)
-                        + b'{"step_index": 6, "type": "USER_INPUT", "content": "half')
+        log.write_bytes(
+            b"".join(json.dumps(r).encode() + b"\n" for r in records)
+            + b'{"step_index": 6, "type": "USER_INPUT", "content": "half'
+        )
         s = self.listed(store, HEADLESS)
-        self.assertEqual(list(self.provider.transcript(s)), [
-            Turn("user", "make it blue", "2026-08-29T09:00:00.000000Z"),
-            Turn("assistant", "On it.", "2026-08-29T09:00:01.000000Z"),
-            Turn("tool", "view_file", "2026-08-29T09:00:01.000000Z"),
-            Turn("tool", "run_command", "2026-08-29T09:00:01.000000Z"),
-            Turn("user", "no wrapper", "2026-08-29T09:00:04.000000Z")])
+        self.assertEqual(
+            list(self.provider.transcript(s)),
+            [
+                Turn("user", "make it blue", "2026-08-29T09:00:00.000000Z"),
+                Turn("assistant", "On it.", "2026-08-29T09:00:01.000000Z"),
+                Turn("tool", "view_file", "2026-08-29T09:00:01.000000Z"),
+                Turn("tool", "run_command", "2026-08-29T09:00:01.000000Z"),
+                Turn("user", "no wrapper", "2026-08-29T09:00:04.000000Z"),
+            ],
+        )
 
     def test_steps_table_when_there_is_no_log(self):
         store = self.copy()
@@ -658,16 +818,20 @@ class TranscriptTest(AgyCase):
             1: pb_int(1, 15) + pb_bytes(20, pb_bytes(3, "private reasoning") + tool + tool),
             2: pb_int(1, 132) + pb_bytes(140, pb_bytes(1, "tool output")),
             # the reasoning field is cut off; the reply before it still reads
-            3: pb_int(1, 15) + pb_bytes(20, pb_bytes(1, "Done: it is blue.")
-                                        + pb_bytes(3, "more reasoning")[:-1]),
+            3: pb_int(1, 15)
+            + pb_bytes(20, pb_bytes(1, "Done: it is blue.") + pb_bytes(3, "more reasoning")[:-1]),
         }
         for idx, payload in payloads.items():
             self.edit(db, "UPDATE steps SET step_payload = ? WHERE idx = ?", (payload, idx))
-        self.assertEqual(list(self.provider.transcript(s)), [
-            Turn("user", "make it blue", "2026-08-29T09:14:43.066548Z"),
-            Turn("tool", "view_file", "2026-08-29T09:14:43.137965Z"),
-            Turn("tool", "view_file", "2026-08-29T09:14:43.137965Z"),
-            Turn("assistant", "Done: it is blue.", "2026-08-29T09:15:02.058732Z")])
+        self.assertEqual(
+            list(self.provider.transcript(s)),
+            [
+                Turn("user", "make it blue", "2026-08-29T09:14:43.066548Z"),
+                Turn("tool", "view_file", "2026-08-29T09:14:43.137965Z"),
+                Turn("tool", "view_file", "2026-08-29T09:14:43.137965Z"),
+                Turn("assistant", "Done: it is blue.", "2026-08-29T09:15:02.058732Z"),
+            ],
+        )
         self.assertEqual(sidecars(store.root), [])
 
     def test_session_without_files_or_with_a_missing_database(self):
@@ -690,8 +854,10 @@ class IndexIntegrationTest(unittest.TestCase):
         before = {root: tree_state(root) for root in (box.home, disk)}
         summary = api.scan(deep=True)
         self.assertEqual(summary["warnings"], [])
-        self.assertEqual((summary["stores"], summary["candidates"], summary["sessions"],
-                          summary["parsed"]), (3, 4, 3, 4))
+        self.assertEqual(
+            (summary["stores"], summary["candidates"], summary["sessions"], summary["parsed"]),
+            (3, 4, 3, 4),
+        )
         sessions = api.list_sessions("antigravity")
         self.assertEqual({s.id for s in sessions}, set(LISTED))
         self.assertEqual({s.origin for s in sessions}, {"foreign"})

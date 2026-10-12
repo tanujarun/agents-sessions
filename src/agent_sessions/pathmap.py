@@ -15,22 +15,30 @@ import os
 import re
 import urllib.parse
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .fsutil import config_dir, listdir_ro
 
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+    from .mounts import Mount
+
 OVERRIDE_FILE = "pathmap.json"
-HOST_ROOT = "/" if os.sep == "/" else None   # a Windows host has drive roots
+HOST_ROOT = "/" if os.sep == "/" else None  # a Windows host has drive roots
 
 # (segments recorded, segments on disk). A trailing "*" matches any suffix.
 # Claude Desktop is an MSIX app: Windows shows it AppData\Roaming\Claude but
 # the files are in the package's private copy.
 REDIRECTS = (
-    (("AppData", "Roaming", "Claude"),
-     ("AppData", "Local", "Packages", "Claude_*", "LocalCache", "Roaming", "Claude")),
+    (
+        ("AppData", "Roaming", "Claude"),
+        ("AppData", "Local", "Packages", "Claude_*", "LocalCache", "Roaming", "Claude"),
+    ),
 )
 # Directories that mark the Windows system volume.
 SYSTEM_VOLUME_DIRS = ("users", "windows")
-SYSTEM_LETTER = "C:"   # what Windows calls the volume it runs from
+SYSTEM_LETTER = "C:"  # what Windows calls the volume it runs from
 
 _DRIVE = re.compile(r"^([A-Za-z]):(?:[\\/]+(.*))?$", re.S)
 _SPLIT_ANY = re.compile(r"[\\/]+")
@@ -38,11 +46,11 @@ _SPLIT_ANY = re.compile(r"[\\/]+")
 
 @dataclass(frozen=True)
 class Recorded:
-    root: str      # "F:" (always upper case) or "/"
-    parts: tuple   # the segments below the root
+    root: str  # "F:" (always upper case) or "/"
+    parts: tuple  # the segments below the root
 
 
-def normalise(recorded) -> Recorded | None:
+def normalise(recorded: object) -> Recorded | None:
     """Reduce a recorded path to root and segments; None when it has no root
     that can be mapped (relative, UNC, empty, not a string).
 
@@ -73,7 +81,7 @@ def normalise(recorded) -> Recorded | None:
     return None
 
 
-def _mount_path(mount) -> str:
+def _mount_path(mount: Mount | str) -> str:
     return mount if isinstance(mount, str) else mount.path
 
 
@@ -84,7 +92,9 @@ def _join(base: str, name: str) -> str:
 class PathMap:
     """Use ``PathMap.build(mounts, evidence)``."""
 
-    def __init__(self, mounts, overrides=None):
+    def __init__(
+        self, mounts: Iterable[Mount | str], overrides: Mapping[str, object] | None = None
+    ) -> None:
         self.mounts = sorted({_mount_path(m) for m in mounts})
         self.warnings: list[str] = []
         self._root_overrides: dict[str, str] = {}
@@ -96,7 +106,12 @@ class PathMap:
         self._load_overrides(overrides)
 
     @classmethod
-    def build(cls, mounts, evidence, overrides=None) -> "PathMap":
+    def build(
+        cls,
+        mounts: Iterable[Mount | str],
+        evidence: Iterable[tuple[object, Mount | str | None]],
+        overrides: Mapping[str, object] | None = None,
+    ) -> PathMap:
         """``evidence``: every ``(recorded cwd, source mount)`` pair known.
         ``overrides`` replaces the override file (a dict like its content)."""
         pathmap = cls(mounts, overrides)
@@ -107,14 +122,17 @@ class PathMap:
                 continue
             # Spellings that differ only in case are one path.
             seen.setdefault((_mount_path(source), rec.root), set()).add(
-                tuple(part.lower() for part in rec.parts))
+                tuple(part.lower() for part in rec.parts)
+            )
         for key in sorted(seen):
             pathmap._settle(key, sorted(seen[key]))
         return pathmap
 
     # --- public -------------------------------------------------------------
 
-    def to_local(self, recorded_cwd, source_mount=None) -> tuple[str | None, bool]:
+    def to_local(
+        self, recorded_cwd: object, source_mount: Mount | str | None = None
+    ) -> tuple[str | None, bool]:
         """``(local path, True)`` when the recorded directory exists here, in
         its on-disk spelling; ``(None, False)`` otherwise. A parent that
         exists is never substituted."""
@@ -129,7 +147,9 @@ class PathMap:
         hit = self._find(base, rec.parts) if base is not None else None
         return (hit, True) if hit else (None, False)
 
-    def letter_for_mount(self, mount, source_mount=None) -> str | None:
+    def letter_for_mount(
+        self, mount: Mount | str, source_mount: Mount | str | None = None
+    ) -> str | None:
         """The drive letter (``"C:"``) of a mount, or None when unknown.
 
         Without ``source_mount`` the mount's own stores decide, then any other
@@ -137,10 +157,12 @@ class PathMap:
         """
         mount = _mount_path(mount)
 
-        def letters(source):
-            found = {root: count for (src, root), (base, _how, count)
-                     in self._roots.items()
-                     if base == mount and (source is None or src == source)}
+        def letters(source: str | None) -> dict[str, int]:
+            found = {
+                root: count
+                for (src, root), (base, _how, count) in self._roots.items()
+                if base == mount and (source is None or src == source)
+            }
             for root, base in self._root_overrides.items():
                 if base == mount:
                     found.setdefault(root, 0)
@@ -158,25 +180,34 @@ class PathMap:
     def letters(self) -> list[dict]:
         """Every resolved root, sorted: ``{letter, source_mount, mount, how,
         paths}`` with ``how`` in ``override``, ``evidence``, ``system volume``."""
-        rows = [{"letter": root, "source_mount": source, "mount": base,
-                 "how": how, "paths": count}
-                for (source, root), (base, how, count) in self._roots.items()]
+        rows = [
+            {"letter": root, "source_mount": source, "mount": base, "how": how, "paths": count}
+            for (source, root), (base, how, count) in self._roots.items()
+        ]
         known = {(row["letter"], row["mount"]) for row in rows}
         for root, base in self._root_overrides.items():
             if (root, base) not in known:
-                rows.append({"letter": root, "source_mount": None, "mount": base,
-                             "how": "override", "paths": 0})
+                rows.append(
+                    {
+                        "letter": root,
+                        "source_mount": None,
+                        "mount": base,
+                        "how": "override",
+                        "paths": 0,
+                    }
+                )
         return sorted(rows, key=lambda r: (r["source_mount"] or "", r["letter"]))
 
     def unresolved(self) -> list[dict]:
         """Roots that stay unmapped, sorted: ``{letter, source_mount, reason,
         candidates, paths}`` with ``reason`` ``no evidence`` or ``ambiguous``."""
-        return [dict(self._open[key], letter=key[1], source_mount=key[0])
-                for key in sorted(self._open)]
+        return [
+            dict(self._open[key], letter=key[1], source_mount=key[0]) for key in sorted(self._open)
+        ]
 
     # --- overrides ----------------------------------------------------------
 
-    def _load_overrides(self, overrides) -> None:
+    def _load_overrides(self, overrides: Mapping[str, object] | None) -> None:
         if overrides is None:
             path = config_dir() / OVERRIDE_FILE
             try:
@@ -197,7 +228,8 @@ class PathMap:
                 self.warnings.append(f"path map override {key!r}: not an absolute path")
             elif rec is None or (rec.root != "/" and rec.parts):
                 self.warnings.append(
-                    f"path map override {key!r}: not a drive letter or an absolute path")
+                    f"path map override {key!r}: not a drive letter or an absolute path"
+                )
             else:
                 base = value.rstrip(os.sep) or os.sep
                 if rec.root == "/":
@@ -208,29 +240,29 @@ class PathMap:
 
     def _host_path(self, rec: Recorded) -> str:
         for prefix, base in self._prefix_overrides:
-            if rec.parts[:len(prefix)] == prefix:
-                return os.sep.join((base,) + rec.parts[len(prefix):])
+            if rec.parts[: len(prefix)] == prefix:
+                return os.sep.join((base,) + rec.parts[len(prefix) :])
         return os.sep + os.sep.join(rec.parts)
 
     # --- roots --------------------------------------------------------------
 
-    def _settle(self, key, paths) -> None:
+    def _settle(self, key: tuple[str, str], paths: list[tuple[str, ...]]) -> None:
         source, root = key
         if root in self._root_overrides:
             self._roots[key] = (self._root_overrides[root], "override", len(paths))
             return
-        alone: dict[str, int] = {}   # mounts that are the only one holding a path
-        shared: set[str] = set()     # mounts holding a path other mounts hold too
+        alone: dict[str, int] = {}  # mounts that are the only one holding a path
+        shared: set[str] = set()  # mounts holding a path other mounts hold too
         for parts in paths:
             if not parts:
-                continue   # the bare root is on every mount
+                continue  # the bare root is on every mount
             hits = [m for m in self.mounts if self._find(m, parts)]
             if len(hits) == 1:
                 alone[hits[0]] = alone.get(hits[0], 0) + 1
             else:
                 shared.update(hits)
         if len(alone) == 1:
-            (mount, count), = alone.items()
+            ((mount, count),) = alone.items()
             self._roots[key] = (mount, "evidence", count)
         elif len(alone) > 1:
             self._unsettled(key, "ambiguous", alone, paths)
@@ -247,14 +279,19 @@ class PathMap:
         else:
             self._unsettled(key, "no evidence", (), paths)
 
-    def _unsettled(self, key, reason, candidates, paths) -> None:
-        self._open[key] = {"reason": reason, "candidates": sorted(candidates),
-                           "paths": len(paths)}
+    def _unsettled(
+        self,
+        key: tuple[str, str],
+        reason: str,
+        candidates: Iterable[str],
+        paths: list[tuple[str, ...]],
+    ) -> None:
+        self._open[key] = {"reason": reason, "candidates": sorted(candidates), "paths": len(paths)}
 
     def _base(self, root: str, source: str | None) -> str | None:
         if root in self._root_overrides:
             return self._root_overrides[root]
-        if (source, root) in self._roots:
+        if source is not None and (source, root) in self._roots:
             return self._roots[(source, root)][0]
         if (source, root) in self._open:
             return None
@@ -267,8 +304,10 @@ class PathMap:
         table = self._names(mount)
         if not table:
             return False
-        return all(any(os.path.isdir(_join(mount, name)) for name in table.get(wanted, ()))
-                   for wanted in SYSTEM_VOLUME_DIRS)
+        return all(
+            any(os.path.isdir(_join(mount, name)) for name in table.get(wanted, ()))
+            for wanted in SYSTEM_VOLUME_DIRS
+        )
 
     # --- resolution ---------------------------------------------------------
 
@@ -294,15 +333,18 @@ class PathMap:
         for recorded, actual in REDIRECTS:
             want = tuple(p.lower() for p in recorded)
             for i in range(len(parts) - len(want) + 1):
-                if lowered[i:i + len(want)] == want:
-                    hit = self._resolve(base, parts[:i] + actual + parts[i + len(want):],
-                                        wild=range(i, i + len(actual)))
+                if lowered[i : i + len(want)] == want:
+                    hit = self._resolve(
+                        base,
+                        parts[:i] + actual + parts[i + len(want) :],
+                        wild=range(i, i + len(actual)),
+                    )
                     if hit is not None:
                         return hit
                     break
         return None
 
-    def _resolve(self, base: str, parts: tuple, wild=()) -> str | None:
+    def _resolve(self, base: str, parts: tuple, wild: range = range(0)) -> str | None:
         """Follow ``parts`` below ``base`` comparing names case-insensitively;
         the result is spelled as on disk. Indexes in ``wild`` may end in "*"."""
         current = base
@@ -316,7 +358,7 @@ class PathMap:
                 for key in sorted(table):
                     if key.startswith(stem):
                         for name in table[key]:
-                            hit = self._resolve(_join(current, name), parts[i + 1:], rest)
+                            hit = self._resolve(_join(current, name), parts[i + 1 :], rest)
                             if hit is not None:
                                 return hit
                 return None
@@ -328,6 +370,6 @@ class PathMap:
             elif len(group) == 1:
                 name = group[0]
             else:
-                return None   # several spellings differ only by case
+                return None  # several spellings differ only by case
             current = _join(current, name)
         return current if os.path.isdir(current) else None
