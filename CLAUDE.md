@@ -10,7 +10,7 @@ Textual, from the project `.venv` (`./install.sh` creates it).
 - Lint: `make lint` (`ruff check`, `ruff format --check`, `compileall`); `make format` applies the
   formatter; `make typecheck` runs `mypy`; `make coverage`; `make check` runs lint, typecheck and
   both suites. These need the tools in `.venv`: `make dev` (installs `.[tui,dev]` editable)
-- Run: `bin/agent-sessions` (TUI) or `bin/agent-sessions <scan|list|open|import|show|status|verify|mount|forget|map>`
+- Run: `bin/agent-sessions` (TUI) or `bin/agent-sessions <scan|list|open|import|unimport|show|status|verify|mount|forget|map>`
 - TUI tests: `make test-tui` (needs `.venv`; about 80 s)
 - Install: `./install.sh` (creates `.venv` with Textual, symlinks into
   `~/.local/bin`, installs the desktop launcher)
@@ -28,6 +28,8 @@ Textual, from the project `.venv` (`./install.sh` creates it).
   `fsutil.open_ro`, never `shutil.copy` or a plain `open`.
 - A store that is not the native one is hostile: a session id must `fullmatch` `Provider.id_pattern`,
   and an import writes only below the native root (`importer.contained`).
+- An undo removes only what its journal record lists; every file must pass `importer.below`,
+  and a directory goes only when empty.
 - Text from a store is shown only through `textsafe` (`cli._out`/`_err`/`_json`, `view.clean`); no `print` in `cli.py`.
   The log is written through `logs.logger()` only (its formatter cleans every message).
 - Foreign bytes are read bounded (`open_ro`, `iter_jsonl`, `read_small`, `open_sqlite_ro`); where JSON is
