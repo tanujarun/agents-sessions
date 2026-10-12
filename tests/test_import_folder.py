@@ -200,6 +200,35 @@ class ChosenFolderTest(FolderCase):
         self.assertFalse(self.record_file.exists())
 
 
+class FolderIsNeededTest(FolderCase):
+    """Claude and Grok name a directory after the folder. A plan that came
+    without one (only an import that needs none asks for that) is refused by
+    the adapter itself."""
+
+    foreign = ("claude", "grok")
+
+    def test_no_directory_is_named_after_no_folder(self):
+        from agent_sessions.providers.base import NotSupported
+        from agent_sessions.providers.claude import Claude
+        from agent_sessions.providers.grok import Grok
+
+        self.lose_the_folder()
+        real = importer.start_plan
+
+        def without_a_folder(*args, **kwargs):
+            return real(*args, **dict(kwargs, needs_folder=False))
+
+        with mock.patch.object(importer, "start_plan", without_a_folder):
+            for provider, session_id, needle in (
+                (Claude(), CLAUDE_WIN, "the project folder None has no directory name"),
+                (Grok(), GROK_WIN, "the project folder has no name"),
+            ):
+                with self.assertRaises(NotSupported) as caught:
+                    provider.import_plan(self.source(session_id), self.index.pathmap)
+                self.assertIn(needle, caught.exception.reason)
+        self.assert_nothing_written()
+
+
 # --- Claude -------------------------------------------------------------------
 
 

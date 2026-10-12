@@ -24,6 +24,11 @@ class ImportFailed(ApiError):
     """A session could not be imported, or its provider does not allow it."""
 
 
+class UndoFailed(ApiError):
+    """An import could not be undone (``unimport``), or the undo was
+    refused."""
+
+
 class Offline(ApiError):
     """What was asked needs the files of a session whose drive is not
     mounted."""
@@ -33,4 +38,12 @@ class MountFailed(ApiError):
     """A drive could not be mounted (``mounts.mount_volume``)."""
 
 
-__all__ = ["ApiError", "ImportFailed", "LaunchFailed", "MountFailed", "NotFound", "Offline"]
+__all__ = [
+    "ApiError",
+    "ImportFailed",
+    "LaunchFailed",
+    "MountFailed",
+    "NotFound",
+    "Offline",
+    "UndoFailed",
+]

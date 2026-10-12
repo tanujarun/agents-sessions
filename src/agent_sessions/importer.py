@@ -30,7 +30,8 @@ the rules that hold for every provider, ``execute`` carries the plan out:
   place);
 - a record of the import is added to the journal ``<state dir>/imports.jsonl``
   (``journal``): one line, with a manifest of every file and directory the
-  import created, as they lie in the native store;
+  import created, as they lie in the native store. ``unimport`` takes an
+  import back from that record;
 - all of it happens with the state directory's lock held (``fsutil.lock``),
   so one import runs at a time, whichever process starts it.
 
@@ -388,6 +389,25 @@ def _relative_ok(rel: str) -> bool:
     return not any(part in ("", ".", "..") for part in _SEPARATORS.split(rel))
 
 
+def _outside(root: str, path: object) -> bool:
+    """True for what is not text, holds a NUL or does not start with the
+    root and a separator."""
+    return not isinstance(path, str) or "\0" in path or not path.startswith(_below(root))
+
+
+def below(root: str, path: object) -> bool:
+    """True when ``path`` names a place below ``root`` by the rule
+    ``contained`` holds every destination to: the root plus components none
+    of which is empty, ``.`` or ``..``, and no NUL. On the names alone;
+    reads nothing. For a caller with one path to check (an undo checks what
+    a journal record names before it removes anything)."""
+    return (
+        isinstance(path, str)
+        and not _outside(root, path)
+        and _relative_ok(path[len(_below(root)) :])
+    )
+
+
 def contained(plan: ImportPlan) -> None:
     """Refuse a plan that would write anywhere but below its native store.
 
@@ -425,9 +445,9 @@ def contained(plan: ImportPlan) -> None:
             raise ImportFailed(f"{unit.dst} is planned as one file but is not one")
     targets += [addition.path for addition in plan.appends]
     for path in targets:
-        if not isinstance(path, str) or "\0" in path or not path.startswith(_below(root)):
+        if _outside(root, path):
             raise ImportFailed(f"{path!r} is outside the native store {root}; nothing was imported")
-        if not _relative_ok(path[len(_below(root)) :]):
+        if not below(root, path):
             raise ImportFailed(f"{path!r} is not a plain path below {root}; nothing was imported")
     for addition in plan.appends:  # a line is only ever added to a plain file
         try:
@@ -985,6 +1005,7 @@ __all__ = [
     "NoFolder",
     "Rewrite",
     "Unit",
+    "below",
     "check",
     "chosen_folder",
     "contained",

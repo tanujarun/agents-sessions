@@ -6,8 +6,9 @@ state directory's lock held (``fsutil.lock``): two processes that import at
 the same moment both leave their record, and a crash can at worst cut the
 last line short. Nothing in the file is rewritten.
 
-A record says what it is in ``record`` (``"import"``) and which form it has
-in ``version``. Before version 2 the records were a JSON array in
+A record says what it is in ``record`` (``"import"``, or ``"undo"`` for an
+import that was taken back, ``unimport``) and which form it has in
+``version``. Before version 2 the records were a JSON array in
 ``imports.json``, rewritten on every import; such a file is still read, its
 records first, and is never written or removed.
 
@@ -29,6 +30,7 @@ LEGACY_NAME = "imports.json"
 VERSION = 2  # of a record written now
 LEGACY_VERSION = 1  # what a record of ``imports.json`` is given
 IMPORT = "import"  # ``record`` of an import
+UNDO = "undo"  # ``record`` of an import that was taken back
 
 _log = logging.getLogger(__name__)
 
@@ -178,6 +180,7 @@ __all__ = [
     "LEGACY_NAME",
     "LEGACY_VERSION",
     "NAME",
+    "UNDO",
     "VERSION",
     "append",
     "legacy_path",

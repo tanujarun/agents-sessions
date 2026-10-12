@@ -260,6 +260,12 @@ class NativeAndImportedTest(OptionsCase):
             self.options(own, target=str(self.home)).reason, "this session is already on Linux"
         )
 
+    def test_the_dry_run_of_a_native_session_is_refused_the_same_way(self):
+        for call in (api.import_plan, api.import_report):
+            with self.assertRaises(api.ImportFailed) as caught:
+                call(CLAUDE_NATIVE)
+            self.assertEqual(caught.exception.reason, "this session is already on Linux")
+
     def test_already_imported(self):
         self.writes = True  # this test imports; what it asks afterwards is compared below
         native = api.import_session(self.source(CLAUDE_WIN))

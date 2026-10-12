@@ -33,7 +33,8 @@
   traceback, once), `written`, `close`
 - `src/agent_sessions/journal.py` — the import journal `<state>/imports.jsonl`: `read` (oldest first, the
   records of an old `imports.json` before them, a torn line skipped with a warning), `append` (lock, one
-  write on an appending descriptor, fsync), `open_for_append`/`write` for a caller that holds the lock
+  write on an appending descriptor, fsync), `open_for_append`/`write` for a caller that holds the lock; the
+  two kinds of record, `IMPORT` and `UNDO`
 - `src/agent_sessions/textsafe.py` — the one sanitiser for text from a store: `clean` (control and
   bidirectional characters become spaces; `multiline` keeps line feed and tab), `json_escape` (the same
   characters as `\uXXXX` in `--json` output), the set `UNSAFE`. Used by the CLI's output helpers, `clean_title`,
@@ -59,32 +60,44 @@
 - `src/agent_sessions/providers/__init__.py` — registry: `register`, `all_providers`, `get`; imports the five adapters
 - `src/agent_sessions/providers/base.py` — `Provider` contract (with `id_pattern`, `valid_id`, `read_back`, the
   `resumable` property, `evidence_files` and `path_evidence`: recorded folders beyond the sessions' own, for
-  the path map), `NotSupported`, shared helpers (`iter_jsonl`, `read_lines` and `JSONL_LINE_MAX`,
+  the path map; `import_plan` and `import_session` with a chosen folder (`target`) and `experimental`;
+  `undo_extras`: what the tool adds beside an imported session), `NotSupported`, `ExperimentalOnly` (an
+  import that is done only when asked for; carries the warning to show first), shared helpers (`iter_jsonl`, `read_lines` and `JSONL_LINE_MAX`,
   `read_small`, `open_sqlite_ro`, `parse_ts` (nothing outside 1990 to 2100; `unit` for epoch numbers),
   `clean_title`, `open_ro`), warnings (`warn`, `collect_warnings`)
 - `src/agent_sessions/providers/{claude,codex,grok,antigravity,gemini}.py` — the adapters: store signature,
   `candidates`, `parse`, `transcript`, `resume_argv`, and `import_plan` (Claude, Codex and Grok; Antigravity
-  and Gemini raise `NotSupported` with the reason); Claude also gives path evidence (the `projects` keys of
-  the `.claude.json` beside the store)
+  as an experimental import only, a plain copy; Gemini raises `NotSupported` with the reason); Claude also
+  gives path evidence (the `projects` keys of the `.claude.json` beside the store); Grok names its group
+  directories (`group_name`, `group_slug`); Antigravity says what its tool adds beside a conversation
+  (`undo_extras`)
 - `src/agent_sessions/blake3.py` — BLAKE3 of an input of up to 1,024 bytes (one chunk; the plain hash and
   nothing else): `digest`, `hexdigest`. What the Grok adapter names a long group directory with
   (`providers.grok.group_name`)
-- `src/agent_sessions/importer.py` — copy a foreign session into the native store: plans, the checks
-  (`check`, `contained`), `execute` (stage, place, verify, append, journal record with a manifest; all
-  under the state directory's lock, rolled back on any failure), `sweep_staging`
+- `src/agent_sessions/importer.py` — copy a foreign session into the native store: plans (`start_plan`; a
+  folder the user chose, `chosen_folder`; `NoFolder` when the session's own is not found), the checks
+  (`check`, `contained`, and `below` for one path), `execute` (stage, place, verify, append, journal record
+  with a manifest; all under the state directory's lock, rolled back on any failure), `sweep_staging`
+- `src/agent_sessions/unimport.py` — take an import back: `not_undone` and `find_record` (the last import of a
+  session that no undo took back), `plan` (what would be removed and left, read from the record's manifest
+  and the disk; refuses a copy that was used since, a damaged record, a path outside the native store),
+  `undo` (plan and removal under the state directory's lock, files then empty directories, an `undo` record
+  in the journal)
 - `src/agent_sessions/launch.py` — build and run the resume command (platform layer): `plan`, `launch`, the
   `starter`/`notifier` hooks; and `tool_state` (`ToolState`: is the tool behind a command installed, or is
   the command a wrapper that would install it; read from the wrapper's text and mise's installs, no
   program run, remembered per run, `forget_tools`)
 - `src/agent_sessions/api.py` — facade used by the CLI and the TUI: `load_index`, `scan`, `list_sessions`,
-  `status`, `verify`, `find_session`, `transcript`, `open_session`, `can_import`, `import_plan`,
-  `import_report`, `import_session`; the drives: `volumes`, `find_volume`, `mount_drive`, `forget_drive`,
+  `status`, `verify`, `find_session`, `transcript`, `open_session`, `import_options` (`ImportOptions`: what an
+  import of a session can be), `can_import`, `import_plan`, `import_report`, `import_session` (each with a
+  chosen folder and the experimental flag), `unimport` (`UnimportReport`); the drives: `volumes`, `find_volume`, `mount_drive`, `forget_drive`,
   `set_letter`, `remove_letter`; what needs a session's files refuses an offline one (`Offline`); what goes
-  into the log is written here (scan summary and warnings, imports, launches, mounts, forgotten drives,
-  unexpected exceptions)
-- `src/agent_sessions/cli.py` — argparse entry: `scan`, `list`, `open`, `import`, `show`, `status`, `verify`,
-  `mount`, `forget`, `map` (`tui` is started by the launcher, not here), the global flags `--version` and
-  `--debug`, the output helpers that make text safe (`_ask` for the one question), and what ends a command:
+  into the log is written here (scan summary and warnings, imports, undos, launches, mounts, forgotten
+  drives, unexpected exceptions)
+- `src/agent_sessions/cli.py` — argparse entry: `scan`, `list`, `open`, `import` (`--to`, `--experimental`),
+  `unimport`, `show`, `status`, `verify`, `mount`, `forget`, `map` (`tui` is started by the launcher, not
+  here), the global flags `--version` and `--debug`, the output helpers that make text safe (`_ask` for a
+  question), and what ends a command:
   exit codes, Ctrl-C and SIGTERM/SIGHUP (`_signals`), the `internal error` line
 - `src/agent_sessions/tui/` — Textual front end: `app.py`, `view.py` (pure view logic), `app.tcss` (all styling)
 - `share/agent-sessions.desktop` — desktop launcher for the TUI
@@ -134,8 +147,9 @@
   (`claude/`, `codex/`, `grok/`, `antigravity/`, `gemini/`; SQLite fixtures are WAL-mode, open immutable)
 - `tests/fixtures/claude/not-a-store/`, `tests/fixtures/gemini/native-no-chats/` — negative cases for `is_store`
 - `scratch/` — throwaway investigation scripts (git-ignored): `walk.py`, `*_count.py`, `drives.py`, `build_fixtures.py`
-- `src/agent_sessions/errors.py` — `ApiError`, `NotFound`, `LaunchFailed`, `ImportFailed`, `Offline` (the
-  drive of a session is not mounted), `MountFailed` (re-exported by `api`)
+- `src/agent_sessions/errors.py` — `ApiError`, `NotFound`, `LaunchFailed`, `ImportFailed`, `UndoFailed` (an
+  import could not be taken back), `Offline` (the drive of a session is not mounted), `MountFailed`
+  (re-exported by `api`)
 - `tests/fixture_world.py` — `World`: fake home plus two fake drives built from the fixtures, launches and
   notifications recorded; `tree_state`, `age_access_times`, `files_below`
 - `tests/test_launch.py` — launch plans per provider, folder gone, foreign refused, `--here`, hooks
@@ -146,6 +160,11 @@
   `XDG_DATA_HOME`, the per-run cache, and the answer in the index, `status` and `launch.plan`
 - `tests/test_blake3.py` — `blake3` against the BLAKE3 team's test vectors (every input length they list up
   to 1,024 bytes), the three folder names Grok made on this machine, the refusal of a longer input
+- `tests/test_unimport.py` — `unimport`: import then unimport leaves the fake home byte for byte what it was
+  (every provider that can import, with and without a native store; Codex's one index line), which record
+  is used, a copy that was used since, `--force`, what is left and why, the provider's extras, a journal
+  that names paths outside the native store or is damaged, a record without a manifest, the lock (real
+  processes), the undo record, the command and its question
 - `tests/test_importer.py` — imports per provider (bytes, rewrites, idempotence, collisions, roll back, free
   space, provenance, source times), `encode_cwd`, refusals
 - `tests/test_import_folder.py` — imports into a folder the user chose (`target`, `import --to`): what is

@@ -212,6 +212,13 @@ class Provider:
         except importer.ImportFailed:
             return verified[0]
 
+    def undo_extras(self, session_id: str, native_root: StrPath) -> list[str]:
+        """Paths in the native store that the tool itself creates beside an
+        imported session once it has opened it, whether they exist or not.
+        An undo of the import removes them only when it is forced
+        (``unimport``). None by default."""
+        return []
+
     def read_back(self, plan: importer.ImportPlan) -> Session:
         """The session an import has put into the native store, read the way
         ``parse`` reads any other.

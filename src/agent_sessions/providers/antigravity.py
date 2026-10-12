@@ -638,6 +638,19 @@ class Antigravity(Provider):
         plan.info["experimental"] = True
         return plan
 
+    def undo_extras(self, session_id: str, native_root: StrPath) -> list[str]:
+        """What the tool adds once it has opened a conversation (FORMATS
+        "Phase 2 findings", Q5, "undo"): the write-ahead log and its index
+        beside the database, and the lock file, which stays after the tool
+        has exited."""
+        root = os.fspath(native_root)
+        database = os.path.join(root, "conversations", f"{session_id}.db")
+        return [
+            database + "-wal",
+            database + "-shm",
+            os.path.join(root, "presence", f"{session_id}.lock"),
+        ]
+
     @staticmethod
     def _refuse_hot_wal(wal: str) -> None:
         """Raise ``NotSupported`` for a conversation whose write-ahead log

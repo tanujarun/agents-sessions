@@ -1,12 +1,12 @@
 """The facade the CLI and the TUI call: load, scan, list, status, verify,
-find, open, import, transcript, and the drives: volumes, mount, forget, the
-drive letters.
+find, open, import, unimport, transcript, and the drives: volumes, mount,
+forget, the drive letters.
 
 What is worth a line in the log is written here, so both front ends log
-alike (``logs``): the summary and the warnings of a scan, an import and how
-it ended, a launch with the exact command, a mount, a drive that is
-forgotten, and any exception that is not one of the failures this module
-reports (``ApiError``), with its traceback.
+alike (``logs``): the summary and the warnings of a scan, an import or an
+undo and how it ended, a launch with the exact command, a mount, a drive
+that is forgotten, and any exception that is not one of the failures this
+module reports (``ApiError``), with its traceback.
 """
 
 from __future__ import annotations
@@ -25,7 +25,16 @@ from . import discover, importer, launch, logs, pathmap
 from . import index as index_mod
 from . import mounts as mounts_mod
 from . import providers as registry
-from .errors import ApiError, ImportFailed, LaunchFailed, MountFailed, NotFound, Offline
+from . import unimport as undoing
+from .errors import (
+    ApiError,
+    ImportFailed,
+    LaunchFailed,
+    MountFailed,
+    NotFound,
+    Offline,
+    UndoFailed,
+)
 from .fsutil import cache_file, home, log_file
 from .index import Index
 from .launch import LaunchPlan
@@ -781,6 +790,118 @@ def import_session(
     return import_report(ref, progress, index, target, experimental).session
 
 
+@dataclass
+class UnimportReport:
+    """What ``unimport`` did, or with ``dry_run`` would do."""
+
+    provider: str
+    id: str
+    native_key: str | None  # of the copy, as its import record has it
+    source_key: str | None  # of the session it was imported from
+    removed: list[str] = field(default_factory=list)  # files, then directories deepest first
+    left: list[tuple[str, str]] = field(default_factory=list)  # (path, why), by path
+    differences: list[str] = field(default_factory=list)  # from the record: a forced undo
+    forced: bool = False
+    dry_run: bool = False
+    bytes: int = 0  # of the files in ``removed``, as they were
+
+
+def _undo_target(ref: Session | str, index: Index) -> tuple[str, str]:
+    """The provider and session id ``ref`` names for an undo: those of a
+    listed session (``find_session``: a key, a start of one, an id), else of
+    the import record that still stands whose native key, source key or id
+    ``ref`` is. The second way finds a copy whose session is not listed any
+    more (its files were removed by hand, its drive forgotten)."""
+    if isinstance(ref, Session):
+        return ref.provider, ref.id
+    try:
+        session = find_session(ref, index)
+    except NotFound as missing:
+        text = ref.strip() if isinstance(ref, str) else ""
+        named = sorted(
+            {
+                (record["provider"], record["id"])
+                for record in undoing.not_undone(undoing.read_records())
+                if text
+                and text in (record.get("native_key"), record.get("source_key"), record.get("id"))
+            }
+        )
+        if len(named) != 1:
+            raise missing from None
+        return named[0]
+    return session.provider, session.id
+
+
+@_logged
+def unimport(
+    ref: Session | str,
+    force: bool = False,
+    dry_run: bool = False,
+    index: Index | None = None,
+) -> UnimportReport:
+    """Take an import back: remove from the native store what the last
+    import of this session created, and nothing else (``unimport``, the
+    module, has the rules). ``ref`` is the native copy, the foreign session
+    it came from, or the id.
+
+    Refused (``UndoFailed``, nothing removed) when no import of the session
+    is recorded, and when a file of the copy differs from what the record
+    says of it: the session was used since. ``force=True`` removes the copy
+    all the same, together with what the tool made beside it since
+    (``Provider.undo_extras``), and is the only way to undo an import
+    recorded without a manifest.
+
+    Directories go only when they are empty, and a line the import added to
+    a file of the tool's stays: ``left`` says what was left and why. With
+    ``dry_run=True`` nothing is touched and the report is what would be
+    done. Otherwise the undo is recorded in the journal and a quick scan
+    runs afterwards (an ``index`` passed in is not refreshed). Raises
+    ``NotFound`` for a reference that names nothing."""
+    index = index if index is not None else load_index()
+    name, session_id = _undo_target(ref, index)
+    try:
+        provider = registry.get(name)
+    except KeyError:
+        raise NotFound(f"no reader for provider {name!r}") from None
+    native = provider.native_store()
+    if native is None or not provider.valid_id(session_id):
+        raise UndoFailed(undoing.NO_RECORD)
+    log = logs.logger()
+    if not dry_run:
+        log.info("unimport %s %s from %s%s", name, session_id, native, " (forced)" if force else "")
+    try:
+        made, record = undoing.undo(
+            name, session_id, native, provider.undo_extras(session_id, native), force, dry_run
+        )
+    except UndoFailed as exc:
+        if not dry_run:
+            log.warning("unimport %s %s refused: %s", name, session_id, exc.reason)
+        raise
+    report = UnimportReport(
+        provider=name,
+        id=session_id,
+        native_key=made.record.get("native_key"),
+        source_key=made.record.get("source_key"),
+        removed=made.files + made.dirs,
+        left=list(made.left),
+        differences=list(made.differences),
+        forced=made.forced,
+        dry_run=dry_run,
+        bytes=made.bytes,
+    )
+    if record is not None:
+        log.info(
+            "unimport %s %s: removed %d files and directories, left %d: %s",
+            name,
+            session_id,
+            len(report.removed),
+            len(report.left),
+            ", ".join(f"{path} ({why})" for path, why in report.left) or "nothing",
+        )
+        Index.load().scan(all_providers(), list_mounts(), deep=False)
+    return report
+
+
 # --- drives: volumes, mount, forget, drive letters ----------------------------
 
 _LETTER = re.compile(r"[A-Za-z]:")  # a drive letter as a reference, with ``fullmatch``
@@ -955,6 +1076,8 @@ __all__ = [
     "NotFound",
     "Offline",
     "Turn",
+    "UndoFailed",
+    "UnimportReport",
     "cache_file",
     "can_import",
     "find_session",
@@ -973,6 +1096,7 @@ __all__ = [
     "set_letter",
     "status",
     "transcript",
+    "unimport",
     "verify",
     "volumes",
 ]

@@ -430,6 +430,16 @@ class PreconditionTest(AgyImportCase):
         self.assertIn("write-ahead log", self.refused(source))
         self.assert_nothing_written()
 
+    @unittest.skipIf(os.geteuid() == 0, "root can look at everything")
+    def test_a_store_whose_conversations_cannot_be_looked_at(self):
+        source = self.source()
+        conversations = self.src / "conversations"
+        os.chmod(conversations, 0)
+        self.addCleanup(os.chmod, conversations, 0o700)
+        self.assertEqual(self.refused(source), f"cannot read {self.db()}-wal: Permission denied")
+        os.chmod(conversations, 0o700)
+        self.assert_nothing_written()
+
     def test_an_empty_one_is_the_state_at_rest_and_no_sidecar_is_ever_copied(self):
         source = self.source()
         for suffix in SIDECARS:

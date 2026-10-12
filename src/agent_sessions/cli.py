@@ -91,6 +91,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="print what would be copied and rewritten, write nothing",
     )
 
+    p = sub.add_parser(
+        "unimport",
+        help="remove the copy an import made",
+        description=(
+            "Take an import back: remove from the native store what the last import of the "
+            "session created, and nothing else. Refused when the copy was used since. "
+            "Directories are removed only when they are empty, and a line the import added "
+            "to a file of the tool's is left; both are reported."
+        ),
+    )
+    p.add_argument("key", help=key_help + ": the imported copy, or what it was imported from")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "remove the copy even when it was used since the import, and what the tool "
+            "made beside it; needed for an import recorded without a list of its files"
+        ),
+    )
+    p.add_argument(
+        "--dry-run", action="store_true", help="print what would be removed, remove nothing"
+    )
+    p.add_argument("--yes", action="store_true", help="do not ask")
+
     p = sub.add_parser("show", help="plain-text transcript to stdout")
     p.add_argument("key", help=key_help)
 
@@ -719,6 +743,48 @@ def _import(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_undo(report: api.UnimportReport) -> None:
+    """What an undo removed and left, or with a dry run would: a line each."""
+    removed, left = ("would remove", "would leave") if report.dry_run else ("removed", "left")
+    for text in report.differences:
+        _out(f"differs from the import record: {text}")
+    for path in report.removed:
+        _out(f"{removed} {path}")
+    for path, why in report.left:
+        _out(f"{left} {path} ({why})")
+
+
+def _unimport(args: argparse.Namespace) -> int:
+    # Planned first, without touching anything: every refusal comes from
+    # here, before a question is asked.
+    planned = api.unimport(args.key, force=args.force, dry_run=True)
+    name = planned.native_key or f"{planned.provider}:{planned.id}"
+    what = (
+        f"{_count(len(planned.removed), 'file or directory', 'files and directories')} "
+        f"({_size(planned.bytes)})"
+    )
+    if args.dry_run:
+        _print_undo(planned)
+        _out("dry run: nothing was removed")
+        return 0
+    if not args.yes:
+        if not (sys.stdin.isatty() and sys.stderr.isatty()):
+            _err(f"unimport {name}: not a terminal to ask on; pass --yes")
+            return 1
+        used = " It was used since the import." if planned.differences else ""
+        if not _ask(f"Remove the imported copy {name}, {what}?{used}"):
+            _err("nothing was removed")
+            return 1
+    report = api.unimport(args.key, force=args.force)
+    _print_undo(report)
+    _err(
+        f"removed the imported copy {name}: "
+        f"{_count(len(report.removed), 'file or directory', 'files and directories')}"
+        + (f"; {len(report.left)} left in place" if report.left else "")
+    )
+    return 0
+
+
 def _show(args: argparse.Namespace) -> int:
     index = api.load_index()
     session = api.find_session(args.key, index=index)
@@ -775,6 +841,7 @@ _COMMANDS = {
     "verify": _verify,
     "open": _open,
     "import": _import,
+    "unimport": _unimport,
     "show": _show,
     "mount": _mount,
     "forget": _forget,
