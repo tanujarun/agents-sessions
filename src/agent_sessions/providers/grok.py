@@ -10,7 +10,7 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
-from .. import importer
+from .. import blake3, importer
 from ..fsutil import home, listdir_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
@@ -43,12 +43,12 @@ _SMALL_FILE = 16 * 1024 * 1024
 # a file from elsewhere can nest values without end.
 _NEST_MAX = 32
 _INJECTED = ("<user_info>", "<system-reminder>")
-# Import (FORMATS section 6): the only cwd shape whose group directory name
-# is known for certain, and the reason given for every other one.
-_PLAIN_CWD = re.compile(r"[A-Za-z0-9/ ]+")
-_GROUP_NAME = re.compile(r"[A-Za-z0-9%]+")  # all a percent-encoded plain cwd can give
-_GROUP_NAME_MAX = 255  # bytes; longer names get a slug and a hash [docs]
-ENCODING_UNVERIFIED = "Grok's directory encoding of '-', '.', '_', '~' is unverified"
+# The group directory of a working directory (FORMATS "Phase 2 findings", Q1).
+GROUP_NAME_MAX = 255  # bytes of the percent-encoded name; a longer one is a slug and a hash
+_SLUG_MAX = 40  # characters of the slug that are kept
+_SLUG_OTHER = re.compile(r"[^a-z0-9]+")  # every run of these is one "-" in a slug
+_SLUG_EMPTY = "workspace"  # the slug of a name that leaves nothing
+_HASH_DIGITS = 16  # hex digits of the BLAKE3 that follow the slug
 
 
 def _load_json(path: StrPath) -> tuple[Any, str | None]:
@@ -69,6 +69,50 @@ def _load_json(path: StrPath) -> tuple[Any, str | None]:
         return json.loads(raw.decode("utf-8-sig", "replace")), None
     except (ValueError, RecursionError):
         return None, "not valid JSON"
+
+
+def group_slug(cwd: str) -> str:
+    """The slug that starts the group name of a long working directory: its
+    last segment in lower case, every run of characters that are not
+    ``a-z0-9`` as one ``-``, the ``-`` at both ends taken off, and then the
+    first 40 characters (the cut is not trimmed again); ``workspace`` when
+    nothing is left."""
+    slug = _SLUG_OTHER.sub("-", os.path.basename(cwd).lower()).strip("-")
+    return slug[:_SLUG_MAX] or _SLUG_EMPTY
+
+
+def group_name(cwd: str) -> str:
+    """The name of the directory under ``sessions/`` in which the tool keeps
+    the sessions of the working directory ``cwd``, and the only one it lists
+    them from (FORMATS "Phase 2 findings", Q1; seen in a sandbox).
+
+    ``urllib.parse.quote(cwd, safe="")`` when that is at most 255 bytes:
+    letters, digits and ``- . _ ~`` as they are, every other byte of the
+    UTF-8 path as ``%XX`` in upper-case hex. Otherwise ``<slug>-<first 16
+    hex digits of BLAKE3(cwd as UTF-8)>`` (``group_slug``).
+
+    Raises ``NotSupported`` for what was never seen: an empty path, a path
+    that is not valid UTF-8 text, and a path of more than 1,024 bytes (the
+    BLAKE3 here hashes one chunk)."""
+    try:
+        raw = cwd.encode("utf-8")
+    except UnicodeEncodeError:
+        raise NotSupported(
+            "the project folder's name is not valid UTF-8, and how Grok names its "
+            f"directory for such a folder is not known (project folder {cwd})"
+        ) from None
+    if not raw:
+        raise NotSupported("the project folder has no name to make Grok's directory name from")
+    encoded = urllib.parse.quote(raw, safe="")
+    if len(encoded) <= GROUP_NAME_MAX:  # ASCII: characters are bytes
+        return encoded
+    if len(raw) > blake3.MAX_INPUT:
+        raise NotSupported(
+            f"the project folder's path is {len(raw):,} bytes long; Grok's directory name "
+            f"for it can be worked out for paths up to {blake3.MAX_INPUT:,} bytes only "
+            f"(project folder {cwd})"
+        )
+    return f"{group_slug(cwd)}-{blake3.hexdigest(raw)[:_HASH_DIGITS]}"
 
 
 class _SummaryRewrite(importer.Rewrite):
@@ -421,9 +465,9 @@ class Grok(Provider):
     def import_plan(self, s: Session, pathmap: PathMap) -> importer.ImportPlan:
         """The session directory without ``*.lock``, into the group directory
         of the mapped cwd, with ``summary.json`` rewritten (FORMATS section
-        6). Allowed only when the group directory name is certain: a native
-        group already decodes to the mapped cwd, or the cwd is made of
-        letters, digits, ``/`` and spaces."""
+        6). The group directory is the one the tool itself would use
+        (``group_name``); when the native store has none of that name but
+        has one that decodes to the same folder, that one is used."""
         if not s.files:
             raise NotSupported("this session has no directory to copy")
         source = s.files[0]
@@ -439,18 +483,9 @@ class Grok(Provider):
             groups = sorted(subdirs(sessions))
         except OSError:
             groups = []
-        group = next((g for g in groups if urllib.parse.unquote(g) == plan.cwd_local), None)
-        if group is None:
-            if not _PLAIN_CWD.fullmatch(plan.cwd_local):
-                raise NotSupported(f"{ENCODING_UNVERIFIED} (project folder {plan.cwd_local})")
-            group = urllib.parse.quote(plan.cwd_local, safe="")
-            if len(group.encode("utf-8")) > _GROUP_NAME_MAX:
-                raise NotSupported(
-                    "Grok shortens directory names over 255 bytes in a way that is "
-                    f"unverified (project folder {plan.cwd_local})"
-                )
-            if not _GROUP_NAME.fullmatch(group):
-                raise NotSupported(f"{ENCODING_UNVERIFIED} (project folder {plan.cwd_local})")
+        group = group_name(plan.cwd_local)
+        if group not in groups:
+            group = next((g for g in groups if urllib.parse.unquote(g) == plan.cwd_local), group)
         plan.existing = sorted(
             {
                 path

@@ -497,16 +497,17 @@ A candidate is a directory `sessions/<group>/<name>/` that contains `summary.jso
 
 ### 6. Import
 
-Verdict: **supported for any target folder; the adapter still applies the narrow rule of step 1
-until it is changed** (the encoding it waited for is verified since Phase 2, Q1).
+Verdict: **supported for any folder: copy, rewrite two values of `summary.json`** `[verified,
+sandbox: `sessions list` and `export`; the resume itself not run]`.
 
-1. As implemented today: mapped cwd must consist of `[A-Za-z0-9/ ]` only, **or** an existing
-   native group directory must already decode to it (then reuse that directory name); otherwise
-   `NotSupported("Grok's directory encoding of '-', '.', '_', '~' is unverified")`, and a name
-   over 255 bytes is refused. What the tool does `[verified, sandbox]`: the group is
-   `quote(realpath(cwd), safe="")` for every character, and `<slug>-<16 hex of BLAKE3>` over
-   255 bytes (Phase 2, Q1), so both refusals can go; the long form needs a BLAKE3
-   implementation, which the standard library does not have.
+1. The group directory is the one the tool itself uses for the folder `[verified, sandbox]`
+   (`providers.grok.group_name`): `quote(cwd, safe="")` when that is at most 255 bytes, else
+   `<slug>-<first 16 hex of BLAKE3(cwd as UTF-8)>` (rule and slug: Phase 2, Q1). BLAKE3 is not
+   in the standard library; `agent_sessions/blake3.py` is a one-chunk implementation (inputs up
+   to 1,024 bytes), checked against the BLAKE3 team's test vectors. Refused, because never
+   seen: a folder whose path is over 1,024 bytes, and one whose name is not valid UTF-8. When
+   the native store has no directory of that name but has one that decodes
+   (`urllib.parse.unquote`) to the same folder, that one is used.
 2. Refuse when `~/.grok/sessions/*/<id>/` exists.
 3. Copy the session directory to `~/.grok/sessions/<group>/<id>/`, leaving out `*.lock`.
 4. Rewrite `summary.json` only: `info.cwd` → mapped cwd; `grok_home` → the native store path
@@ -995,7 +996,8 @@ the parsed count on both stores.)
   source has it (then only the two values differ) and writes compact JSON otherwise. Keys that
   are absent are not added.
 - **Grok group directory**: besides the `[A-Za-z0-9/ ]` rule, an encoded name over 255 bytes is
-  refused (the slug-and-hash naming is documented but was never seen). Sub-agent child sessions
+  refused (the slug-and-hash naming is documented but was never seen). Both limits are gone
+  since Phase 2, Q1 gave the tool's own rule (Grok §6, step 1). Sub-agent child sessions
   of an imported session are not copied (none exists).
 - **Every import**: files are staged in `<native store>/.agent-sessions-import-<pid>-<n>/` and
   moved into place (a file is hard-linked under its name and the staged name removed, so an
@@ -1490,7 +1492,7 @@ Items answered since are struck through, with where the answer is.
    threads does).
 4. ~~**Grok encoding** — are `-`, `.`, `_`, `~` percent-encoded in group directory names?~~
    Answered in the sandbox (Phase 2, Q1): they are kept; the full rule, the form for names over
-   255 bytes included, is there. The adapter's narrow rule (Grok §6, step 1) can be lifted.
+   255 bytes included, is there, and the adapter now names the directory by it (Grok §6, step 1).
 5. **Grok import and cross-cwd resume** — ~~`grok export <id>` after a test import is a
    model-free probe.~~ Done (Phase 2, Q1): the imported 1.0.34 session exports in full from any
    directory. Still open: `grok --resume <id>` itself, from the mapped folder and from another

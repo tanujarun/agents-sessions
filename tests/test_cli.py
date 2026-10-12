@@ -7,6 +7,7 @@ import shlex
 import shutil
 import sys
 import unittest
+import urllib.parse
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -495,14 +496,21 @@ class SessionCommandsTest(unittest.TestCase):
         self.assertIn(f"\n  session_meta payload.cwd: F:\\Proj\\My Site -> {self.w.site}\n", out)
         self.assertIn("\n  turn_context payload.workspace_roots[]: F:\\Proj\\My Site -> ", out)
 
+        # Grok: the group directory is named the way the tool names it, for
+        # a folder with '-' or '_' in its path too (the temp directory's).
         code, out, err = run("import", GROK_WIN, "--dry-run")
-        self.assertEqual((code, out), (1, ""))
-        self.assertIn("Grok's directory encoding of '-', '.', '_', '~' is unverified", err)
+        self.assertEqual((code, err), (0, ""))
+        group = urllib.parse.quote(str(self.w.site), safe="")
+        self.assertRegex(group, r"[-_]")
+        self.assertIn(f" -> {self.home / '.grok' / 'sessions' / group / GROK_WIN}/ (", out)
+        self.assertIn(": info.cwd and grok_home in summary.json\n", out)
+        self.assertIn(f"\n  info.cwd: F:\\Proj\\My Site -> {self.w.site}\n", out)
 
         # Nothing was written anywhere: the stores are as the fixtures were.
         self.assertEqual(state_names(), [])  # the log apart
         self.assertNotIn(CLAUDE_WIN, " ".join(files_below(self.home / ".claude")))
         self.assertNotIn(CODEX_WIN, " ".join(files_below(self.home / ".codex")))
+        self.assertNotIn(GROK_WIN, " ".join(files_below(self.home / ".grok")))
 
     def test_import_prints_the_native_key_and_is_idempotent(self):
         code, out, err = run("import", self.foreign_key)
@@ -557,7 +565,6 @@ class SessionCommandsTest(unittest.TestCase):
         for ref, needle in (
             (AGY_WIN, "Antigravity keeps conversations in SQLite files"),
             (GEMINI_WIN, "Gemini CLI is not installed on this machine"),
-            (GROK_WIN, "Grok's directory encoding"),
             (CLAUDE_NATIVE, "this session is already on Linux"),
         ):
             code, out, err = run("import", ref, "--open")

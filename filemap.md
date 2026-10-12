@@ -66,6 +66,9 @@
   `candidates`, `parse`, `transcript`, `resume_argv`, and `import_plan` (Claude, Codex and Grok; Antigravity
   and Gemini raise `NotSupported` with the reason); Claude also gives path evidence (the `projects` keys of
   the `.claude.json` beside the store)
+- `src/agent_sessions/blake3.py` — BLAKE3 of an input of up to 1,024 bytes (one chunk; the plain hash and
+  nothing else): `digest`, `hexdigest`. What the Grok adapter names a long group directory with
+  (`providers.grok.group_name`)
 - `src/agent_sessions/importer.py` — copy a foreign session into the native store: plans, the checks
   (`check`, `contained`), `execute` (stage, place, verify, append, journal record with a manifest; all
   under the state directory's lock, rolled back on any failure), `sweep_staging`
@@ -141,6 +144,8 @@
 - `tests/test_tools.py` — `launch.tool_state` on a fake PATH and a fake mise tree: the wrappers' text and
   what is not one, where the executable may lie, the install directory's name, `MISE_DATA_DIR` and
   `XDG_DATA_HOME`, the per-run cache, and the answer in the index, `status` and `launch.plan`
+- `tests/test_blake3.py` — `blake3` against the BLAKE3 team's test vectors (every input length they list up
+  to 1,024 bytes), the three folder names Grok made on this machine, the refusal of a longer input
 - `tests/test_importer.py` — imports per provider (bytes, rewrites, idempotence, collisions, roll back, free
   space, provenance, source times), `encode_cwd`, refusals
 - `tests/test_hostile_files.py` — named pipes, devices and directories named like session files (`open_ro`,
