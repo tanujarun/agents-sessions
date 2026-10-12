@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
 
 class ApiError(Exception):
     """``reason`` is plain words, shown to the user as it is."""
@@ -26,7 +31,20 @@ class ImportFailed(ApiError):
 
 class UndoFailed(ApiError):
     """An import could not be undone (``unimport``), or the undo was
-    refused."""
+    refused.
+
+    Two refusals a front end answers in its own way are marked, so that it
+    need not read the reason: ``no_record`` when no import of the session is
+    recorded, and ``differences`` (what differs, one text per file) when the
+    copy was used since the import, which a forced undo gets past. Any other
+    refusal has neither."""
+
+    def __init__(
+        self, reason: str, *, no_record: bool = False, differences: Iterable[str] = ()
+    ) -> None:
+        super().__init__(reason)
+        self.no_record = no_record
+        self.differences = list(differences)
 
 
 class ExportFailed(ApiError):

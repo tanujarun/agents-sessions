@@ -162,7 +162,8 @@
 - `tests/fixtures/claude/not-a-store/`, `tests/fixtures/gemini/native-no-chats/` — negative cases for `is_store`
 - `scratch/` — throwaway investigation scripts (git-ignored): `walk.py`, `*_count.py`, `drives.py`, `build_fixtures.py`
 - `src/agent_sessions/errors.py` — `ApiError`, `NotFound`, `LaunchFailed`, `ImportFailed`, `UndoFailed` (an
-  import could not be taken back), `ExportFailed` (a transcript could not be written to a file), `Offline`
+  import could not be taken back; `no_record` and `differences` mark the two refusals a front end answers
+  in its own way), `ExportFailed` (a transcript could not be written to a file), `Offline`
   (the drive of a session is not mounted), `MountFailed` (re-exported by `api`)
 - `tests/fixture_world.py` — `World`: fake home plus two fake drives built from the fixtures, launches and
   notifications recorded; `tree_state`, `age_access_times`, `files_below`

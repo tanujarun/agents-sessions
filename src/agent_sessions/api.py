@@ -1103,6 +1103,7 @@ class UnimportReport:
     native_key: str | None  # of the copy, as its import record has it
     source_key: str | None  # of the session it was imported from
     removed: list[str] = field(default_factory=list)  # files, then directories deepest first
+    files: int = 0  # how many of ``removed`` are files; the rest are directories
     left: list[tuple[str, str]] = field(default_factory=list)  # (path, why), by path
     differences: list[str] = field(default_factory=list)  # from the record: a forced undo
     forced: bool = False
@@ -1149,8 +1150,9 @@ def unimport(
     it came from, or the id.
 
     Refused (``UndoFailed``, nothing removed) when no import of the session
-    is recorded, and when a file of the copy differs from what the record
-    says of it: the session was used since. ``force=True`` removes the copy
+    is recorded (the exception's ``no_record`` is set), and when a file of
+    the copy differs from what the record says of it: the session was used
+    since (its ``differences`` name the files). ``force=True`` removes the copy
     all the same, together with what the tool made beside it since
     (``Provider.undo_extras``), and is the only way to undo an import
     recorded without a manifest.
@@ -1169,7 +1171,7 @@ def unimport(
         raise NotFound(f"no reader for provider {name!r}") from None
     native = provider.native_store()
     if native is None or not provider.valid_id(session_id):
-        raise UndoFailed(undoing.NO_RECORD)
+        raise UndoFailed(undoing.NO_RECORD, no_record=True)
     log = logs.logger()
     if not dry_run:
         log.info("unimport %s %s from %s%s", name, session_id, native, " (forced)" if force else "")
@@ -1189,6 +1191,7 @@ def unimport(
         native_key=native_key,
         source_key=source_key,
         removed=made.files + made.dirs,
+        files=len(made.files),
         left=list(made.left),
         differences=list(made.differences),
         forced=made.forced,
