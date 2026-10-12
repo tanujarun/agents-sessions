@@ -52,7 +52,10 @@
 - `src/agent_sessions/importer.py` — copy a foreign session into the native store: plans, the checks
   (`check`, `contained`), `execute` (stage, place, verify, append, journal record with a manifest; all
   under the state directory's lock, rolled back on any failure), `sweep_staging`
-- `src/agent_sessions/launch.py` — build and run the resume command (platform layer)
+- `src/agent_sessions/launch.py` — build and run the resume command (platform layer): `plan`, `launch`, the
+  `starter`/`notifier` hooks; and `tool_state` (`ToolState`: is the tool behind a command installed, or is
+  the command a wrapper that would install it; read from the wrapper's text and mise's installs, no
+  program run, remembered per run, `forget_tools`)
 - `src/agent_sessions/api.py` — facade used by the CLI and the TUI: `load_index`, `scan`, `list_sessions`,
   `status`, `verify`, `find_session`, `transcript`, `open_session`, `can_import`, `import_plan`,
   `import_report`, `import_session`; what goes into the log is written here (scan summary and warnings,
@@ -66,7 +69,8 @@
 - `tests/support.py` — `Sandbox` (fake home, cache, mounts, registry) and `FakeProvider` for the engine tests;
   `write_jsonl`, `claude_transcript` (a minimal transcript written from scratch); child processes for the
   tests that need real ones (`python_child`, `launcher_child`, `finish`, `wait_for`, the slow-import driver
-  `SLOW_IMPORT`); `state_names`/`drop_state` (the state directory without its log); a temp
+  `SLOW_IMPORT`); `FakePath` (what PATH holds for a test: programs and installing wrappers in a temp
+  directory); `state_names`/`drop_state` (the state directory without its log); a temp
   `AGENT_SESSIONS_STATE` for anything that runs outside a `Sandbox`
 - `tests/test_smoke.py` — imports, CLI skeleton, `make_key`
 - `tests/test_base_helpers.py` — `iter_jsonl`, `open_sqlite_ro`, `parse_ts`, `clean_title`, warnings, model
@@ -95,6 +99,9 @@
 - `tests/fixture_world.py` — `World`: fake home plus two fake drives built from the fixtures, launches and
   notifications recorded; `tree_state`, `age_access_times`, `files_below`
 - `tests/test_launch.py` — launch plans per provider, folder gone, foreign refused, `--here`, hooks
+- `tests/test_tools.py` — `launch.tool_state` on a fake PATH and a fake mise tree: the wrappers' text and
+  what is not one, where the executable may lie, the install directory's name, `MISE_DATA_DIR` and
+  `XDG_DATA_HOME`, the per-run cache, and the answer in the index, `status` and `launch.plan`
 - `tests/test_importer.py` — imports per provider (bytes, rewrites, idempotence, collisions, roll back, free
   space, provenance, source times), `encode_cwd`, refusals
 - `tests/test_hostile_files.py` — named pipes, devices and directories named like session files (`open_ro`,

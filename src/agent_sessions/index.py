@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
 import time
 from collections.abc import Collection, Iterable
@@ -20,7 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import discover, textsafe
+from . import discover, launch, textsafe
 from .discover import Skipped
 from .fsutil import cache_file
 from .model import Candidate, Session, Store
@@ -315,6 +314,7 @@ class Index:
         summary. ``deep=None`` follows ``needs_deep``. A set ``cancel`` event
         stops the walk or the parsing; what was done until then is kept."""
         started = time.monotonic()
+        launch.forget_tools()  # a tool installed since the last scan is seen by this one
         providers = list(providers)
         mounts = sorted(mounts, key=lambda m: m.path)
         do_deep = self.needs_deep(mounts) if deep is None else bool(deep)
@@ -573,8 +573,11 @@ class Index:
         self.pathmap = PathMap.build(mounts, [(s.cwd, s.mount) for s in sessions if s.cwd])
         warnings.update(self.pathmap.warnings)
         native = {(s.provider, s.id): s.key for s in sessions if s.origin == "native"}
+        # Installed, not merely on PATH (``launch.tool_state``): asked once
+        # per provider, and remembered there for the sessions that follow.
         usable = {
-            p.name: bool(p.resumable and p.binary and shutil.which(p.binary)) for p in providers
+            p.name: bool(p.resumable and p.binary and launch.tool_state(p.binary).installed)
+            for p in providers
         }
         for s in sessions:
             if s.cwd:

@@ -215,7 +215,10 @@ class FixtureParseTest(GeminiCase):
     def test_resume_argv_and_not_resumable(self):
         (s,) = self.provider.list_sessions(FIXTURE_STORE)
         self.assertEqual(self.provider.resume_argv(s), ["gemini", "--resume", SYNTHETIC_ID])
-        self.assertFalse(self.provider.resumable)
+        # "The real CLI is installed" (tests/test_tools.py has the cases):
+        # with no gemini command at all it is not.
+        with mock.patch("shutil.which", return_value=None):
+            self.assertFalse(self.provider.resumable)
 
     def test_a_gemini_dir_without_tmp_is_not_a_store(self):
         self.assertFalse(self.provider.is_store(NOT_A_STORE))

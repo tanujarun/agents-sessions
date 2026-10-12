@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import functools
 import shlex
-import shutil
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -112,9 +111,12 @@ def list_sessions(provider: str | None = None, index: Index | None = None) -> li
 
 @_logged
 def status(index: Index | None = None) -> dict:
-    """Mounts, stores and counts, drive letters, skipped stores, tools with
-    no reader, warnings, where the cache and the log are. Every list is
-    sorted."""
+    """Mounts, stores and counts, drive letters, skipped stores, the agent
+    tools and whether each is installed, warnings, where the cache and the
+    log are. Every list is sorted.
+
+    "Installed" is ``launch.tool_state``: a command on PATH that would only
+    install the tool does not count."""
     index = index if index is not None else load_index()
     present = {m.path for m in index.current_mounts}
     mounts = [
@@ -144,21 +146,37 @@ def status(index: Index | None = None) -> dict:
         if path not in present
     ]
     providers = []
+    readers = set()
     for p in all_providers():
         rows = [r for r in index.store_rows if r["provider"] == p.name and r["present"]]
+        state = launch.tool_state(p.binary)
+        readers.add(p.binary)
         providers.append(
             {
                 "name": p.name,
                 "label": p.label,
                 "binary": p.binary,
-                "installed": shutil.which(p.binary) if p.binary else None,
+                "installed": state.path if state.installed else None,
+                "tool": state.detail,
                 "resumable": bool(p.resumable),
                 "reader": all(r["reader"] for r in rows),
                 "stores": len(rows),
                 "sessions": sum(r["listed"] for r in rows),
             }
         )
-    tools = [{"tool": name, "path": shutil.which(name)} for name in NO_READER_TOOLS]
+    tools = []
+    for name in sorted(readers | set(NO_READER_TOOLS)):
+        state = launch.tool_state(name)
+        tools.append(
+            {
+                "tool": name,
+                "path": state.path,
+                "installed": state.installed,
+                "wrapper": state.wrapper,
+                "detail": state.detail,
+                "reader": name in readers,
+            }
+        )
     return {
         "cache": str(index.path),
         "log": str(log_file()),
@@ -178,7 +196,12 @@ def status(index: Index | None = None) -> dict:
         ],
         "letters": index.pathmap.letters(),
         "unresolved_letters": index.pathmap.unresolved(),
-        "no_reader": [t for t in tools if t["path"]],
+        "tools": tools,
+        "no_reader": [
+            {"tool": t["tool"], "path": t["path"]}
+            for t in tools
+            if t["installed"] and not t["reader"]
+        ],
         "warnings": index.warnings,
     }
 

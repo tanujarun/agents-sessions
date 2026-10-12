@@ -17,7 +17,7 @@ _SRC = str(Path(__file__).resolve().parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from agent_sessions import logs, providers  # noqa: E402
+from agent_sessions import launch, logs, providers  # noqa: E402
 from agent_sessions.fsutil import home  # noqa: E402
 from agent_sessions.model import Candidate, Session  # noqa: E402
 from agent_sessions.providers.base import (  # noqa: E402
@@ -138,6 +138,56 @@ class OtherProvider(FakeProvider):
         return home() / ".other"
 
 
+WRAPPER = (
+    "#!/bin/bash\n"
+    "export MISE_MINIMUM_RELEASE_AGE=0\n"
+    'mise use -g --quiet "{spec}" || exit 1\n'
+    'exec mise x "{spec}" -- "{tool}" "$@"\n'
+)  # the text of the wrappers in ~/.local/bin (docs/FORMATS.md "What is on PATH")
+
+
+class FakePath:
+    """What PATH holds, for the length of a test: ``shutil.which`` answers
+    from ``directory``. A command that "is installed" is a small file there
+    that is no script (``launch.tool_state`` reads it and takes it for a
+    program); ``wrapper`` puts an installing wrapper in its place.
+
+    ``installed``: the commands that exist; None means every command asked
+    for exists, except those in ``missing``."""
+
+    def __init__(self, case, directory, installed=None, missing=()):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.installed = None if installed is None else set(installed)
+        self.missing = set(missing)
+        launch.forget_tools()
+        case.addCleanup(launch.forget_tools)
+        patch = mock.patch("shutil.which", side_effect=self.which)
+        patch.start()
+        case.addCleanup(patch.stop)
+
+    def which(self, name, *args, **kwargs):
+        if name in self.missing or (self.installed is not None and name not in self.installed):
+            return None
+        path = self.directory / name
+        if not path.exists():
+            path.write_bytes(b"\x7fELF a program, for the tests\n")
+            path.chmod(0o755)
+        return str(path)
+
+    def wrapper(self, tool, spec=None, text=None) -> Path:
+        """Put the installing wrapper for ``tool`` on the fake PATH (or a
+        script with ``text``), and count the command as there."""
+        path = self.directory / tool
+        path.write_text(text or WRAPPER.format(spec=spec or tool, tool=tool), encoding="utf-8")
+        path.chmod(0o755)
+        self.missing.discard(tool)
+        if self.installed is not None:
+            self.installed.add(tool)
+        launch.forget_tools()
+        return path
+
+
 class Sandbox:
     """Temp dir with a fake home, cache and state; env overrides set; the
     provider registry replaced. Use ``self.box = Sandbox(self)`` in setUp."""
@@ -155,6 +205,8 @@ class Sandbox:
                 "AGENT_SESSIONS_CACHE": str(self.cache),
                 "AGENT_SESSIONS_STATE": str(self.root / "state"),
                 "AGENT_SESSIONS_NOTIFY": "0",  # a failed launch must not notify the desktop
+                # What mise has installed on this machine is not the test's business.
+                "MISE_DATA_DIR": str(self.root / "mise"),
             },
         )
         env.start()

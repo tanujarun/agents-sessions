@@ -72,7 +72,6 @@ class Provider:
     label: str = ""  # "Claude"
     binary: str = ""  # executable to resume with
     app_id: str = ""  # omarchy-launch-tui --app-id value
-    resumable: bool = True  # False when no usable binary exists
     # True when the tool finds a session only from its project directory
     resume_needs_cwd: bool = False
     dir_names: ClassVar[set[str]] = set()  # directory names that may be a store root
@@ -80,6 +79,13 @@ class Provider:
     # session whose id fails it, ``launch`` resumes none and ``importer``
     # copies none, so an adapter cannot let another kind of id through.
     id_pattern: ClassVar[re.Pattern[str]] = UUID_PATTERN
+
+    @property
+    def resumable(self) -> bool:
+        """False when the tool cannot resume a session on this machine at
+        all. An adapter overrides it with a constant, or with a property of
+        its own when the answer depends on what is installed (Gemini)."""
+        return True
 
     def valid_id(self, session_id: object) -> bool:
         """True when ``session_id`` is text in the form ``id_pattern``."""

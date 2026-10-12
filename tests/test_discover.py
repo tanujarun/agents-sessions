@@ -574,7 +574,7 @@ class SkeletonSignatureTest(unittest.TestCase):
         box.session(inside, "leftover")
         outside = box.store(mount / "elsewhere")
         box.session(outside, "real")
-        with unittest.mock.patch("agent_sessions.index.shutil.which", return_value=None):
+        with unittest.mock.patch("shutil.which", return_value=None):
             api.scan(deep=True)  # before the rule: both are listed
             with unittest.mock.patch.object(discover, "PROJECT_ROOT", None):
                 api.scan(deep=True)

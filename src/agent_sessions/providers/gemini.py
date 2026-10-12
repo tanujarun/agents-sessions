@@ -9,6 +9,7 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
+from .. import launch
 from ..fsutil import home, listdir_ro, subdirs
 from ..importer import human_size
 from ..model import Candidate, Session, Store
@@ -244,11 +245,17 @@ class Gemini(Provider):
     label = "Gemini"
     binary = "gemini"
     app_id = "org.omarchy.gemini"
-    # No usable gemini binary exists here (FORMATS "Gemini CLI" section 0).
-    resumable = False
     # Resume searches only the chats of the process cwd's project (section 5).
     resume_needs_cwd = True
     dir_names: ClassVar[set[str]] = {".gemini"}
+
+    @property
+    def resumable(self) -> bool:
+        """Whether the real Gemini CLI is installed. On the machine this was
+        written on it is not: the ``gemini`` on PATH is a wrapper that would
+        install it, and what it left behind is a ``package.json`` (FORMATS
+        "Gemini CLI" section 0, "What is on PATH")."""
+        return launch.tool_state(self.binary).installed
 
     def native_store(self) -> Path:
         return home() / ".gemini"

@@ -5,6 +5,11 @@ terminal window through ``omarchy-launch-tui``, which runs
 ``setsid uwsm-app -- xdg-terminal-exec --app-id=<id> -e <tool> <args>``; the
 terminal inherits the working directory it was started in.
 
+It also answers whether a tool is installed at all (``tool_state``). A name
+on PATH proves nothing here: most agent commands are small scripts that
+install the tool when it is missing, and starting one of those would install
+software. The answer is read from files; no program is run for it.
+
 Two module-level hooks let a caller record instead of acting: ``starter``
 (called as ``starter(command, cwd)`` to open the window) and ``notifier``
 (called as ``notifier(reason)`` after a failed launch). Tests and the TUI
@@ -15,6 +20,8 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -23,7 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import textsafe
 from .errors import LaunchFailed
-from .fsutil import home
+from .fsutil import home, open_ro
 
 if TYPE_CHECKING:
     from .model import Session
@@ -37,6 +44,200 @@ NOTIFY_TITLE = "Cannot resume session"
 # the fields that are ours, not a store's.
 _PROBE = "00000000-0000-4000-8000-000000000000"
 _NOT_DATA = ("provider", "origin")
+
+
+# --- is the tool installed? -------------------------------------------------
+
+INSTALLED = "installed"
+NOT_INSTALLED = "not installed (the command on PATH would install it)"
+NOT_FOUND = "not found"
+
+WRAPPER_MAX = 4096  # bytes; the wrappers seen are 111 to 419 bytes long
+WRAPPER_COMMANDS = 8  # "a script of a few lines": more commands than this is a program
+SEARCH_DEPTH = 3  # directories below a version in which the tool's executable may lie
+SEARCH_ENTRIES = 4000  # directory entries looked at for one tool, at most
+
+
+@dataclass(frozen=True)
+class ToolState:
+    """What is behind a command name. ``path`` is what PATH gives for it
+    (None: nothing); ``wrapper`` says that this is a script which installs
+    the tool when it is missing; ``installed`` that the tool itself is there
+    to be started; ``detail`` is one of ``INSTALLED``, ``NOT_INSTALLED``,
+    ``NOT_FOUND``, for a person."""
+
+    path: str | None
+    installed: bool
+    wrapper: bool
+    detail: str
+
+
+def _wrapper(path: str) -> tuple[str, str] | None:
+    """``(mise spec, tool)`` when the file is an installing wrapper, else
+    None. Recognised by its text (docs/FORMATS.md "What is on PATH"):
+
+        #!/bin/bash
+        export MISE_MINIMUM_RELEASE_AGE=0
+        mise use -g --quiet "<spec>" || exit 1
+        exec mise x "<spec>" -- "<tool>" "$@"
+
+    A short script whose last command is that ``exec``; the quoting may
+    differ and ``mise exec`` is the same as ``mise x``. Anything else, a
+    real program included, is not a wrapper. The file is read, never run.
+    """
+    try:
+        with open_ro(path) as fh:  # regular files only, and it never waits
+            head = fh.read(WRAPPER_MAX + 1)
+    except OSError:
+        return None
+    if len(head) > WRAPPER_MAX or not head.startswith(b"#!") or b"\0" in head:
+        return None
+    try:
+        lines = head.decode("utf-8").splitlines()[1:]
+    except UnicodeDecodeError:
+        return None
+    commands = [
+        line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not commands or len(commands) > WRAPPER_COMMANDS:
+        return None
+    try:
+        words = shlex.split(commands[-1])
+    except ValueError:  # quotes that do not close
+        return None
+    if (
+        len(words) != 7
+        or words[0] != "exec"
+        or os.path.basename(words[1]) != "mise"
+        or words[2] not in ("x", "exec")
+        or words[4] != "--"
+        or words[6] != "$@"
+    ):
+        return None
+    spec, tool = words[3], words[5]
+    if not spec or spec.startswith("-") or not tool or tool != os.path.basename(tool):
+        return None
+    return spec, tool
+
+
+def _install_name(spec: str) -> str:
+    """The name of the directory mise keeps a tool in, for the spec a
+    wrapper passes to ``mise x``.
+
+    The rule is read off this machine's ``~/.local/share/mise/installs``
+    (2026-10-12), where the specs ``claude``, ``codex``, ``opencode``,
+    ``npm:playwright`` and ``npm:@xai-official/grok`` have the directories
+    ``claude``, ``codex``, ``opencode``, ``npm-playwright`` and
+    ``npm-xai-official-grok``: lower case, every run of characters that are
+    not letters or digits becomes one ``-``, none at either end. It was not
+    checked against mise's code. Where it is wrong for some other spec, the
+    directory is not found and the tool counts as not installed: a launch is
+    refused, nothing is installed. A version (``tool@1.2``) is not part of
+    the name.
+    """
+    cut = spec.rfind("@")
+    if cut > 0 and spec[cut - 1] not in ":/":  # not the scope of ``npm:@scope/tool``
+        spec = spec[:cut]
+    return re.sub(r"[^a-z0-9]+", "-", spec.lower()).strip("-")
+
+
+def _mise_installs() -> str:
+    """Where mise keeps what it installed: ``installs`` below its data
+    directory, which is ``$MISE_DATA_DIR``, else ``$XDG_DATA_HOME/mise``,
+    else ``~/.local/share/mise``. A value that is not an absolute path is
+    passed over, as the XDG rules have it."""
+    data = os.environ.get("MISE_DATA_DIR", "")
+    if not os.path.isabs(data):
+        share = os.environ.get("XDG_DATA_HOME", "")
+        if not os.path.isabs(share):
+            share = os.path.join(os.path.expanduser("~"), ".local", "share")
+        data = os.path.join(share, "mise")
+    return os.path.join(data, "installs")
+
+
+def _executable_below(root: str, tool: str) -> bool:
+    """Whether some version directory in ``root`` holds an executable file
+    named ``tool``, or a link to one, at most ``SEARCH_DEPTH`` directories
+    down: ``claude/<version>/claude``, ``codex/<version>/bin/codex``,
+    ``npm-…/<version>/node_modules/.bin/grok``. A version directory with
+    nothing but a ``package.json`` (an install that did not finish) has
+    none. Listings and stats only."""
+    try:
+        versions = sorted(os.listdir(root), reverse=True)
+    except OSError:
+        return False
+    budget = SEARCH_ENTRIES
+    seen = set()
+    for version in versions:
+        start = os.path.join(root, version)
+        real = os.path.realpath(start)  # ``latest`` and ``1.0`` are links to a version
+        if real in seen or not os.path.isdir(start):
+            continue
+        seen.add(real)
+        level = [start]
+        for depth in range(SEARCH_DEPTH):
+            below = []
+            for directory in level:
+                candidate = os.path.join(directory, tool)
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    return True
+                if depth + 1 == SEARCH_DEPTH:
+                    continue
+                try:
+                    with os.scandir(directory) as entries:
+                        for entry in entries:
+                            budget -= 1
+                            if budget < 0:
+                                return False
+                            if entry.is_dir(follow_symlinks=False):
+                                below.append(entry.path)
+                except OSError:
+                    continue
+            level = sorted(below)
+    return False
+
+
+def _inspect(path: str) -> ToolState:
+    found = _wrapper(path)
+    if found is None:
+        return ToolState(path, True, False, INSTALLED)  # a program, or a script of another kind
+    spec, tool = found
+    if _executable_below(os.path.join(_mise_installs(), _install_name(spec)), tool):
+        return ToolState(path, True, True, INSTALLED)
+    return ToolState(path, False, True, NOT_INSTALLED)
+
+
+_inspected: dict[tuple[str, str], ToolState] = {}
+
+
+def tool_state(binary: str) -> ToolState:
+    """Whether the tool behind the command ``binary`` is installed: ``not
+    found`` when PATH has no such command, ``not installed`` when the command
+    is a wrapper whose tool is missing from mise's installs, ``installed``
+    otherwise (a wrapper whose tool is there, a real program, a script that
+    is not such a wrapper).
+
+    Files only; no program is started. What a file says is remembered for
+    the life of the process (``forget_tools`` drops it), so asking for every
+    session of a listing reads a wrapper once.
+    """
+    path = shutil.which(binary) if binary else None
+    if path is None:
+        return ToolState(None, False, False, NOT_FOUND)
+    key = (path, _mise_installs())
+    state = _inspected.get(key)
+    if state is None:
+        state = _inspected[key] = _inspect(path)
+    return state
+
+
+def forget_tools() -> None:
+    """Look again next time: a scan calls this, so a tool installed while
+    the program runs is seen by the next scan."""
+    _inspected.clear()
+
+
+# --- launch -----------------------------------------------------------------
 
 
 @dataclass
@@ -173,9 +374,13 @@ def plan(
             f"the id of this session is not in the form {label} ids have; it was not resumed"
         )
     argv = [str(arg) for arg in provider.resume_argv(session)]
-    if not argv or not shutil.which(argv[0]):
-        tool = argv[0] if argv else provider.binary
+    tool = argv[0] if argv else provider.binary
+    state = tool_state(tool) if argv else ToolState(None, False, False, NOT_FOUND)
+    if state.path is None:
         raise LaunchFailed(f"{tool} is not installed (not found on PATH)")
+    if not state.installed:
+        # Starting the wrapper would install the tool: never from here.
+        raise LaunchFailed(f"{tool} is {state.detail}")
     if any(arg.startswith("-") for arg in _from_session(session, provider, argv)):
         raise LaunchFailed(
             f"the data of this session would be read as an option of {argv[0]}; it was not resumed"
@@ -231,4 +436,16 @@ def launch(
         raise failure from exc
 
 
-__all__ = ["LAUNCHER", "LaunchFailed", "LaunchPlan", "launch", "plan"]
+__all__ = [
+    "INSTALLED",
+    "LAUNCHER",
+    "NOT_FOUND",
+    "NOT_INSTALLED",
+    "LaunchFailed",
+    "LaunchPlan",
+    "ToolState",
+    "forget_tools",
+    "launch",
+    "plan",
+    "tool_state",
+]

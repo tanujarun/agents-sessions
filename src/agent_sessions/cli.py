@@ -339,7 +339,7 @@ def _status(args: argparse.Namespace) -> int:
                 p["name"],
                 _count(p["stores"], "store"),
                 _count(p["sessions"], "session"),
-                (p["installed"] or f"{p['binary']} not installed")
+                (p["installed"] or f"{p['binary']} {p['tool']}")
                 + ("" if p["resumable"] else " (not resumable)"),
             ]
             for p in status["providers"]
@@ -384,6 +384,20 @@ def _status(args: argparse.Namespace) -> int:
     _table(rows, "  ")
     if not rows:
         _out("  none recorded")
+
+    _out("")
+    _out("tools")
+    _table(
+        [
+            [
+                t["tool"],
+                t["detail"],
+                (t["path"] or "") + (" (wrapper)" if t["wrapper"] else ""),
+            ]
+            for t in status["tools"]
+        ],
+        "  ",
+    )
 
     if status["no_reader"]:
         _out("")

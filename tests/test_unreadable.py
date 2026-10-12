@@ -112,7 +112,7 @@ class IndexTest(unittest.TestCase):
         self.profile.mkdir(parents=True)
         for name in ("claude", "grok"):
             shutil.copytree(FIXTURES / name / "windows", self.profile, dirs_exist_ok=True)
-        which = mock.patch("agent_sessions.index.shutil.which", return_value=None)
+        which = mock.patch("shutil.which", return_value=None)
         which.start()
         self.addCleanup(which.stop)
 

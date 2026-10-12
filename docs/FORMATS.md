@@ -1026,6 +1026,28 @@ Behind the wrappers `[verified]`:
 | gemini | `…/installs/gemini/0.63.0/` holds `package.json` only | install incomplete |
 | cursor-agent, copilot, crush | no directory under `…/installs/`, not in `~/.config/mise/config.toml` | not installed; the first call would install |
 
+The wrapper, byte for byte (here for claude, 123 bytes; the other seven are 120 to 153 bytes and
+differ in the two names only) `[verified]`:
+
+```
+#!/bin/bash
+export MISE_MINIMUM_RELEASE_AGE=0
+mise use -g --quiet "claude" || exit 1
+exec mise x "claude" -- "claude" "$@"
+```
+
+For Grok the spec is `npm:@xai-official/grok` and the tool `grok`. The directory under
+`~/.local/share/mise/installs/` is named after the spec `[verified]` for the five that are
+installed: `claude`, `codex`, `opencode`, `npm:playwright` → `npm-playwright`,
+`npm:@xai-official/grok` → `npm-xai-official-grok`. The rule `launch._install_name` uses (lower
+case, every run of characters that are not letters or digits becomes one `-`) fits those five
+and was not checked against mise's code `[inferred]`. Each directory holds one sub-directory per
+version, links to versions (`latest`, `1`, `1.0`) and `.mise.backend.toml`. The program is at
+`claude/<version>/claude`, `codex/<version>/bin/codex`, `opencode/<version>/opencode` and
+`npm-xai-official-grok/<version>/node_modules/.bin/grok`: at most three directories below the
+version, which is how far `launch.tool_state` looks. `gemini/0.63.0/` has no program at any
+depth.
+
 ### Q1. Grok: group directory, lookup by id, search index, 1.0.34 sessions
 
 Method: copies of the native session `01a106cb-…` (118 kB) with the last 12 hex digits of the
@@ -1351,8 +1373,10 @@ with `<data>` = `$XDG_DATA_HOME/opencode` or `~/.local/share/opencode`; it has a
 command group (`session delete <sessionID>` among it). No format section is written: there is
 no file to describe.
 
-Consequence for `status`: it lists `copilot`, `crush` and `cursor-agent` as "installed tools
-with no reader" because a wrapper of that name is on PATH; they are not installed.
+Consequence for `status`: it listed `copilot`, `crush` and `cursor-agent` as "installed tools
+with no reader" because a wrapper of that name is on PATH; they are not installed. Since the
+production pass `status` asks `launch.tool_state`, which reads the wrapper and looks into mise's
+installs (below), and lists only what is there.
 
 ### Q7. Drive letter `D:`
 

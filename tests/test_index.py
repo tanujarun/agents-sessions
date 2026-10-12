@@ -10,7 +10,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from support import FakeProvider, OtherProvider, Sandbox
+from support import FakePath, FakeProvider, OtherProvider, Sandbox
 
 from agent_sessions import api, discover, providers
 from agent_sessions import index as index_mod
@@ -37,11 +37,7 @@ class IndexCase(unittest.TestCase):
         self.native = self.box.store(self.box.home)
         self.disk = self.box.mount("Win Disk")
         self.foreign = self.box.store(self.disk / "Users" / "arun")
-        which = mock.patch(
-            "agent_sessions.index.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"
-        )
-        which.start()
-        self.addCleanup(which.stop)
+        self.path = FakePath(self, self.box.root / "bin")  # every command is installed
 
     def by_id(self) -> dict:
         return {s.id: s for s in api.list_sessions()}
@@ -490,7 +486,7 @@ class DerivedFieldsTest(IndexCase):
         got = self.by_id()
         self.assertEqual((got["n"].launchable, got["n"].note), (True, None))
         self.assertEqual((got["f"].launchable, got["f"].note), (False, None))  # foreign: never
-        with mock.patch("agent_sessions.index.shutil.which", return_value=None):
+        with mock.patch("shutil.which", return_value=None):
             n = self.by_id()["n"]  # binary missing
             self.assertEqual((n.launchable, n.note), (False, "Fake CLI is not installed"))
         with mock.patch.object(FakeProvider, "resumable", False):  # not resumable
@@ -500,7 +496,7 @@ class DerivedFieldsTest(IndexCase):
     def test_adapter_note_is_kept(self):
         self.box.session(self.native, "n", note="continued in x")
         api.scan()
-        with mock.patch("agent_sessions.index.shutil.which", return_value=None):
+        with mock.patch("shutil.which", return_value=None):
             self.assertEqual(self.by_id()["n"].note, "continued in x")
 
     def test_imported_as(self):
