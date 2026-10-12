@@ -13,7 +13,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from support import FIXTURES, Sandbox
+from support import FIXTURES, FakePath, Sandbox
 
 from agent_sessions import api, launch
 from agent_sessions.fsutil import listdir_ro
@@ -72,10 +72,8 @@ class World:
             for folder in ("proj", "My Proj"):
                 (self.home / folder).mkdir(exist_ok=True)
             self.override({"/home/user": str(self.home)})
-        self.installed = set(TOOLS)
-        which = mock.patch("shutil.which", side_effect=self._which)
-        which.start()
-        case.addCleanup(which.stop)
+        self.path = FakePath(case, self.box.root / "bin", TOOLS)
+        self.installed = self.path.installed  # the set itself: tests add to it and take from it
         self.started: list[tuple[list[str], str]] = []  # (command, cwd) of each launch
         self.notified: list[str] = []
         for name, hook in (
@@ -85,9 +83,6 @@ class World:
             patch = mock.patch.object(launch, name, hook)
             patch.start()
             case.addCleanup(patch.stop)
-
-    def _which(self, name, *args, **kwargs):
-        return f"/usr/bin/{name}" if name in self.installed else None
 
     def override(self, mapping: dict) -> None:
         """Write the path-map override file of the fake home."""

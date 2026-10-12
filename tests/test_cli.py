@@ -3,7 +3,6 @@
 import contextlib
 import io
 import json
-import os
 import shlex
 import shutil
 import sys
@@ -26,7 +25,7 @@ from fixture_world import (
     World,
     files_below,
 )
-from support import Sandbox
+from support import FakePath, Sandbox, state_names
 
 from agent_sessions import api, cli, launch
 from agent_sessions.fsutil import cache_file
@@ -54,11 +53,7 @@ class CliTest(unittest.TestCase):
         self.foreign = self.box.store(self.disk / "Users" / "arun")
         self.site = self.disk / "Users" / "arun" / "Site Work"
         self.site.mkdir()
-        which = mock.patch(
-            "agent_sessions.index.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"
-        )
-        which.start()
-        self.addCleanup(which.stop)
+        self.path = FakePath(self, self.box.root / "bin")  # every command is installed
         now = datetime.now(UTC)
         stamp = lambda **ago: (now - timedelta(**ago)).isoformat()  # noqa: E731
         self.box.session(
@@ -238,17 +233,16 @@ class CliTest(unittest.TestCase):
 
     def test_status_json(self):
         run("scan")
-        with mock.patch(
-            "agent_sessions.api.shutil.which",
-            side_effect=lambda name: None if name == "crush" else f"/bin/{name}",
-        ):
-            code, out, _ = run("status", "--json")
+        self.path.missing.add("crush")  # not on PATH at all
+        self.path.wrapper("copilot")  # on PATH, but only the script that would install it
+        code, out, _ = run("status", "--json")
         status = json.loads(out)
         self.assertEqual(code, 0)
         self.assertEqual(
             set(status),
             {
                 "cache",
+                "log",
                 "last_quick",
                 "last_deep",
                 "mounts",
@@ -257,12 +251,44 @@ class CliTest(unittest.TestCase):
                 "skipped_stores",
                 "letters",
                 "unresolved_letters",
+                "tools",
                 "no_reader",
                 "warnings",
             },
         )
+        # Only what is really installed is an "installed tool with no reader".
+        bin_dir = self.box.root / "bin"
         self.assertEqual(
-            [t["tool"] for t in status["no_reader"]], ["copilot", "cursor-agent", "opencode"]
+            status["no_reader"],
+            [
+                {"tool": "cursor-agent", "path": str(bin_dir / "cursor-agent")},
+                {"tool": "opencode", "path": str(bin_dir / "opencode")},
+            ],
+        )
+        self.assertEqual(
+            [(t["tool"], t["detail"], t["wrapper"], t["reader"]) for t in status["tools"]],
+            [
+                (
+                    "copilot",
+                    "not installed (the command on PATH would install it)",
+                    True,
+                    False,
+                ),
+                ("crush", "not found", False, False),
+                ("cursor-agent", "installed", False, False),
+                ("fake-agent", "installed", False, True),
+                ("opencode", "installed", False, False),
+            ],
+        )
+        self.assertEqual(
+            [(t["path"], t["installed"]) for t in status["tools"]],
+            [
+                (str(bin_dir / "copilot"), False),
+                (None, False),
+                (str(bin_dir / "cursor-agent"), True),
+                (str(bin_dir / "fake-agent"), True),
+                (str(bin_dir / "opencode"), True),
+            ],
         )
         self.assertEqual(
             status["providers"],
@@ -271,7 +297,8 @@ class CliTest(unittest.TestCase):
                     "name": "fake",
                     "label": "Fake",
                     "binary": "fake-agent",
-                    "installed": "/bin/fake-agent",
+                    "installed": str(bin_dir / "fake-agent"),
+                    "tool": "installed",
                     "resumable": True,
                     "reader": True,
                     "stores": 2,
@@ -470,7 +497,7 @@ class SessionCommandsTest(unittest.TestCase):
         self.assertIn("Grok's directory encoding of '-', '.', '_', '~' is unverified", err)
 
         # Nothing was written anywhere: the stores are as the fixtures were.
-        self.assertFalse(os.path.exists(os.environ["AGENT_SESSIONS_STATE"]))
+        self.assertEqual(state_names(), [])  # the log apart
         self.assertNotIn(CLAUDE_WIN, " ".join(files_below(self.home / ".claude")))
         self.assertNotIn(CODEX_WIN, " ".join(files_below(self.home / ".codex")))
 
@@ -546,7 +573,7 @@ class SessionCommandsTest(unittest.TestCase):
             ),
         )
         self.assertEqual(self.w.started, [])
-        self.assertFalse(os.path.exists(os.environ["AGENT_SESSIONS_STATE"]))
+        self.assertEqual(state_names(), [])  # the log apart
 
     # --- show ---------------------------------------------------------------
 

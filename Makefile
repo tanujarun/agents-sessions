@@ -23,16 +23,11 @@ format: need-tools
 typecheck: need-tools
 	$(BIN)/mypy
 
-# Engine suite and TUI suite, measured apart and combined, then the per-module
-# report. Two runs because test_smoke checks that the engine leaves Textual
-# unimported, which cannot hold in a process that also loads the TUI app tests.
-ENGINE_TESTS := $(filter-out test_tui_app,$(basename $(notdir $(wildcard tests/test_*.py))))
-
+# Every suite in one run under the venv's Python (it has Textual), then the
+# per-module report.
 coverage: need-tools
 	$(BIN)/coverage erase
-	PYTHONPATH=tests $(BIN)/coverage run -p -m unittest $(ENGINE_TESTS)
-	$(BIN)/coverage run -p -m unittest discover -s tests -p 'test_tui*.py'
-	$(BIN)/coverage combine
+	$(BIN)/coverage run -m unittest discover -s tests
 	$(BIN)/coverage report
 
 # .venv with Textual and the development tools, the project installed editable.

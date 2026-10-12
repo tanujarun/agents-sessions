@@ -135,6 +135,23 @@ class CandidatesTest(GeminiCase):
                 ],
             )
 
+    def test_a_chat_files_name_is_matched_whole(self):
+        """A name with a line break in it or after it is not a chat file's
+        name (with ``match`` and ``$`` the second passed)."""
+        good = self.write([], name="session-2026-08-30T10-00-abcd1234.jsonl")
+        for name in (
+            "session-2026-08-30T10-00-abcd1234.jsonl\n",
+            "session-2026-08-30T10-00-abcd1234.json\n",
+            "session-2026\n-08-30T10-00-abcd1234.jsonl",
+            "xsession-2026-08-30T10-00-abcd1234.jsonl",
+            "session-2026-08-30T10-00-abcd1234.jsonlx",
+        ):
+            self.write([], name=name)
+        hints = [c.id_hint for c in self.provider.candidates(self.store)]
+        self.assertEqual(hints, [f"tmp/my-proj/chats/{good.name}"])
+        self.assertEqual(gemini_mod._id_group(good.name), "abcd1234")
+        self.assertEqual(gemini_mod._id_group(good.name + "\n"), good.name + "\n")
+
     def test_counts_match_the_readme(self):
         self.assertEqual(len(self.provider.candidates(FIXTURE_STORE)), 2)
         self.assertEqual(len(self.provider.list_sessions(FIXTURE_STORE)), 1)
@@ -215,7 +232,10 @@ class FixtureParseTest(GeminiCase):
     def test_resume_argv_and_not_resumable(self):
         (s,) = self.provider.list_sessions(FIXTURE_STORE)
         self.assertEqual(self.provider.resume_argv(s), ["gemini", "--resume", SYNTHETIC_ID])
-        self.assertFalse(self.provider.resumable)
+        # "The real CLI is installed" (tests/test_tools.py has the cases):
+        # with no gemini command at all it is not.
+        with mock.patch("shutil.which", return_value=None):
+            self.assertFalse(self.provider.resumable)
 
     def test_a_gemini_dir_without_tmp_is_not_a_store(self):
         self.assertFalse(self.provider.is_store(NOT_A_STORE))

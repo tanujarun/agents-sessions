@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fixture_world import CLAUDE_NATIVE, CLAUDE_WIN, CODEX_NATIVE, GROK_NATIVE, REAL, World
 from support import FIXTURES, FakeProvider, Sandbox, write_jsonl
 
-from agent_sessions import api, cli, importer, launch, textsafe
+from agent_sessions import api, cli, importer, journal, launch, textsafe
 from agent_sessions.model import UUID_PATTERN, Session, Store
 from agent_sessions.providers.antigravity import Antigravity
 from agent_sessions.providers.base import Provider
@@ -385,7 +385,7 @@ class ImporterRefusesTest(unittest.TestCase):
                     action(broken)
                 self.assertEqual(caught.exception.reason, NOT_IMPORTED)
         self.assertFalse((self.w.home / ".claude").exists())
-        self.assertFalse(Path(importer.provenance_file()).exists())
+        self.assertFalse(journal.path().exists())
 
     def test_a_session_with_a_bad_id_cannot_be_imported(self):
         """Through the facade, with an adapter that plans it all the same."""
@@ -400,7 +400,7 @@ class ImporterRefusesTest(unittest.TestCase):
         # The real adapter does not plan it in the first place.
         self.assertFalse(api.can_import(session, self.index)[0])
         self.assertFalse((self.w.home / ".claude").exists())
-        self.assertFalse(Path(importer.provenance_file()).exists())
+        self.assertFalse(journal.path().exists())
 
     def test_the_plan_carries_the_providers_grammar(self):
         plan = api._plan(self.source, self.index)

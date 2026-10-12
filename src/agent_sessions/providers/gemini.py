@@ -9,6 +9,7 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
+from .. import launch
 from ..fsutil import home, listdir_ro, subdirs
 from ..importer import human_size
 from ..model import Candidate, Session, Store
@@ -36,9 +37,11 @@ IMPORT_UNSAFE = (
     "Gemini CLI is not installed on this machine, and no resumable Gemini session exists to import"
 )
 
-_CHAT_NAME = re.compile(r"^session-.*\.jsonl?$")
+# A chat file's name, matched whole (``fullmatch``): no line break in it
+# or after it.
+_CHAT_NAME = re.compile(r"session-.*\.jsonl?")
 # The tool names a chat file ``session-<time>-<first 8 of the session id>``.
-_ID_PART = re.compile(r"-([^-]{1,8})\.jsonl?$")
+_ID_PART = re.compile(r"-([^-]{1,8})\.jsonl?\Z")
 _FIXED_PATHS = 3  # the chat file, .project_root, projects.json
 _SMALL_FILE = 16 * 1024 * 1024
 _LEGACY_MAX = 64 * 1024 * 1024
@@ -228,7 +231,7 @@ def _load(path: Path) -> tuple[dict, list[dict]] | None:
 
 def _mtime(path: StrPath) -> str | None:
     try:
-        return parse_ts(os.stat(path).st_mtime)
+        return parse_ts(os.stat(path).st_mtime, unit="s")
     except OSError:
         return None
 
@@ -244,11 +247,17 @@ class Gemini(Provider):
     label = "Gemini"
     binary = "gemini"
     app_id = "org.omarchy.gemini"
-    # No usable gemini binary exists here (FORMATS "Gemini CLI" section 0).
-    resumable = False
     # Resume searches only the chats of the process cwd's project (section 5).
     resume_needs_cwd = True
     dir_names: ClassVar[set[str]] = {".gemini"}
+
+    @property
+    def resumable(self) -> bool:
+        """Whether the real Gemini CLI is installed. On the machine this was
+        written on it is not: the ``gemini`` on PATH is a wrapper that would
+        install it, and what it left behind is a ``package.json`` (FORMATS
+        "Gemini CLI" section 0, "What is on PATH")."""
+        return launch.tool_state(self.binary).installed
 
     def native_store(self) -> Path:
         return home() / ".gemini"
@@ -277,7 +286,7 @@ class Gemini(Provider):
         for slug in slugs:
             chats = root / "tmp" / slug / "chats"
             try:
-                names = sorted(n for n in listdir_ro(chats) if _CHAT_NAME.match(n))
+                names = sorted(n for n in listdir_ro(chats) if _CHAT_NAME.fullmatch(n))
             except OSError as exc:
                 unreadable(chats, exc)
                 continue

@@ -36,9 +36,9 @@ from fixture_world import (
     files_below,
     tree_state,
 )
-from support import FIXTURES
+from support import FIXTURES, state_names
 
-from agent_sessions import api, importer
+from agent_sessions import api, importer, journal
 from agent_sessions.model import make_key
 from agent_sessions.providers import antigravity, gemini
 from agent_sessions.providers import grok as grok_mod
@@ -120,10 +120,14 @@ class ImportCase(unittest.TestCase):
 
     @property
     def record_file(self) -> Path:
-        return Path(os.environ["AGENT_SESSIONS_STATE"]) / "imports.json"
+        return Path(os.environ["AGENT_SESSIONS_STATE"]) / "imports.jsonl"
 
     def records(self) -> list[dict]:
-        return json.loads(self.record_file.read_text(encoding="utf-8"))["imports"]
+        """The journal, read by hand: one JSON object per line."""
+        lines = self.record_file.read_text(encoding="utf-8").splitlines()
+        records = [json.loads(line) for line in lines]
+        self.assertEqual(records, journal.read())
+        return records
 
     def refused(self, ref, **kwargs) -> str:
         with self.assertRaises(api.ImportFailed) as caught:
@@ -212,9 +216,12 @@ class ClaudeImportTest(ImportCase):
         native = api.import_session(source)
         (record,) = self.records()
         self.assertRegex(record.pop("imported_at"), r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        manifest = record.pop("manifest")
         self.assertEqual(
             record,
             {
+                "record": "import",
+                "version": 2,
                 "provider": "claude",
                 "id": CLAUDE_WIN,
                 "source_key": source.key,
@@ -240,9 +247,48 @@ class ClaudeImportTest(ImportCase):
                 "source_tool_version": "2.1.293",
             },
         )
+        # The manifest: everything this import created, as it lies there.
+        created = {str(self.home / ".claude"), str(self.target.parent), str(self.target)}
+        files = [rel for rel in files_below(self.target) if rel.startswith(CLAUDE_WIN)]
+        for rel in files:
+            parent = os.path.dirname(rel)
+            while parent:
+                created.add(str(self.target / parent))
+                parent = os.path.dirname(parent)
+        self.assertEqual(manifest["dirs"], sorted(created))
+        self.assertEqual(
+            manifest["files"],
+            [
+                {
+                    "path": path,
+                    "size": os.path.getsize(path),
+                    "mtime_ns": os.stat(path).st_mtime_ns,
+                }
+                for path in sorted(str(self.target / rel) for rel in files)
+            ],
+        )
+        self.assertGreater(len(manifest["files"]), 1)
         api.import_session(self.source(CLAUDE_WIN_PLAIN))
-        self.assertEqual([r["id"] for r in self.records()], [CLAUDE_WIN, CLAUDE_WIN_PLAIN])
-        self.assertEqual(os.listdir(self.record_file.parent), ["imports.json"])
+        second = self.records()
+        self.assertEqual([r["id"] for r in second], [CLAUDE_WIN, CLAUDE_WIN_PLAIN])
+        # This time only the transcript was created: its folder was there.
+        self.assertEqual(
+            second[1]["manifest"],
+            {
+                "dirs": [],
+                "files": [
+                    {
+                        "path": str(self.target / f"{CLAUDE_WIN_PLAIN}.jsonl"),
+                        "size": os.path.getsize(self.project / f"{CLAUDE_WIN_PLAIN}.jsonl"),
+                        "mtime_ns": os.stat(self.project / f"{CLAUDE_WIN_PLAIN}.jsonl").st_mtime_ns,
+                    }
+                ],
+            },
+        )
+        # The journal is private, and no lock file stays behind.
+        self.assertEqual(state_names(), ["imports.jsonl"])
+        self.assertEqual(stat.S_IMODE(os.stat(self.record_file).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(self.record_file.parent).st_mode), 0o700)
 
     def test_side_directory_goes_first_and_the_transcript_last(self):
         plan = Claude().import_plan(self.source(CLAUDE_WIN), self.index.pathmap)
@@ -252,18 +298,19 @@ class ClaudeImportTest(ImportCase):
         )
         self.assertTrue(all(item.rewrite is None for unit in plan.units for item in unit.files))
         placed = []
-        real = os.replace
-        with mock.patch.object(
-            importer.os, "replace", side_effect=lambda a, b: (placed.append(b), real(a, b))[1]
-        ):
+        real = importer._place
+
+        def place(target, dst, is_dir):
+            placed.append((dst, is_dir))
+            return real(target, dst, is_dir)
+
+        with mock.patch.object(importer, "_place", place):
             api.import_session(self.source(CLAUDE_WIN))
-        # ... then the import record; the scan that follows saves the index.
         self.assertEqual(
-            [str(path) for path in placed[:3]],
+            placed,
             [
-                str(self.target / CLAUDE_WIN),
-                str(self.target / f"{CLAUDE_WIN}.jsonl"),
-                str(self.record_file),
+                (str(self.target / CLAUDE_WIN), True),
+                (str(self.target / f"{CLAUDE_WIN}.jsonl"), False),
             ],
         )
         plain = Claude().import_plan(self.source(CLAUDE_WIN_PLAIN), self.index.pathmap)
@@ -345,15 +392,15 @@ class ClaudeImportTest(ImportCase):
         keep = self.home / ".claude" / "projects" / "-kept" / "note.txt"
         keep.parent.mkdir(parents=True)
         keep.write_text("mine", encoding="utf-8")
-        real, calls = os.replace, []
+        real, calls = importer._place, []
 
-        def failing(src, dst):
+        def failing(src, dst, is_dir):
             calls.append(dst)
             if len(calls) == 2:  # the side directory is in place, the transcript is not
                 raise OSError(errno.ENOSPC, "No space left on device", dst)
-            return real(src, dst)
+            return real(src, dst, is_dir)
 
-        with mock.patch.object(importer.os, "replace", failing):
+        with mock.patch.object(importer, "_place", failing):
             reason = self.refused(self.source(CLAUDE_WIN))
         self.assertEqual(
             calls, [str(self.target / CLAUDE_WIN), str(self.target / f"{CLAUDE_WIN}.jsonl")]
@@ -362,7 +409,7 @@ class ClaudeImportTest(ImportCase):
         self.assertEqual(files_below(self.home / ".claude"), ["projects/-kept/note.txt"])
         self.assertEqual(sorted(os.listdir(self.home / ".claude")), ["projects"])
         self.assertEqual(os.listdir(self.home / ".claude" / "projects"), ["-kept"])
-        self.assertFalse(self.record_file.parent.exists() and os.listdir(self.record_file.parent))
+        self.assertEqual(state_names(), [])
 
     def test_an_interrupted_copy_leaves_nothing_behind(self):
         class Stop(Exception):
@@ -452,14 +499,15 @@ class ClaudeImportTest(ImportCase):
             self.assertEqual(api.import_plan(ref)["already"], native.key)
         self.assertEqual(len(self.records()), 1)
 
-    def test_unusable_import_record_stops_the_import_first(self):
-        self.record_file.parent.mkdir(parents=True)
-        for content in ("{ not json", '{"imports": 3}', "[]"):
-            self.record_file.write_text(content, encoding="utf-8")
-            reason = self.refused(self.source(CLAUDE_WIN))
-            self.assertIn(str(self.record_file), reason)
-            self.assertEqual(self.record_file.read_text(encoding="utf-8"), content)
-            self.assertFalse((self.home / ".claude").exists())
+    def test_an_unreadable_journal_stops_the_import_first(self):
+        """A journal that cannot be read could not take the record either."""
+        self.record_file.mkdir(parents=True)  # a directory where the journal belongs
+        reason = self.refused(self.source(CLAUDE_WIN))
+        self.assertIn(str(self.record_file), reason)
+        self.assertIn("cannot be read", reason)
+        self.assertEqual(api.can_import(self.source(CLAUDE_WIN)), (False, reason))
+        self.assertFalse((self.home / ".claude").exists())
+        self.assertEqual(state_names(), ["imports.jsonl"])
 
     def test_symlinks_in_the_side_directory_are_not_followed(self):
         outside = self.w.c / "outside.txt"
@@ -562,6 +610,21 @@ class CodexImportTest(ImportCase):
         (record,) = self.records()
         self.assertEqual(record["source_tool_version"], "0.150.1")
         self.assertEqual(record["appended"], [])
+        # The manifest has the file as it was placed, not as it was planned:
+        # the rewrite changed its length.
+        placed = os.stat(self.copy)
+        self.assertEqual(
+            record["manifest"]["files"],
+            [{"path": str(self.copy), "size": placed.st_size, "mtime_ns": placed.st_mtime_ns}],
+        )
+        self.assertNotEqual(placed.st_size, record["bytes"])
+        self.assertEqual(record["bytes"], os.path.getsize(source.files[0]))
+        day = self.copy.parent
+        self.assertEqual(
+            record["manifest"]["dirs"],
+            sorted(str(path) for path in (day, *list(day.parents)[:4])),  # up to ~/.codex
+        )
+        self.assertEqual(Path(record["manifest"]["dirs"][0]), self.home / ".codex")
         self.assertEqual(
             record["rewritten"],
             {
@@ -620,6 +683,34 @@ class CodexImportTest(ImportCase):
         )
         self.assertEqual(native.title, "Site révision")
         self.assertEqual(self.records()[0]["appended"], [str(index)])
+
+    def test_an_index_the_import_creates_is_private(self):
+        """docs/REVIEW.md R-10: thread names are session data like the rest."""
+        own = self.w.profile / ".codex" / "session_index.jsonl"
+        own.write_bytes(
+            b'{"id":"%s","thread_name":"from the store","updated_at":"t"}\n' % CODEX_WIN.encode()
+        )
+        self.w.scan()
+        index = self.home / ".codex" / "session_index.jsonl"
+        self.assertFalse(index.exists())
+        native = api.import_session(CODEX_WIN)
+        self.assertEqual(native.title, "from the store")
+        self.assertEqual(stat.S_IMODE(os.stat(index).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(self.copy).st_mode), 0o600)
+
+    def test_an_index_that_exists_keeps_its_mode(self):
+        own = self.w.profile / ".codex" / "session_index.jsonl"
+        own.write_bytes(
+            b'{"id":"%s","thread_name":"from the store","updated_at":"t"}\n' % CODEX_WIN.encode()
+        )
+        index = self.home / ".codex" / "session_index.jsonl"
+        index.parent.mkdir(parents=True)
+        index.write_bytes(b'{"id":"mine","thread_name":"kept","updated_at":"z"}\n')
+        os.chmod(index, 0o640)
+        self.w.scan()
+        api.import_session(CODEX_WIN)
+        self.assertEqual(read(index).count(b"\n"), 2)
+        self.assertEqual(stat.S_IMODE(os.stat(index).st_mode), 0o640)
 
     def test_a_name_the_native_index_already_has_is_not_appended_again(self):
         own = self.w.profile / ".codex" / "session_index.jsonl"
@@ -735,15 +826,15 @@ class CodexSegmentImportTest(ImportCase):
         )
 
     def test_base_goes_in_first_and_a_failure_takes_it_out_again(self):
-        real, calls = os.replace, []
+        real, calls = importer._place, []
 
-        def failing(src, dst):
+        def failing(src, dst, is_dir):
             calls.append(os.path.basename(dst))
             if len(calls) == 2:
                 raise OSError(errno.EIO, "Input/output error", dst)
-            return real(src, dst)
+            return real(src, dst, is_dir)
 
-        with mock.patch.object(importer.os, "replace", failing):
+        with mock.patch.object(importer, "_place", failing):
             self.refused(self.source(CODEX_SEGMENTED))
         self.assertEqual(calls, [SEGMENT_BASE, SEGMENT_LAST])
         self.assert_nothing_written()

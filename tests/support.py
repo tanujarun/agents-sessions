@@ -1,12 +1,15 @@
 """Shared test scaffolding: a sandbox (fake home, cache, mounts) and a fake
 provider. Nothing here touches a real store."""
 
+import atexit
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -14,7 +17,7 @@ _SRC = str(Path(__file__).resolve().parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from agent_sessions import providers  # noqa: E402
+from agent_sessions import launch, logs, providers  # noqa: E402
 from agent_sessions.fsutil import home  # noqa: E402
 from agent_sessions.model import Candidate, Session  # noqa: E402
 from agent_sessions.providers.base import (  # noqa: E402
@@ -25,6 +28,15 @@ from agent_sessions.providers.base import (  # noqa: E402
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+# A net below every test: the engine writes its log into the state directory
+# from many places, and a test that reaches one outside a ``Sandbox`` must
+# not write the user's real one. ``Sandbox`` puts its own directory over
+# this for the length of a test.
+if "AGENT_SESSIONS_STATE" not in os.environ:
+    _stray_state = tempfile.mkdtemp(prefix="agent-sessions-test-state-")
+    os.environ["AGENT_SESSIONS_STATE"] = _stray_state
+    atexit.register(shutil.rmtree, _stray_state, ignore_errors=True)
 
 
 def write_jsonl(path, records) -> Path:
@@ -126,6 +138,56 @@ class OtherProvider(FakeProvider):
         return home() / ".other"
 
 
+WRAPPER = (
+    "#!/bin/bash\n"
+    "export MISE_MINIMUM_RELEASE_AGE=0\n"
+    'mise use -g --quiet "{spec}" || exit 1\n'
+    'exec mise x "{spec}" -- "{tool}" "$@"\n'
+)  # the text of the wrappers in ~/.local/bin (docs/FORMATS.md "What is on PATH")
+
+
+class FakePath:
+    """What PATH holds, for the length of a test: ``shutil.which`` answers
+    from ``directory``. A command that "is installed" is a small file there
+    that is no script (``launch.tool_state`` reads it and takes it for a
+    program); ``wrapper`` puts an installing wrapper in its place.
+
+    ``installed``: the commands that exist; None means every command asked
+    for exists, except those in ``missing``."""
+
+    def __init__(self, case, directory, installed=None, missing=()):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.installed = None if installed is None else set(installed)
+        self.missing = set(missing)
+        launch.forget_tools()
+        case.addCleanup(launch.forget_tools)
+        patch = mock.patch("shutil.which", side_effect=self.which)
+        patch.start()
+        case.addCleanup(patch.stop)
+
+    def which(self, name, *args, **kwargs):
+        if name in self.missing or (self.installed is not None and name not in self.installed):
+            return None
+        path = self.directory / name
+        if not path.exists():
+            path.write_bytes(b"\x7fELF a program, for the tests\n")
+            path.chmod(0o755)
+        return str(path)
+
+    def wrapper(self, tool, spec=None, text=None) -> Path:
+        """Put the installing wrapper for ``tool`` on the fake PATH (or a
+        script with ``text``), and count the command as there."""
+        path = self.directory / tool
+        path.write_text(text or WRAPPER.format(spec=spec or tool, tool=tool), encoding="utf-8")
+        path.chmod(0o755)
+        self.missing.discard(tool)
+        if self.installed is not None:
+            self.installed.add(tool)
+        launch.forget_tools()
+        return path
+
+
 class Sandbox:
     """Temp dir with a fake home, cache and state; env overrides set; the
     provider registry replaced. Use ``self.box = Sandbox(self)`` in setUp."""
@@ -143,6 +205,8 @@ class Sandbox:
                 "AGENT_SESSIONS_CACHE": str(self.cache),
                 "AGENT_SESSIONS_STATE": str(self.root / "state"),
                 "AGENT_SESSIONS_NOTIFY": "0",  # a failed launch must not notify the desktop
+                # What mise has installed on this machine is not the test's business.
+                "MISE_DATA_DIR": str(self.root / "mise"),
             },
         )
         env.start()
@@ -158,6 +222,7 @@ class Sandbox:
         self.set_mounts()
 
     def _remove(self):
+        logs.close()  # the log file is in the state directory that goes now
         for base, dirs, _files in os.walk(self.root):
             for name in dirs:
                 try:
@@ -198,3 +263,122 @@ class Sandbox:
         fields.setdefault("updated", "2026-10-01T10:00:00.000Z")
         path.write_text(json.dumps(fields), encoding="utf-8")
         return path
+
+
+LOG_NAME = "agent-sessions.log"
+
+
+def state_names() -> list[str]:
+    """What the state directory holds besides the log, sorted; nothing when
+    it does not exist. Scans, imports and launches write the log, so a test
+    that says "the state directory is untouched" means everything else."""
+    try:
+        names = os.listdir(os.environ["AGENT_SESSIONS_STATE"])
+    except FileNotFoundError:
+        return []
+    return sorted(name for name in names if not name.startswith(LOG_NAME))
+
+
+def drop_state() -> None:
+    """Remove the sandbox's state directory, log included, for a test that
+    has to see whether something creates it again."""
+    logs.close()
+    shutil.rmtree(os.environ["AGENT_SESSIONS_STATE"], ignore_errors=True)
+
+
+REPO = Path(__file__).resolve().parent.parent
+LAUNCHER = REPO / "bin" / "agent-sessions"
+CHILD_TIMEOUT = 60  # seconds a child process of a test may take
+
+
+def python_child(code, *args, **options):
+    """Start a Python that can import the package and runs ``code`` with
+    ``args``; returns the ``Popen``. It inherits the environment, the
+    overrides of a ``Sandbox`` included. Output is captured as text unless
+    ``options`` say otherwise."""
+    options.setdefault("stdout", subprocess.PIPE)
+    options.setdefault("stderr", subprocess.PIPE)
+    options.setdefault("stdin", subprocess.DEVNULL)
+    options.setdefault("text", True)
+    script = f"import sys\nsys.path.insert(0, {_SRC!r})\n{code}"
+    return subprocess.Popen([sys.executable, "-c", script, *map(str, args)], **options)
+
+
+def launcher_child(*argv, **options):
+    """Start our own launcher (``bin/agent-sessions``) with ``argv``."""
+    options.setdefault("stdout", subprocess.PIPE)
+    options.setdefault("stderr", subprocess.PIPE)
+    options.setdefault("stdin", subprocess.DEVNULL)
+    options.setdefault("text", True)
+    return subprocess.Popen([sys.executable, str(LAUNCHER), *map(str, argv)], **options)
+
+
+def finish(case, children, timeout=CHILD_TIMEOUT) -> list[tuple[int, str, str]]:
+    """Wait for child processes; ``(exit status, stdout, stderr)`` of each.
+    One that does not finish is killed and fails the test. A child's stdin,
+    when it is a pipe, is closed here (``communicate`` does it): do not close
+    it before, Python 3.11 then fails on the closed file."""
+    results = []
+    try:
+        for child in children:
+            out, err = child.communicate(timeout=timeout)
+            results.append((child.returncode, out, err))
+    except subprocess.TimeoutExpired:
+        case.fail(f"a child process did not finish in {timeout} s")
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
+    return results
+
+
+# A child process that imports slowly, for the tests that have to catch an
+# import in the middle of its copy: ``python_child(SLOW_IMPORT, mark, gate,
+# "import", key)``. It runs the CLI with ``importer.CHUNK`` at 16 bytes and a
+# source reader that, once the first piece is read, creates the file ``mark``
+# and then waits for the file ``gate`` before it hands anything on. The hook
+# is this script: the package has no switch for it.
+SLOW_IMPORT = """
+import os, time
+from agent_sessions import cli, importer
+
+mark, gate = sys.argv[1], sys.argv[2]
+real_open = importer.open_ro
+importer.CHUNK = 16
+
+
+class Slow:
+    def __init__(self, reader):
+        self.reader = reader
+
+    def read(self, size=-1):
+        data = self.reader.read(size)
+        if data:
+            open(mark, "a").close()
+            while not os.path.exists(gate):
+                time.sleep(0.01)
+        return data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.reader.close()
+
+    def __getattr__(self, name):
+        return getattr(self.reader, name)
+
+
+importer.open_ro = lambda path: Slow(real_open(path))
+sys.exit(cli.main(sys.argv[3:]))
+"""
+
+
+def wait_for(case, path, timeout=CHILD_TIMEOUT) -> None:
+    """Wait until ``path`` exists; fail the test when it does not appear."""
+    deadline = time.monotonic() + timeout
+    while not os.path.exists(path):
+        if time.monotonic() > deadline:
+            case.fail(f"{path} did not appear in {timeout} s")
+        time.sleep(0.01)

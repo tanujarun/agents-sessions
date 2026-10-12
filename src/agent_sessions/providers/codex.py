@@ -32,9 +32,11 @@ if TYPE_CHECKING:
 
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 # Groups: local time, thread id, segment id (or None), ".zst" (or None).
+# A rollout's file name, matched whole (``fullmatch``): with ``match`` and a
+# ``$``, a name that ends in a line break would pass too.
 _ROLLOUT = re.compile(
-    rf"^rollout-(\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}-\d{{2}}-\d{{2}})-({_UUID})(?:_({_UUID}))?"
-    r"\.jsonl(\.zst)?$"
+    rf"rollout-(\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}-\d{{2}}-\d{{2}})-({_UUID})(?:_({_UUID}))?"
+    r"\.jsonl(\.zst)?"
 )
 _DATE_DIRS = re.compile(r"[0-9]{4}/[0-9]{2}/[0-9]{2}")  # YYYY/MM/DD below sessions/
 _INDEX = "session_index.jsonl"
@@ -107,7 +109,7 @@ class _Rollout:
     def is_segment(self) -> bool:
         if self.meta is not None and "history_base" in self.meta:
             return True
-        match = _ROLLOUT.match(os.path.basename(self.path))
+        match = _ROLLOUT.fullmatch(os.path.basename(self.path))
         return bool(match and match.group(3))
 
 
@@ -335,7 +337,7 @@ def _is_subagent(meta: dict) -> bool:
 
 def _mtime(path: StrPath) -> str | None:
     try:
-        return parse_ts(os.stat(path).st_mtime)
+        return parse_ts(os.stat(path).st_mtime, unit="s")
     except OSError:
         return None
 
@@ -373,7 +375,7 @@ class Codex(Provider):
                         unreadable(folder, exc)
                         continue
                     for name in names:
-                        match = _ROLLOUT.match(name)
+                        match = _ROLLOUT.fullmatch(name)
                         if match:
                             threads.setdefault(match.group(2), []).append(
                                 os.path.join(folder, name)
@@ -386,7 +388,7 @@ class Codex(Provider):
     def parse(self, store: Store, c: Candidate) -> Session | None:
         rollouts = []
         for path in sorted(set(c.paths)):
-            match = _ROLLOUT.match(os.path.basename(path))
+            match = _ROLLOUT.fullmatch(os.path.basename(path))
             if not match:
                 continue  # the index
             if match.group(4):
@@ -401,7 +403,7 @@ class Codex(Provider):
         base = next((r for r in ordered if not r.is_segment), ordered[0])
         thread_id = base.thread_id
         if thread_id is None:
-            match = _ROLLOUT.match(os.path.basename(base.path))
+            match = _ROLLOUT.fullmatch(os.path.basename(base.path))
             thread_id = match.group(2) if match else c.id_hint
         kept = []
         for rollout in ordered:
@@ -443,7 +445,7 @@ class Codex(Provider):
     def transcript(self, s: Session) -> Iterator[Turn]:
         rollouts = []
         for path in s.files:
-            match = _ROLLOUT.match(os.path.basename(path))
+            match = _ROLLOUT.fullmatch(os.path.basename(path))
             if match and not match.group(4):
                 rollouts.append(_read(path, tools=True))
         yield from _surviving(_ordered(rollouts))
@@ -456,14 +458,16 @@ class Codex(Provider):
         byte offset into the base, and only its last segment is rewritten.
         The thread's name line, when the source has one, is appended to the
         native ``session_index.jsonl`` after the files are in place."""
-        files = [f for f in s.files if _ROLLOUT.match(os.path.basename(f))]
+        files = [f for f in s.files if _ROLLOUT.fullmatch(os.path.basename(f))]
         if not files:
             raise NotSupported("this thread has no rollout file to copy")
         plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern)
         native = Store(self.name, plan.native_root, "native")
         for candidate in self.candidates(native):
             if candidate.id_hint == s.id:
-                plan.existing = [p for p in candidate.paths if _ROLLOUT.match(os.path.basename(p))]
+                plan.existing = [
+                    p for p in candidate.paths if _ROLLOUT.fullmatch(os.path.basename(p))
+                ]
         source_sessions = os.path.join(s.store, "sessions")
         for position, path in enumerate(files):
             # These four names become names in the native store: the date

@@ -1,23 +1,31 @@
 """The facade the CLI and the TUI call: load, scan, list, status, verify,
-find, open, import, transcript."""
+find, open, import, transcript.
+
+What is worth a line in the log is written here, so both front ends log
+alike (``logs``): the summary and the warnings of a scan, an import and how
+it ended, a launch with the exact command, and any exception that is not one
+of the failures this module reports (``ApiError``), with its traceback.
+"""
 
 from __future__ import annotations
 
-import shutil
+import functools
+import shlex
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
-from . import discover, importer, launch
+from . import discover, importer, launch, logs
 from . import index as index_mod
 from . import providers as registry
 from .errors import ApiError, ImportFailed, LaunchFailed, NotFound
-from .fsutil import cache_file
+from .fsutil import cache_file, log_file
 from .index import Index
 from .launch import LaunchPlan
 from .model import Session, make_key
-from .mounts import NATIVE_LABEL, list_mounts
+from .mounts import NATIVE_LABEL, MountsError, list_mounts
 from .providers import all_providers
 from .providers.base import NotSupported, Provider, Turn, parse_ts
 
@@ -27,7 +35,29 @@ if TYPE_CHECKING:
 # Agent CLIs that may be installed but have no adapter (SPEC non-goals).
 NO_READER_TOOLS = ("copilot", "crush", "cursor-agent", "opencode")
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
+
+def _logged(function: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Write an exception that nobody planned for to the log, with its
+    traceback, and let it go on. The failures a caller is told in plain
+    words (``ApiError``, ``MountsError``) are not such exceptions."""
+
+    @functools.wraps(function)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        try:
+            return function(*args, **kwargs)
+        except (ApiError, MountsError):
+            raise
+        except Exception as exc:
+            logs.unexpected(exc, function.__name__)
+            raise
+
+    return wrapper
+
+
+@_logged
 def load_index() -> Index:
     """The cached index, finalised against the mounts present now. Reads no
     store; ``index.sessions`` is the listing."""
@@ -36,6 +66,7 @@ def load_index() -> Index:
     return index
 
 
+@_logged
 def scan(
     deep: bool | None = None,
     progress: discover.Progress | None = None,
@@ -48,7 +79,26 @@ def scan(
     or that pass is older than 24 h. ``progress(mount_label, dirs_seen)`` is
     called during a walk; ``cancel`` is a ``threading.Event``.
     """
-    return Index.load().scan(all_providers(), list_mounts(), deep, progress, cancel)
+    log = logs.logger()
+    summary = Index.load().scan(all_providers(), list_mounts(), deep, progress, cancel)
+    log.info(
+        "scan %s%s: %.2f s, %d mounts, %d stores, %d candidates (%d parsed, %d from cache), "
+        "%d sessions, %d warnings",
+        summary["mode"],
+        " (cancelled)" if summary["cancelled"] else "",
+        summary["seconds"],
+        len(summary["mounts"]),
+        summary["stores"],
+        summary["candidates"],
+        summary["parsed"],
+        summary["cached"],
+        summary["sessions"],
+        len(summary["warnings"]),
+    )
+    # Here and not in ``load_index``: once per scan, not once per listing.
+    for warning in summary["warnings"]:
+        log.warning("scan: %s", warning)
+    return summary
 
 
 def list_sessions(provider: str | None = None, index: Index | None = None) -> list[Session]:
@@ -60,9 +110,14 @@ def list_sessions(provider: str | None = None, index: Index | None = None) -> li
     return [s for s in index.sessions if provider is None or s.provider == provider]
 
 
+@_logged
 def status(index: Index | None = None) -> dict:
-    """Mounts, stores and counts, drive letters, skipped stores, tools with
-    no reader, warnings. Every list is sorted."""
+    """Mounts, stores and counts, drive letters, skipped stores, the agent
+    tools and whether each is installed, warnings, where the cache and the
+    log are. Every list is sorted.
+
+    "Installed" is ``launch.tool_state``: a command on PATH that would only
+    install the tool does not count."""
     index = index if index is not None else load_index()
     present = {m.path for m in index.current_mounts}
     mounts = [
@@ -92,23 +147,40 @@ def status(index: Index | None = None) -> dict:
         if path not in present
     ]
     providers = []
+    readers = set()
     for p in all_providers():
         rows = [r for r in index.store_rows if r["provider"] == p.name and r["present"]]
+        state = launch.tool_state(p.binary)
+        readers.add(p.binary)
         providers.append(
             {
                 "name": p.name,
                 "label": p.label,
                 "binary": p.binary,
-                "installed": shutil.which(p.binary) if p.binary else None,
+                "installed": state.path if state.installed else None,
+                "tool": state.detail,
                 "resumable": bool(p.resumable),
                 "reader": all(r["reader"] for r in rows),
                 "stores": len(rows),
                 "sessions": sum(r["listed"] for r in rows),
             }
         )
-    tools = [{"tool": name, "path": shutil.which(name)} for name in NO_READER_TOOLS]
+    tools = []
+    for name in sorted(readers | set(NO_READER_TOOLS)):
+        state = launch.tool_state(name)
+        tools.append(
+            {
+                "tool": name,
+                "path": state.path,
+                "installed": state.installed,
+                "wrapper": state.wrapper,
+                "detail": state.detail,
+                "reader": name in readers,
+            }
+        )
     return {
         "cache": str(index.path),
+        "log": str(log_file()),
         "last_quick": index.last_quick,
         "last_deep": index.last_deep,
         "mounts": mounts,
@@ -125,22 +197,41 @@ def status(index: Index | None = None) -> dict:
         ],
         "letters": index.pathmap.letters(),
         "unresolved_letters": index.pathmap.unresolved(),
-        "no_reader": [t for t in tools if t["path"]],
+        "tools": tools,
+        "no_reader": [
+            {"tool": t["tool"], "path": t["path"]}
+            for t in tools
+            if t["installed"] and not t["reader"]
+        ],
         "warnings": index.warnings,
     }
 
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _epoch_ns(moment: str | None) -> int | None:
+    """An ISO time as nanoseconds since 1970, the unit of a file's
+    ``st_mtime_ns``; None when ``moment`` is not a time."""
+    stamp = parse_ts(moment)
+    if stamp is None:
+        return None
+    then = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    return (then - _EPOCH) // timedelta(microseconds=1) * 1000
+
+
 def _newer_than(sig: list, moment: str | None) -> bool:
     """True when a file of the signature is missing or was modified at or
-    after ``moment`` (an ISO time)."""
-    if moment is None:
+    after ``moment`` (an ISO time), and when ``moment`` is not a time at
+    all: then nothing can be called older than it.
+
+    The two are compared as numbers. A file's time is whatever the
+    filesystem says, 1970 or the year 3000 included, and has no reading as a
+    session time (``parse_ts`` gives none outside 1990 to 2100)."""
+    limit = _epoch_ns(moment)
+    if limit is None:
         return True
-    limit = parse_ts(moment)
-    # Both sides are times: ``moment`` is the index's last_quick, the other a file's mtime.
-    return any(
-        mtime_ns is None or parse_ts(mtime_ns // 1_000_000) >= limit  # type: ignore[operator]
-        for _path, mtime_ns, _size in sig
-    )
+    return any(mtime_ns is None or mtime_ns >= limit for _path, mtime_ns, _size in sig)
 
 
 def _moved_on(sig: list) -> bool:
@@ -148,6 +239,7 @@ def _moved_on(sig: list) -> bool:
     return index_mod.signature([row[0] for row in sig]) != sig
 
 
+@_logged
 def verify(
     progress: discover.Progress | None = None, cancel: threading.Event | None = None
 ) -> dict:
@@ -263,6 +355,7 @@ def verify(
 MATCHES_SHOWN = 8  # keys named in an "ambiguous" message
 
 
+@_logged
 def find_session(ref: Session | str, index: Index | None = None) -> Session:
     """The session ``ref`` names: a full key, a key prefix that only one
     session has, or a bare session id. A ``Session`` is returned as it is.
@@ -321,6 +414,7 @@ def _native_copy(session: Session, index: Index) -> Session | None:
     return found if wanted is None else None
 
 
+@_logged
 def transcript(ref: Session | str, index: Index | None = None) -> Iterator[Turn]:
     """The conversation as ``Turn(role, text, ts)``, oldest first: ``user``
     and ``assistant`` text, and one ``tool`` turn per tool call whose text is
@@ -329,6 +423,7 @@ def transcript(ref: Session | str, index: Index | None = None) -> Iterator[Turn]
     return iter(_provider(session).transcript(session))
 
 
+@_logged
 def open_session(
     ref: Session | str, here: bool = False, dry_run: bool = False, index: Index | None = None
 ) -> LaunchPlan:
@@ -352,7 +447,29 @@ def open_session(
             where = index.where(session)
             if where == NATIVE_LABEL:  # another store on this machine's own disks
                 where = session.store
-    return launch.launch(session, _provider(session), where=where, here=here, dry_run=dry_run)
+    provider = _provider(session)
+    if dry_run:
+        return launch.launch(session, provider, where=where, here=here, dry_run=True)
+    log = logs.logger()
+    try:
+        # Planned once more, for the log: with ``here`` the launch below
+        # replaces this process and nothing could be written after it.
+        planned = launch.plan(session, provider, where, here)
+    except LaunchFailed:
+        pass  # the launch below fails the same way; it notifies, and is logged there
+    else:
+        log.info(
+            "launch %s%s: cd %s && %s",
+            session.key,
+            " (in this terminal)" if here else "",
+            shlex.quote(planned.cwd),
+            shlex.join(planned.command),
+        )
+    try:
+        return launch.launch(session, provider, where=where, here=here)
+    except LaunchFailed as exc:
+        log.warning("launch %s refused: %s", session.key, exc.reason)
+        raise
 
 
 @dataclass
@@ -375,6 +492,7 @@ def _plan(session: Session, index: Index) -> importer.ImportPlan:
         raise ImportFailed(exc.reason) from None
 
 
+@_logged
 def can_import(session: Session | str, index: Index | None = None) -> tuple[bool, str]:
     """``(True, "")`` when ``import_session`` would copy this session, else
     ``(False, reason)``: it is native, already imported, its provider cannot
@@ -392,6 +510,7 @@ def can_import(session: Session | str, index: Index | None = None) -> tuple[bool
     return True, ""
 
 
+@_logged
 def import_plan(ref: Session | str, index: Index | None = None) -> dict:
     """What ``import_session`` would do, as plain data, for a dry run:
     ``already`` (the native key when it is imported already, else None),
@@ -418,6 +537,7 @@ def import_plan(ref: Session | str, index: Index | None = None) -> dict:
     return dict(importer.describe(plan), already=None)
 
 
+@_logged
 def import_report(
     ref: Session | str, progress: importer.Progress | None = None, index: Index | None = None
 ) -> ImportReport:
@@ -426,6 +546,29 @@ def import_report(
     files were put in place."""
     index = index if index is not None else load_index()
     session = find_session(ref, index)
+    log = logs.logger()
+    log.info("import %s (store %s)", session.key, session.store)
+    try:
+        report = _import(session, progress, index)
+    except ApiError as exc:
+        log.warning("import %s refused: %s", session.key, exc.reason)
+        raise
+    if report.created:
+        log.info(
+            "import %s: imported as %s, %d items, %d bytes: %s",
+            session.key,
+            report.session.key,
+            len(report.files),
+            report.bytes,
+            ", ".join(report.files),
+        )
+    else:
+        log.info("import %s: already imported as %s", session.key, report.session.key)
+    return report
+
+
+def _import(session: Session, progress: importer.Progress | None, index: Index) -> ImportReport:
+    """``import_report`` for a session that was found."""
     copy = _native_copy(session, index)
     if copy is not None:
         return ImportReport(copy, False)
@@ -457,6 +600,7 @@ def import_report(
     return ImportReport(copy, True, files, size)
 
 
+@_logged
 def import_session(
     ref: Session | str, progress: importer.Progress | None = None, index: Index | None = None
 ) -> Session:

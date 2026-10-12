@@ -28,6 +28,7 @@ Textual, from the project `.venv` (`./install.sh` creates it).
 - A store that is not the native one is hostile: a session id must `fullmatch` `Provider.id_pattern`,
   and an import writes only below the native root (`importer.contained`).
 - Text from a store is shown only through `textsafe` (`cli._out`/`_err`/`_json`, `view.clean`); no `print` in `cli.py`.
+  The log is written through `logs.logger()` only (its formatter cleans every message).
 - Foreign bytes are read bounded (`open_ro`, `iter_jsonl`, `read_small`, `open_sqlite_ro`); where JSON is
   parsed, catch `RecursionError` with `ValueError`.
 - Do not leave store-shaped directories (fake homes, copied fixtures)
@@ -49,4 +50,5 @@ Textual, from the project `.venv` (`./install.sh` creates it).
 ## Docs
 
 `docs/SPEC.md` (what and why), `docs/PLAN.md` (tasks), `docs/FORMATS.md`
-(per-provider on-disk formats), `filemap.md` (where things are).
+(per-provider on-disk formats), `docs/JSON.md` (the `--json` outputs; a test
+holds the code to it, so change both together), `filemap.md` (where things are).

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
 import time
 from collections.abc import Collection, Iterable
@@ -20,9 +19,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import discover, textsafe
+from . import discover, launch, textsafe
 from .discover import Skipped
-from .fsutil import cache_file
+from .fsutil import cache_file, make_private_dir, open_private
 from .model import Candidate, Session, Store
 from .mounts import NATIVE_LABEL, Mount
 from .pathmap import PathMap
@@ -163,6 +162,11 @@ def _strings(items: object) -> list[str]:
 class Index:
     def __init__(self, path: StrPath | None = None) -> None:
         self.path = Path(path) if path is not None else None
+        self._reset()
+
+    def _reset(self) -> None:
+        """Empty the index: everything but where its file is. ``load`` comes
+        back here when a cache turns out to be unusable half way through."""
         # persisted
         self.stores: list[Store] = []  # every store remembered
         self.skipped: list[Skipped] = []  # stores found but not listed
@@ -190,15 +194,14 @@ class Index:
         empty index, and ``load_error`` says which it was."""
         where = Path(path) if path is not None else cache_file()
         index = cls(where)
-        # ``__init__`` again empties the index in place, whatever _adopt had set.
         try:
             with open(where, encoding="utf-8") as fh:
                 index._adopt(json.load(fh))
         except FileNotFoundError:
-            index.__init__(where)  # type: ignore[misc]  # same class: cls(where) made it
+            index._reset()
             index.load_error = "missing"
         except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
-            index.__init__(where)  # type: ignore[misc]  # same class: cls(where) made it
+            index._reset()  # whatever _adopt had taken over before it failed
             reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
             index.load_error = f"unreadable: {reason or type(exc).__name__}"
         return index
@@ -262,7 +265,9 @@ class Index:
 
     def save(self) -> None:
         """Write the cache atomically: a temp file in the same directory, then
-        ``os.replace``."""
+        ``os.replace``. The file is private (0600), whatever mode the one it
+        replaces had, and so is a cache directory this makes (0700): the
+        cache holds the title and the folder of every session."""
         if self.path is None:
             return
         data = {
@@ -276,10 +281,10 @@ class Index:
             "walk": self.walk,
             "parsed": self.parsed,
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        make_private_dir(self.path.parent)
         tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
         try:
-            with open(tmp, "w", encoding="utf-8") as fh:
+            with open_private(tmp) as fh:
                 json.dump(data, fh, sort_keys=True, separators=(",", ":"))
             os.replace(tmp, self.path)
         finally:
@@ -297,9 +302,12 @@ class Index:
             return True
         if sorted(m.path for m in mounts) != sorted(self.deep_mounts):
             return True
-        # last_deep is a time: utc_now() wrote it, or _adopt checked it.
         stamp = base.parse_ts(self.last_deep)
-        last = datetime.fromisoformat(stamp.replace("Z", "+00:00"))  # type: ignore[union-attr]
+        if stamp is None:
+            # Not a time (a caller set it, or a clock far off wrote it): a
+            # pass whose age cannot be told is due.
+            return True
+        last = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
         age = (datetime.now(UTC) - last).total_seconds()
         return age < 0 or age > DEEP_MAX_AGE
 
@@ -315,6 +323,7 @@ class Index:
         summary. ``deep=None`` follows ``needs_deep``. A set ``cancel`` event
         stops the walk or the parsing; what was done until then is kept."""
         started = time.monotonic()
+        launch.forget_tools()  # a tool installed since the last scan is seen by this one
         providers = list(providers)
         mounts = sorted(mounts, key=lambda m: m.path)
         do_deep = self.needs_deep(mounts) if deep is None else bool(deep)
@@ -573,8 +582,11 @@ class Index:
         self.pathmap = PathMap.build(mounts, [(s.cwd, s.mount) for s in sessions if s.cwd])
         warnings.update(self.pathmap.warnings)
         native = {(s.provider, s.id): s.key for s in sessions if s.origin == "native"}
+        # Installed, not merely on PATH (``launch.tool_state``): asked once
+        # per provider, and remembered there for the sessions that follow.
         usable = {
-            p.name: bool(p.resumable and p.binary and shutil.which(p.binary)) for p in providers
+            p.name: bool(p.resumable and p.binary and launch.tool_state(p.binary).installed)
+            for p in providers
         }
         for s in sessions:
             if s.cwd:

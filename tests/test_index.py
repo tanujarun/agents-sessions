@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 import sys
 import threading
 import unittest
@@ -10,7 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from support import FakeProvider, OtherProvider, Sandbox
+from support import FakePath, FakeProvider, OtherProvider, Sandbox
 
 from agent_sessions import api, discover, providers
 from agent_sessions import index as index_mod
@@ -37,11 +38,7 @@ class IndexCase(unittest.TestCase):
         self.native = self.box.store(self.box.home)
         self.disk = self.box.mount("Win Disk")
         self.foreign = self.box.store(self.disk / "Users" / "arun")
-        which = mock.patch(
-            "agent_sessions.index.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"
-        )
-        which.start()
-        self.addCleanup(which.stop)
+        self.path = FakePath(self, self.box.root / "bin")  # every command is installed
 
     def by_id(self) -> dict:
         return {s.id: s for s in api.list_sessions()}
@@ -240,6 +237,56 @@ class CacheFileTest(IndexCase):
             [s["root"] for s in data["stores"]], sorted([str(self.native), str(self.foreign)])
         )
 
+    @unittest.skipUnless(os.name == "posix", "file modes")
+    def test_the_cache_is_private(self):
+        """It holds the title and the folder of every session."""
+
+        def mode(path) -> int:
+            return stat.S_IMODE(os.stat(path).st_mode)
+
+        self.box.session(self.native, "a", title="a private title")
+        self.assertFalse(self.box.cache.exists())
+        api.scan()
+        self.assertEqual((mode(self.box.cache), mode(cache_file())), (0o700, 0o600))
+        self.assertIn("a private title", cache_file().read_text())
+        # A cache written before this, readable by everyone, in a directory
+        # that was made the ordinary way: the file is tightened when it is
+        # rewritten, the directory that exists is left as it is.
+        text = cache_file().read_text()
+        cache_file().unlink()
+        self.box.cache.rmdir()
+        self.box.cache.mkdir()
+        ordinary = mode(self.box.cache)
+        cache_file().write_text(text)
+        os.chmod(cache_file(), 0o644)
+        api.scan()
+        self.assertEqual(mode(cache_file()), 0o600)
+        self.assertEqual(mode(self.box.cache), ordinary)
+        # A temp file of that name left behind, with a wide mode: not inherited.
+        stale = self.box.cache / f"index.json.{os.getpid()}.tmp"
+        stale.write_text("left over")
+        os.chmod(stale, 0o644)
+        os.chmod(cache_file(), 0o644)
+        api.scan()
+        self.assertEqual(mode(cache_file()), 0o600)
+        self.assertEqual(sorted(p.name for p in self.box.cache.iterdir()), ["index.json"])
+        # Reading changes nothing.
+        os.chmod(cache_file(), 0o640)
+        api.load_index()
+        api.status()
+        self.assertEqual(mode(cache_file()), 0o640)
+
+    @unittest.skipUnless(os.name == "posix", "file modes")
+    def test_a_cache_directory_that_is_made_is_private_and_its_parents_are_not_ours(self):
+        target = self.box.root / "a" / "b" / "cache"
+        with mock.patch.dict(os.environ, {"AGENT_SESSIONS_CACHE": str(target)}):
+            api.scan()
+        umask = os.umask(0)
+        os.umask(umask)
+        self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(target.parent).st_mode), 0o777 & ~umask)
+        self.assertEqual(stat.S_IMODE(os.stat(target / "index.json").st_mode), 0o600)
+
     def test_cache_env_may_name_the_file(self):
         target = self.box.root / "elsewhere" / "my-index.json"
         with mock.patch.dict(os.environ, {"AGENT_SESSIONS_CACHE": str(target)}):
@@ -290,6 +337,40 @@ class CacheFileTest(IndexCase):
         cache_file().write_bytes(b"\xff\xfe\x00garbage")
         self.assertEqual(api.list_sessions(), [])
 
+    def test_an_unusable_cache_is_emptied_without_building_the_index_twice(self):
+        """``load`` used to call ``__init__`` a second time on the object to
+        empty it; a subclass's ``__init__`` ran twice with it."""
+
+        class Counting(Index):
+            made = 0
+
+            def __init__(self, path=None, label="mine"):
+                type(self).made += 1
+                self.label = label
+                super().__init__(path)
+
+        self.box.session(self.native, "a")
+        api.scan()
+        good = json.loads(cache_file().read_text())
+        loaded = Counting.load()
+        self.assertEqual((Counting.made, loaded.load_error, len(loaded.stores)), (1, None, 2))
+        # Stores are read before the part that is wrong: taken over, then dropped again.
+        cache_file().write_text(json.dumps(dict(good, parsed={"k": {"candidates": []}})))
+        Counting.made = 0
+        broken = Counting.load()
+        self.assertEqual(Counting.made, 1)
+        self.assertTrue(broken.load_error.startswith("unreadable: "))
+        self.assertEqual(
+            (broken.stores, broken.mounts, broken.parsed, broken.last_quick, broken.sessions),
+            ([], [], {}, None, []),
+        )
+        self.assertEqual((broken.path, broken.label), (cache_file(), "mine"))
+        cache_file().unlink()
+        Counting.made = 0
+        missing = Counting.load()
+        self.assertEqual((Counting.made, missing.load_error, missing.label), (1, "missing", "mine"))
+        self.assertEqual(missing.stores, [])
+
     def test_missing_cache(self):
         self.assertEqual(api.list_sessions(), [])
         status = api.status()
@@ -323,11 +404,28 @@ class ScanPolicyTest(IndexCase):
     def test_deep_pass_older_than_a_day_is_repeated(self):
         api.scan()
         data = json.loads(cache_file().read_text())
-        for stamp, mode in (("2020-01-01T00:00:00Z", "deep"), ("2999-01-01T00:00:00Z", "deep")):
+        for stamp, mode in (("2020-01-01T00:00:00Z", "deep"), ("2099-01-01T00:00:00Z", "deep")):
             data["last_deep"] = stamp
             cache_file().write_text(json.dumps(data))
+            self.assertEqual(Index.load().last_deep, stamp)  # the cache was taken
             self.assertEqual(api.scan()["mode"], mode)
             self.assertEqual(api.scan()["mode"], "quick")
+
+    def test_a_last_deep_pass_that_is_no_time_is_due(self):
+        """``needs_deep`` used the parsed time without looking whether there
+        was one (the type checker's finding)."""
+        api.scan()
+        index = Index.load()
+        mounts = api.list_mounts()
+        self.assertFalse(index.needs_deep(mounts))
+        for stamp in ("soon", "", "1980-01-01T00:00:00Z", "2999-01-01T00:00:00Z", "12"):
+            with self.subTest(stamp=stamp):
+                index.last_deep = stamp
+                self.assertTrue(index.needs_deep(mounts))
+        index.last_deep = None
+        self.assertTrue(index.needs_deep(mounts))
+        index.last_deep = index_mod.utc_now()
+        self.assertFalse(index.needs_deep(mounts))
 
     def test_quick_scan_finds_only_known_places(self):
         tucked = self.box.store(self.disk / "Projects" / "old profile")
@@ -490,7 +588,7 @@ class DerivedFieldsTest(IndexCase):
         got = self.by_id()
         self.assertEqual((got["n"].launchable, got["n"].note), (True, None))
         self.assertEqual((got["f"].launchable, got["f"].note), (False, None))  # foreign: never
-        with mock.patch("agent_sessions.index.shutil.which", return_value=None):
+        with mock.patch("shutil.which", return_value=None):
             n = self.by_id()["n"]  # binary missing
             self.assertEqual((n.launchable, n.note), (False, "Fake CLI is not installed"))
         with mock.patch.object(FakeProvider, "resumable", False):  # not resumable
@@ -500,7 +598,7 @@ class DerivedFieldsTest(IndexCase):
     def test_adapter_note_is_kept(self):
         self.box.session(self.native, "n", note="continued in x")
         api.scan()
-        with mock.patch("agent_sessions.index.shutil.which", return_value=None):
+        with mock.patch("shutil.which", return_value=None):
             self.assertEqual(self.by_id()["n"].note, "continued in x")
 
     def test_imported_as(self):
@@ -690,6 +788,44 @@ class VerifyTest(IndexCase):
             sorted(result["walk"]), sorted([str(self.box.root / "home"), str(self.disk)])
         )
 
+    def test_newer_than(self):
+        """A file's time against the time of the last scan, as numbers."""
+        second = 1_000_000_000
+        scan = "2026-10-01T10:00:00Z"
+        at = 1790848800 * second  # that moment
+        sig = lambda *times: [[f"/f{n}", t, 1] for n, t in enumerate(times)]  # noqa: E731
+        self.assertFalse(api._newer_than(sig(at - 1), scan))
+        self.assertTrue(api._newer_than(sig(at), scan))
+        self.assertTrue(api._newer_than(sig(at - 5 * second, at + 1), scan))
+        self.assertTrue(api._newer_than(sig(at - 5 * second, None), scan))  # a file is gone
+        self.assertFalse(api._newer_than(sig(), scan))
+        # Times that are no session times are still times of files.
+        self.assertFalse(api._newer_than(sig(0), scan))  # 1970
+        self.assertFalse(api._newer_than(sig(5 * second), scan))
+        self.assertTrue(api._newer_than(sig(32_503_680_000 * second), scan))  # the year 3000
+        # No usable time of the last scan: nothing is older than it.
+        for moment in (None, "", "soon", "1980-01-01T00:00:00Z"):
+            self.assertTrue(api._newer_than(sig(at - 1), moment))
+
+    def test_a_file_from_1970_does_not_break_verify(self):
+        """A candidate written while the clock was unset, and missing from
+        the index: a difference, as for any other old file."""
+        path = self.foreign / "sessions" / "f.json"
+        os.utime(path, (5, 5))
+        api.scan()
+        data = json.loads(cache_file().read_text())
+        del data["parsed"][f"fake:{self.foreign}"]["candidates"]["f"]
+        cache_file().write_text(json.dumps(data))
+        result = api.verify()
+        self.assertEqual(
+            result["differences"],
+            [
+                f"{self.foreign}: f: candidate on disk but not in the index",
+                f"session on disk but not listed: {make_key('fake', self.foreign, 'f')}",
+            ],
+        )
+        self.assertEqual(result["stale"], [])
+
     def test_does_not_use_or_write_the_cache(self):
         before = cache_file().read_bytes()
         FakeProvider.parsed.clear()
@@ -742,7 +878,7 @@ class VerifyTest(IndexCase):
     def test_candidate_missing_from_the_index(self):
         data = json.loads(cache_file().read_text())
         del data["parsed"][f"fake:{self.foreign}"]["candidates"]["f"]
-        data["last_quick"] = "2999-01-01T00:00:00Z"
+        data["last_quick"] = "2099-01-01T00:00:00Z"
         cache_file().write_text(json.dumps(data))
         result = api.verify()
         self.assertEqual(

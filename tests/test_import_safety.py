@@ -21,7 +21,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fixture_world import CLAUDE_WIN, CODEX_WIN, GROK_WIN, World
-from support import write_jsonl
+from support import LOG_NAME, drop_state, state_names, write_jsonl
 
 from agent_sessions import api, importer
 from agent_sessions.providers.claude import encode_cwd
@@ -31,13 +31,33 @@ OTHER = "0f0f0f0f-1111-4222-8333-444444444444"
 CODEX_ROLLOUT = f"rollout-2026-08-29T13-57-23-{CODEX_WIN}.jsonl"
 
 
+def other_filesystem(case, here) -> Path | None:
+    """A fresh temp directory on another filesystem than ``here``, removed
+    with the test; None when this machine offers none."""
+    device = os.stat(here).st_dev
+    for base in ("/dev/shm", "/var/tmp"):
+        try:
+            if os.stat(base).st_dev == device or not os.access(base, os.W_OK):
+                continue
+        except OSError:
+            continue
+        holder = tempfile.TemporaryDirectory(prefix="agent-sessions-test-", dir=base)
+        case.addCleanup(holder.cleanup)
+        return Path(holder.name)
+    return None
+
+
 def snapshot(*roots) -> dict:
     """Every file and directory below the roots: a regular file with its
-    bytes, anything else (a directory, a link, a named pipe) with its kind."""
+    bytes, anything else (a directory, a link, a named pipe) with its kind.
+    The log is left out: every scan and every import through the facade adds
+    to it, and it is not what an import leaves or takes back."""
     found: dict[str, bytes | int] = {}
     for root in roots:
         for base, dirs, files in os.walk(root):
             for name in dirs + files:
+                if name == LOG_NAME:
+                    continue
                 path = os.path.join(base, name)
                 mode = os.lstat(path).st_mode
                 if stat.S_ISREG(mode):
@@ -170,22 +190,116 @@ class ContainedTest(SafetyCase):
             plan = dataclasses.replace(copy.deepcopy(self.good), native_root=root)
             self.assertIn("is not an absolute path", self.refused(plan))
 
-    def test_a_link_out_of_the_native_root_is_not_followed(self):
-        outside = self.w.box.root / "elsewhere"
-        outside.mkdir()
+    def test_an_import_goes_through_a_linked_sub_directory(self):
+        """``~/.claude/projects`` is a link to a directory elsewhere, the way
+        a user keeps the transcripts on another disk. The native store is
+        the user's own: the link is followed, as the tool follows it."""
+        elsewhere = self.w.box.root / "other-disk" / "claude-projects"
+        elsewhere.mkdir(parents=True)
         os.makedirs(self.root)
-        os.symlink(outside, os.path.join(self.root, "projects"))
-        reason = self.refused(self.good)
-        self.assertIn("leads out of the native store", reason)
-        self.assertIn("through a symbolic link", reason)
-        self.assertEqual(os.listdir(outside), [])
-        self.assertEqual(api.can_import(self.source(CLAUDE_WIN)), (False, reason))
-        # The same with the link one level down, at the project directory.
-        os.unlink(os.path.join(self.root, "projects"))
-        os.makedirs(os.path.join(self.root, "projects"))
-        os.symlink(outside, os.path.dirname(self.good.units[1].dst))
-        self.assertIn("leads out of the native store", self.refused(self.good))
-        self.assertEqual(os.listdir(outside), [])
+        os.symlink(elsewhere, os.path.join(self.root, "projects"))
+        importer.contained(self.good)
+        source = self.source(CLAUDE_WIN)
+        self.assertEqual(api.can_import(source), (True, ""))
+        native = api.import_session(source)
+        self.assertEqual(
+            (native.id, native.origin, native.launchable), (CLAUDE_WIN, "native", True)
+        )
+        folder = encode_cwd(str(self.w.site))
+        copied = elsewhere / folder / f"{CLAUDE_WIN}.jsonl"
+        self.assertEqual(
+            copied.read_bytes(),
+            (
+                self.w.profile / ".claude/projects/F--Proj-My-Site" / f"{CLAUDE_WIN}.jsonl"
+            ).read_bytes(),
+        )
+        self.assertTrue((elsewhere / folder / CLAUDE_WIN).is_dir())
+        # The link is still a link, and the record names the paths as the store has them.
+        self.assertTrue(os.path.islink(os.path.join(self.root, "projects")))
+        (record,) = importer.read_journal()
+        self.assertEqual(
+            record["destination_files"],
+            [
+                os.path.join(self.root, "projects", folder, CLAUDE_WIN),
+                os.path.join(self.root, "projects", folder, f"{CLAUDE_WIN}.jsonl"),
+            ],
+        )
+        self.assertEqual(sorted(os.listdir(self.root)), ["projects"])  # no staging left
+        self.assertEqual(api.import_report(self.source(CLAUDE_WIN)).created, False)
+
+    def test_a_link_the_reader_does_not_follow_ends_in_a_clean_refusal(self):
+        """The project's own directory is the link. ``contained`` lets it
+        pass, the copy is placed through it, and the read-back does not find
+        it: the Claude reader lists real project directories only
+        (``fsutil.subdirs``), in the native store as anywhere. The import is
+        taken out again and says why."""
+        elsewhere = self.w.box.root / "other-disk" / "site"
+        elsewhere.mkdir(parents=True)
+        project = os.path.dirname(self.good.units[1].dst)
+        os.makedirs(os.path.dirname(project))
+        os.symlink(elsewhere, project)
+        importer.contained(self.good)
+        before = snapshot(self.w.box.root)
+        with self.assertRaises(api.ImportFailed) as caught:
+            api.import_session(self.source(CLAUDE_WIN))
+        self.assertEqual(
+            caught.exception.reason,
+            f"the copy does not read as session {CLAUDE_WIN}; it was removed again and "
+            "nothing was left in the native store",
+        )
+        self.assertEqual(os.listdir(elsewhere), [])
+        after = snapshot(self.w.box.root)
+        cache = str(self.w.box.cache)  # the scans of this test rewrote the index
+        self.assertEqual(
+            {k: v for k, v in after.items() if not k.startswith(cache)},
+            {k: v for k, v in before.items() if not k.startswith(cache)},
+        )
+
+    def test_a_failed_import_through_a_link_leaves_the_linked_directory_as_it_was(self):
+        elsewhere = self.w.box.root / "other-disk" / "claude-projects"
+        (elsewhere / "kept").mkdir(parents=True)
+        os.makedirs(self.root)
+        os.symlink(elsewhere, os.path.join(self.root, "projects"))
+        before = snapshot(self.w.box.root)
+        with self.assertRaises(importer.ImportFailed):
+            importer.execute(self.good, verify=mock.Mock(side_effect=ValueError("no")))
+        self.assertEqual(snapshot(self.w.box.root), before)
+
+    def test_a_link_to_another_filesystem_is_refused_in_plain_words(self):
+        """The copy is staged at the root of the native store; a move from
+        there to another filesystem cannot be one step. (Simulated: the
+        error every move across filesystems gives.)"""
+        elsewhere = self.w.box.root / "other-disk" / "claude-projects"
+        elsewhere.mkdir(parents=True)
+        os.makedirs(self.root)
+        os.symlink(elsewhere, os.path.join(self.root, "projects"))
+        before = snapshot(self.w.box.root)
+        crossing = OSError(18, "Invalid cross-device link")
+        with (
+            mock.patch.object(importer.os, "link", side_effect=crossing),
+            mock.patch.object(importer.os, "replace", side_effect=crossing),
+            mock.patch.object(importer.os, "rename", side_effect=crossing),
+            self.assertRaises(importer.ImportFailed) as caught,
+        ):
+            importer.execute(self.good)
+        self.assertIn("is on another filesystem than the native store", caught.exception.reason)
+        self.assertIn(os.path.dirname(self.good.units[0].dst), caught.exception.reason)
+        self.assertEqual(snapshot(self.w.box.root), before)
+
+    def test_a_link_to_a_real_other_filesystem(self):
+        """The same with the kernel's own answer, where the machine has a
+        second filesystem to try it on."""
+        elsewhere = other_filesystem(self, self.w.box.root)
+        if elsewhere is None:
+            self.skipTest("no second writable filesystem for temp files")
+        os.makedirs(self.root)
+        os.symlink(elsewhere, os.path.join(self.root, "projects"))
+        before = snapshot(self.w.box.root)
+        with self.assertRaises(api.ImportFailed) as caught:
+            importer.execute(self.good)
+        self.assertIn("is on another filesystem than the native store", caught.exception.reason)
+        self.assertEqual(snapshot(self.w.box.root), before)
+        self.assertEqual(os.listdir(elsewhere), [])
 
     def test_a_link_that_stays_inside_the_native_root_is_fine(self):
         os.makedirs(os.path.join(self.root, "real-projects"))
@@ -212,13 +326,24 @@ class ContainedTest(SafetyCase):
         self.assertEqual((native.id, native.origin), (CLAUDE_WIN, "native"))
         copied = dotfiles / "projects" / encode_cwd(str(self.w.site)) / f"{CLAUDE_WIN}.jsonl"
         self.assertTrue(copied.is_file())
-        # A link out of it is still refused.
-        plan = self.plan("69669cf3-d7ae-4ba4-a028-c6abfd2bd622")
-        shutil.rmtree(dotfiles / "projects")
-        os.symlink(self.w.box.root, dotfiles / "projects")
-        with self.assertRaises(importer.ImportFailed) as caught:
-            importer.check(plan)
-        self.assertIn("leads out of the native store", caught.exception.reason)
+        self.assertTrue(os.path.islink(self.root))
+        # The staging directory was made, and removed, where the link leads.
+        self.assertEqual(os.listdir(dotfiles), ["projects"])
+        # And a link below it is followed too.
+        plain = "69669cf3-d7ae-4ba4-a028-c6abfd2bd622"
+        other = self.w.box.root / "other-disk"
+        shutil.move(dotfiles / "projects", other)
+        os.symlink(other, dotfiles / "projects")
+        self.assertEqual(api.import_session(self.source(plain)).id, plain)
+        self.assertTrue((other / encode_cwd(str(self.w.site)) / f"{plain}.jsonl").is_file())
+
+    def test_the_names_are_still_checked_when_links_are_about(self):
+        """Following the user's links does not loosen the rule for the names
+        a plan carries: ``..`` is refused before any link is looked at."""
+        os.makedirs(os.path.join(self.root, "projects"))
+        os.symlink(self.w.box.root, os.path.join(self.root, "up"))
+        for dst in (f"{self.root}/up/../x.jsonl", f"{self.root}/projects/../../x.jsonl"):
+            self.assertIn("nothing was imported", self.refused(self.with_dst(dst)))
 
 
 class AdapterNamesTest(SafetyCase):
@@ -233,7 +358,7 @@ class AdapterNamesTest(SafetyCase):
             api.import_session(session)
         self.assertEqual(caught.exception.reason, why)
         self.assertEqual(snapshot(self.home, self.state), before)
-        self.assertFalse((self.state / "imports.json").exists())
+        self.assertFalse((self.state / "imports.jsonl").exists())
         return why
 
     # --- Codex ----------------------------------------------------------
@@ -263,9 +388,17 @@ class AdapterNamesTest(SafetyCase):
                 )
 
     def test_codex_rollout_name_is_matched_whole(self):
-        session = self.codex_session("2026", "08", "29", CODEX_ROLLOUT + "\n")
-        self.assertEqual(session.files[0][-1], "\n")
-        self.assertIn("is not named after its thread id", self.reason(session))
+        """A name with a line break after it is not a rollout's name: the
+        file is no candidate and no session, and a session that names such a
+        file all the same is not imported."""
+        listed = self.w.session(CODEX_WIN, "foreign", self.w.scan())
+        day = self.w.profile / ".codex" / "sessions" / "2026" / "08" / "29"
+        os.replace(day / CODEX_ROLLOUT, day / (CODEX_ROLLOUT + "\n"))
+        index = self.w.scan()
+        self.assertEqual([s.id for s in index.sessions if s.id == CODEX_WIN], [])
+        self.assertEqual(index.warnings, [])
+        odd = dataclasses.replace(listed, files=[listed.files[0] + "\n"])
+        self.assertEqual(self.reason(odd), "this thread has no rollout file to copy")
 
     def test_codex_rollout_must_carry_this_threads_id(self):
         """A file named for one thread whose first line names another: the
@@ -281,9 +414,14 @@ class AdapterNamesTest(SafetyCase):
     def test_claude_transcript_name_is_matched_whole(self):
         project = self.w.profile / ".claude" / "projects" / "F--Proj-My-Site"
         plain = "69669cf3-d7ae-4ba4-a028-c6abfd2bd622"
+        listed = self.w.session(plain, "foreign", self.w.scan())
         os.replace(project / f"{plain}.jsonl", project / f"{plain}.jsonl\n")
-        session = self.w.session(plain, "foreign", self.w.scan())
-        self.assertIn("is not named after its session id", self.reason(session))
+        index = self.w.scan()
+        self.assertEqual([s.id for s in index.sessions if s.id == plain], [])  # no candidate
+        self.assertEqual(index.warnings, [])
+        # A session that names such a file all the same is not imported.
+        odd = dataclasses.replace(listed, files=[listed.files[0] + "\n"])
+        self.assertEqual(self.reason(odd), "this session has no transcript file to copy")
 
     def test_claude_transcript_must_carry_this_sessions_id(self):
         session = dataclasses.replace(self.source(CLAUDE_WIN), id=OTHER)
@@ -358,7 +496,8 @@ def codex_thread(root, file_id, payload_id, name_line=None) -> Path:
 class VerifyAndRollBackTest(unittest.TestCase):
     """docs/REVIEW.md R-04: an import whose copy does not read back as the
     planned session leaves nothing behind. The native store already holds
-    sessions and an import record, so "unchanged" means something."""
+    sessions and the state directory an import record (in the form from
+    before the journal), so "unchanged" means something."""
 
     FILE_ID = "01a04ca1-6e27-7817-9f54-07105f962073"
 
@@ -366,7 +505,7 @@ class VerifyAndRollBackTest(unittest.TestCase):
         self.w = World(self, foreign=(), native=("codex",))
         self.home = self.w.home
         self.state = Path(os.environ["AGENT_SESSIONS_STATE"])
-        self.state.mkdir()
+        self.state.mkdir(exist_ok=True)
         record = {"version": 1, "imports": [{"id": "earlier", "provider": "codex"}]}
         (self.state / "imports.json").write_text(json.dumps(record), encoding="utf-8")
         self.foreign = self.w.profile / ".codex"
@@ -375,7 +514,7 @@ class VerifyAndRollBackTest(unittest.TestCase):
 
     def unchanged(self, before):
         self.assertEqual(snapshot(self.home, self.state), before)
-        self.assertEqual(sorted(os.listdir(self.state)), ["imports.json"])
+        self.assertEqual(state_names(), ["imports.json"])
         self.assertEqual((self.native / "session_index.jsonl").read_bytes(), self.native_index)
         self.assertEqual(
             [n for n in os.listdir(self.native) if n.startswith(importer.STAGING_PREFIX)], []
@@ -430,11 +569,17 @@ class VerifyAndRollBackTest(unittest.TestCase):
         def verify():
             seen["placed"] = [os.path.isfile(dst) for dst in plan.destinations]
             seen["index"] = (self.native / "session_index.jsonl").read_bytes()
-            seen["records"] = len(importer.read_provenance())
+            seen["records"] = len(importer.read_journal())
 
+        old = (self.state / "imports.json").read_bytes()
         importer.execute(plan, verify=verify)
         self.assertEqual(seen, {"placed": [True], "index": self.native_index, "records": 1})
-        self.assertEqual(len(importer.read_provenance()), 2)
+        records = importer.read_journal()
+        self.assertEqual([r["id"] for r in records], ["earlier", self.FILE_ID])
+        self.assertEqual([r["version"] for r in records], [1, 2])
+        # The record from before the journal is read and never written.
+        self.assertEqual((self.state / "imports.json").read_bytes(), old)
+        self.assertEqual(state_names(), ["imports.json", "imports.jsonl"])
         added = (self.native / "session_index.jsonl").read_bytes()[len(self.native_index) :]
         self.assertEqual(json.loads(added)["thread_name"], "a name")
 
@@ -462,8 +607,8 @@ class VerifyAndRollBackTest(unittest.TestCase):
     def test_directories_made_for_the_import_are_removed_too(self):
         """Nothing native and no state directory yet: none is left."""
         shutil.rmtree(self.native)
-        shutil.rmtree(self.state)
         plan = self.good_plan()
+        drop_state()
         self.native_index = b""
         with self.assertRaises(importer.ImportFailed):
             importer.execute(plan, verify=mock.Mock(side_effect=importer.ImportFailed("no")))
@@ -474,7 +619,7 @@ class VerifyAndRollBackTest(unittest.TestCase):
             self.w.session(self.FILE_ID, "foreign"), api.load_index().pathmap
         )
         self.assertEqual((native.id, native.title), (self.FILE_ID, "a name"))
-        self.assertTrue((self.state / "imports.json").is_file())
+        self.assertTrue((self.state / "imports.jsonl").is_file())
 
     def test_read_back(self):
         plan = self.good_plan()

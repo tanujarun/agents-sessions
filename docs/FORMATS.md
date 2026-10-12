@@ -48,6 +48,24 @@ Throwaway scripts that produced the numbers are in `scratch/` (git-ignored): `wa
   `~/.cache/agent-sessions/` and open the copy.
 - Mounts are `relatime`: reading a file can update its atime on the NTFS drive. Open with
   `os.O_NOATIME` where the platform has it (ignore `PermissionError`).
+- **Size caps.** A file on another drive can hold anything, so every read is bounded; what is
+  over a cap is skipped with a warning (a title, a folder and a note are cut or left out).
+
+  | what | cap | constant |
+  |---|---|---|
+  | one line of a JSONL file (with its line break) | 32 MiB | `providers.base.JSONL_LINE_MAX` |
+  | a Gemini chat file (`.jsonl`, and the older `.json`) | 64 MiB | `providers.gemini._CHAT_MAX`, `_LEGACY_MAX` |
+  | the Codex `session_index.jsonl` | 64 MiB | `providers.codex._INDEX_MAX` |
+  | the text a title is made from | 64 Ki characters | `providers.base.TITLE_SOURCE_MAX` |
+  | a recorded working directory | 32,767 characters | `index.CWD_MAX` |
+  | a session's note | 200 characters | `index.NOTE_MAX` |
+
+  The longest real line is 2.74 MB; the caps are far above anything seen and exist for what
+  was not.
+- A time before 1990 or after 2100 is not a time (`parse_ts` gives none): a damaged or made-up
+  value, or a file written while the clock was unset. An epoch number is read in the unit its
+  source fixes (a file's modification time: seconds); only a number in a field documented as
+  text has its unit taken from its magnitude, and then only a result inside that range counts.
 
 ---
 
@@ -980,9 +998,11 @@ the parsed count on both stores.)
   refused (the slug-and-hash naming is documented but was never seen). Sub-agent child sessions
   of an imported session are not copied (none exists).
 - **Every import**: files are staged in `<native store>/.agent-sessions-import-<pid>-<n>/` and
-  renamed into place; a hard kill can leave that directory behind (it is inert). Copies keep the
-  source's modification time, are created `0600` (directories `0700`), and symbolic links and
-  special files in a session directory are left out.
+  moved into place (a file is hard-linked under its name and the staged name removed, so an
+  existing name is never replaced; a directory is renamed); a hard kill can leave that directory
+  behind (it is inert). Copies keep the source's modification time, are created `0600`
+  (directories `0700`, and so is a `session_index.jsonl` the import has to create), and symbolic
+  links and special files in a session directory are left out.
 - **SQLite**: a database up to 64 MB is now read through `open_ro` and loaded into an in-memory
   connection with `Connection.deserialize` (header bytes 18 and 19 set from 2 to 1 in the copy,
   `PRAGMA query_only`), so SQLite never opens the file and its access time cannot move. Larger
@@ -1025,6 +1045,28 @@ Behind the wrappers `[verified]`:
 | opencode | `~/.local/share/mise/installs/opencode/1.18.35/opencode` | installed, never used (Q6) |
 | gemini | `…/installs/gemini/0.63.0/` holds `package.json` only | install incomplete |
 | cursor-agent, copilot, crush | no directory under `…/installs/`, not in `~/.config/mise/config.toml` | not installed; the first call would install |
+
+The wrapper, byte for byte (here for claude, 123 bytes; the other seven are 120 to 153 bytes and
+differ in the two names only) `[verified]`:
+
+```
+#!/bin/bash
+export MISE_MINIMUM_RELEASE_AGE=0
+mise use -g --quiet "claude" || exit 1
+exec mise x "claude" -- "claude" "$@"
+```
+
+For Grok the spec is `npm:@xai-official/grok` and the tool `grok`. The directory under
+`~/.local/share/mise/installs/` is named after the spec `[verified]` for the five that are
+installed: `claude`, `codex`, `opencode`, `npm:playwright` → `npm-playwright`,
+`npm:@xai-official/grok` → `npm-xai-official-grok`. The rule `launch._install_name` uses (lower
+case, every run of characters that are not letters or digits becomes one `-`) fits those five
+and was not checked against mise's code `[inferred]`. Each directory holds one sub-directory per
+version, links to versions (`latest`, `1`, `1.0`) and `.mise.backend.toml`. The program is at
+`claude/<version>/claude`, `codex/<version>/bin/codex`, `opencode/<version>/opencode` and
+`npm-xai-official-grok/<version>/node_modules/.bin/grok`: at most three directories below the
+version, which is how far `launch.tool_state` looks. `gemini/0.63.0/` has no program at any
+depth.
 
 ### Q1. Grok: group directory, lookup by id, search index, 1.0.34 sessions
 
@@ -1351,8 +1393,10 @@ with `<data>` = `$XDG_DATA_HOME/opencode` or `~/.local/share/opencode`; it has a
 command group (`session delete <sessionID>` among it). No format section is written: there is
 no file to describe.
 
-Consequence for `status`: it lists `copilot`, `crush` and `cursor-agent` as "installed tools
-with no reader" because a wrapper of that name is on PATH; they are not installed.
+Consequence for `status`: it listed `copilot`, `crush` and `cursor-agent` as "installed tools
+with no reader" because a wrapper of that name is on PATH; they are not installed. Since the
+production pass `status` asks `launch.tool_state`, which reads the wrapper and looks into mise's
+installs (below), and lists only what is there.
 
 ### Q7. Drive letter `D:`
 

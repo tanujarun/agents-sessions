@@ -106,7 +106,7 @@ runs are not sessions and are skipped silently; `status` counts them.
 
 `imported_as` is derived, not stored: a foreign session is "imported" when a
 session with the same provider and id exists in the native store.
-`imports.json` is provenance only.
+The import journal (`imports.jsonl`) is provenance only.
 
 ### Provider adapter contract
 
@@ -118,6 +118,8 @@ class Provider:
     app_id: str          # omarchy-launch-tui --app-id value
     resumable: bool      # False when no usable binary exists (Gemini today)
     dir_names: set[str]  # directory names that may be a store root, for discovery
+    id_pattern: re.Pattern   # the form of the tool's session ids, matched whole (a UUID for all five)
+    def valid_id(self, session_id) -> bool                    # text that fullmatches id_pattern
     def native_store(self) -> Path | None
     def is_store(self, path: Path) -> bool                    # cheap signature check
     def candidates(self, store: Store) -> list[Candidate]     # cheap: names and stats only
@@ -125,7 +127,15 @@ class Provider:
     def resume_argv(self, s: Session) -> list[str]            # for native sessions
     def transcript(self, s: Session) -> Iterator[Turn]       # (role, text, ts); user, assistant, tool-name turns
     def import_session(self, s: Session, pathmap) -> Session  # may raise NotSupported(reason)
+    def read_back(self, plan) -> Session                      # the placed copy, parsed like any session
 ```
+
+`id_pattern` is the one gate for an id: the index lists no session whose id
+fails `valid_id`, `launch` resumes none and the importer copies none (an id
+is text from a file on another drive, and it ends up in a command line and
+in file names). `read_back` is how an import is verified: the copy in the
+native store is parsed the way any session is, and must be the session that
+was planned, made of everything that was put in place.
 
 `Candidate` = `(id_hint, paths)`: `paths` are the files/dirs whose
 `(path, mtime_ns, size)` decide whether a cached parse is still valid (for a
@@ -189,6 +199,14 @@ plain `mode=ro` creates or rewrites `-shm`/`-wal` on these WAL databases.
 Session files on other drives are opened with `os.O_NOATIME` where the
 platform has it (fall back silently), so a scan does not update access times.
 
+`fsutil.open_ro` reads regular files only and never waits: a named pipe, a
+device, a socket or a directory under a session file's name raises
+`NotRegularFile` before and after the open, and the open itself does not
+block. A SQLite connection is hardened before any statement reads the file
+(`query_only`, `trusted_schema` off, `cell_size_check` on, defensive mode
+where the Python can set it), and a database whose schema holds a view, a
+trigger or a virtual table is refused.
+
 ### Path map
 
 Foreign cwd -> local path. Drive letters are resolved by evidence, not
@@ -220,8 +238,13 @@ Foreign -> native, explicit only. Copies the session's files into the native
 store, rewriting recorded working directories through the path map where the
 tool needs it to resume. Rules: never overwrite an existing native session;
 idempotent (a second import reports the existing copy); source untouched;
-provenance appended to `~/.local/state/agent-sessions/imports.json`; the copy
-is written to a temp name and renamed into place. A provider whose format
+provenance appended to `~/.local/state/agent-sessions/imports.jsonl` (see
+phase 2, "Import"); the copy is written to a temp name and moved into place.
+The order is: stage every file, place the units, verify (`read_back`), append
+(a line added to a file the tool owns), record. Every destination must be
+contained: a path below the native store whose components are checked one by
+one (`importer.contained`), whatever the adapter that planned it did. On any
+failure before the record, what was placed is taken out again. A provider whose format
 cannot be imported safely raises `NotSupported` with the reason, and the TUI
 shows that reason. After import the foreign row shows as imported and the
 native copy is launchable.
@@ -242,6 +265,12 @@ agent-sessions verify                          compare index against a brute-for
 
 Exit codes: 0 ok, 1 failure, 2 usage. The engine functions behind these
 commands are importable; the TUI calls them directly, not through a subprocess.
+
+Text from a store is never printed as it is. Readable output replaces every
+control character and every character that reorders text (the C0 and C1
+controls, DEL, the bidirectional controls, U+2028, U+2029, U+FEFF) with a
+space, one for one; `--json` output stays exact data and writes the same
+characters as `\uXXXX` escapes (`textsafe`).
 
 ## TUI (function-first)
 
@@ -381,13 +410,20 @@ follow, each enforced in one place and again at the point of use:
   a UUID for all five) to be listed, launched or imported.
 - Nothing from a foreign store reaches a command line except a validated id
   and a directory that exists. No shell is ever used.
-- Every import destination stays inside the native store (checked on the
-  resolved path, independently of the adapter).
+- Every import destination is a path below the native store (checked on
+  its components, independently of the adapter). Symbolic links inside the
+  native store are followed: the store is the user's own, and nothing from
+  a foreign store can create a link there (an import writes regular files
+  and directories only).
 - Everything printed for a person passes `textsafe.clean` (control, C1 and
   bidi characters). `--json` output is exact data with those characters
   escaped.
 - Reads never block and never allocate without a bound: regular files only,
   capped line and file sizes, a warning for what is skipped.
+- What we keep holds titles, prompts and paths, and is for the user alone:
+  the cache index and every file in the state directory (journal, log, lock)
+  are created 0600, the directories made for them 0700, and a cache file
+  with a wider mode is tightened when it is rewritten.
 
 ## Tool detection
 
@@ -513,8 +549,12 @@ agent-sessions continue <key> [--with TOOL] [--in DIR] [--dry-run] [--here]
 ```
 
 `list` gains `--mounted` (leave offline sessions out). Exit codes: 0 ok,
-1 failure, 2 usage, 130 interrupted. Every `--json` shape is documented in
-`docs/JSON.md` and pinned by a test.
+1 failure, 2 usage, 130 interrupted (Ctrl-C; SIGTERM and SIGHUP end a
+command the same way, with 128 + the signal: 143, 129). An interrupt prints
+one line and no traceback, and an import that was under way is rolled back
+first. An exception nobody planned for prints `internal error: <Type>:
+<message> (details in <log>)` and exits 1; `--debug` shows the traceback.
+Every `--json` shape is documented in `docs/JSON.md` and pinned by a test.
 
 ## Logs
 

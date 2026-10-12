@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -53,11 +54,37 @@ class SmokeTest(unittest.TestCase):
             providers.get("nope")
 
     def test_engine_does_not_import_textual(self):
-        import importlib
-
-        for name in ("api", "cli", "index", "discover", "pathmap", "mounts", "fsutil"):
-            importlib.import_module(f"agent_sessions.{name}")
-        self.assertNotIn("textual", sys.modules)
+        """Every module of the package outside ``tui/``, imported in a fresh
+        interpreter: neither Textual nor the ``tui`` package comes with it.
+        A fresh one because ``sys.modules`` of this process says nothing
+        once the TUI's own tests have run in it (docs/REVIEW.md R-12)."""
+        package = Path(_SRC) / "agent_sessions"
+        names = sorted(
+            ".".join(path.relative_to(package.parent).with_suffix("").parts)
+            for path in package.rglob("*.py")
+            if "tui" not in path.relative_to(package).parts and path.name != "__init__.py"
+        )
+        self.assertIn("agent_sessions.api", names)
+        self.assertIn("agent_sessions.providers.claude", names)
+        self.assertGreater(len(names), 15)
+        code = (
+            "import importlib, sys\n"
+            f"sys.path.insert(0, {_SRC!r})\n"
+            f"for name in {names!r}:\n"
+            "    importlib.import_module(name)\n"
+            "unwanted = ('textual.', 'agent_sessions.tui')\n"
+            "loaded = [m for m in sys.modules if m == 'textual' or m.startswith(unwanted)]\n"
+            "print(sorted(loaded))\n"
+        )
+        done = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (0, "[]\n", ""))
 
     def test_help_exits_zero(self):
         code, out, _ = run(["--help"])

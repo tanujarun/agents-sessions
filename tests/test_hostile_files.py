@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fixture_world import AGY_WIN, GEMINI_WIN, World
 from support import FIXTURES, claude_transcript, write_jsonl
 
-from agent_sessions import api, fsutil, importer
+from agent_sessions import api, fsutil, importer, journal
 from agent_sessions.model import Store
 from agent_sessions.pathmap import PathMap
 from agent_sessions.providers import antigravity as agy_mod
@@ -708,8 +708,8 @@ class DeepJsonTest(TempCase):
                     self.assertIn("cannot be rewritten", exc.reason)
 
     def test_our_own_files(self):
-        """The cache, the path-map override and the import record are ours,
-        but they may be damaged."""
+        """The cache, the path-map override, the import journal and the
+        import record from before it are ours, but they may be damaged."""
         deep = self.nested(200_000)
         env = {
             "AGENT_SESSIONS_HOME": str(self.tmp / "home"),
@@ -720,13 +720,19 @@ class DeepJsonTest(TempCase):
         (config / "pathmap.json").write_text(deep, encoding="utf-8")
         (self.tmp / "state").mkdir()
         (self.tmp / "state" / "imports.json").write_text(deep, encoding="utf-8")
+        (self.tmp / "state" / "imports.jsonl").write_text(
+            deep + '\n{"record":"import","id":"kept"}\n', encoding="utf-8"
+        )
         with mock.patch.dict(os.environ, env):
             pathmap = PathMap([], None)
             self.assertEqual(len(pathmap.warnings), 1)
             self.assertIn("pathmap.json: ignored", pathmap.warnings[0])
-            with self.assertRaises(importer.ImportFailed) as caught:
-                importer.read_provenance()
-            self.assertIn("cannot be read", caught.exception.reason)
+            with self.assertLogs("agent_sessions", "WARNING") as logged:
+                self.assertEqual(importer.read_journal(), [{"record": "import", "id": "kept"}])
+            self.assertEqual(len(logged.output), 2)
+            self.assertIn("imports.json cannot be read", logged.output[0])
+            self.assertIn("line 1 is not a record", logged.output[1])
+            self.assertEqual(journal.read(), importer.read_journal())
 
 
 class TimingTest(unittest.TestCase):

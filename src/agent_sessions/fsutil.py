@@ -6,11 +6,15 @@ Everything here is portable: the flags that only Linux has are looked up with
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import io
 import os
 import stat
-from collections.abc import Callable
+import sys
+import threading
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 StrPath = str | os.PathLike[str]
@@ -61,6 +65,248 @@ def state_dir() -> Path:
 
 def config_dir() -> Path:
     return home() / ".config" / "agent-sessions"
+
+
+def log_file() -> Path:
+    """The log (``logs``): in the state directory, rotated there."""
+    return state_dir() / "agent-sessions.log"
+
+
+def lock_file() -> Path:
+    """The file ``lock`` locks: one for everything that changes the state
+    directory or puts a session into a native store."""
+    return state_dir() / "agent-sessions.lock"
+
+
+# --- our own directories ----------------------------------------------------
+
+PRIVATE_FILE = 0o600  # the cache and the state hold titles, prompts and paths
+PRIVATE_DIR = 0o700
+
+
+def make_private_dir(path: StrPath, made: list[str] | None = None) -> list[str]:
+    """``mkdir -p`` for one of our own directories. Each directory this call
+    creates is added to ``made`` (outermost first) as it is created, and
+    ``made`` is returned. The directory itself is created 0700, parents that
+    are missing with the default mode (they are not ours: ``~/.cache``,
+    ``~/.local/state``). One that exists is left as it is."""
+    target = os.path.abspath(os.fspath(path))
+    missing = []
+    current = target
+    while not os.path.isdir(current):
+        missing.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    made = [] if made is None else made
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory, PRIVATE_DIR if directory == target else 0o777)
+        except FileExistsError:
+            if not os.path.isdir(directory):
+                raise
+            continue  # another process made it meanwhile
+        made.append(directory)
+    return made
+
+
+def open_private(path: StrPath) -> io.TextIOWrapper:
+    """Open one of our own files for writing as UTF-8 text, empty, and for
+    its owner alone (0600): created so, and made so when a file of that name
+    was there with a wider mode. The cache and the state directory hold
+    titles, prompts and paths."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(path, flags, PRIVATE_FILE)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, PRIVATE_FILE)
+        return os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def fsync_dir(path: StrPath) -> bool:
+    """Flush a directory to disk, so that a name just created, renamed or
+    removed in it survives a crash. Best effort: False where a directory
+    cannot be opened (Windows) or the filesystem refuses, never an error."""
+    flag = getattr(os, "O_DIRECTORY", None)
+    if flag is None:
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY | flag)
+    except OSError:
+        return False
+    try:
+        os.fsync(fd)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
+# --- lock -------------------------------------------------------------------
+
+LOCK_TIMEOUT = 30.0  # seconds ``lock`` waits for another holder by default
+_LOCK_POLL = 0.05  # seconds between two attempts
+# Windows locks a range of bytes, and a locked byte cannot be read by anyone
+# else: the byte that is locked lies far behind the holder's process id.
+_LOCK_BYTE = 1 << 30
+_PID_TEXT_MAX = 32
+
+
+class LockTimeout(TimeoutError):
+    """``lock`` gave up: someone else held the lock for the whole wait.
+    ``pid`` is the holder's process id when the lock file names one."""
+
+    def __init__(self, path: StrPath, waited: float, pid: int | None = None) -> None:
+        self.path = os.fspath(path)
+        self.waited = waited
+        self.pid = pid
+        who = f"process {pid}" if pid is not None else "another process"
+        super().__init__(f"{self.path} is locked by {who}; gave up after {waited:g} s")
+
+
+def _try_lock(fd: int) -> bool:
+    """One attempt at an exclusive lock on an open lock file; never waits.
+    ``flock`` on POSIX, a byte-range lock on Windows; on a platform with
+    neither there is no lock and the answer is yes."""
+    if sys.platform == "win32":
+        import msvcrt
+
+        os.lseek(fd, _LOCK_BYTE, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    try:
+        import fcntl
+    except ImportError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+            return False
+        raise
+    return True
+
+
+def _holder(path: str) -> int | None:
+    """The process id the holder wrote into the lock file, when it is one."""
+    try:
+        with open(path, "rb") as fh:
+            text = fh.read(_PID_TEXT_MAX).strip()
+    except OSError:
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def _still_named(fd: int, path: str) -> bool:
+    """Whether the lock file that is open is still the one at ``path``."""
+    if sys.platform == "win32":
+        return True  # the file is never removed there, see _release
+    try:
+        return os.path.samestat(os.fstat(fd), os.stat(path))
+    except OSError:
+        return False
+
+
+def _note_holder(fd: int) -> None:
+    """Write this process's id into the lock file, for whoever waits. The
+    lock is the descriptor, not this number: a disk too full to take it does
+    not cost the lock."""
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, b"%d\n" % os.getpid())
+    except OSError:
+        pass
+
+
+def _acquire(path: str, deadline: float, timeout: float) -> int:
+    """Open the lock file and lock it, by ``deadline`` (``timeout`` is what
+    the caller asked for, for the error); the descriptor is the lock."""
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+    while True:
+        fd = os.open(path, flags, PRIVATE_FILE)
+        mine = False
+        try:
+            while not _try_lock(fd):
+                if time.monotonic() >= deadline:
+                    raise LockTimeout(path, timeout, _holder(path))
+                time.sleep(_LOCK_POLL)
+            mine = _still_named(fd, path)
+            if mine:
+                _note_holder(fd)
+                return fd
+        except BaseException:
+            if mine:
+                _release(fd, path)  # interrupted with the lock in hand: no file is left
+            else:
+                os.close(fd)
+            raise
+        # The holder before us removed the file on its way out, and what was
+        # locked just now is a file nobody can find: take the one that is
+        # there now.
+        os.close(fd)
+
+
+def _release(fd: int, path: str) -> None:
+    """Give the lock up and leave no lock file. The name goes while the lock
+    is still held, so whoever waits on this file finds it gone and opens a
+    new one (``_acquire``). Windows cannot remove an open file: there the
+    lock file stays, empty of meaning once the lock is released."""
+    try:
+        if sys.platform != "win32":
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    finally:
+        os.close(fd)  # closing releases the lock on every platform
+
+
+_LOCKS_GUARD = threading.Lock()
+_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_HELD: dict[str, list[int]] = {}  # lock path -> [descriptor, depth], for this process
+
+
+@contextlib.contextmanager
+def lock(path: StrPath | None = None, timeout: float | None = None) -> Iterator[None]:
+    """Hold the exclusive lock of the state directory (``lock_file``, or
+    ``path``) for the block: between processes through the lock file,
+    between the threads of this process through a lock of their own.
+
+    Waits up to ``timeout`` seconds (``LOCK_TIMEOUT``) and then raises
+    ``LockTimeout``, which names the process that holds it when the lock
+    file says so. The thread that holds the lock may take it again. The
+    directory of the lock file must exist.
+    """
+    name = os.path.abspath(os.fspath(path if path is not None else lock_file()))
+    wait = LOCK_TIMEOUT if timeout is None else timeout
+    deadline = time.monotonic() + wait
+    with _LOCKS_GUARD:
+        mine = _THREAD_LOCKS.setdefault(name, threading.RLock())
+    if not mine.acquire(timeout=wait):
+        raise LockTimeout(name, wait, os.getpid())
+    try:
+        held = _HELD.get(name)
+        if held is None:
+            held = _HELD[name] = [_acquire(name, deadline, wait), 0]
+        held[1] += 1
+        try:
+            yield
+        finally:
+            held[1] -= 1
+            if not held[1]:
+                del _HELD[name]
+                _release(held[0], name)
+    finally:
+        mine.release()
 
 
 def _open_fd(path: StrPath) -> int:

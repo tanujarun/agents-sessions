@@ -72,7 +72,6 @@ class Provider:
     label: str = ""  # "Claude"
     binary: str = ""  # executable to resume with
     app_id: str = ""  # omarchy-launch-tui --app-id value
-    resumable: bool = True  # False when no usable binary exists
     # True when the tool finds a session only from its project directory
     resume_needs_cwd: bool = False
     dir_names: ClassVar[set[str]] = set()  # directory names that may be a store root
@@ -80,6 +79,13 @@ class Provider:
     # session whose id fails it, ``launch`` resumes none and ``importer``
     # copies none, so an adapter cannot let another kind of id through.
     id_pattern: ClassVar[re.Pattern[str]] = UUID_PATTERN
+
+    @property
+    def resumable(self) -> bool:
+        """False when the tool cannot resume a session on this machine at
+        all. An adapter overrides it with a constant, or with a property of
+        its own when the answer depends on what is installed (Gemini)."""
+        return True
 
     def valid_id(self, session_id: object) -> bool:
         """True when ``session_id`` is text in the form ``id_pattern``."""
@@ -481,6 +487,12 @@ def open_sqlite_ro(path: StrPath, plain_schema: bool = True) -> sqlite3.Connecti
 # --- values -----------------------------------------------------------------
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+# No session of an agent tool was recorded before 1990 or will be after 2100:
+# a time outside is a damaged or a made-up value, and is not a time at all.
+TS_MIN = datetime(1990, 1, 1, tzinfo=UTC)
+TS_MAX = datetime(2101, 1, 1, tzinfo=UTC)  # exclusive
+# Microseconds in one unit of an epoch number (``parse_ts(value, unit=…)``).
+_UNITS = {"s": 1_000_000, "ms": 1_000, "us": 1}
 # No recorded time is longer than some 40 characters. Longer text is not a
 # time, and is not given to the pattern below (which is slow on a long run of
 # spaces) or to ``int`` (which refuses more than 4300 digits by raising).
@@ -491,7 +503,11 @@ _TS = re.compile(
 )
 
 
-def _iso(moment: datetime) -> str:
+def _iso(moment: datetime) -> str | None:
+    """The fixed form of a time, or None for one outside ``TS_MIN`` to
+    ``TS_MAX``: every time ``parse_ts`` returns passes here."""
+    if not TS_MIN <= moment < TS_MAX:
+        return None
     # isoformat pads the year; strftime("%Y") does not on every platform.
     return moment.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
@@ -504,10 +520,17 @@ def _from_epoch(seconds: int, micros: int = 0) -> str | None:
     return _iso(moment)
 
 
-def _from_number(value: float) -> str | None:
+def _from_number(value: float, unit: str | None = None) -> str | None:
     if value != value or value in (float("inf"), float("-inf")):
         return None
-    # Magnitude tells the unit: 1e11 s is the year 5138, 1e11 ms is 1973.
+    if unit == "ns":
+        return _from_epoch(0, int(value) // 1000)
+    if unit is not None:
+        return _from_epoch(0, int(value * _UNITS[unit]))
+    # No unit known: the magnitude tells it. 1e11 s is the year 5138, 1e11 ms
+    # is 1973. Only a guess that lands between 1990 and 2100 is believed
+    # (``_iso``), and for a number in that range of one unit, every other
+    # unit gives a year far outside it: the guess cannot pick a wrong one.
     size = abs(value)
     if size < 1e11:
         scale = 1_000_000
@@ -520,20 +543,27 @@ def _from_number(value: float) -> str | None:
     return _from_epoch(0, int(value * scale))
 
 
-def parse_ts(value: object) -> str | None:
+def parse_ts(value: object, unit: str | None = None) -> str | None:
     """Normalise a recorded timestamp to ``YYYY-MM-DDTHH:MM:SS.ffffffZ`` (UTC).
 
     Accepts ISO text with ``Z`` or an offset and any number of fraction
     digits (cut to six), SQLite text with a space, text without a zone (taken
-    as UTC), epoch seconds or milliseconds as int, float or digit string, and
-    a protobuf timestamp as ``{1: seconds, 2: nanos}`` or ``(seconds,
-    nanos)``. Anything else gives None. The fixed width makes the strings
-    sort in time order.
+    as UTC), an epoch number as int, float or digit string, and a protobuf
+    timestamp as ``{1: seconds, 2: nanos}`` or ``(seconds, nanos)``. Anything
+    else gives None, and so does every time before 1990 or after 2100. The
+    fixed width makes the strings sort in time order.
+
+    ``unit`` says what an epoch number counts: ``"s"``, ``"ms"``, ``"us"`` or
+    ``"ns"``. Pass it wherever the source fixes it (a file's modification
+    time is seconds). Without it the unit is taken from the magnitude, the
+    last resort for a number in a field that is documented as text.
     """
+    if unit is not None and unit != "ns" and unit not in _UNITS:
+        raise ValueError(f"unknown unit: {unit!r}")
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return _from_number(value)
+        return _from_number(value, unit)
     if isinstance(value, dict):
         value = (value.get(1, value.get("1")), value.get(2, value.get("2", 0)))
     if isinstance(value, (tuple, list)):
@@ -552,7 +582,7 @@ def parse_ts(value: object) -> str | None:
         return None
     text = value.strip()
     if re.fullmatch(r"-?\d+(\.\d+)?", text):
-        return _from_number(float(text) if "." in text else int(text))
+        return _from_number(float(text) if "." in text else int(text), unit)
     m = _TS.match(text)
     if not m:
         return None

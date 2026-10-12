@@ -8,25 +8,31 @@ the rules that hold for every provider, ``execute`` carries the plan out:
 - the source is only read, through ``fsutil.open_ro`` and ``listdir_ro`` (no
   access time moves on the other drive);
 - the session id must be in the form its provider's ids have, and every
-  destination must lie below the native store (``contained``): the names in
-  a plan come from the source and are not trusted;
+  destination must name a place below the native store (``contained``): the
+  names in a plan come from the source and are not trusted. Symbolic links
+  inside the native store are the user's own and are followed;
 - nothing that exists is overwritten: an id already in the native store, or a
   destination path that exists, raises ``Exists``;
 - there must be room for the copy plus 10 %;
 - every file is first written into a staging directory at the root of the
   native store (same filesystem, outside the directories the tool lists),
-  then moved into place with ``os.replace``, in plan order, so the piece that
-  makes the session visible to the tool arrives last and complete;
+  then moved into place in plan order, so the piece that makes the session
+  visible to the tool arrives last and complete. The move never replaces
+  anything (``_place``), and the directories it changed are flushed to disk;
 - once the files are in place the copy is read back the way any session of
   the native store is read, and must be the session that was planned (the
   ``verify`` step of ``execute``);
 - on any failure, a failed read-back included, the staging directory, the
   pieces already in place and the directories made for them are removed (a
   line appended to a native file is the one thing that cannot be taken back,
-  so appends come after everything that can fail but the final rename of the
-  import record);
-- a record of the import is added to ``<state dir>/imports.json``, written to
-  a temp file and renamed.
+  so appends come after everything that can fail but the one write that adds
+  the import record, and the journal is opened before anything is put in
+  place);
+- a record of the import is added to the journal ``<state dir>/imports.jsonl``
+  (``journal``): one line, with a manifest of every file and directory the
+  import created, as they lie in the native store;
+- all of it happens with the state directory's lock held (``fsutil.lock``),
+  so one import runs at a time, whichever process starts it.
 
 Nothing here imports the provider registry, so adapters can import this
 module freely.
@@ -34,6 +40,7 @@ module freely.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -45,7 +52,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, BinaryIO
 
-from . import __version__
+from . import __version__, fsutil, journal
 from .errors import ImportFailed
 from .fsutil import listdir_ro, open_ro, state_dir
 from .model import UUID_PATTERN, make_key
@@ -59,8 +66,6 @@ Progress = Callable[[int, int], None]  # progress(done_bytes, total_bytes)
 
 CHUNK = 1024 * 1024
 HEADROOM = 10  # per cent of the copy size that must stay free on top
-PROVENANCE = "imports.json"
-PROVENANCE_VERSION = 1
 STAGING_PREFIX = ".agent-sessions-import-"
 # What ``execute`` names its staging directory: prefix, pid, hex time.
 _STAGING_NAME = re.compile(re.escape(STAGING_PREFIX) + r"([0-9]+)-[0-9a-f]+")
@@ -119,7 +124,7 @@ class FileCopy:
 @dataclass
 class Unit:
     """One file or one directory that appears in the native store in a single
-    rename."""
+    step (``_place``)."""
 
     dst: str
     src: str = ""  # the source file or directory, for reports
@@ -308,26 +313,16 @@ def free_space(plan: ImportPlan) -> tuple[int, int, str]:
     return need, shutil.disk_usage(where).free, where
 
 
-def provenance_file() -> str:
-    return str(state_dir() / PROVENANCE)
-
-
-def read_provenance() -> list[dict]:
-    """The import records, oldest first; a missing file gives none. Raises
-    ``ImportFailed`` when the file is there but unusable: importing would
-    lose its history."""
-    path = provenance_file()
+def read_journal() -> list[dict]:
+    """The import records, oldest first (``journal.read``); none when there
+    is no journal. Raises ``ImportFailed`` when the journal is there but
+    cannot be read: an import could not add its record to it either."""
     try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError, RecursionError) as exc:
-        raise ImportFailed(f"the import record {path} cannot be read: {exc}") from exc
-    records = data.get("imports") if isinstance(data, dict) else None
-    if not isinstance(records, list):
-        raise ImportFailed(f"the import record {path} is not in the expected form")
-    return records
+        return journal.read()
+    except OSError as exc:
+        raise ImportFailed(
+            f"the import journal {journal.path()} cannot be read: {exc.strerror or exc}"
+        ) from exc
 
 
 _SEPARATORS = re.compile("[" + re.escape(os.sep + (os.altsep or "")) + "]")
@@ -353,10 +348,15 @@ def contained(plan: ImportPlan) -> None:
     the plan checked, every destination is checked again here: each unit,
     each directory and file below a unit, each file appended to. A
     destination must be the native root plus components none of which is
-    empty, ``.`` or ``..``, must hold no NUL, and must still be below the
-    native root once the symbolic links on the way are resolved (the links
-    in the part of the path that exists; the native root itself may be a
-    link, as a home directory kept in a dotfiles repository has it).
+    empty, ``.`` or ``..``, and must hold no NUL.
+
+    The check is on the names, not on where symbolic links lead. The native
+    store is the user's own and trusted (docs/SPEC.md "Threat model"): a
+    ``~/.claude`` kept in a dotfiles repository, or a ``projects`` directory
+    that is a link to another disk, is how that user set it up, and the
+    tool itself writes through such a link. Nothing from another store can
+    put a link there: an import creates regular files and directories only
+    (``tree``, ``file_copy``, ``_copy``).
 
     Raises ``ImportFailed``; reads only.
     """
@@ -376,18 +376,11 @@ def contained(plan: ImportPlan) -> None:
         elif len(unit.files) != 1 or unit.files[0].rel or unit.dirs:
             raise ImportFailed(f"{unit.dst} is planned as one file but is not one")
     targets += [addition.path for addition in plan.appends]
-    real_root = os.path.realpath(root)
     for path in targets:
         if not isinstance(path, str) or "\0" in path or not path.startswith(_below(root)):
             raise ImportFailed(f"{path!r} is outside the native store {root}; nothing was imported")
         if not _relative_ok(path[len(_below(root)) :]):
             raise ImportFailed(f"{path!r} is not a plain path below {root}; nothing was imported")
-        real = os.path.realpath(path)
-        if not real.startswith(_below(real_root)):
-            raise ImportFailed(
-                f"{path} leads out of the native store {root} through a symbolic link; "
-                "nothing was imported"
-            )
     for addition in plan.appends:  # a line is only ever added to a plain file
         try:
             mode = os.stat(addition.path).st_mode
@@ -417,7 +410,7 @@ def check(plan: ImportPlan) -> None:
     """Everything ``execute`` would refuse, without writing: a session id
     that is not in the form its provider's ids have, a destination outside
     the native store (``contained``), an id or a destination that already
-    exists (``Exists``), too little free space, an unusable import record."""
+    exists (``Exists``), too little free space, an unreadable import journal."""
     _sound(plan)
     taken = list(plan.existing) + [dst for dst in plan.destinations if os.path.lexists(dst)]
     if taken:
@@ -433,7 +426,7 @@ def check(plan: ImportPlan) -> None:
             f"not enough free space on {where}: {human_size(need)} needed "
             f"(the copy plus {HEADROOM} %), {human_size(free)} free"
         )
-    read_provenance()
+    read_journal()
 
 
 def describe(plan: ImportPlan) -> dict:
@@ -497,8 +490,15 @@ def _make_dirs(path: str, made: list[str], mode: int = DIR_MODE) -> None:
             break
         current = parent
     for directory in reversed(missing):
-        os.mkdir(directory, mode)
+        # Remembered first: an interrupt between the two steps then costs a
+        # failed rmdir in the roll back, not a directory left behind. One
+        # that could not be made is not ours and is forgotten again.
         made.append(directory)
+        try:
+            os.mkdir(directory, mode)
+        except OSError:
+            made.pop()
+            raise
 
 
 def _copy(item: FileCopy, target: str, tick: Callable[[int], None]) -> None:
@@ -534,6 +534,86 @@ def _copy(item: FileCopy, target: str, tick: Callable[[int], None]) -> None:
     os.utime(target, ns=(time.time_ns(), source.st_mtime_ns))
 
 
+# What ``os.link`` fails with where a hard link cannot be made at all, as
+# opposed to "the name is taken" (EEXIST).
+_NO_LINK = frozenset(
+    getattr(errno, name)
+    for name in ("EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EMLINK", "EXDEV")
+    if hasattr(errno, name)
+)
+
+
+def _place(target: str, dst: str, is_dir: bool) -> None:
+    """Move one staged unit to its place in the native store without
+    replacing anything. Raises ``Exists`` when the name is taken.
+
+    A file is hard-linked under its final name and the staged name removed.
+    ``link`` fails when the name exists, whatever it is, and the kernel
+    decides that in the same step that creates the name: a file that appears
+    at the last moment is never overwritten. Only where the filesystem has
+    no hard links (FAT, some network mounts) is the name looked at first and
+    the file then renamed, which leaves a moment between the two.
+
+    A directory cannot be linked; it is renamed. What ``os.rename`` of a
+    directory guarantees: on POSIX it fails when the name is a file, a link
+    or a directory with anything in it, and replaces only an *empty*
+    directory; on Windows it fails whenever the name exists. So nothing that
+    holds data is ever replaced, and the name is looked for just before
+    (the standard library has no rename that refuses an empty directory
+    too).
+    """
+    if os.path.lexists(dst):
+        raise Exists([dst])
+    if is_dir:
+        os.rename(target, dst)
+        return
+    try:
+        os.link(target, dst)
+    except FileExistsError:
+        raise Exists([dst]) from None
+    except (OSError, NotImplementedError, AttributeError) as exc:
+        if isinstance(exc, OSError) and os.name == "posix" and exc.errno not in _NO_LINK:
+            raise
+        if os.path.lexists(dst):
+            raise Exists([dst]) from None
+        os.replace(target, dst)
+        return
+    os.unlink(target)
+
+
+def _arrived(target: str, dst: str) -> bool:
+    """Whether a move that was interrupted had put the unit in place: the
+    name is there, and the staged one is gone or is the same file (linked,
+    not yet unlinked). A name that someone else holds leaves the staged unit
+    where it was."""
+    try:
+        there = os.lstat(dst)
+    except OSError:
+        return False
+    try:
+        return os.path.samestat(os.lstat(target), there)
+    except OSError:
+        return True
+
+
+def _flush_tree(root: str, dirs: Iterable[str]) -> None:
+    """Flush a staged directory and the directories below it, deepest first:
+    the names of the files in them are part of the copy."""
+    for rel in sorted(dirs, reverse=True):
+        fsutil.fsync_dir(os.path.join(root, rel))
+    fsutil.fsync_dir(root)
+
+
+def _flush_placed(placed: Iterable[str], made_dirs: Iterable[str]) -> None:
+    """Flush every directory in which this import created a name, so that a
+    crash right afterwards does not lose a rename or a new directory. Best
+    effort (``fsutil.fsync_dir``): not every platform can."""
+    made = list(made_dirs)
+    changed = {os.path.dirname(path) for path in [*placed, *made]} | set(made)
+    for directory in sorted(changed):
+        fsutil.fsync_dir(directory)
+
+
 def _remove(path: str) -> None:
     try:
         if os.path.isdir(path) and not os.path.islink(path):
@@ -546,7 +626,9 @@ def _remove(path: str) -> None:
 
 def _append(item: Append) -> None:
     """Add the bytes in one write; start on a fresh line when the file does
-    not end with one."""
+    not end with one. A file that is not there yet is created private, like
+    everything else an import puts into the store; one that exists keeps its
+    mode."""
     data = item.data
     try:
         with open(item.path, "rb") as fh:
@@ -558,7 +640,7 @@ def _append(item: Append) -> None:
     except FileNotFoundError:
         pass
     fd = os.open(
-        item.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o644
+        item.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), FILE_MODE
     )
     try:
         os.write(fd, data)
@@ -567,7 +649,35 @@ def _append(item: Append) -> None:
         os.close(fd)
 
 
-def _record(plan: ImportPlan) -> dict:
+def _manifest(placed: list[str], made_dirs: list[str]) -> dict:
+    """What an import created, read from the native store once its units are
+    in place, not taken from the plan: ``dirs`` (every directory, those made
+    on the way to a destination included) and ``files`` (each with the size
+    and modification time it has there). An undo compares against this."""
+    dirs = list(made_dirs)
+    files = []
+    pending = []
+    for dst in placed:
+        st = os.lstat(dst)
+        if stat.S_ISDIR(st.st_mode):
+            dirs.append(dst)
+            pending.append(dst)
+        else:
+            files.append({"path": dst, "size": st.st_size, "mtime_ns": st.st_mtime_ns})
+    while pending:
+        current = pending.pop()
+        for name in os.listdir(current):
+            path = os.path.join(current, name)
+            st = os.lstat(path)
+            if stat.S_ISDIR(st.st_mode):
+                dirs.append(path)
+                pending.append(path)
+            else:
+                files.append({"path": path, "size": st.st_size, "mtime_ns": st.st_mtime_ns})
+    return {"dirs": sorted(dirs), "files": sorted(files, key=lambda item: item["path"])}
+
+
+def _record(plan: ImportPlan, manifest: dict) -> dict:
     rewritten = {}
     for unit in plan.units:
         for item in unit.files:
@@ -575,6 +685,8 @@ def _record(plan: ImportPlan) -> dict:
                 target = os.path.join(unit.dst, item.rel) if item.rel else unit.dst
                 rewritten[target] = list(item.rewrite.changes)
     record = {
+        "record": journal.IMPORT,
+        "version": journal.VERSION,
         "imported_at": _now(),
         "provider": plan.provider,
         "id": plan.session_id,
@@ -590,6 +702,7 @@ def _record(plan: ImportPlan) -> dict:
         "bytes": plan.total_bytes,
         "rewritten": rewritten,
         "appended": [item.path for item in plan.appends],
+        "manifest": manifest,
         "agent_sessions_version": __version__,
     }
     record.update({k: v for k, v in sorted(plan.info.items()) if k not in record})
@@ -646,29 +759,73 @@ def sweep_staging(native_root: StrPath) -> list[str]:
     return removed
 
 
+def _drop_if_empty(path: StrPath) -> None:
+    """Remove a journal this import created and wrote nothing to."""
+    try:
+        if os.path.getsize(path) == 0:
+            os.unlink(path)
+    except OSError:
+        pass
+
+
 def execute(
     plan: ImportPlan,
     progress: Progress | None = None,
     verify: Callable[[], object] | None = None,
 ) -> dict:
-    """Carry out a plan and return its provenance record.
+    """Carry out a plan and return its record in the journal.
 
-    The order is: stage every file, move the units into place, ``verify``,
-    append, write the record. ``verify()`` is the caller's check that what
-    now lies in the native store reads back as the session that was planned
-    (``Provider.import_session`` passes one); it raises when it does not.
-    Then, as after any other failure, everything this import put in place is
-    taken out again, the directories it made included: no line is appended
-    and no record is written.
+    The order is: check, stage every file, move the units into place,
+    ``verify``, append, write the record. ``verify()`` is the caller's check
+    that what now lies in the native store reads back as the session that
+    was planned (``Provider.import_session`` passes one); it raises when it
+    does not. Then, as after any other failure, everything this import put
+    in place is taken out again, the directories it made included: no line
+    is appended and no record is written.
+
+    All of it runs with the state directory's lock held, so two imports
+    never run at once: the second waits (``fsutil.LOCK_TIMEOUT``), and when
+    it is its turn it sees what the first one left.
 
     ``progress(done_bytes, total_bytes)`` is called as the copy advances.
     Raises ``Exists`` or ``ImportFailed``; after a failure nothing of this
-    import is left in the native store.
+    import is left in the native store or in the state directory.
     """
     _sound(plan)
+    state_made: list[str] = []  # the state directory, when this run created it
+    finished = False
+    try:
+        fsutil.make_private_dir(state_dir(), state_made)
+        with fsutil.lock():
+            record = _carry_out(plan, progress, verify)
+        finished = True
+        return record
+    except fsutil.LockTimeout as exc:
+        who = f"process {exc.pid}" if exc.pid is not None else "another process"
+        raise ImportFailed(
+            f"another import is still running ({who}); nothing was imported"
+        ) from exc
+    except OSError as exc:
+        where = f" ({exc.filename})" if exc.filename else ""
+        raise ImportFailed(
+            f"import failed: {exc.strerror or exc}{where}; nothing was left in the native store"
+        ) from exc
+    finally:
+        if not finished:
+            for directory in reversed(state_made):
+                try:
+                    os.rmdir(directory)  # only when nothing else is in it
+                except OSError:
+                    pass
+
+
+def _carry_out(
+    plan: ImportPlan, progress: Progress | None, verify: Callable[[], object] | None
+) -> dict:
+    """``execute`` below the lock: every step, and the roll back of a failed
+    one, before anyone else can look."""
     sweep_staging(plan.native_root)
     check(plan)
-    records = read_provenance()  # read again below the checks: this is what gets extended
     total = plan.total_bytes
     done = 0
 
@@ -679,9 +836,11 @@ def execute(
             progress(min(done, total), total)
 
     made_dirs: list[str] = []  # created by this run, outermost first
-    placed: list[str] = []  # units already renamed into the store
+    placed: list[str] = []  # units already moved into the store
+    moving: tuple[str, str] | None = None  # (staged, destination) of the move under way
     staging = None
-    record_tmp = None
+    record_fd = None
+    record_new = False  # this run created the journal
     finished = False
     try:
         _make_dirs(plan.native_root, made_dirs)
@@ -698,33 +857,36 @@ def execute(
                     os.makedirs(os.path.join(target, rel), DIR_MODE, exist_ok=True)
                 for item in unit.files:
                     _copy(item, os.path.join(target, item.rel), tick)
+                _flush_tree(target, unit.dirs)
             else:
                 _copy(unit.files[0], target, tick)
             staged.append(target)
 
-        # The record is prepared before anything becomes visible, so the
-        # last step that can fail for lack of space is behind us.
-        record = _record(plan)
-        path = provenance_file()
-        _make_dirs(os.path.dirname(path), made_dirs, 0o777)  # as makedirs would: the umask decides
-        record_tmp = f"{path}.{os.getpid()}.tmp"
-        with open(record_tmp, "w", encoding="utf-8") as fh:
-            json.dump(
-                {"version": PROVENANCE_VERSION, "imports": records + [record]},
-                fh,
-                ensure_ascii=False,
-                indent=1,
-            )
-            fh.write("\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        # The journal is opened before anything becomes visible: what can
+        # still fail for it after the appends is one small write.
+        record_fd, record_new = journal.open_for_append()
 
         for unit, target in zip(plan.units, staged, strict=False):
             _make_dirs(os.path.dirname(unit.dst), made_dirs)
-            if os.path.lexists(unit.dst):
-                raise Exists([unit.dst])
-            os.replace(target, unit.dst)
+            moving = (target, unit.dst)
+            try:
+                _place(target, unit.dst, unit.is_dir)
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                # A link inside the native store that leads to another disk:
+                # the copy was staged on this one and cannot be moved over
+                # in one step.
+                raise ImportFailed(
+                    f"{os.path.dirname(unit.dst)} is on another filesystem than the native "
+                    f"store {plan.native_root} (a symbolic link or a mount leads there), and "
+                    "a copy cannot be moved across in one step; nothing was left in the "
+                    "native store"
+                ) from exc
             placed.append(unit.dst)
+        moving = None
+        _flush_placed(placed, made_dirs)
+        manifest = _manifest(placed, made_dirs)
         if verify is not None:
             try:
                 verify()
@@ -737,21 +899,24 @@ def execute(
                 ) from exc
         for addition in plan.appends:
             _append(addition)
-        os.replace(record_tmp, path)
-        record_tmp = None
+        record = _record(plan, manifest)
+        journal.write(record_fd, record)
         finished = True
+        if record_new:
+            fsutil.fsync_dir(os.path.dirname(journal.path()))
         return record
-    except OSError as exc:
-        where = f" ({exc.filename})" if exc.filename else ""
-        raise ImportFailed(
-            f"import failed: {exc.strerror or exc}{where}; nothing was left in the native store"
-        ) from exc
     finally:
+        if record_fd is not None:
+            os.close(record_fd)
+        # An interrupt between a move and the line that notes it: asked
+        # while the staged unit can still tell whose the name is.
+        if moving is not None and moving[1] not in placed and _arrived(*moving):
+            placed.append(moving[1])
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
-        if record_tmp is not None:
-            _remove(record_tmp)
         if not finished:
+            if record_new:
+                _drop_if_empty(journal.path())
             for path in reversed(placed):
                 _remove(path)
             for directory in reversed(made_dirs):
@@ -777,8 +942,7 @@ __all__ = [
     "free_space",
     "human_size",
     "only_changed",
-    "provenance_file",
-    "read_provenance",
+    "read_journal",
     "start_plan",
     "sweep_staging",
     "tree",

@@ -194,14 +194,32 @@ class GeminiTest(LaunchCase):
         )
         self.index = self.w.scan()
 
-    def test_gemini_is_not_resumable(self):
+    def test_gemini_is_not_resumable_until_the_real_cli_is_installed(self):
         session = self.w.session(GEMINI_WIN, "native", self.index)
         self.assertEqual((session.launchable, session.note), (False, "Gemini CLI is not installed"))
-        self.w.installed.add("gemini")  # the wrapper script on PATH changes nothing
+        self.assertFalse(Gemini().resumable)
+        self.w.path.wrapper("gemini")  # the script that would install it changes nothing
+        self.assertFalse(Gemini().resumable)
+        session = self.w.session(GEMINI_WIN, "native", self.w.scan())
+        self.assertEqual((session.launchable, session.note), (False, "Gemini CLI is not installed"))
         expected = "Gemini sessions cannot be resumed here: the Gemini CLI is not installed"
         self.assertEqual(self.failure(session, dry_run=True), expected)
         self.assertEqual(self.failure(session.key), expected)
         self.assertEqual((self.w.started, self.w.notified), ([], [expected]))
+        # What an install that did not finish leaves (FORMATS "What is on PATH").
+        version = Path(os.environ["MISE_DATA_DIR"]) / "installs" / "gemini" / "0.63.0"
+        version.mkdir(parents=True)
+        (version / "package.json").write_text("{}", encoding="utf-8")
+        self.assertFalse(self.w.session(GEMINI_WIN, "native", self.w.scan()).launchable)
+        # The real program behind the wrapper: resumable, and launched through it.
+        (version / "bin").mkdir()
+        (version / "bin" / "gemini").write_text("#!/bin/sh\n", encoding="utf-8")
+        (version / "bin" / "gemini").chmod(0o755)
+        session = self.w.session(GEMINI_WIN, "native", self.w.scan())
+        self.assertEqual((session.launchable, session.note), (True, None))
+        self.assertTrue(Gemini().resumable)
+        plan = api.open_session(session, dry_run=True)
+        self.assertEqual(plan.argv, ["gemini", "--resume", GEMINI_WIN])
 
     def test_a_tool_that_needs_its_folder_fails_without_it(self):
         """Gemini once a real binary exists: resume is project-scoped."""
@@ -314,7 +332,10 @@ class StarterTest(LaunchCase):
             command = popen.call_args[0][0]
             self.assertEqual(
                 (command[0], command[-2:]),
-                ("/usr/bin/notify-send", ["Cannot resume session", "the reason"]),
+                (
+                    str(self.w.path.directory / "notify-send"),
+                    ["Cannot resume session", "the reason"],
+                ),
             )
             self.assertTrue(popen.call_args[1]["start_new_session"])
             # notify-send is not installed: nothing is started.

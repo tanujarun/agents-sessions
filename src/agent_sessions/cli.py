@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
 import shlex
+import signal
 import sys
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, TextIO
 
-from . import __version__, api, textsafe
+from . import __version__, api, logs, textsafe
 from .mounts import MountsError
 from .providers import all_providers
 
@@ -30,6 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Find, list and resume saved AI coding-agent sessions.",
     )
     parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
+    parser.add_argument(
+        "--debug", action="store_true", help="log more, and to stderr as well as to the log file"
+    )
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     sub.add_parser("tui", help="open the TUI")
@@ -275,6 +280,7 @@ def _status(args: argparse.Namespace) -> int:
         _json(status)
         return 0
     _out(f"index: {status['cache']}")
+    _out(f"log: {status['log']}")
     _out(
         f"last scan: {status['last_quick'] or 'never'}; "
         f"last deep scan: {status['last_deep'] or 'never'}"
@@ -333,7 +339,7 @@ def _status(args: argparse.Namespace) -> int:
                 p["name"],
                 _count(p["stores"], "store"),
                 _count(p["sessions"], "session"),
-                (p["installed"] or f"{p['binary']} not installed")
+                (p["installed"] or f"{p['binary']} {p['tool']}")
                 + ("" if p["resumable"] else " (not resumable)"),
             ]
             for p in status["providers"]
@@ -378,6 +384,20 @@ def _status(args: argparse.Namespace) -> int:
     _table(rows, "  ")
     if not rows:
         _out("  none recorded")
+
+    _out("")
+    _out("tools")
+    _table(
+        [
+            [
+                t["tool"],
+                t["detail"],
+                (t["path"] or "") + (" (wrapper)" if t["wrapper"] else ""),
+            ]
+            for t in status["tools"]
+        ],
+        "  ",
+    )
 
     if status["no_reader"]:
         _out("")
@@ -565,15 +585,78 @@ _COMMANDS = {
 }
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.command is None:
-        parser.print_help()
-        return 2
+INTERRUPTED = 130  # exit status after Ctrl-C: 128 + SIGINT, as a shell reports it
+_TERMINATING = ("SIGTERM", "SIGHUP")  # ended like Ctrl-C: cleanly, with 128 + the signal
+
+
+class _Signalled(BaseException):
+    """SIGTERM or SIGHUP arrived while a command ran. Not an ``Exception``:
+    nothing that catches errors to carry on may swallow it."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+@contextlib.contextmanager
+def _signals() -> Iterator[None]:
+    """For the length of a command, turn SIGTERM and SIGHUP into an
+    exception raised in the main thread, the way Ctrl-C is one already.
+
+    Left alone, either ends the process on the spot and no ``finally`` runs:
+    an import would leave its staging directory and whatever it had already
+    put in place. Only the first signal is raised; one that arrives while
+    the command is unwinding is ignored, so a roll back is not cut short.
+    The handlers that were there come back when the command is over.
+    """
+
+    def raise_it(signum: int, frame: object) -> None:
+        if not seen:
+            seen.append(signum)
+            raise _Signalled(signum)
+
+    seen: list[int] = []
+    before = {}
+    for name in _TERMINATING:
+        signum = getattr(signal, name, None)  # SIGHUP is not on every platform
+        if signum is None:
+            continue
+        try:
+            before[signum] = signal.signal(signum, raise_it)
+        except (ValueError, OSError):
+            pass  # not the main thread, or a signal this platform does not let us handle
     try:
-        code = _COMMANDS.get(args.command, _not_implemented)(args)
-        sys.stdout.flush()
+        yield
+    finally:
+        for signum, handler in before.items():
+            signal.signal(signum, handler)
+
+
+def _stopped(text: str) -> None:
+    """The one line after an interrupt, on a line of its own."""
+    if sys.stderr.isatty():
+        _progress()  # whatever progress line was showing
+    _err(text)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run one command; the exit status is 0, 1 (failure), 2 (usage) or,
+    after an interrupt, 130 (Ctrl-C) or 128 + the signal (SIGTERM, SIGHUP)."""
+    command = None
+    debugging = False
+    try:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        if args.command is None:
+            parser.print_help()
+            return 2
+        command = args.command
+        if args.debug:
+            logs.debug()
+            debugging = True
+        with _signals():
+            code = _COMMANDS.get(args.command, _not_implemented)(args)
+            sys.stdout.flush()
         return code
     except BrokenPipeError:
         _quiet_stdout()  # the reader (head, less) went away: not an error
@@ -584,3 +667,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     except MountsError as exc:
         _err(exc)
         return 1
+    except KeyboardInterrupt:
+        _stopped("interrupted")
+        return INTERRUPTED
+    except _Signalled as exc:
+        _stopped(f"terminated ({signal.Signals(exc.signum).name})")
+        return 128 + exc.signum
+    except Exception as exc:
+        # Not a failure anyone planned for. The traceback goes to the log
+        # (and, with --debug, to stderr through the log's copy there).
+        logs.unexpected(exc, f"`{PROG} {command}`" if command else PROG)
+        where = logs.written()
+        details = f" (details in {where})" if where is not None else ""
+        _err(f"internal error: {type(exc).__name__}: {exc}{details}")
+        return 1
+    finally:
+        if debugging:
+            logs.debug(False)  # for this command only, should the process run another
