@@ -111,6 +111,22 @@ def make_private_dir(path: StrPath, made: list[str] | None = None) -> list[str]:
     return made
 
 
+def open_private(path: StrPath) -> io.TextIOWrapper:
+    """Open one of our own files for writing as UTF-8 text, empty, and for
+    its owner alone (0600): created so, and made so when a file of that name
+    was there with a wider mode. The cache and the state directory hold
+    titles, prompts and paths."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(path, flags, PRIVATE_FILE)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, PRIVATE_FILE)
+        return os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def fsync_dir(path: StrPath) -> bool:
     """Flush a directory to disk, so that a name just created, renamed or
     removed in it survives a crash. Best effort: False where a directory

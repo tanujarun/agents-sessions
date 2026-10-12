@@ -242,6 +242,22 @@ class PrivateDirTest(StateCase):
             fsutil.make_private_dir(self.box.root / "a" / "b" / "c", made)
         self.assertEqual(made, [str(self.box.root / "a"), str(self.box.root / "a" / "b")])
 
+    @unittest.skipUnless(POSIX, "file modes")
+    def test_open_private(self):
+        path = self.box.root / "ours.json"
+        with fsutil.open_private(path) as fh:
+            fh.write("naïve")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(path.read_text(encoding="utf-8"), "naïve")
+        # One that is there with a wider mode: emptied, and tightened.
+        os.chmod(path, 0o644)
+        with fsutil.open_private(path) as fh:
+            fh.write("x")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(path.read_text(encoding="utf-8"), "x")
+        with self.assertRaises(OSError):
+            fsutil.open_private(self.box.root / "missing" / "f")
+
     def test_fsync_dir_never_raises(self):
         self.assertIn(fsutil.fsync_dir(self.box.root), (True, False))
         self.assertFalse(fsutil.fsync_dir(self.box.root / "missing"))

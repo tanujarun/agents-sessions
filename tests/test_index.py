@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 import sys
 import threading
 import unittest
@@ -235,6 +236,56 @@ class CacheFileTest(IndexCase):
         self.assertEqual(
             [s["root"] for s in data["stores"]], sorted([str(self.native), str(self.foreign)])
         )
+
+    @unittest.skipUnless(os.name == "posix", "file modes")
+    def test_the_cache_is_private(self):
+        """It holds the title and the folder of every session."""
+
+        def mode(path) -> int:
+            return stat.S_IMODE(os.stat(path).st_mode)
+
+        self.box.session(self.native, "a", title="a private title")
+        self.assertFalse(self.box.cache.exists())
+        api.scan()
+        self.assertEqual((mode(self.box.cache), mode(cache_file())), (0o700, 0o600))
+        self.assertIn("a private title", cache_file().read_text())
+        # A cache written before this, readable by everyone, in a directory
+        # that was made the ordinary way: the file is tightened when it is
+        # rewritten, the directory that exists is left as it is.
+        text = cache_file().read_text()
+        cache_file().unlink()
+        self.box.cache.rmdir()
+        self.box.cache.mkdir()
+        ordinary = mode(self.box.cache)
+        cache_file().write_text(text)
+        os.chmod(cache_file(), 0o644)
+        api.scan()
+        self.assertEqual(mode(cache_file()), 0o600)
+        self.assertEqual(mode(self.box.cache), ordinary)
+        # A temp file of that name left behind, with a wide mode: not inherited.
+        stale = self.box.cache / f"index.json.{os.getpid()}.tmp"
+        stale.write_text("left over")
+        os.chmod(stale, 0o644)
+        os.chmod(cache_file(), 0o644)
+        api.scan()
+        self.assertEqual(mode(cache_file()), 0o600)
+        self.assertEqual(sorted(p.name for p in self.box.cache.iterdir()), ["index.json"])
+        # Reading changes nothing.
+        os.chmod(cache_file(), 0o640)
+        api.load_index()
+        api.status()
+        self.assertEqual(mode(cache_file()), 0o640)
+
+    @unittest.skipUnless(os.name == "posix", "file modes")
+    def test_a_cache_directory_that_is_made_is_private_and_its_parents_are_not_ours(self):
+        target = self.box.root / "a" / "b" / "cache"
+        with mock.patch.dict(os.environ, {"AGENT_SESSIONS_CACHE": str(target)}):
+            api.scan()
+        umask = os.umask(0)
+        os.umask(umask)
+        self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(target.parent).st_mode), 0o777 & ~umask)
+        self.assertEqual(stat.S_IMODE(os.stat(target / "index.json").st_mode), 0o600)
 
     def test_cache_env_may_name_the_file(self):
         target = self.box.root / "elsewhere" / "my-index.json"

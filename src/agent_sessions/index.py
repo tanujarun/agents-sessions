@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import discover, launch, textsafe
 from .discover import Skipped
-from .fsutil import cache_file
+from .fsutil import cache_file, make_private_dir, open_private
 from .model import Candidate, Session, Store
 from .mounts import NATIVE_LABEL, Mount
 from .pathmap import PathMap
@@ -265,7 +265,9 @@ class Index:
 
     def save(self) -> None:
         """Write the cache atomically: a temp file in the same directory, then
-        ``os.replace``."""
+        ``os.replace``. The file is private (0600), whatever mode the one it
+        replaces had, and so is a cache directory this makes (0700): the
+        cache holds the title and the folder of every session."""
         if self.path is None:
             return
         data = {
@@ -279,10 +281,10 @@ class Index:
             "walk": self.walk,
             "parsed": self.parsed,
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        make_private_dir(self.path.parent)
         tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
         try:
-            with open(tmp, "w", encoding="utf-8") as fh:
+            with open_private(tmp) as fh:
                 json.dump(data, fh, sort_keys=True, separators=(",", ":"))
             os.replace(tmp, self.path)
         finally:

@@ -378,6 +378,21 @@ class ImportAndLaunchTest(unittest.TestCase):
         api.import_plan(source)
         self.assertEqual(len(self.messages()), before)
 
+    @unittest.skipUnless(POSIX, "file modes")
+    def test_everything_we_keep_is_private(self):
+        """After a scan, an import and a launch: the cache, the journal, the
+        log, and the directories made for them."""
+        api.import_session(self.w.session(CLAUDE_WIN, "foreign"))
+        api.open_session(self.w.session(CLAUDE_NATIVE, "native"))
+        state = Path(os.environ["AGENT_SESSIONS_STATE"])
+        cache = Path(os.environ["AGENT_SESSIONS_CACHE"])
+        self.assertEqual(sorted(os.listdir(state)), [LOG_NAME, "imports.jsonl"])
+        self.assertEqual(os.listdir(cache), ["index.json"])
+        for directory in (state, cache):
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700, directory)
+            for name in os.listdir(directory):
+                self.assertEqual(stat.S_IMODE((directory / name).stat().st_mode), 0o600, name)
+
     def test_a_refused_import(self):
         source = self.w.session(GEMINI_WIN, "foreign")
         with self.assertRaises(api.ImportFailed) as caught:

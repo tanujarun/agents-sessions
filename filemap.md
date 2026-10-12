@@ -23,7 +23,8 @@
 - `src/agent_sessions/fsutil.py` — our own locations (`home`, `cache_file`, `cache_dir`, `state_dir`, `config_dir`,
   `log_file`, `lock_file`, env overrides) and trace-free reads (`open_ro`, `subdirs`, `listdir_ro`: `O_NOATIME` where the
   platform has it). `open_ro` never waits and reads regular files only: `NotRegularFile` for a named pipe, a
-  device, a directory. Our own directories (`make_private_dir`: 0700, `fsync_dir`) and the state directory's
+  device, a directory. Our own files and directories (`open_private`: 0600, `make_private_dir`: 0700,
+  `fsync_dir`) and the state directory's
   lock (`lock`, `LockTimeout`: `flock` on POSIX, a byte-range lock on Windows, re-entrant in one thread)
 - `src/agent_sessions/logs.py` — the log `<state>/agent-sessions.log`: `logger()` (set up on first use; a
   rotating file, 1 MB and three older ones, created 0600 when the first message is written, silent when

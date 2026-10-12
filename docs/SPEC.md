@@ -420,6 +420,10 @@ follow, each enforced in one place and again at the point of use:
   escaped.
 - Reads never block and never allocate without a bound: regular files only,
   capped line and file sizes, a warning for what is skipped.
+- What we keep holds titles, prompts and paths, and is for the user alone:
+  the cache index and every file in the state directory (journal, log, lock)
+  are created 0600, the directories made for them 0700, and a cache file
+  with a wider mode is tightened when it is rewritten.
 
 ## Tool detection
 
