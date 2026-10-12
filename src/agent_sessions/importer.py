@@ -7,6 +7,9 @@ the rules that hold for every provider, ``execute`` carries the plan out:
 
 - the source is only read, through ``fsutil.open_ro`` and ``listdir_ro`` (no
   access time moves on the other drive);
+- the session id must be in the form its provider's ids have, and every
+  destination must lie below the native store (``contained``): the names in
+  a plan come from the source and are not trusted;
 - nothing that exists is overwritten: an id already in the native store, or a
   destination path that exists, raises ``Exists``;
 - there must be room for the copy plus 10 %;
@@ -14,10 +17,14 @@ the rules that hold for every provider, ``execute`` carries the plan out:
   native store (same filesystem, outside the directories the tool lists),
   then moved into place with ``os.replace``, in plan order, so the piece that
   makes the session visible to the tool arrives last and complete;
-- on any failure the staging directory, the pieces already in place and the
-  directories made for them are removed (a line appended to a native file is
-  the one thing that cannot be taken back, so appends come after everything
-  that can fail but the final rename of the import record);
+- once the files are in place the copy is read back the way any session of
+  the native store is read, and must be the session that was planned (the
+  ``verify`` step of ``execute``);
+- on any failure, a failed read-back included, the staging directory, the
+  pieces already in place and the directories made for them are removed (a
+  line appended to a native file is the one thing that cannot be taken back,
+  so appends come after everything that can fail but the final rename of the
+  import record);
 - a record of the import is added to ``<state dir>/imports.json``, written to
   a temp file and renamed.
 
@@ -41,7 +48,7 @@ from typing import TYPE_CHECKING, BinaryIO
 from . import __version__
 from .errors import ImportFailed
 from .fsutil import listdir_ro, open_ro, state_dir
-from .model import make_key
+from .model import UUID_PATTERN, make_key
 
 if TYPE_CHECKING:
     from .fsutil import StrPath
@@ -96,7 +103,7 @@ class Rewrite:
             with open_ro(src) as reader:
                 for _chunk in self.apply(reader):
                     pass
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RecursionError) as exc:
             raise ImportFailed(f"{src} cannot be rewritten: {exc}") from exc
         return list(self.changes)
 
@@ -149,6 +156,10 @@ class ImportPlan:
     appends: list[Append] = field(default_factory=list)  # after the units
     existing: list[str] = field(default_factory=list)  # native paths that hold this id
     info: dict = field(default_factory=dict)  # extra provenance fields
+    # The form ``session_id`` must have (``Provider.id_pattern``); ``check``
+    # refuses any other. The default is the strict one, so a plan built
+    # without the provider's own pattern is refused rather than let through.
+    id_pattern: re.Pattern[str] = UUID_PATTERN
 
     @property
     def total_bytes(self) -> int:
@@ -166,10 +177,16 @@ class ImportPlan:
 # --- helpers for adapters ---------------------------------------------------
 
 
-def start_plan(session: Session, native_root: StrPath, pathmap: PathMap) -> ImportPlan:
-    """A plan with everything but the copies filled in. Raises ``ImportFailed``
-    when the session's project folder is not on any mounted drive: an import
-    without it would resume in the wrong place."""
+def start_plan(
+    session: Session,
+    native_root: StrPath,
+    pathmap: PathMap,
+    id_pattern: re.Pattern[str] = UUID_PATTERN,
+) -> ImportPlan:
+    """A plan with everything but the copies filled in; ``id_pattern`` is
+    the provider's. Raises ``ImportFailed`` when the session's project folder
+    is not on any mounted drive: an import without it would resume in the
+    wrong place."""
     local, exists = pathmap.to_local(session.cwd, session.mount) if session.cwd else (None, False)
     if not exists or not local:
         if not session.cwd:
@@ -185,6 +202,7 @@ def start_plan(session: Session, native_root: StrPath, pathmap: PathMap) -> Impo
         native_root=str(native_root),
         cwd=session.cwd,
         cwd_local=local,
+        id_pattern=id_pattern,
     )
 
 
@@ -304,7 +322,7 @@ def read_provenance() -> list[dict]:
             data = json.load(fh)
     except FileNotFoundError:
         return []
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         raise ImportFailed(f"the import record {path} cannot be read: {exc}") from exc
     records = data.get("imports") if isinstance(data, dict) else None
     if not isinstance(records, list):
@@ -312,10 +330,95 @@ def read_provenance() -> list[dict]:
     return records
 
 
+_SEPARATORS = re.compile("[" + re.escape(os.sep + (os.altsep or "")) + "]")
+
+
+def _below(root: str) -> str:
+    return root if root.endswith(os.sep) else root + os.sep
+
+
+def _relative_ok(rel: str) -> bool:
+    """True for a path below a unit that names one place inside it: no
+    drive, not absolute, no empty, ``.`` or ``..`` component, no NUL."""
+    if not rel or "\0" in rel or os.path.isabs(rel) or os.path.splitdrive(rel)[0]:
+        return False
+    return not any(part in ("", ".", "..") for part in _SEPARATORS.split(rel))
+
+
+def contained(plan: ImportPlan) -> None:
+    """Refuse a plan that would write anywhere but below its native store.
+
+    The names in a plan come from the source: ids, date directories and
+    file names of a store on another drive. Whatever the adapter that built
+    the plan checked, every destination is checked again here: each unit,
+    each directory and file below a unit, each file appended to. A
+    destination must be the native root plus components none of which is
+    empty, ``.`` or ``..``, must hold no NUL, and must still be below the
+    native root once the symbolic links on the way are resolved (the links
+    in the part of the path that exists; the native root itself may be a
+    link, as a home directory kept in a dotfiles repository has it).
+
+    Raises ``ImportFailed``; reads only.
+    """
+    root = plan.native_root
+    if not root or "\0" in root or not os.path.isabs(root):
+        raise ImportFailed(f"the native store {root!r} is not an absolute path")
+    targets: list[str] = []
+    for unit in plan.units:
+        targets.append(unit.dst)
+        if unit.is_dir:
+            for rel in unit.dirs + [item.rel for item in unit.files]:
+                if not isinstance(rel, str) or not _relative_ok(rel):
+                    raise ImportFailed(
+                        f"{rel!r} is not a path below {unit.dst}; nothing was imported"
+                    )
+                targets.append(os.path.join(unit.dst, rel))
+        elif len(unit.files) != 1 or unit.files[0].rel or unit.dirs:
+            raise ImportFailed(f"{unit.dst} is planned as one file but is not one")
+    targets += [addition.path for addition in plan.appends]
+    real_root = os.path.realpath(root)
+    for path in targets:
+        if not isinstance(path, str) or "\0" in path or not path.startswith(_below(root)):
+            raise ImportFailed(f"{path!r} is outside the native store {root}; nothing was imported")
+        if not _relative_ok(path[len(_below(root)) :]):
+            raise ImportFailed(f"{path!r} is not a plain path below {root}; nothing was imported")
+        real = os.path.realpath(path)
+        if not real.startswith(_below(real_root)):
+            raise ImportFailed(
+                f"{path} leads out of the native store {root} through a symbolic link; "
+                "nothing was imported"
+            )
+    for addition in plan.appends:  # a line is only ever added to a plain file
+        try:
+            mode = os.stat(addition.path).st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ImportFailed(f"cannot read {addition.path}: {exc.strerror or exc}") from exc
+        if not stat.S_ISREG(mode):
+            raise ImportFailed(f"{addition.path} is not a regular file; nothing was imported")
+
+
+def _sound(plan: ImportPlan) -> None:
+    """The refusals that do not depend on what is in the native store: a
+    session id that is not in the form its provider's ids have, and a
+    destination outside the native store. ``execute`` makes them before it
+    touches anything."""
+    # The id becomes file and directory names in the native store and, once
+    # the copy is listed, an argument of the tool that resumes it.
+    if not isinstance(plan.session_id, str) or not plan.id_pattern.fullmatch(plan.session_id):
+        raise ImportFailed(
+            "the id of this session is not in the form its tool gives ids; nothing was imported"
+        )
+    contained(plan)
+
+
 def check(plan: ImportPlan) -> None:
-    """Everything ``execute`` would refuse, without writing: an id or a
-    destination that already exists (``Exists``), too little free space, an
-    unusable import record."""
+    """Everything ``execute`` would refuse, without writing: a session id
+    that is not in the form its provider's ids have, a destination outside
+    the native store (``contained``), an id or a destination that already
+    exists (``Exists``), too little free space, an unusable import record."""
+    _sound(plan)
     taken = list(plan.existing) + [dst for dst in plan.destinations if os.path.lexists(dst)]
     if taken:
         raise Exists(taken)
@@ -383,7 +486,7 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _make_dirs(path: str, made: list[str]) -> None:
+def _make_dirs(path: str, made: list[str], mode: int = DIR_MODE) -> None:
     """``mkdir -p``, remembering each directory this call created."""
     missing = []
     current = os.path.abspath(path)
@@ -394,7 +497,7 @@ def _make_dirs(path: str, made: list[str]) -> None:
             break
         current = parent
     for directory in reversed(missing):
-        os.mkdir(directory, DIR_MODE)
+        os.mkdir(directory, mode)
         made.append(directory)
 
 
@@ -412,7 +515,8 @@ def _copy(item: FileCopy, target: str, tick: Callable[[int], None]) -> None:
                 while True:
                     try:
                         chunk = next(chunks, None)
-                    except ValueError as exc:  # text the rewrite cannot carry over
+                    except (ValueError, RecursionError) as exc:
+                        # text the rewrite cannot carry over, or JSON nested too deeply
                         raise ImportFailed(f"{item.src} cannot be rewritten: {exc}") from exc
                     if chunk is None:
                         break
@@ -542,13 +646,26 @@ def sweep_staging(native_root: StrPath) -> list[str]:
     return removed
 
 
-def execute(plan: ImportPlan, progress: Progress | None = None) -> dict:
+def execute(
+    plan: ImportPlan,
+    progress: Progress | None = None,
+    verify: Callable[[], object] | None = None,
+) -> dict:
     """Carry out a plan and return its provenance record.
+
+    The order is: stage every file, move the units into place, ``verify``,
+    append, write the record. ``verify()`` is the caller's check that what
+    now lies in the native store reads back as the session that was planned
+    (``Provider.import_session`` passes one); it raises when it does not.
+    Then, as after any other failure, everything this import put in place is
+    taken out again, the directories it made included: no line is appended
+    and no record is written.
 
     ``progress(done_bytes, total_bytes)`` is called as the copy advances.
     Raises ``Exists`` or ``ImportFailed``; after a failure nothing of this
     import is left in the native store.
     """
+    _sound(plan)
     sweep_staging(plan.native_root)
     check(plan)
     records = read_provenance()  # read again below the checks: this is what gets extended
@@ -589,7 +706,7 @@ def execute(plan: ImportPlan, progress: Progress | None = None) -> dict:
         # last step that can fail for lack of space is behind us.
         record = _record(plan)
         path = provenance_file()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _make_dirs(os.path.dirname(path), made_dirs, 0o777)  # as makedirs would: the umask decides
         record_tmp = f"{path}.{os.getpid()}.tmp"
         with open(record_tmp, "w", encoding="utf-8") as fh:
             json.dump(
@@ -608,6 +725,16 @@ def execute(plan: ImportPlan, progress: Progress | None = None) -> dict:
                 raise Exists([unit.dst])
             os.replace(target, unit.dst)
             placed.append(unit.dst)
+        if verify is not None:
+            try:
+                verify()
+            except ImportFailed:
+                raise
+            except Exception as exc:  # whatever stopped the copy from being read back
+                raise ImportFailed(
+                    f"the copy could not be read back ({type(exc).__name__}: {exc}); it was "
+                    "removed again and nothing was left in the native store"
+                ) from exc
         for addition in plan.appends:
             _append(addition)
         os.replace(record_tmp, path)
@@ -643,6 +770,7 @@ __all__ = [
     "Rewrite",
     "Unit",
     "check",
+    "contained",
     "describe",
     "execute",
     "file_copy",

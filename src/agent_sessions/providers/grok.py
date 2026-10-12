@@ -18,10 +18,12 @@ from .base import (
     NotSupported,
     Provider,
     Turn,
+    between,
     clean_title,
     iter_jsonl,
     open_ro,
     parse_ts,
+    read_small,
     unreadable,
     warn,
 )
@@ -37,11 +39,14 @@ _SUBAGENTS = "subagents"
 _META = "meta.json"
 _FIXED_PATHS = 3  # summary.json, chat_history.jsonl, <group>/.cwd
 _SMALL_FILE = 16 * 1024 * 1024
-_QUERY = re.compile(r"<user_query>(.*?)</user_query>", re.S)
+# How deep a ``meta.json`` value is searched. The tool writes a flat object;
+# a file from elsewhere can nest values without end.
+_NEST_MAX = 32
 _INJECTED = ("<user_info>", "<system-reminder>")
 # Import (FORMATS section 6): the only cwd shape whose group directory name
 # is known for certain, and the reason given for every other one.
 _PLAIN_CWD = re.compile(r"[A-Za-z0-9/ ]+")
+_GROUP_NAME = re.compile(r"[A-Za-z0-9%]+")  # all a percent-encoded plain cwd can give
 _GROUP_NAME_MAX = 255  # bytes; longer names get a slug and a hash [docs]
 ENCODING_UNVERIFIED = "Grok's directory encoding of '-', '.', '_', '~' is unverified"
 
@@ -159,26 +164,29 @@ def _prompt_text(record: dict[str, Any]) -> str | None:
     if record.get("type") != "user" or record.get("synthetic_reason"):
         return None
     text = _text(record.get("content"))
-    wrapped = _QUERY.search(text)
-    if wrapped:
-        return wrapped.group(1).strip()
+    wrapped = between(text, "<user_query>", "</user_query>")
+    if wrapped is not None:
+        return wrapped.strip()
     if not _is_prompt(record):
         return None
     text = text.strip()
     return None if text.startswith(_INJECTED) else text
 
 
-def _names_session(value: object, session_id: str, key: str = "") -> bool:
+def _names_session(value: object, session_id: str, key: str = "", depth: int = 0) -> bool:
     """True when a ``meta.json`` value holds ``session_id`` as a string,
-    anywhere but under a key that names a parent."""
+    anywhere but under a key that names a parent, and no more than
+    ``_NEST_MAX`` levels down."""
     if "parent" in key.lower():
         return False
     if isinstance(value, str):
         return value == session_id
+    if depth >= _NEST_MAX:
+        return False
     if isinstance(value, dict):
-        return any(_names_session(v, session_id, str(k)) for k, v in value.items())
+        return any(_names_session(v, session_id, str(k), depth + 1) for k, v in value.items())
     if isinstance(value, list):
-        return any(_names_session(v, session_id, key) for v in value)
+        return any(_names_session(v, session_id, key, depth + 1) for v in value)
     return False
 
 
@@ -347,7 +355,7 @@ class Grok(Provider):
         elif first_prompt:
             title, title_source = first_prompt, "first prompt"
         else:
-            title, title_source = session_id[:8], "id"
+            title, title_source = clean_title(session_id[:8]), "id"
 
         cwd, cwd_source = info.get("cwd"), "info.cwd"
         if not isinstance(cwd, str) or not cwd:
@@ -375,11 +383,8 @@ class Grok(Provider):
     def _group_cwd(group_dir: Path) -> tuple[str | None, str]:
         """cwd fallbacks: the group's ``.cwd`` file, then the decoded group
         directory name."""
-        try:
-            with open_ro(group_dir / _CWD) as fh:
-                recorded = fh.read(_SMALL_FILE).decode("utf-8", "replace").strip()
-        except OSError:
-            recorded = ""
+        raw = read_small(group_dir / _CWD, _SMALL_FILE)
+        recorded = raw.decode("utf-8", "replace").strip() if raw else ""
         if recorded:
             return recorded, ".cwd"
         decoded = urllib.parse.unquote(group_dir.name)
@@ -422,7 +427,13 @@ class Grok(Provider):
         if not s.files:
             raise NotSupported("this session has no directory to copy")
         source = s.files[0]
-        plan = importer.start_plan(s, self.native_store(), pathmap)
+        # The directory's name becomes a name in the native store. The tool
+        # names a session directory after the session's id; one that is named
+        # otherwise is not copied under either name.
+        name = os.path.basename(os.path.normpath(source))
+        if name != s.id or not self.valid_id(name):
+            raise NotSupported(f"the session directory is not named after its session id: {source}")
+        plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern)
         sessions = os.path.join(plan.native_root, "sessions")
         try:
             groups = sorted(subdirs(sessions))
@@ -438,7 +449,8 @@ class Grok(Provider):
                     "Grok shortens directory names over 255 bytes in a way that is "
                     f"unverified (project folder {plan.cwd_local})"
                 )
-        name = os.path.basename(os.path.normpath(source))
+            if not _GROUP_NAME.fullmatch(group):
+                raise NotSupported(f"{ENCODING_UNVERIFIED} (project folder {plan.cwd_local})")
         plan.existing = sorted(
             {
                 path

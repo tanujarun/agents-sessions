@@ -16,14 +16,16 @@ from ..fsutil import home, listdir_ro
 from ..model import Candidate, Session, Store
 from . import register
 from .base import (
+    SQLITE_ERRORS,
     NotSupported,
     Provider,
     Turn,
+    between,
     clean_title,
     iter_jsonl,
-    open_ro,
     open_sqlite_ro,
     parse_ts,
+    read_small,
     unreadable,
     warn,
 )
@@ -45,8 +47,10 @@ _SUMMARIES = "conversation_summaries.db"
 _SIDECARS = ("-wal", "-shm", "-journal")
 _SMALL_FILE = 16 * 1024 * 1024
 _STEP_USER, _STEP_PLANNER = 14, 15
-_USER_REQUEST = re.compile(r"<USER_REQUEST>(.*?)</USER_REQUEST>", re.S)
-_PBTXT_TITLE = re.compile(rb'^\s*title\s*:\s*"((?:[^"\\]|\\.)*)"', re.M | re.S)
+# ``title`` as the first thing on a line. The blanks before it are matched
+# without line breaks: ``^\s*`` finds the same titles, but on a file of blank
+# lines it reads the rest of the file again from every line.
+_PBTXT_TITLE = re.compile(rb'^[ \t\r\f\v]*title\s*:\s*"((?:[^"\\]|\\.)*)"', re.M | re.S)
 _PBTXT_ESCAPE = re.compile(rb"\\(x[0-9a-fA-F]{1,2}|[0-7]{1,3}|.)", re.S)
 _PBTXT_SIMPLE = {
     b"n": b"\n",
@@ -186,17 +190,9 @@ def uri_to_path(uri: object) -> str | None:
     return path or None
 
 
-def _read_small(path: StrPath) -> bytes | None:
-    try:
-        with open_ro(path) as fh:
-            return fh.read(_SMALL_FILE)
-    except OSError:
-        return None
-
-
 def _pbtxt_title(path: StrPath) -> str:
     """The ``title:"…"`` value of an annotations text proto, or ''."""
-    raw = _read_small(path)
+    raw = read_small(path, _SMALL_FILE)
     found = _PBTXT_TITLE.search(raw) if raw else None
     if not found:
         return ""
@@ -217,8 +213,8 @@ def _user_request(content: object) -> str:
     ``<USER_REQUEST>``, which is followed by injected metadata blocks."""
     if not isinstance(content, str):
         return ""
-    wrapped = _USER_REQUEST.search(content)
-    return (wrapped.group(1) if wrapped else content).strip()
+    wrapped = between(content, "<USER_REQUEST>", "</USER_REQUEST>")
+    return (content if wrapped is None else wrapped).strip()
 
 
 def _mtime(path: StrPath) -> str | None:
@@ -247,7 +243,7 @@ def _optional(con: sqlite3.Connection, sql: str) -> tuple[Any, ...] | None:
     try:
         row: tuple[Any, ...] | None = con.execute(sql).fetchone()
         return row
-    except sqlite3.Error:
+    except SQLITE_ERRORS:
         return None
 
 
@@ -349,7 +345,7 @@ class Antigravity(Provider):
         if not title:
             title, title_source = clean_title(self._first_request(log)), "first user input"
         if not title:
-            title, title_source = cid[:8], "id"
+            title, title_source = clean_title(cid[:8]), "id"
 
         cwd, cwd_source = self._workspace(row.get("workspace_uris")), "workspace_uris"
         if not cwd:
@@ -407,7 +403,7 @@ class Antigravity(Provider):
                 ).fetchone()
                 blob = _optional(con, "SELECT data FROM trajectory_metadata_blob WHERE id = 'main'")
                 parents = _optional(con, "SELECT count(*) FROM parent_references")
-        except sqlite3.Error as exc:
+        except SQLITE_ERRORS as exc:
             warn(f"conversation database not readable: {exc}", db)
             return None
         return {
@@ -434,7 +430,7 @@ class Antigravity(Provider):
                 if row is None:
                     return {}
                 return dict(zip((column[0] for column in cursor.description), row, strict=False))
-        except sqlite3.Error as exc:
+        except SQLITE_ERRORS as exc:
             warn(f"conversation summaries not readable: {exc}", path)
             return {}
 
@@ -452,7 +448,7 @@ class Antigravity(Provider):
     @staticmethod
     def _last_cwd(path: Path, cid: str) -> str | None:
         """The key of ``last_conversations.json`` whose value is the id."""
-        raw = _read_small(path)
+        raw = read_small(path, _SMALL_FILE)
         if not raw:
             return None
         try:
@@ -520,7 +516,7 @@ class Antigravity(Provider):
                 rows = con.execute(
                     "SELECT step_type, metadata, step_payload FROM steps ORDER BY idx"
                 ).fetchall()
-        except sqlite3.Error:
+        except SQLITE_ERRORS:
             return
         for step_type, metadata, payload in rows:
             ts = parse_ts(pb_timestamp(pb_first(metadata, 1)))

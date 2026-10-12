@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from ..fsutil import home, listdir_ro, subdirs
+from ..importer import human_size
 from ..model import Candidate, Session, Store
 from . import register
 from .base import (
@@ -20,6 +21,7 @@ from .base import (
     iter_jsonl,
     open_ro,
     parse_ts,
+    read_small,
     unreadable,
     warn,
 )
@@ -40,6 +42,10 @@ _ID_PART = re.compile(r"-([^-]{1,8})\.jsonl?$")
 _FIXED_PATHS = 3  # the chat file, .project_root, projects.json
 _SMALL_FILE = 16 * 1024 * 1024
 _LEGACY_MAX = 64 * 1024 * 1024
+_CHAT_MAX = 64 * 1024 * 1024  # bytes; a larger chat file is not read
+# How deep the parts of a message ``content`` are followed. The tool writes
+# a list of parts; a file from elsewhere can nest lists without end.
+_NEST_MAX = 16
 _IGNORED_STARTS = ("/", "?", "<session_context>", "<hook_context>")
 # Parts that are not text; the tool renders each as a non-empty marker.
 _PART_MARKERS = (
@@ -60,15 +66,18 @@ def _id_group(name: str) -> str:
     return found.group(1) if found else name
 
 
-def _content_string(value: object) -> str:
+def _content_string(value: object, depth: int = 0) -> str:
     """A message ``content`` as the tool's own listing rule sees it: text,
-    with a marker for every part that is not text."""
+    with a marker for every part that is not text. Lists nested more than
+    ``_NEST_MAX`` deep give nothing."""
     if not value:
         return ""
     if isinstance(value, str):
         return value
     if isinstance(value, list):
-        return "".join(_content_string(part) for part in value)
+        if depth >= _NEST_MAX:
+            return ""
+        return "".join(_content_string(part, depth + 1) for part in value)
     if not isinstance(value, dict):
         return ""
     for key in _PART_MARKERS:
@@ -77,12 +86,15 @@ def _content_string(value: object) -> str:
     return value["text"] if isinstance(value.get("text"), str) else ""
 
 
-def _plain_text(value: object) -> str:
-    """The text parts of a message ``content``, nothing else."""
+def _plain_text(value: object, depth: int = 0) -> str:
+    """The text parts of a message ``content``, nothing else. Lists nested
+    more than ``_NEST_MAX`` deep give nothing."""
     if isinstance(value, str):
         return value
     if isinstance(value, list):
-        return "".join(_plain_text(part) for part in value)
+        if depth >= _NEST_MAX:
+            return ""
+        return "".join(_plain_text(part, depth + 1) for part in value)
     if isinstance(value, dict) and not any(key in value for key in _PART_MARKERS):
         return value["text"] if isinstance(value.get("text"), str) else ""
     return ""
@@ -182,6 +194,14 @@ def _load(path: Path) -> tuple[dict, list[dict]] | None:
     which is what older versions wrote to ``.json`` files (the tool does the
     same: ``parseLegacyRecordFallback``).
     """
+    # Every message of the file is held while it is replayed.
+    try:
+        large = os.stat(path).st_size > _CHAT_MAX
+    except OSError:
+        large = False  # the read below reports that
+    if large:
+        warn(f"larger than {human_size(_CHAT_MAX)}; not read", path)
+        return None
     meta, messages = apply_records(iter_jsonl(path))
     if meta.get("sessionId") and meta.get("projectHash"):
         return meta, messages
@@ -214,11 +234,8 @@ def _mtime(path: StrPath) -> str | None:
 
 
 def _read_text(path: StrPath) -> str:
-    try:
-        with open_ro(path) as fh:
-            return fh.read(_SMALL_FILE).decode("utf-8-sig", "replace").strip()
-    except OSError:
-        return ""
+    raw = read_small(path, _SMALL_FILE)
+    return raw.decode("utf-8-sig", "replace").strip() if raw else ""
 
 
 @register
@@ -348,7 +365,7 @@ class Gemini(Provider):
                     if title:
                         break
         if not title:
-            title, title_source = session_id[:8], "id"
+            title, title_source = clean_title(session_id[:8]), "id"
         start, last = parse_ts(meta.get("startTime")), parse_ts(meta.get("lastUpdated"))
         return {
             "id": session_id,

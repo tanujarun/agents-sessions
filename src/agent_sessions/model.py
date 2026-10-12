@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import asdict, dataclass, field, fields
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .fsutil import StrPath
+
+# The form of a session id, used with ``fullmatch``: a UUID, hex digits in
+# either case. Every provider's tool gives its sessions such ids today
+# (docs/FORMATS.md); ``Provider.id_pattern`` is where one would differ. An id
+# is read from files on other drives and ends up in a command line and in
+# file names, so nothing that does not match is ever accepted as a session.
+UUID_PATTERN = re.compile(
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+)
 
 
 def make_key(provider: str, store_root: StrPath, session_id: str) -> str:

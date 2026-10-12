@@ -13,13 +13,15 @@ replace them, for example with ``mock.patch.object(launch, "starter", rec)``.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import subprocess
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from . import textsafe
 from .errors import LaunchFailed
 from .fsutil import home
 
@@ -31,6 +33,10 @@ LAUNCHER = "omarchy-launch-tui"
 NOTIFIER = "notify-send"
 NOTIFY_ENV = "AGENT_SESSIONS_NOTIFY"  # "0" switches desktop notifications off
 NOTIFY_TITLE = "Cannot resume session"
+# ``_from_session``: what stands in for every text of the second session, and
+# the fields that are ours, not a store's.
+_PROBE = "00000000-0000-4000-8000-000000000000"
+_NOT_DATA = ("provider", "origin")
 
 
 @dataclass
@@ -59,13 +65,24 @@ def _spawn(command: list[str], cwd: str | None) -> None:
     _detached(command, cwd)
 
 
+def _notice(reason: object) -> str:
+    """The text of a notification: one line with nothing a terminal or a
+    notification daemon would act on (``textsafe.clean``), and never an
+    option. The reason can quote a session's folder, which is data from
+    another drive; ``notify-send`` reads an argument that starts with ``-``
+    as an option wherever it stands (its ``--help`` names no ``--``
+    terminator), so such a text gets a space in front."""
+    text = textsafe.clean(reason).strip()
+    return f" {text}" if text.startswith("-") else text
+
+
 def _notify(reason: str) -> None:
     """A desktop notification, when ``notify-send`` exists."""
     if os.environ.get(NOTIFY_ENV, "").strip().lower() in ("0", "false", "no", "off"):
         return
     tool = shutil.which(NOTIFIER)
     if tool:
-        _detached([tool, "--app-name=agent-sessions", NOTIFY_TITLE, reason])
+        _detached([tool, "--app-name=agent-sessions", NOTIFY_TITLE, _notice(reason)])
 
 
 starter = _spawn  # starter(command, cwd): open the terminal window
@@ -73,9 +90,10 @@ notifier = _notify  # notifier(reason): tell the desktop about a failure
 
 
 def _tell(reason: str) -> None:
-    """Best effort: a notification that fails never hides the real failure."""
+    """Best effort: a notification that fails never hides the real failure.
+    The notifier gets the reason with control characters taken out."""
     try:
-        notifier(reason)
+        notifier(textsafe.clean(reason))
     except Exception:  # noqa: S110  (best effort, see the docstring)
         pass
 
@@ -98,6 +116,34 @@ def _directory(session: Session, provider: Provider) -> tuple[str, str | None]:
     return start, f"project folder {state}; starting in the home directory"
 
 
+def _from_session(session: Session, provider: Provider, argv: list[str]) -> list[str]:
+    """The elements of a resume command that came from session data.
+
+    The command is built a second time for a session that has ``_PROBE`` in
+    place of every text it holds; an element that differs between the two
+    depends on the session. An adapter does not have to declare anything for
+    this, so a new one cannot forget to. When the two commands cannot be
+    compared (the second build fails, or has another length), every element
+    after the program's name counts as session data.
+    """
+    changes: dict[str, Any] = {}
+    for field in dataclasses.fields(session):
+        value = getattr(session, field.name)
+        if field.name in _NOT_DATA:
+            continue
+        if isinstance(value, list):
+            changes[field.name] = [_PROBE for _item in value]
+        elif isinstance(value, str) and value:
+            changes[field.name] = _PROBE
+    try:
+        other = [str(arg) for arg in provider.resume_argv(dataclasses.replace(session, **changes))]
+    except Exception:
+        return argv[1:]
+    if len(other) != len(argv):
+        return argv[1:]
+    return [arg for arg, probe in zip(argv[1:], other[1:], strict=True) if arg != probe]
+
+
 def plan(
     session: Session, provider: Provider, where: str | None = None, here: bool = False
 ) -> LaunchPlan:
@@ -105,6 +151,14 @@ def plan(
 
     ``where`` names the place a foreign session is on, for the refusal.
     Raises ``LaunchFailed`` with the reason when it cannot be resumed.
+
+    A session's fields are data from a file, possibly one that came from
+    another drive. Two rules keep them from being read as options of the
+    tool, each on its own: the id must be in the form the provider's ids
+    have, and no element of the command that came from the session may start
+    with ``-`` or hold a NUL. (``--`` in front of the id is not the answer:
+    for ``--resume <id>`` and ``--conversation <id>`` the id is an option's
+    value, and ``--`` there would change what the command means.)
     """
     label = provider.label or provider.name
     if session.origin != "native":
@@ -114,10 +168,20 @@ def plan(
         raise LaunchFailed(
             f"{label} sessions cannot be resumed here: the {label} CLI is not installed"
         )
+    if not provider.valid_id(session.id):
+        raise LaunchFailed(
+            f"the id of this session is not in the form {label} ids have; it was not resumed"
+        )
     argv = [str(arg) for arg in provider.resume_argv(session)]
     if not argv or not shutil.which(argv[0]):
         tool = argv[0] if argv else provider.binary
         raise LaunchFailed(f"{tool} is not installed (not found on PATH)")
+    if any(arg.startswith("-") for arg in _from_session(session, provider, argv)):
+        raise LaunchFailed(
+            f"the data of this session would be read as an option of {argv[0]}; it was not resumed"
+        )
+    if any("\0" in arg for arg in argv):
+        raise LaunchFailed("the data of this session holds a NUL character; it was not resumed")
     cwd, note = _directory(session, provider)
     if here:
         return LaunchPlan(cwd, argv, list(argv), note)

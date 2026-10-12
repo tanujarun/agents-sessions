@@ -25,6 +25,11 @@ Textual, from the project `.venv` (`./install.sh` creates it).
   `-wal`/`-shm` files or move access times on another drive.
 - `subprocess` only in `launch.py`. Read files on other drives through
   `fsutil.open_ro`, never `shutil.copy` or a plain `open`.
+- A store that is not the native one is hostile: a session id must `fullmatch` `Provider.id_pattern`,
+  and an import writes only below the native root (`importer.contained`).
+- Text from a store is shown only through `textsafe` (`cli._out`/`_err`/`_json`, `view.clean`); no `print` in `cli.py`.
+- Foreign bytes are read bounded (`open_ro`, `iter_jsonl`, `read_small`, `open_sqlite_ro`); where JSON is
+  parsed, catch `RecursionError` with `ValueError`.
 - Do not leave store-shaped directories (fake homes, copied fixtures)
   readable under `scratch/`: a real scan of `/home` would list them.
 - Tests never touch the real stores for writing. Use temp dirs and the env

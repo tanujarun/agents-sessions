@@ -1,9 +1,10 @@
 """Pure view logic for the TUI: what a row says, how columns fit, which rows
 a filter keeps, where the selection lands, what a key means.
 
-Standard library only and no I/O, so every decision here is unit-tested on
-the system Python. Nothing in this module knows about Textual, and nothing
-here is a colour, a border or a spacing value: those are in ``app.tcss``.
+Standard library only (plus the engine's ``textsafe``) and no I/O, so every
+decision here is unit-tested on the system Python. Nothing in this module
+knows about Textual, and nothing here is a colour, a border or a spacing
+value: those are in ``app.tcss``.
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
 from typing import Any, Protocol
+
+from .. import textsafe
 
 APP_TITLE = "agent-sessions"
 ELLIPSIS = "…"
@@ -84,12 +87,10 @@ def text_width(text: str) -> int:
 
 
 def clean(text: object) -> str:
-    """One printable line: control characters (newline, tab, escape) become
-    spaces, so no value can break a row or move the cursor."""
-    text = "" if text is None else str(text)
-    if text.isprintable():
-        return text
-    return "".join(" " if unicodedata.category(ch) == "Cc" else ch for ch in text)
+    """One printable line: control characters (newline, tab, escape) and the
+    characters that reorder text become spaces, so no value can break a row
+    or move the cursor. The rule itself is ``textsafe.clean``."""
+    return textsafe.clean(text)
 
 
 def _take(text: str, width: int) -> str:

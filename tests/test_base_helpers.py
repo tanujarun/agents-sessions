@@ -272,7 +272,8 @@ class SqliteTest(TempCase):
             before = sorted(p.name for p in path.parent.iterdir())
             uri = "file:" + base.urllib.parse.quote(str(path)) + "?mode=ro&immutable=1"
             dumps = []
-            for con in (open_sqlite_ro(path), sqlite3.connect(uri, uri=True)):
+            # Grok's search index holds FTS virtual tables: the schema check is left out.
+            for con in (open_sqlite_ro(path, plain_schema=False), sqlite3.connect(uri, uri=True)):
                 tables = [
                     row[0]
                     for row in con.execute(
