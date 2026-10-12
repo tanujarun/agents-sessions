@@ -205,8 +205,12 @@ must be ignored.
 - No list/sessions subcommand exists `[verified, --help]`. `claude agents` lists background
   sessions only. The source also accepts `--resume <path ending in .jsonl>` (undocumented;
   do not use).
-- `CLAUDE_CONFIG_DIR` moves the whole store, `projects/` included (Phase 2, Q2). Starting a
-  new session with a first prompt: Phase 2, Q3.
+- `CLAUDE_CONFIG_DIR` moves the whole store, `projects/` included (Phase 2, Q2).
+- New session with a first prompt (`continue`): argv `["claude", "<prompt>"]` `[verified,
+  --help: "Usage: claude [options] [command] [prompt]"; "prompt  Your prompt"; "starts an
+  interactive session by default, use -p/--print for non-interactive output"]`. That the prompt
+  is sent without a key press is `[inferred]`: the help does not say. Never `-p/--print`. No
+  flag sets the working directory; the launcher starts the tool in the folder. Phase 2, Q3.
 
 ### 6. Import
 
@@ -357,6 +361,11 @@ Every line is `{"timestamp", "ordinal", "type", "payload"}`. `type` values: `ses
   --json` without `--apply` "only reports eligible sessions" (it is about legacy rollouts and may
   report nothing for `paginated` ones). `codex agents` needs the app-server daemon.
 - `CODEX_HOME` moves the store, `CODEX_SQLITE_HOME` the SQLite files (Phase 2, Q2).
+- New session with a first prompt (`continue`): argv `["codex", "<prompt>"]` `[verified,
+  --help: "Usage: codex [OPTIONS] [PROMPT]"; "[PROMPT]  Optional user prompt to start the
+  session"]`. That it is sent without a key press is `[inferred]` from "to start the session".
+  Never `codex exec`. The launcher starts the tool in the folder; `-C, --cd <DIR>` is not used.
+  Phase 2, Q3.
 
 ### 6. Import
 
@@ -510,6 +519,11 @@ A candidate is a directory `sessions/<group>/<name>/` that contains `summary.jso
   for a session without `usage.json`, so not an existence probe). None needs a login. `list` and
   `search` also try a remote search and wait about 5 s for it when offline. Details: Phase 2, Q1.
 - `grok sessions delete <id>` exists `[verified, --help]`: never call it.
+- New session with a first prompt (`continue`): argv `["grok", "<prompt>"]` `[verified, --help:
+  "[PROMPT]  Initial prompt for the interactive session, e.g. grok "fix the bug""]`; sent
+  as the first turn `[docs, 01-getting-started.md: "Launch the interactive TUI and submit an
+  initial prompt as the first turn"]`. Never `-p`. The launcher starts the tool in the folder;
+  `--cwd <CWD>` is not used. Phase 2, Q3.
 
 ### 6. Import
 
@@ -662,6 +676,11 @@ the SQL columns):
   not run]`. The id is looked up as the file `conversations/<id>.db`, not in either summary
   index (Phase 2, Q5).
 - There is no list subcommand `[verified, --help]`.
+- New conversation with a first prompt (`continue`): argv `["agy", "--prompt-interactive",
+  "<prompt>"]` `[verified, --help: "--prompt-interactive  Run an initial prompt interactively
+  and continue the session"; "-i  Short alias for --prompt-interactive"]`; sent at once, by
+  that wording. Never `-p`, `--print` or `--prompt`. No flag sets the working directory; the
+  launcher starts the tool in the folder. Phase 2, Q3.
 - IDE conversations: none exist to test. The summaries table has an `app_data_dir` column
   (`antigravity-cli` in every row), which suggests one schema for both apps and that `agy` reads
   only its own directory `[inferred]`. Treat an `antigravity-ide` store as **list-only**.
@@ -806,7 +825,10 @@ reproduced for the one session]`.
 - No-model check: `gemini --list-sessions` ("List available sessions for the current project and
   exit") `[verified, source]`.
 - `GEMINI_CLI_HOME` replaces the home directory the store is looked up in (the store is then
-  `$GEMINI_CLI_HOME/.gemini`) `[verified, source: homedir()]`. First prompt of a new session:
+  `$GEMINI_CLI_HOME/.gemini`) `[verified, source: homedir()]`.
+- New session with a first prompt (`continue`), once a real binary exists: argv `["gemini",
+  "-i", "<prompt>"]` `[verified, source: "-i, --prompt-interactive": "Execute the provided
+  prompt and continue in interactive mode"; not installed, not run]`. Never `-p/--prompt`.
   Phase 2, Q3.
 
 ### 6. Import
@@ -1256,6 +1278,15 @@ is submitted as the first turn without a key press.
   transcript itself.
 - Claude's two other hidden options, `--prefill-b64` and `--deep-link-cwd-b64`, act only
   together with `--deep-link-origin` `[verified, code]`; do not use them.
+- What the program does with this table: `Provider.new_session_argv(prompt)` of each adapter
+  returns the argv of its row (for gemini the `-i` form), and `launch.plan_new` refuses a
+  command that is anything but the adapter's own words and the prompt as one whole element.
+  The working directory is the directory the tool is started in, for all five; no tool's
+  directory flag is used. The prompt is one fixed sentence (`launch.FIRST_PROMPT`) that names
+  the tool the old session was made with and the file its transcript was exported to
+  (`<state>/handoff/<provider>-<id>.md`); with a state directory of ordinary length it is under
+  400 bytes. No tool was started with it: that each of them reads the file and waits is the
+  hand test "continue as new" (Open questions, 12).
 
 ### Q4. Mounting a drive that is attached but not mounted
 
@@ -1578,7 +1609,9 @@ Items answered since are struck through, with where the answer is.
     started from a TUI.
 12. **First prompt** (Phase 2, Q3) — are `claude "<prompt>"` and `codex "<prompt>"` sent
     without a key press; does Claude's hidden `--prefill <text>` behave as its description
-    says.
+    says. And for `continue`, which no run of ours has tried with any tool: does the tool read
+    the exported transcript the first prompt names (a file outside its working directory, in
+    the state directory), say where the work stood, and wait.
 13. **Re-pointing** (Phase 2, Q8) — does a Claude session imported under a folder its
     transcript never names resume cleanly there, and is a `relocated` record needed.
 14. **`grok sessions list` as a probe** — it also asks a remote service; what it sends when

@@ -487,6 +487,9 @@ class Codex(Provider):
     def resume_argv(self, s: Session) -> list[str]:
         return [self.binary, "resume", s.id]
 
+    def new_session_argv(self, prompt: str) -> list[str]:
+        return [self.binary, prompt]  # ``codex [PROMPT]``; never ``codex exec``
+
     def transcript(self, s: Session) -> Iterator[Turn]:
         rollouts = []
         for path in s.files:

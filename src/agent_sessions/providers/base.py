@@ -149,6 +149,14 @@ class Provider:
         """Resume command for a native session."""
         raise NotImplementedError
 
+    def new_session_argv(self, prompt: str) -> list[str]:
+        """The command that starts the tool as a new interactive session
+        with ``prompt`` as its first message (FORMATS "Phase 2 findings",
+        Q3). Its own words and the prompt, whole, as one element; never one
+        of the non-interactive forms (``-p``, ``exec``): the session is the
+        user's to carry on. ``launch.plan_new`` holds an adapter to that."""
+        raise NotImplementedError
+
     def transcript(self, s: Session) -> Iterator[Turn]:
         """The conversation as plain turns, oldest first, read from ``s.files``.
 

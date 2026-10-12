@@ -72,10 +72,41 @@ def log_file() -> Path:
     return state_dir() / "agent-sessions.log"
 
 
+def handoff_dir() -> Path:
+    """Where the transcript of a session is exported to for the tool that
+    continues it as a new session (``api.continue_session``): one file per
+    session, in the state directory."""
+    return state_dir() / "handoff"
+
+
 def lock_file() -> Path:
     """The file ``lock`` locks: one for everything that changes the state
     directory or puts a session into a native store."""
     return state_dir() / "agent-sessions.lock"
+
+
+def existing_folder(target: object, what: str) -> str:
+    """A folder the user named, checked and in one spelling
+    (``os.path.normpath``: no trailing separator, no doubled one). ``what``
+    says which folder it is, for the reason: ``the folder to import into``.
+
+    It is the user's own input, not a name from a store, and it must be an
+    absolute path of a directory that exists. Raises ``ValueError`` with the
+    reason in plain words for anything else: text with a NUL, a relative
+    path (``~`` is the caller's to expand), a path that is not there, a
+    file. Reads only."""
+    if not isinstance(target, str) or not target:
+        raise ValueError(f"{what} is not a path")
+    if "\0" in target:
+        raise ValueError(f"{what} has a NUL character in its path")
+    if not os.path.isabs(target):
+        raise ValueError(f"{what} must be an absolute path: {target}")
+    folder = os.path.normpath(target)
+    if not os.path.lexists(folder):
+        raise ValueError(f"{what} does not exist: {folder}")
+    if not os.path.isdir(folder):
+        raise ValueError(f"{what} is not a directory: {folder}")
+    return folder
 
 
 # --- our own directories ----------------------------------------------------

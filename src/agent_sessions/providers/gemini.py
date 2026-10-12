@@ -405,6 +405,11 @@ class Gemini(Provider):
     def resume_argv(self, s: Session) -> list[str]:
         return [self.binary, "--resume", s.id]
 
+    def new_session_argv(self, prompt: str) -> list[str]:
+        # "Execute the provided prompt and continue in interactive mode";
+        # never ``-p``.
+        return [self.binary, "-i", prompt]
+
     def transcript(self, s: Session) -> Iterator[Turn]:
         """From the chat file, after ``$set`` and ``$rewindTo`` are applied."""
         if not s.files:

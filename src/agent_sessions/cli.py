@@ -142,6 +142,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--force", action="store_true", help="with -o: replace a file that exists")
 
+    p = sub.add_parser(
+        "continue",
+        help="carry a session on as a new session, in its own tool or another",
+        description=(
+            "Start a tool as a NEW session that continues an old one: for a session that "
+            "cannot be resumed where it is wanted. The transcript is exported to a file in "
+            "the state directory, and the tool is started with a fixed first message that "
+            "names that file. The tool sends that message to its model as soon as it starts."
+        ),
+    )
+    p.add_argument("key", help=key_help)
+    p.add_argument(
+        "--with",
+        dest="tool",
+        metavar="TOOL",
+        help=(
+            "the tool to start instead of the session's own: "
+            + ", ".join(provider.name for provider in all_providers())
+        ),
+    )
+    p.add_argument(
+        "--in",
+        dest="folder",
+        metavar="DIR",
+        help=(
+            "start in this folder instead of the session's own "
+            "(an absolute path, or one that starts with ~; the folder must exist)"
+        ),
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "print the folder, the command and where the transcript would be written; "
+            "write nothing and start nothing"
+        ),
+    )
+    p.add_argument(
+        "--here",
+        action="store_true",
+        help="start the tool in this terminal instead of a new window",
+    )
+
     p = sub.add_parser("status", help="mounts, stores, counts per provider, warnings")
     p.add_argument("--json", action="store_true", help="JSON output")
 
@@ -882,6 +925,41 @@ def _export(args: argparse.Namespace) -> int:
     return 0
 
 
+# The last line of ``continue --dry-run``: what a real run does beyond
+# opening a window.
+_FIRST_MESSAGE = "starting it sends a first message to the model"
+
+
+def _continue(args: argparse.Namespace) -> int:
+    # ``~`` is expanded here: the engine takes an absolute path and nothing else.
+    folder = os.path.expanduser(args.folder) if args.folder is not None else None
+    if args.dry_run:
+        plan = api.continue_session(
+            args.key, tool=args.tool, folder=folder, here=args.here, dry_run=True
+        )
+        _out(f"folder: {plan.cwd}")
+        _out(f"command: {shlex.join(plan.command)}")
+        _out(f"transcript: {plan.handoff}")
+        _out(_FIRST_MESSAGE)
+        return 0
+    if args.here:
+        # exec replaces this process: say what runs before it does.
+        try:
+            _print_plan(
+                api.continue_session(
+                    args.key, tool=args.tool, folder=folder, here=True, dry_run=True
+                )
+            )
+            sys.stdout.flush()
+        except api.ApiError:
+            pass  # the real call below fails the same way, and says why
+    plan = api.continue_session(args.key, tool=args.tool, folder=folder, here=args.here)
+    if not args.here:
+        _print_plan(plan)
+        _err(f"the transcript was written to {plan.handoff}")
+    return 0
+
+
 def _not_implemented(args: argparse.Namespace) -> int:
     _err(f"{args.command}: not implemented")
     return 1
@@ -907,6 +985,7 @@ _COMMANDS = {
     "unimport": _unimport,
     "show": _show,
     "export": _export,
+    "continue": _continue,
     "mount": _mount,
     "forget": _forget,
     "map": _map,

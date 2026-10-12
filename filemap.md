@@ -21,7 +21,8 @@
 - `src/agent_sessions/model.py` — `Session` (`for_store`, `from_dict`; `offline`: listed from the cache, its
   drive is not mounted), `Store`, `Candidate`, `make_key`, `UUID_PATTERN` (the default session id grammar)
 - `src/agent_sessions/fsutil.py` — our own locations (`home`, `cache_file`, `cache_dir`, `state_dir`, `config_dir`,
-  `log_file`, `lock_file`, env overrides) and trace-free reads (`open_ro`, `subdirs`, `listdir_ro`: `O_NOATIME` where the
+  `log_file`, `lock_file`, `handoff_dir`, env overrides), the check of a folder a user named
+  (`existing_folder`: what `import --to` and `continue --in` take) and trace-free reads (`open_ro`, `subdirs`, `listdir_ro`: `O_NOATIME` where the
   platform has it). `open_ro` never waits and reads regular files only: `NotRegularFile` for a named pipe, a
   device, a directory. Our own files and directories (`open_private`: 0600, `make_private_dir`: 0700,
   `fsync_dir`) and the state directory's
@@ -62,14 +63,14 @@
 - `src/agent_sessions/providers/` — one adapter per provider, plus the registry
 - `src/agent_sessions/providers/__init__.py` — registry: `register`, `all_providers`, `get`; imports the five adapters
 - `src/agent_sessions/providers/base.py` — `Provider` contract (with `id_pattern`, `valid_id`, `read_back`, the
-  `resumable` property, `evidence_files` and `path_evidence`: recorded folders beyond the sessions' own, for
+  `resumable` property, `new_session_argv`: the command for a new session with a first prompt, `evidence_files` and `path_evidence`: recorded folders beyond the sessions' own, for
   the path map; `import_plan` and `import_session` with a chosen folder (`target`) and `experimental`;
   `undo_extras`: what the tool adds beside an imported session), `NotSupported`, `ExperimentalOnly` (an
   import that is done only when asked for; carries the warning to show first), shared helpers (`iter_jsonl`, `read_lines` and `JSONL_LINE_MAX`,
   `read_small`, `open_sqlite_ro`, `parse_ts` (nothing outside 1990 to 2100; `unit` for epoch numbers),
   `clean_title`, `open_ro`), warnings (`warn`, `collect_warnings`)
 - `src/agent_sessions/providers/{claude,codex,grok,antigravity,gemini}.py` — the adapters: store signature,
-  `candidates`, `parse`, `transcript`, `resume_argv`, and `import_plan` (Claude, Codex and Grok; Antigravity
+  `candidates`, `parse`, `transcript`, `resume_argv`, `new_session_argv`, and `import_plan` (Claude, Codex and Grok; Antigravity
   as an experimental import only, a plain copy; Gemini raises `NotSupported` with the reason); Claude also
   gives path evidence (the `projects` keys of the `.claude.json` beside the store); Grok names its group
   directories (`group_name`, `group_slug`); Antigravity says what its tool adds beside a conversation
@@ -92,20 +93,24 @@
   unless asked)
 - `src/agent_sessions/launch.py` — build and run the resume command (platform layer): `plan`, `launch`, the
   `starter`/`notifier` hooks; which terminal opens the window (`terminal_command`: `AGENT_SESSIONS_TERMINAL`,
-  `omarchy-launch-tui`, `xdg-terminal-exec`, `$TERMINAL`, the table `TERMINALS`); and `tool_state` (`ToolState`: is the tool behind a command installed, or is
+  `omarchy-launch-tui`, `xdg-terminal-exec`, `$TERMINAL`, the table `TERMINALS`); a new session that
+  continues an old one (`FIRST_PROMPT`, `handoff_file`, `plan_new`: the prompt is made here and is the only
+  element of the command that is not the adapter's own word, `launch_new`, `ContinuePlan`); and `tool_state` (`ToolState`: is the tool behind a command installed, or is
   the command a wrapper that would install it; read from the wrapper's text and mise's installs, no
   program run, remembered per run, `forget_tools`)
 - `src/agent_sessions/api.py` — facade used by the CLI and the TUI: `load_index`, `scan`, `list_sessions`,
   `status`, `verify`, `find_session`, `transcript`, `export_transcript` and `export_file` (the transcript as
-  Markdown or JSON lines; never into a session store), `open_session`, `import_options` (`ImportOptions`: what an
+  Markdown or JSON lines; never into a session store), `continue_options` (`ContinueOptions`) and
+  `continue_session` (the transcript to `<state>/handoff/`, old ones swept, then a tool started as a new
+  session), `open_session`, `import_options` (`ImportOptions`: what an
   import of a session can be), `can_import`, `import_plan`, `import_report`, `import_session` (each with a
   chosen folder and the experimental flag), `unimport` (`UnimportReport`); the drives: `volumes`, `find_volume`, `mount_drive`, `forget_drive`,
   `set_letter`, `remove_letter`; what needs a session's files refuses an offline one (`Offline`); what goes
-  into the log is written here (scan summary and warnings, imports, undos, launches, mounts, forgotten
-  drives, unexpected exceptions)
+  into the log is written here (scan summary and warnings, imports, undos, launches, continues, mounts,
+  forgotten drives, unexpected exceptions)
 - `src/agent_sessions/cli.py` — argparse entry: `scan`, `list`, `open`, `import` (`--to`, `--experimental`),
-  `unimport`, `show`, `export` (`-o`, `--format`, `--force`), `status`, `verify`, `mount`, `forget`, `map`
-  (`tui` is started by the launcher, not here), the global flags `--version` and `--debug`, the output helpers that make text safe (`_ask` for a
+  `unimport`, `show`, `export` (`-o`, `--format`, `--force`), `continue` (`--with`, `--in`, `--dry-run`,
+  `--here`), `status`, `verify`, `mount`, `forget`, `map` (`tui` is started by the launcher, not here), the global flags `--version` and `--debug`, the output helpers that make text safe (`_ask` for a
   question), and what ends a command:
   exit codes, Ctrl-C and SIGTERM/SIGHUP (`_signals`), the `internal error` line
 - `src/agent_sessions/tui/` — Textual front end: `app.py`, `view.py` (pure view logic), `app.tcss` (all styling)
@@ -180,6 +185,11 @@
 - `tests/test_resume_folder.py` — an imported copy is resumed in the folder of its import: the chosen folder
   (Claude, Antigravity), the mapped one while the source drive is away, an import that was undone, records
   and journals that are malformed or unreadable (no failure, no warning), the journal read once per listing
+- `tests/test_continue.py` — `continue`: every adapter's new-session command against FORMATS Q3, the plan
+  (`launch.plan_new`: the prompt and nothing else from outside the adapter, the handoff file's name, the
+  folder, a tool that is not installed), `continue_options`, `continue_session` (the transcript written
+  private and replaced in one step, another tool, a foreign session, a hostile session, `--here`), every
+  refusal, the sweep of old handoff files, the log, the command
 - `tests/test_export.py` — `export`: the Markdown and the JSON lines (structure, what is not known, hostile
   values, laziness), `export.write` (private, whole or not at all, nothing replaced unless asked, paths
   that will not do), the facade on every provider's fixture, offline sessions, no write into a session
