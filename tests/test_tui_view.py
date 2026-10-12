@@ -1873,9 +1873,9 @@ class EntryTest(unittest.TestCase):
         self.assertRegex(pins[0], r"^textual==\d+\.\d+\.\d+$")
         install = (REPO / "install.sh").read_text(encoding="utf-8")
         for needle in (
-            "python3 -m venv",
+            '"$python" -m venv',
             "requirements-tui.txt",
-            ".local/bin/agent-sessions",
+            '"$HOME/.local/bin"',
             "agent-sessions.desktop",
         ):
             self.assertIn(needle, install)
