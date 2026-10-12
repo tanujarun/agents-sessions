@@ -233,7 +233,7 @@ class AdapterNamesTest(SafetyCase):
             api.import_session(session)
         self.assertEqual(caught.exception.reason, why)
         self.assertEqual(snapshot(self.home, self.state), before)
-        self.assertFalse((self.state / "imports.json").exists())
+        self.assertFalse((self.state / "imports.jsonl").exists())
         return why
 
     # --- Codex ----------------------------------------------------------
@@ -358,7 +358,8 @@ def codex_thread(root, file_id, payload_id, name_line=None) -> Path:
 class VerifyAndRollBackTest(unittest.TestCase):
     """docs/REVIEW.md R-04: an import whose copy does not read back as the
     planned session leaves nothing behind. The native store already holds
-    sessions and an import record, so "unchanged" means something."""
+    sessions and the state directory an import record (in the form from
+    before the journal), so "unchanged" means something."""
 
     FILE_ID = "01a04ca1-6e27-7817-9f54-07105f962073"
 
@@ -430,11 +431,17 @@ class VerifyAndRollBackTest(unittest.TestCase):
         def verify():
             seen["placed"] = [os.path.isfile(dst) for dst in plan.destinations]
             seen["index"] = (self.native / "session_index.jsonl").read_bytes()
-            seen["records"] = len(importer.read_provenance())
+            seen["records"] = len(importer.read_journal())
 
+        old = (self.state / "imports.json").read_bytes()
         importer.execute(plan, verify=verify)
         self.assertEqual(seen, {"placed": [True], "index": self.native_index, "records": 1})
-        self.assertEqual(len(importer.read_provenance()), 2)
+        records = importer.read_journal()
+        self.assertEqual([r["id"] for r in records], ["earlier", self.FILE_ID])
+        self.assertEqual([r["version"] for r in records], [1, 2])
+        # The record from before the journal is read and never written.
+        self.assertEqual((self.state / "imports.json").read_bytes(), old)
+        self.assertEqual(sorted(os.listdir(self.state)), ["imports.json", "imports.jsonl"])
         added = (self.native / "session_index.jsonl").read_bytes()[len(self.native_index) :]
         self.assertEqual(json.loads(added)["thread_name"], "a name")
 
@@ -474,7 +481,7 @@ class VerifyAndRollBackTest(unittest.TestCase):
             self.w.session(self.FILE_ID, "foreign"), api.load_index().pathmap
         )
         self.assertEqual((native.id, native.title), (self.FILE_ID, "a name"))
-        self.assertTrue((self.state / "imports.json").is_file())
+        self.assertTrue((self.state / "imports.jsonl").is_file())
 
     def test_read_back(self):
         plan = self.good_plan()

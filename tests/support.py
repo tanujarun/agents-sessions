@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -198,3 +199,48 @@ class Sandbox:
         fields.setdefault("updated", "2026-10-01T10:00:00.000Z")
         path.write_text(json.dumps(fields), encoding="utf-8")
         return path
+
+
+REPO = Path(__file__).resolve().parent.parent
+LAUNCHER = REPO / "bin" / "agent-sessions"
+CHILD_TIMEOUT = 60  # seconds a child process of a test may take
+
+
+def python_child(code, *args, **options):
+    """Start a Python that can import the package and runs ``code`` with
+    ``args``; returns the ``Popen``. It inherits the environment, the
+    overrides of a ``Sandbox`` included. Output is captured as text unless
+    ``options`` say otherwise."""
+    options.setdefault("stdout", subprocess.PIPE)
+    options.setdefault("stderr", subprocess.PIPE)
+    options.setdefault("stdin", subprocess.DEVNULL)
+    options.setdefault("text", True)
+    script = f"import sys\nsys.path.insert(0, {_SRC!r})\n{code}"
+    return subprocess.Popen([sys.executable, "-c", script, *map(str, args)], **options)
+
+
+def launcher_child(*argv, **options):
+    """Start our own launcher (``bin/agent-sessions``) with ``argv``."""
+    options.setdefault("stdout", subprocess.PIPE)
+    options.setdefault("stderr", subprocess.PIPE)
+    options.setdefault("stdin", subprocess.DEVNULL)
+    options.setdefault("text", True)
+    return subprocess.Popen([sys.executable, str(LAUNCHER), *map(str, argv)], **options)
+
+
+def finish(case, children, timeout=CHILD_TIMEOUT) -> list[tuple[int, str, str]]:
+    """Wait for child processes; ``(exit status, stdout, stderr)`` of each.
+    One that does not finish is killed and fails the test."""
+    results = []
+    try:
+        for child in children:
+            out, err = child.communicate(timeout=timeout)
+            results.append((child.returncode, out, err))
+    except subprocess.TimeoutExpired:
+        case.fail(f"a child process did not finish in {timeout} s")
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
+    return results

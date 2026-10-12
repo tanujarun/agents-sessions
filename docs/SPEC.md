@@ -106,7 +106,7 @@ runs are not sessions and are skipped silently; `status` counts them.
 
 `imported_as` is derived, not stored: a foreign session is "imported" when a
 session with the same provider and id exists in the native store.
-`imports.json` is provenance only.
+The import journal (`imports.jsonl`) is provenance only.
 
 ### Provider adapter contract
 
@@ -220,8 +220,8 @@ Foreign -> native, explicit only. Copies the session's files into the native
 store, rewriting recorded working directories through the path map where the
 tool needs it to resume. Rules: never overwrite an existing native session;
 idempotent (a second import reports the existing copy); source untouched;
-provenance appended to `~/.local/state/agent-sessions/imports.json`; the copy
-is written to a temp name and renamed into place. A provider whose format
+provenance appended to `~/.local/state/agent-sessions/imports.jsonl` (see
+phase 2, "Import"); the copy is written to a temp name and moved into place. A provider whose format
 cannot be imported safely raises `NotSupported` with the reason, and the TUI
 shows that reason. After import the foreign row shows as imported and the
 native copy is launchable.
