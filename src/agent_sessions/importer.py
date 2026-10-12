@@ -86,6 +86,12 @@ class Exists(ImportFailed):
         )
 
 
+class NoFolder(ImportFailed):
+    """The folder the session ran in is not on this machine, or was never
+    recorded. Nothing was written. The same import with a folder the user
+    chooses (``target``) does not fail this way."""
+
+
 class Rewrite:
     """How one file is changed on its way into the native store.
 
@@ -156,7 +162,10 @@ class ImportPlan:
     source_files: list[str]
     native_root: str
     cwd: str | None  # as recorded
-    cwd_local: str  # where that folder is on this machine
+    # The folder the copy is made for: the chosen one, else where the
+    # recorded one is on this machine. None only for an import that needs no
+    # folder (``start_plan(needs_folder=False)``) and found none.
+    cwd_local: str | None
     units: list[Unit] = field(default_factory=list)  # put in place in this order
     appends: list[Append] = field(default_factory=list)  # after the units
     existing: list[str] = field(default_factory=list)  # native paths that hold this id
@@ -165,6 +174,9 @@ class ImportPlan:
     # refuses any other. The default is the strict one, so a plan built
     # without the provider's own pattern is refused rather than let through.
     id_pattern: re.Pattern[str] = UUID_PATTERN
+    # The folder the user chose for this import (``chosen_folder``), or None
+    # when the recorded one was mapped.
+    chosen_folder: str | None = None
 
     @property
     def total_bytes(self) -> int:
@@ -182,21 +194,56 @@ class ImportPlan:
 # --- helpers for adapters ---------------------------------------------------
 
 
+def chosen_folder(target: object) -> str:
+    """The folder a user chose to import into, checked and in one spelling
+    (``os.path.normpath``: no trailing separator, no doubled one).
+
+    It is the user's own input, not a name from a store, and it must be an
+    absolute path of a directory that exists. Raises ``ImportFailed`` for
+    anything else: text with a NUL, a relative path (``~`` is the caller's
+    to expand), a path that is not there, a file. Reads only."""
+    if not isinstance(target, str) or not target:
+        raise ImportFailed("the folder to import into is not a path")
+    if "\0" in target:
+        raise ImportFailed("the folder to import into has a NUL character in its path")
+    if not os.path.isabs(target):
+        raise ImportFailed(f"the folder to import into must be an absolute path: {target}")
+    folder = os.path.normpath(target)
+    if not os.path.lexists(folder):
+        raise ImportFailed(f"the folder to import into does not exist: {folder}")
+    if not os.path.isdir(folder):
+        raise ImportFailed(f"the folder to import into is not a directory: {folder}")
+    return folder
+
+
 def start_plan(
     session: Session,
     native_root: StrPath,
     pathmap: PathMap,
     id_pattern: re.Pattern[str] = UUID_PATTERN,
+    target: str | None = None,
+    needs_folder: bool = True,
 ) -> ImportPlan:
     """A plan with everything but the copies filled in; ``id_pattern`` is
-    the provider's. Raises ``ImportFailed`` when the session's project folder
-    is not on any mounted drive: an import without it would resume in the
-    wrong place."""
-    local, exists = pathmap.to_local(session.cwd, session.mount) if session.cwd else (None, False)
-    if not exists or not local:
+    the provider's.
+
+    ``target`` is a folder the user chose (``chosen_folder`` checks it); it
+    takes the place of the folder the session recorded. Without one, raises
+    ``NoFolder`` when the session's project folder is not on any mounted
+    drive or was not recorded: an import without it would resume in the
+    wrong place. An adapter whose import uses no folder at all passes
+    ``needs_folder=False``, and then a folder that is not found is None."""
+    chosen = chosen_folder(target) if target is not None else None
+    local: str | None = chosen
+    if local is None:
+        found, exists = (
+            pathmap.to_local(session.cwd, session.mount) if session.cwd else (None, False)
+        )
+        local = found if exists and found else None
+    if local is None and needs_folder:
         if not session.cwd:
-            raise ImportFailed("the project folder of this session is not recorded")
-        raise ImportFailed(f"the project folder {session.cwd} was not found on any mounted drive")
+            raise NoFolder("the project folder of this session is not recorded")
+        raise NoFolder(f"the project folder {session.cwd} was not found on any mounted drive")
     return ImportPlan(
         provider=session.provider,
         session_id=session.id,
@@ -208,6 +255,7 @@ def start_plan(
         cwd=session.cwd,
         cwd_local=local,
         id_pattern=id_pattern,
+        chosen_folder=chosen,
     )
 
 
@@ -462,6 +510,7 @@ def describe(plan: ImportPlan) -> dict:
         "native_store": plan.native_root,
         "cwd": plan.cwd,
         "cwd_local": plan.cwd_local,
+        "chosen_folder": plan.chosen_folder,
         "copies": copies,
         "rewrites": rewrites,
         "appends": [{"file": a.path, "what": a.label} for a in plan.appends],
@@ -699,6 +748,7 @@ def _record(plan: ImportPlan, manifest: dict) -> dict:
         "destination_files": plan.destinations,
         "cwd": plan.cwd,
         "cwd_local": plan.cwd_local,
+        "chosen_folder": plan.chosen_folder,
         "bytes": plan.total_bytes,
         "rewritten": rewritten,
         "appended": [item.path for item in plan.appends],
@@ -932,9 +982,11 @@ __all__ = [
     "FileCopy",
     "ImportFailed",
     "ImportPlan",
+    "NoFolder",
     "Rewrite",
     "Unit",
     "check",
+    "chosen_folder",
     "contained",
     "describe",
     "execute",

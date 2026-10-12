@@ -148,6 +148,10 @@
   to 1,024 bytes), the three folder names Grok made on this machine, the refusal of a longer input
 - `tests/test_importer.py` — imports per provider (bytes, rewrites, idempotence, collisions, roll back, free
   space, provenance, source times), `encode_cwd`, refusals
+- `tests/test_import_folder.py` — imports into a folder the user chose (`target`, `import --to`): what is
+  accepted as one (`importer.chosen_folder`), and what it changes per provider: Claude's directory name,
+  Codex's four fields (`_CwdRewrite` with a recorded and a chosen folder), Grok's group and `info.cwd` for
+  the real path; the record's `chosen_folder`; the command
 - `tests/test_hostile_files.py` — named pipes, devices and directories named like session files (`open_ro`,
   whole scans in a child process under a timeout), over-long lines and the 200 MB line's memory ceiling, size
   caps of files read whole, deeply nested JSON

@@ -146,28 +146,43 @@ class Provider:
         """
         raise NotImplementedError
 
-    def import_plan(self, s: Session, pathmap: PathMap) -> importer.ImportPlan:
+    def import_plan(
+        self, s: Session, pathmap: PathMap, target: str | None = None
+    ) -> importer.ImportPlan:
         """What importing foreign session ``s`` into the native store would
         copy, rewrite and append, as an ``importer.ImportPlan``. Reads the
-        source only, writes nothing. Raises ``NotSupported(reason)`` when the
-        format cannot be imported safely, ``ImportFailed`` when this session
-        cannot be (its project folder is not on any mounted drive)."""
+        source only, writes nothing.
+
+        ``target`` is a folder the user chose to import into (an absolute
+        path of a directory that exists, ``importer.chosen_folder``): the
+        copy is made for that folder instead of the one the session
+        recorded, in the way FORMATS "Phase 2 findings" Q8 gives for each
+        provider.
+
+        Raises ``NotSupported(reason)`` when the format cannot be imported
+        safely, ``ImportFailed`` when this session cannot be
+        (``importer.NoFolder``: its project folder is not on any mounted
+        drive, and no ``target`` was given)."""
         raise NotSupported(f"{self.label or self.name} sessions cannot be imported")
 
     def import_session(
-        self, s: Session, pathmap: PathMap, progress: importer.Progress | None = None
+        self,
+        s: Session,
+        pathmap: PathMap,
+        progress: importer.Progress | None = None,
+        target: str | None = None,
     ) -> Session:
         """Copy foreign session ``s`` into the native store and return the
         native copy as ``parse`` reads it (the index fills the other fields).
 
-        ``progress(done_bytes, total_bytes)`` is called while copying. May
-        raise ``NotSupported(reason)`` or ``ImportFailed`` (``importer.Exists``
-        when the id is already in the native store). The copy is read back
-        (``read_back``) while the import can still be undone: when it is not
-        the session that was planned, nothing of it stays in the native
-        store.
+        ``progress(done_bytes, total_bytes)`` is called while copying;
+        ``target`` is ``import_plan``'s. May raise ``NotSupported(reason)``
+        or ``ImportFailed`` (``importer.Exists`` when the id is already in
+        the native store). The copy is read back (``read_back``) while the
+        import can still be undone: when it is not the session that was
+        planned, nothing of it stays in the native store.
         """
-        plan = self.import_plan(s, pathmap)
+        plan = self.import_plan(s, pathmap, target)
         verified: list[Session] = []
         importer.execute(plan, progress, lambda: verified.append(self.read_back(plan)))
         try:

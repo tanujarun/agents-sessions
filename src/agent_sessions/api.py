@@ -514,14 +514,15 @@ class ImportReport:
     bytes: int = 0
 
 
-def _plan(session: Session, index: Index) -> importer.ImportPlan:
-    """The import plan for a foreign session. Raises ``ImportFailed``, and
-    ``Offline`` when its drive is not mounted."""
+def _plan(session: Session, index: Index, target: str | None = None) -> importer.ImportPlan:
+    """The import plan for a foreign session, into the folder ``target``
+    when one is given. Raises ``ImportFailed``, and ``Offline`` when its
+    drive is not mounted."""
     if session.origin == "native":
         raise ImportFailed(f"this session is already on {NATIVE_LABEL}")
     _need_files(session)
     try:
-        return _provider(session).import_plan(session, index.pathmap)
+        return _provider(session).import_plan(session, index.pathmap, target)
     except NotSupported as exc:
         raise ImportFailed(exc.reason) from None
     except NotFound as exc:
@@ -529,31 +530,41 @@ def _plan(session: Session, index: Index) -> importer.ImportPlan:
 
 
 @_logged
-def can_import(session: Session | str, index: Index | None = None) -> tuple[bool, str]:
+def can_import(
+    session: Session | str, index: Index | None = None, target: str | None = None
+) -> tuple[bool, str]:
     """``(True, "")`` when ``import_session`` would copy this session, else
     ``(False, reason)``: it is native, already imported, its provider cannot
     be imported, its drive is not mounted, its project folder is not on any
     mounted drive, its id is already in the native store, or there is too
-    little free space. Reads only; writes nothing."""
+    little free space. ``target`` asks about an import into that folder.
+    Reads only; writes nothing."""
     try:
+        if target is not None:
+            importer.chosen_folder(target)
         index = index if index is not None else load_index()
         session = find_session(session, index)
         if _native_copy(session, index) is not None:
             return False, "already imported"
-        importer.check(_plan(session, index))
+        importer.check(_plan(session, index, target))
     except ApiError as exc:
         return False, exc.reason
     return True, ""
 
 
 @_logged
-def import_plan(ref: Session | str, index: Index | None = None) -> dict:
+def import_plan(ref: Session | str, index: Index | None = None, target: str | None = None) -> dict:
     """What ``import_session`` would do, as plain data, for a dry run:
     ``already`` (the native key when it is imported already, else None),
+    ``cwd`` (the folder as recorded), ``cwd_local`` (the folder the copy is
+    made for), ``chosen_folder`` (``target`` when one was given, else None),
     ``copies``, ``rewrites`` (with the changes each would make), ``appends``,
     ``bytes``, ``needed``, ``free``. Writes nothing. Raises ``ImportFailed``
-    for everything the import itself would refuse, ``Offline`` for a session
+    for everything the import itself would refuse, a ``target`` that is not
+    an absolute path of a directory included, ``Offline`` for a session
     whose drive is not mounted."""
+    if target is not None:
+        importer.chosen_folder(target)
     index = index if index is not None else load_index()
     session = find_session(ref, index)
     copy = _native_copy(session, index)
@@ -569,14 +580,17 @@ def import_plan(ref: Session | str, index: Index | None = None) -> dict:
             "appends": [],
             "bytes": 0,
         }
-    plan = _plan(session, index)
+    plan = _plan(session, index, target)
     importer.check(plan)
     return dict(importer.describe(plan), already=None)
 
 
 @_logged
 def import_report(
-    ref: Session | str, progress: importer.Progress | None = None, index: Index | None = None
+    ref: Session | str,
+    progress: importer.Progress | None = None,
+    index: Index | None = None,
+    target: str | None = None,
 ) -> ImportReport:
     """``import_session`` with the details: whether anything was copied (a
     session imported before is returned with ``created=False``) and which
@@ -584,9 +598,16 @@ def import_report(
     index = index if index is not None else load_index()
     session = find_session(ref, index)
     log = logs.logger()
-    log.info("import %s (store %s)", session.key, session.store)
+    log.info(
+        "import %s (store %s)%s",
+        session.key,
+        session.store,
+        f" into the chosen folder {target}" if target is not None else "",
+    )
     try:
-        report = _import(session, progress, index)
+        if target is not None:
+            importer.chosen_folder(target)
+        report = _import(session, progress, index, target)
     except ApiError as exc:
         log.warning("import %s refused: %s", session.key, exc.reason)
         raise
@@ -604,7 +625,12 @@ def import_report(
     return report
 
 
-def _import(session: Session, progress: importer.Progress | None, index: Index) -> ImportReport:
+def _import(
+    session: Session,
+    progress: importer.Progress | None,
+    index: Index,
+    target: str | None = None,
+) -> ImportReport:
     """``import_report`` for a session that was found."""
     copy = _native_copy(session, index)
     if copy is not None:
@@ -617,9 +643,9 @@ def _import(session: Session, progress: importer.Progress | None, index: Index) 
     files: list[str] = []
     size = 0
     try:
-        plan = provider.import_plan(session, index.pathmap)
+        plan = provider.import_plan(session, index.pathmap, target)
         files, size = plan.destinations, plan.total_bytes
-        provider.import_session(session, index.pathmap, progress)
+        provider.import_session(session, index.pathmap, progress, target)
     except importer.Exists as exc:
         collision = exc  # in the store but not in this index: look again below
     except NotSupported as exc:
@@ -640,18 +666,27 @@ def _import(session: Session, progress: importer.Progress | None, index: Index) 
 
 @_logged
 def import_session(
-    ref: Session | str, progress: importer.Progress | None = None, index: Index | None = None
+    ref: Session | str,
+    progress: importer.Progress | None = None,
+    index: Index | None = None,
+    target: str | None = None,
 ) -> Session:
     """Copy a foreign session into the native store and return the native
     copy, indexed and launchable. A session that was imported before is
     returned as it is; nothing is copied twice and nothing is overwritten.
+
+    ``target`` is a folder to import into in place of the one the session
+    recorded: an absolute path of a directory that exists. It is the only
+    way to import a session whose own folder is gone or was never recorded.
+    What it changes in the copy depends on the provider (FORMATS "Phase 2
+    findings", Q8); the import record keeps both folders.
 
     ``progress(done_bytes, total_bytes)`` is called while copying. Raises
     ``ImportFailed`` with the reason, also when the provider cannot be
     imported. A quick scan runs afterwards; an ``index`` passed in is not
     refreshed, load it again.
     """
-    return import_report(ref, progress, index).session
+    return import_report(ref, progress, index, target).session
 
 
 # --- drives: volumes, mount, forget, drive letters ----------------------------

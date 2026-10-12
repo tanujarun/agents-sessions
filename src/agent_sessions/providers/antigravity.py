@@ -533,5 +533,7 @@ class Antigravity(Provider):
                     if name:
                         yield Turn("tool", name, ts)
 
-    def import_plan(self, s: Session, pathmap: PathMap) -> importer.ImportPlan:
+    def import_plan(
+        self, s: Session, pathmap: PathMap, target: str | None = None
+    ) -> importer.ImportPlan:
         raise NotSupported(IMPORT_UNSAFE)

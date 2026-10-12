@@ -462,12 +462,19 @@ class Grok(Provider):
                 if isinstance(name, str) and name:
                     yield Turn("tool", name, None)
 
-    def import_plan(self, s: Session, pathmap: PathMap) -> importer.ImportPlan:
+    def import_plan(
+        self, s: Session, pathmap: PathMap, target: str | None = None
+    ) -> importer.ImportPlan:
         """The session directory without ``*.lock``, into the group directory
         of the mapped cwd, with ``summary.json`` rewritten (FORMATS section
         6). The group directory is the one the tool itself would use
         (``group_name``); when the native store has none of that name but
-        has one that decodes to the same folder, that one is used."""
+        has one that decodes to the same folder, that one is used.
+
+        With a chosen folder (``target``) both are made for its real path
+        (``os.path.realpath``): the tool goes by the physical working
+        directory, so a session filed under the name of a symbolic link
+        would not be listed (FORMATS Q1, Q8)."""
         if not s.files:
             raise NotSupported("this session has no directory to copy")
         source = s.files[0]
@@ -477,15 +484,18 @@ class Grok(Provider):
         name = os.path.basename(os.path.normpath(source))
         if name != s.id or not self.valid_id(name):
             raise NotSupported(f"the session directory is not named after its session id: {source}")
-        plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern)
+        plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern, target)
+        if plan.chosen_folder is not None:
+            plan.cwd_local = os.path.realpath(plan.chosen_folder)
+        cwd = plan.cwd_local or ""
         sessions = os.path.join(plan.native_root, "sessions")
         try:
             groups = sorted(subdirs(sessions))
         except OSError:
             groups = []
-        group = group_name(plan.cwd_local)
+        group = group_name(cwd)
         if group not in groups:
-            group = next((g for g in groups if urllib.parse.unquote(g) == plan.cwd_local), group)
+            group = next((g for g in groups if urllib.parse.unquote(g) == cwd), group)
         plan.existing = sorted(
             {
                 path
@@ -496,7 +506,7 @@ class Grok(Provider):
         dirs, files = importer.tree(source, skip=lambda entry: entry.endswith(".lock"))
         for item in files:
             if item.rel == _SUMMARY:
-                item.rewrite = _SummaryRewrite(plan.cwd_local, plan.native_root)
+                item.rewrite = _SummaryRewrite(cwd, plan.native_root)
         files.sort(key=lambda item: (item.rel == _SUMMARY, item.rel))  # summary.json last
         plan.units.append(
             importer.Unit(os.path.join(sessions, group, name), source, files, True, dirs)

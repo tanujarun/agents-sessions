@@ -236,6 +236,7 @@ class ClaudeImportTest(ImportCase):
                 ],
                 "cwd": "F:\\Proj\\My Site",
                 "cwd_local": str(self.w.site),
+                "chosen_folder": None,
                 "bytes": sum(
                     os.path.getsize(self.project / rel)
                     for rel in files_below(self.project)

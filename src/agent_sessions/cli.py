@@ -68,6 +68,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("import", help="import; optionally resume after")
     p.add_argument("key", help=key_help)
+    p.add_argument(
+        "--to",
+        metavar="DIR",
+        help=(
+            "import into this folder instead of the one the session recorded "
+            "(an absolute path, or one that starts with ~; the folder must exist)"
+        ),
+    )
     p.add_argument("--open", action="store_true", help="resume after import")
     p.add_argument(
         "--dry-run",
@@ -618,16 +626,31 @@ def _open(args: argparse.Namespace) -> int:
     return _resume(args.key, args.here, args.dry_run)
 
 
+def _folder_line(plan: dict) -> str:
+    """The line of a dry run that says which folder the copy is made for,
+    and that it was chosen when it was."""
+    recorded = plan["cwd"] or "not recorded"
+    chosen = plan["chosen_folder"]
+    if chosen is None:
+        return f"project folder: {recorded} -> {plan['cwd_local']}"
+    line = f"project folder: {recorded} -> {plan['cwd_local']} (chosen with --to"
+    if plan["cwd_local"] != chosen:  # the folder's real path is what is used
+        line += f" {chosen}"
+    return line + ")"
+
+
 def _import(args: argparse.Namespace) -> int:
+    # ``~`` is expanded here: the engine takes an absolute path and nothing else.
+    target = os.path.expanduser(args.to) if args.to is not None else None
     index = api.load_index()
     if args.dry_run:
-        plan = api.import_plan(args.key, index=index)
+        plan = api.import_plan(args.key, index=index, target=target)
         if plan["already"]:
             _out(f"already imported: {plan['already']}")
             _out("dry run: nothing was written")
             return 0
         _out(f"import {plan['source_key']} -> {plan['native_key']}")
-        _out(f"project folder: {plan['cwd']} -> {plan['cwd_local']}")
+        _out(_folder_line(plan))
         for copy in plan["copies"]:
             size = _size(copy["bytes"])
             if copy["dir"]:
@@ -657,7 +680,7 @@ def _import(args: argparse.Namespace) -> int:
             _progress(f"copying… {share}% of {_size(total)}")
 
     try:
-        report = api.import_report(args.key, progress=progress, index=index)
+        report = api.import_report(args.key, progress=progress, index=index, target=target)
     finally:
         if progress is not None:
             _progress()
