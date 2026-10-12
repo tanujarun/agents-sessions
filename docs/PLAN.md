@@ -94,3 +94,61 @@ saying why; stores inside this project's own tree get listed by a real scan;
 `C:` stays unresolved on a system volume with no path evidence; import staging
 directories are never swept.
 Verify: a regression test per defect; real scan still 135 sessions, `verify` passes.
+
+# Phase 2 (SPEC "Phase 2: production pass")
+
+## 9. Production readiness review — Heavy — after: 8 — [x]
+
+Independent review of the phase 1 code: `docs/REVIEW.md` (R-01 to R-14).
+
+## 10. Limits investigation — Heavy — after: 8 — [x]
+
+FORMATS.md "Phase 2 findings": Grok group naming (sandbox), mounting, first-prompt
+argv, Antigravity lookup, tools with no data, `D:`, re-pointing at import.
+
+## 11. Tooling baseline — Medium — after: 8 — [x]
+
+`pyproject.toml`, ruff (lint and format), mypy, coverage, Makefile targets, CI file;
+suites pass on Python 3.11 and 3.14.
+
+## 12. Security hardening — Careful — after: 9, 11 — [ ]
+
+REVIEW R-01, R-02, R-03, R-04, R-05, R-08, R-09, plus import destination containment.
+SPEC "Threat model". A regression test per finding.
+
+## 13. Robustness hardening — Careful — after: 12 — [ ]
+
+REVIEW R-06, R-07, R-10 to R-14; the import journal (`imports.jsonl`, lock, manifest);
+no-overwrite placement; interrupts and signals; logs; tool detection (SPEC "Tool
+detection", "Logs"); cache and state file modes; the latent `None` comparisons.
+
+## 14. Offline drives and mounting — Careful — after: 10, 13 — [ ]
+
+SPEC "Offline drives" and "Drive letters": volume identity, cache version 2, offline
+sessions, `mount`, `forget`, `map`, Claude path evidence.
+
+## 15. Import retarget and undo — Careful — after: 14 — [ ]
+
+SPEC "Import": `--to`, Grok group naming with BLAKE3, Antigravity experimental import,
+`unimport`, `import_options`.
+
+## 16. Continue as new session — Careful — after: 15 — [ ]
+
+SPEC "Continue as a new session": `export`, `continue`, `new_session_argv`, handoff
+files, terminal fallback.
+
+## 17. TUI for new actions — Careful — after: 16 — [ ]
+
+SPEC "TUI additions".
+
+## 18. Packaging and docs — Medium — after: 17 — [ ]
+
+SPEC "Packaging": entry point starts the TUI, `uninstall.sh`, README, CHANGELOG,
+`docs/JSON.md`, `docs/SECURITY.md`, help texts, version 0.2.0.
+
+## 19. Acceptance audit — Heavy — after: 18 — [ ]
+
+Fresh eyes on the whole change against SPEC "Definition of done (phase 2)", on the
+real machine and in throwaway homes.
+
+## 20. Audit fixes — Careful — after: 19 — [ ]

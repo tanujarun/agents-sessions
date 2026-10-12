@@ -341,3 +341,232 @@ engine module imports it. Textual runs on Windows unchanged. Path mapping is wri
 5. Unmounting a drive, an unreadable folder or a corrupt session file does not
    break listing.
 6. Unit tests pass; the TUI survives resize, an empty index and a missing drive.
+
+---
+
+# Phase 2: production pass (2026-10-12)
+
+Phase 1 above stays the base. Where this part says otherwise, this part wins.
+Evidence for every format statement is in `docs/FORMATS.md` "Phase 2 findings";
+the code review that drives the hardening is `docs/REVIEW.md`.
+
+## Goals
+
+1. Close the review findings (security against hostile drive contents, crash
+   and concurrency safety).
+2. Remove the limits of phase 1: sessions of an unmounted drive disappear;
+   a session whose folder is gone cannot be imported; Grok paths with
+   punctuation are refused; Antigravity cannot be imported; a session of one
+   tool cannot be carried on in another; `D:` stays unresolved.
+3. Make the project maintainable by someone else: packaging, enforced lint
+   and types, CI, logs, documented output formats, user documentation.
+
+## Non-goals
+
+- Readers for opencode, cursor-agent, copilot, crush, and a working Gemini
+  resume: no session data exists on any drive and three of the tools are not
+  installed (FORMATS "Q6"). A reader is never written from guesses.
+- Writing a store on another drive. The Windows front end.
+- The visual redesign of the TUI.
+
+## Threat model
+
+Every byte of a **foreign store** (any store that is not the native one) is
+hostile: file names, file types, sizes, ids, titles, paths, JSON, SQLite,
+protobuf. The native stores, the cache, the state directory and the config
+directory belong to the user: trusted, but possibly malformed. Rules that
+follow, each enforced in one place and again at the point of use:
+
+- A session id must match its provider's id grammar (`Provider.id_pattern`,
+  a UUID for all five) to be listed, launched or imported.
+- Nothing from a foreign store reaches a command line except a validated id
+  and a directory that exists. No shell is ever used.
+- Every import destination stays inside the native store (checked on the
+  resolved path, independently of the adapter).
+- Everything printed for a person passes `textsafe.clean` (control, C1 and
+  bidi characters). `--json` output is exact data with those characters
+  escaped.
+- Reads never block and never allocate without a bound: regular files only,
+  capped line and file sizes, a warning for what is skipped.
+
+## Tool detection
+
+On this machine every agent command in `~/.local/bin` except `agy` is a
+wrapper that **installs the tool when it is missing** (`mise use -g … ;
+exec mise x <spec> -- <tool>`). `shutil.which` therefore proves nothing.
+`launch.tool_state(binary)` (platform layer) answers `installed`,
+`not installed (the command on PATH would install it)` or `not found`, from
+files only: a wrapper is recognised by its text, its `mise x "<spec>"` spec
+is mapped to mise's install directory, and the tool counts as installed when
+an executable of that name exists there. The answer feeds `launchable`,
+`status`, `launch.plan` (which refuses to start a wrapper of a tool that is
+not installed, so the browser never installs software) and Gemini's
+`resumable`, which becomes "the real CLI is installed" instead of a constant.
+
+Terminal: `omarchy-launch-tui` when present; else `xdg-terminal-exec`; else
+`$TERMINAL -e`; else the first of a table of known terminals. The override
+`AGENT_SESSIONS_TERMINAL` (a command; the tool's argv is appended) wins.
+
+## Offline drives
+
+- `Mount` gains `uuid` and `fs_label`, read from `/dev/disk/by-uuid` and
+  `/dev/disk/by-label` (FORMATS "Q4"); the override env accepts them too.
+- The cache keeps a `volumes` table: every mount path that has a remembered
+  store, with label, UUID, filesystem, drive letters as last resolved, and
+  when it was last seen. Cache version 2; a version 1 cache is migrated.
+- Sessions of a remembered store on a volume that is not mounted are
+  **listed**, from the cached parse, with `offline: true`, no `cwd_local`,
+  not launchable, note `drive not mounted`. WHERE shows `C: · offline`.
+  They are ordered and deduplicated like any other session, and an offline
+  session that was imported still resumes its native copy.
+- Reading a transcript, importing and continuing need the files: they fail
+  with `the drive <label> is not mounted`.
+- `mounts.volume_state(uuid)`: `mounted`, `attached` (the device is there),
+  `absent`. `mounts.mount_volume(uuid)` runs `udisksctl mount --block-device
+  /dev/disk/by-uuid/<uuid>` with no terminal attached (the desktop's polkit
+  agent asks for the password; these internal volumes need one), waits up to
+  120 s, and returns the mount point read back from the mount table. Failure
+  gives the tool's own message. `subprocess` is allowed in `mounts.py` for
+  this one call.
+- A volume that comes back at another mount path: its remembered stores at
+  the old path are dropped (the deep pass that a changed mount set triggers
+  finds them at the new one).
+- CLI: `mount <drive>` (label, letter, mount path or UUID), then a scan;
+  `forget <drive>` drops a volume that is not mounted from the cache.
+- `verify` compares mounted volumes only.
+
+## Drive letters
+
+- Adapters may add evidence: `Provider.path_evidence(store) -> list[str]`.
+  Claude returns the keys of the `projects` object of the `.claude.json`
+  beside the store, which resolves `D:` here (FORMATS "Q7").
+- `map` prints the letters; `map D: <dir>` and `map --remove D:` edit
+  `~/.config/agent-sessions/pathmap.json` (written atomically, validated).
+
+## Import
+
+- `import <key> [--to DIR] [--experimental] [--open] [--dry-run]`.
+- **A chosen folder** (`--to`, absolute, must exist): replaces the mapped
+  folder, and is the only way to import a session whose folder is gone or
+  not recorded. Per provider (FORMATS "Q8"): Claude changes the destination
+  directory only; Codex rewrites the same four cwd fields (a value equal to
+  the recorded cwd becomes the folder, a value below it the same path below
+  the folder, anything else goes through the path map); Grok uses the group
+  name and `info.cwd` of the folder's real path. The record keeps both the
+  recorded cwd and the chosen folder.
+- **Grok**: the group directory is `quote(cwd, safe="")`; over 255 bytes it
+  is `<slug>-<16 hex of BLAKE3(cwd)>` (FORMATS "Q1"). BLAKE3 is implemented
+  for inputs up to 1,024 bytes (one chunk) and checked against the published
+  test vectors; a longer path is refused. The old `[A-Za-z0-9/ ]` limit goes.
+- **Antigravity**: copy-only, exactly as FORMATS "Q5" specifies, and only
+  with `--experimental` (the TUI asks a second time and says why): one
+  resume by hand has not been done yet, and the tool starts a new
+  conversation without an error when it cannot read a copy. No folder is
+  needed.
+- **Gemini**: still refused (no CLI, no resumable data).
+- The journal is `imports.jsonl` in the state directory: one JSON object per
+  line, appended under a lock; a record lists every file and directory the
+  import created with size and modification time. An old `imports.json` is
+  read, never rewritten.
+- `unimport <key> [--force] [--dry-run]`: removes what the last import of
+  that session created, and nothing else. Refused when any of those files
+  differs from the record (the session was used since) unless `--force`;
+  directories are removed only when empty; a line appended to a file the
+  tool owns (Codex `session_index.jsonl`) is left and reported; extra files
+  a tool creates beside an imported conversation (Antigravity `-wal`,
+  `-shm`, `presence/<id>.lock`) are removed only with `--force`. The undo is
+  itself a journal record.
+- `api.import_options(session)` tells a front end what is possible:
+  `possible`, `reason`, `needs_folder`, `experimental`, `warning`.
+
+## Continue as a new session
+
+For a session that cannot be resumed where it is wanted (another provider's
+tool, an unimportable provider, a folder that is gone):
+
+- `export <key> [-o FILE] [--format md|json]`: the transcript as Markdown
+  (a header with title, tool, id, folder, dates; then `## User` /
+  `## Assistant` sections and one line per tool call) or as JSON lines.
+- `continue <key> [--with TOOL] [--in DIR] [--dry-run] [--here]`: writes the
+  Markdown export to `<state>/handoff/<provider>-<id>.md` (mode 0600,
+  replaced atomically; files older than 30 days are swept), then starts
+  `TOOL` (default: the session's own tool) as a **new** interactive session
+  in `DIR` (default: the session's folder when it exists; otherwise `--in`
+  is required) with a fixed first prompt that names the file and says it is
+  a record, not instructions. `Provider.new_session_argv(prompt)` gives the
+  command (FORMATS "Q3": `claude <p>`, `codex <p>`, `grok <p>`,
+  `agy --prompt-interactive <p>`, `gemini -i <p>`). The prompt holds no text
+  from the session; the path is built from the validated id.
+- The first prompt is sent as soon as the tool starts: a model call the user
+  asked for. The CLI says so in `--dry-run`, the TUI before it starts.
+
+## CLI additions
+
+```
+agent-sessions --version | --debug
+agent-sessions mount <drive>            agent-sessions forget <drive>
+agent-sessions map [LETTER: DIR | --remove LETTER:]
+agent-sessions import <key> [--to DIR] [--experimental] [--open] [--dry-run]
+agent-sessions unimport <key> [--force] [--dry-run]
+agent-sessions export <key> [-o FILE] [--format md|json]
+agent-sessions continue <key> [--with TOOL] [--in DIR] [--dry-run] [--here]
+```
+
+`list` gains `--mounted` (leave offline sessions out). Exit codes: 0 ok,
+1 failure, 2 usage, 130 interrupted. Every `--json` shape is documented in
+`docs/JSON.md` and pinned by a test.
+
+## Logs
+
+`<state>/agent-sessions.log`, rotating (1 MB, 3 files), mode 0600: scans
+(summary), imports and undos (plan and result), launches (the command),
+mounts, warnings, and every unexpected exception with its traceback. A
+failure the user sees names the log. `--debug` also logs to stderr.
+
+## TUI additions
+
+- Offline rows: dimmed like foreign rows, WHERE `C: · offline`; the status
+  line counts them (`135 sessions · 29 offline`).
+- Enter on an offline row that has no native copy: prompt
+  `<drive> is not mounted: [m] mount  [Esc] cancel`. `m` anywhere on such a
+  row mounts; the status line shows `waiting for the password prompt…`,
+  then the result, then a scan.
+- The foreign-row prompt is built from `import_options`:
+  `[i] import and resume  [I] import only  [t] import into another folder
+  [c] continue as new  [v] view  [Esc] cancel`, leaving out what is not
+  possible and showing the reason for it on the line above. An experimental
+  import asks again with its warning.
+- `t` and `c` open a one-line input for a folder: `~` expands, Tab completes
+  directory names, Enter accepts only an existing directory, Esc cancels.
+- `c` (any row that is not offline): choose the tool with `←` `→` among the
+  installed ones (the session's own first), then the folder; the last line
+  says `starts <Tool> and sends a first message`. Enter starts it.
+- `u` on a row with an import record: `Remove the imported copy? y/n`; a
+  refusal shows its reason.
+- `?` lists all of it. Styling stays in `app.tcss`; the look is unchanged.
+
+## Packaging
+
+`pip install .[tui]` gives a working `agent-sessions` (the entry point
+starts the TUI itself; `cli.py` may import `agent_sessions.tui` lazily for
+that and nothing else may). `install.sh` keeps the checkout flow;
+`uninstall.sh` removes what it installed. `README.md`, `CHANGELOG.md`,
+`docs/JSON.md`, `docs/SECURITY.md` (threat model and what is and is not
+defended). Version 0.2.0.
+
+## Definition of done (phase 2)
+
+1. `make check` is clean on Python 3.11 and 3.14; coverage of the engine is
+   not lower than before.
+2. Every review finding has a regression test that fails on the old code.
+3. The real machine still lists the same 135 sessions with `verify` passing;
+   with the Windows volume unmounted the 29 sessions stay listed as offline.
+4. In a throwaway home: every importable foreign session imports and undoes
+   to a byte-identical store; the Grok import is confirmed by `grok export`
+   in the network-less sandbox; the five sessions without a folder import
+   with `--to`.
+5. No test and no worker starts an agent tool interactively, sends anything
+   to a model, mounts or unmounts a drive, or writes a real store.
+6. Still owed by the user, listed in the README: one real resume, one real
+   import and resume per provider, one mount from the browser, one
+   "continue as new", one Antigravity experimental import.
