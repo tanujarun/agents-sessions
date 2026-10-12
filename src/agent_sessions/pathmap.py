@@ -40,7 +40,7 @@ REDIRECTS = (
 SYSTEM_VOLUME_DIRS = ("users", "windows")
 SYSTEM_LETTER = "C:"  # what Windows calls the volume it runs from
 
-_DRIVE = re.compile(r"^([A-Za-z]):(?:[\\/]+(.*))?$", re.S)
+_DRIVE = re.compile(r"([A-Za-z]):(?:[\\/]+(.*))?", re.S)  # the whole text, with ``fullmatch``
 _SPLIT_ANY = re.compile(r"[\\/]+")
 
 
@@ -72,7 +72,7 @@ def normalise(recorded: object) -> Recorded | None:
         text = text[4:]
         if text[:4].upper() in ("UNC\\", "UNC/"):
             return None
-    m = _DRIVE.match(text)
+    m = _DRIVE.fullmatch(text)
     if m:
         parts = (p for p in _SPLIT_ANY.split(m.group(2) or "") if p and p != ".")
         return Recorded(m.group(1).upper() + ":", tuple(parts))

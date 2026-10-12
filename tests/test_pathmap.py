@@ -54,6 +54,9 @@ class NormaliseTest(unittest.TestCase):
             "file://server/share/x",
             "file://",
             "https://example.com/x",
+            # A drive and nothing but a line break, which the strip at the
+            # ends does not see: matched whole, it is not a path.
+            "file:///C:%0A",
         ):
             with self.subTest(text=text):
                 self.assertIsNone(normalise(text))

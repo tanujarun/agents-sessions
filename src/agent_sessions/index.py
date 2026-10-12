@@ -162,6 +162,11 @@ def _strings(items: object) -> list[str]:
 class Index:
     def __init__(self, path: StrPath | None = None) -> None:
         self.path = Path(path) if path is not None else None
+        self._reset()
+
+    def _reset(self) -> None:
+        """Empty the index: everything but where its file is. ``load`` comes
+        back here when a cache turns out to be unusable half way through."""
         # persisted
         self.stores: list[Store] = []  # every store remembered
         self.skipped: list[Skipped] = []  # stores found but not listed
@@ -189,15 +194,14 @@ class Index:
         empty index, and ``load_error`` says which it was."""
         where = Path(path) if path is not None else cache_file()
         index = cls(where)
-        # ``__init__`` again empties the index in place, whatever _adopt had set.
         try:
             with open(where, encoding="utf-8") as fh:
                 index._adopt(json.load(fh))
         except FileNotFoundError:
-            index.__init__(where)  # type: ignore[misc]  # same class: cls(where) made it
+            index._reset()
             index.load_error = "missing"
         except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
-            index.__init__(where)  # type: ignore[misc]  # same class: cls(where) made it
+            index._reset()  # whatever _adopt had taken over before it failed
             reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
             index.load_error = f"unreadable: {reason or type(exc).__name__}"
         return index
@@ -296,9 +300,12 @@ class Index:
             return True
         if sorted(m.path for m in mounts) != sorted(self.deep_mounts):
             return True
-        # last_deep is a time: utc_now() wrote it, or _adopt checked it.
         stamp = base.parse_ts(self.last_deep)
-        last = datetime.fromisoformat(stamp.replace("Z", "+00:00"))  # type: ignore[union-attr]
+        if stamp is None:
+            # Not a time (a caller set it, or a clock far off wrote it): a
+            # pass whose age cannot be told is due.
+            return True
+        last = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
         age = (datetime.now(UTC) - last).total_seconds()
         return age < 0 or age > DEEP_MAX_AGE
 

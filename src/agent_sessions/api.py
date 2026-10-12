@@ -14,6 +14,7 @@ import shlex
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
 from . import discover, importer, launch, logs
@@ -206,17 +207,31 @@ def status(index: Index | None = None) -> dict:
     }
 
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _epoch_ns(moment: str | None) -> int | None:
+    """An ISO time as nanoseconds since 1970, the unit of a file's
+    ``st_mtime_ns``; None when ``moment`` is not a time."""
+    stamp = parse_ts(moment)
+    if stamp is None:
+        return None
+    then = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    return (then - _EPOCH) // timedelta(microseconds=1) * 1000
+
+
 def _newer_than(sig: list, moment: str | None) -> bool:
     """True when a file of the signature is missing or was modified at or
-    after ``moment`` (an ISO time)."""
-    if moment is None:
+    after ``moment`` (an ISO time), and when ``moment`` is not a time at
+    all: then nothing can be called older than it.
+
+    The two are compared as numbers. A file's time is whatever the
+    filesystem says, 1970 or the year 3000 included, and has no reading as a
+    session time (``parse_ts`` gives none outside 1990 to 2100)."""
+    limit = _epoch_ns(moment)
+    if limit is None:
         return True
-    limit = parse_ts(moment)
-    # Both sides are times: ``moment`` is the index's last_quick, the other a file's mtime.
-    return any(
-        mtime_ns is None or parse_ts(mtime_ns // 1_000_000) >= limit  # type: ignore[operator]
-        for _path, mtime_ns, _size in sig
-    )
+    return any(mtime_ns is None or mtime_ns >= limit for _path, mtime_ns, _size in sig)
 
 
 def _moved_on(sig: list) -> bool:

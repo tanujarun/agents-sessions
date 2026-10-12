@@ -37,9 +37,11 @@ IMPORT_UNSAFE = (
     "Gemini CLI is not installed on this machine, and no resumable Gemini session exists to import"
 )
 
-_CHAT_NAME = re.compile(r"^session-.*\.jsonl?$")
+# A chat file's name, matched whole (``fullmatch``): no line break in it
+# or after it.
+_CHAT_NAME = re.compile(r"session-.*\.jsonl?")
 # The tool names a chat file ``session-<time>-<first 8 of the session id>``.
-_ID_PART = re.compile(r"-([^-]{1,8})\.jsonl?$")
+_ID_PART = re.compile(r"-([^-]{1,8})\.jsonl?\Z")
 _FIXED_PATHS = 3  # the chat file, .project_root, projects.json
 _SMALL_FILE = 16 * 1024 * 1024
 _LEGACY_MAX = 64 * 1024 * 1024
@@ -284,7 +286,7 @@ class Gemini(Provider):
         for slug in slugs:
             chats = root / "tmp" / slug / "chats"
             try:
-                names = sorted(n for n in listdir_ro(chats) if _CHAT_NAME.match(n))
+                names = sorted(n for n in listdir_ro(chats) if _CHAT_NAME.fullmatch(n))
             except OSError as exc:
                 unreadable(chats, exc)
                 continue

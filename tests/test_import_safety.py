@@ -388,9 +388,17 @@ class AdapterNamesTest(SafetyCase):
                 )
 
     def test_codex_rollout_name_is_matched_whole(self):
-        session = self.codex_session("2026", "08", "29", CODEX_ROLLOUT + "\n")
-        self.assertEqual(session.files[0][-1], "\n")
-        self.assertIn("is not named after its thread id", self.reason(session))
+        """A name with a line break after it is not a rollout's name: the
+        file is no candidate and no session, and a session that names such a
+        file all the same is not imported."""
+        listed = self.w.session(CODEX_WIN, "foreign", self.w.scan())
+        day = self.w.profile / ".codex" / "sessions" / "2026" / "08" / "29"
+        os.replace(day / CODEX_ROLLOUT, day / (CODEX_ROLLOUT + "\n"))
+        index = self.w.scan()
+        self.assertEqual([s.id for s in index.sessions if s.id == CODEX_WIN], [])
+        self.assertEqual(index.warnings, [])
+        odd = dataclasses.replace(listed, files=[listed.files[0] + "\n"])
+        self.assertEqual(self.reason(odd), "this thread has no rollout file to copy")
 
     def test_codex_rollout_must_carry_this_threads_id(self):
         """A file named for one thread whose first line names another: the
@@ -406,9 +414,14 @@ class AdapterNamesTest(SafetyCase):
     def test_claude_transcript_name_is_matched_whole(self):
         project = self.w.profile / ".claude" / "projects" / "F--Proj-My-Site"
         plain = "69669cf3-d7ae-4ba4-a028-c6abfd2bd622"
+        listed = self.w.session(plain, "foreign", self.w.scan())
         os.replace(project / f"{plain}.jsonl", project / f"{plain}.jsonl\n")
-        session = self.w.session(plain, "foreign", self.w.scan())
-        self.assertIn("is not named after its session id", self.reason(session))
+        index = self.w.scan()
+        self.assertEqual([s.id for s in index.sessions if s.id == plain], [])  # no candidate
+        self.assertEqual(index.warnings, [])
+        # A session that names such a file all the same is not imported.
+        odd = dataclasses.replace(listed, files=[listed.files[0] + "\n"])
+        self.assertEqual(self.reason(odd), "this session has no transcript file to copy")
 
     def test_claude_transcript_must_carry_this_sessions_id(self):
         session = dataclasses.replace(self.source(CLAUDE_WIN), id=OTHER)

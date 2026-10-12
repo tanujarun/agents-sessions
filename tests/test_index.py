@@ -286,6 +286,40 @@ class CacheFileTest(IndexCase):
         cache_file().write_bytes(b"\xff\xfe\x00garbage")
         self.assertEqual(api.list_sessions(), [])
 
+    def test_an_unusable_cache_is_emptied_without_building_the_index_twice(self):
+        """``load`` used to call ``__init__`` a second time on the object to
+        empty it; a subclass's ``__init__`` ran twice with it."""
+
+        class Counting(Index):
+            made = 0
+
+            def __init__(self, path=None, label="mine"):
+                type(self).made += 1
+                self.label = label
+                super().__init__(path)
+
+        self.box.session(self.native, "a")
+        api.scan()
+        good = json.loads(cache_file().read_text())
+        loaded = Counting.load()
+        self.assertEqual((Counting.made, loaded.load_error, len(loaded.stores)), (1, None, 2))
+        # Stores are read before the part that is wrong: taken over, then dropped again.
+        cache_file().write_text(json.dumps(dict(good, parsed={"k": {"candidates": []}})))
+        Counting.made = 0
+        broken = Counting.load()
+        self.assertEqual(Counting.made, 1)
+        self.assertTrue(broken.load_error.startswith("unreadable: "))
+        self.assertEqual(
+            (broken.stores, broken.mounts, broken.parsed, broken.last_quick, broken.sessions),
+            ([], [], {}, None, []),
+        )
+        self.assertEqual((broken.path, broken.label), (cache_file(), "mine"))
+        cache_file().unlink()
+        Counting.made = 0
+        missing = Counting.load()
+        self.assertEqual((Counting.made, missing.load_error, missing.label), (1, "missing", "mine"))
+        self.assertEqual(missing.stores, [])
+
     def test_missing_cache(self):
         self.assertEqual(api.list_sessions(), [])
         status = api.status()
@@ -319,11 +353,28 @@ class ScanPolicyTest(IndexCase):
     def test_deep_pass_older_than_a_day_is_repeated(self):
         api.scan()
         data = json.loads(cache_file().read_text())
-        for stamp, mode in (("2020-01-01T00:00:00Z", "deep"), ("2999-01-01T00:00:00Z", "deep")):
+        for stamp, mode in (("2020-01-01T00:00:00Z", "deep"), ("2099-01-01T00:00:00Z", "deep")):
             data["last_deep"] = stamp
             cache_file().write_text(json.dumps(data))
+            self.assertEqual(Index.load().last_deep, stamp)  # the cache was taken
             self.assertEqual(api.scan()["mode"], mode)
             self.assertEqual(api.scan()["mode"], "quick")
+
+    def test_a_last_deep_pass_that_is_no_time_is_due(self):
+        """``needs_deep`` used the parsed time without looking whether there
+        was one (the type checker's finding)."""
+        api.scan()
+        index = Index.load()
+        mounts = api.list_mounts()
+        self.assertFalse(index.needs_deep(mounts))
+        for stamp in ("soon", "", "1980-01-01T00:00:00Z", "2999-01-01T00:00:00Z", "12"):
+            with self.subTest(stamp=stamp):
+                index.last_deep = stamp
+                self.assertTrue(index.needs_deep(mounts))
+        index.last_deep = None
+        self.assertTrue(index.needs_deep(mounts))
+        index.last_deep = index_mod.utc_now()
+        self.assertFalse(index.needs_deep(mounts))
 
     def test_quick_scan_finds_only_known_places(self):
         tucked = self.box.store(self.disk / "Projects" / "old profile")
@@ -685,6 +736,44 @@ class VerifyTest(IndexCase):
         self.assertEqual(
             sorted(result["walk"]), sorted([str(self.box.root / "home"), str(self.disk)])
         )
+
+    def test_newer_than(self):
+        """A file's time against the time of the last scan, as numbers."""
+        second = 1_000_000_000
+        scan = "2026-10-01T10:00:00Z"
+        at = 1790848800 * second  # that moment
+        sig = lambda *times: [[f"/f{n}", t, 1] for n, t in enumerate(times)]  # noqa: E731
+        self.assertFalse(api._newer_than(sig(at - 1), scan))
+        self.assertTrue(api._newer_than(sig(at), scan))
+        self.assertTrue(api._newer_than(sig(at - 5 * second, at + 1), scan))
+        self.assertTrue(api._newer_than(sig(at - 5 * second, None), scan))  # a file is gone
+        self.assertFalse(api._newer_than(sig(), scan))
+        # Times that are no session times are still times of files.
+        self.assertFalse(api._newer_than(sig(0), scan))  # 1970
+        self.assertFalse(api._newer_than(sig(5 * second), scan))
+        self.assertTrue(api._newer_than(sig(32_503_680_000 * second), scan))  # the year 3000
+        # No usable time of the last scan: nothing is older than it.
+        for moment in (None, "", "soon", "1980-01-01T00:00:00Z"):
+            self.assertTrue(api._newer_than(sig(at - 1), moment))
+
+    def test_a_file_from_1970_does_not_break_verify(self):
+        """A candidate written while the clock was unset, and missing from
+        the index: a difference, as for any other old file."""
+        path = self.foreign / "sessions" / "f.json"
+        os.utime(path, (5, 5))
+        api.scan()
+        data = json.loads(cache_file().read_text())
+        del data["parsed"][f"fake:{self.foreign}"]["candidates"]["f"]
+        cache_file().write_text(json.dumps(data))
+        result = api.verify()
+        self.assertEqual(
+            result["differences"],
+            [
+                f"{self.foreign}: f: candidate on disk but not in the index",
+                f"session on disk but not listed: {make_key('fake', self.foreign, 'f')}",
+            ],
+        )
+        self.assertEqual(result["stale"], [])
 
     def test_does_not_use_or_write_the_cache(self):
         before = cache_file().read_bytes()

@@ -31,7 +31,9 @@ if TYPE_CHECKING:
     from ..fsutil import StrPath
     from ..pathmap import PathMap
 
-_TRANSCRIPT = re.compile(r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
+# A transcript's file name, matched whole (``fullmatch``): with ``match``
+# and a ``$``, a name that ends in a line break would pass too.
+_TRANSCRIPT = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl")
 
 # The tool's own first-prompt rule (FORMATS "Real prompt"). The tags are
 # found with ``between``, in one pass over the text.
@@ -291,7 +293,7 @@ class Claude(Provider):
                 unreadable(os.path.join(projects, name), exc)
                 continue
             for entry in entries:
-                match = _TRANSCRIPT.match(entry)
+                match = _TRANSCRIPT.fullmatch(entry)
                 if match:
                     found.setdefault(match.group(1), []).append(os.path.join(projects, name, entry))
         return [Candidate(ident, sorted(paths)) for ident, paths in sorted(found.items())]
@@ -303,7 +305,7 @@ class Claude(Provider):
         path = paths[0]
         for other in paths[1:]:
             warn(f"session id also exists at {path}; this copy is not listed", other)
-        match = _TRANSCRIPT.match(os.path.basename(path))
+        match = _TRANSCRIPT.fullmatch(os.path.basename(path))
         session_id = match.group(1) if match else c.id_hint
         scan = _scan(path)
         if not scan.has_message or scan.sidechain:
@@ -365,7 +367,7 @@ class Claude(Provider):
         """Copy only (FORMATS section 6): the ``<id>/`` side directory first,
         the transcript last, into ``projects/<encoded mapped cwd>/``. Nothing
         is rewritten and nothing else is copied."""
-        transcript = next((f for f in s.files if _TRANSCRIPT.match(os.path.basename(f))), None)
+        transcript = next((f for f in s.files if _TRANSCRIPT.fullmatch(os.path.basename(f))), None)
         if transcript is None:
             raise NotSupported("this session has no transcript file to copy")
         # The file's name becomes a name in the native store: it must be
