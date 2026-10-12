@@ -27,6 +27,7 @@ from fixture_world import (
     CLAUDE_NATIVE,
     CLAUDE_WIN,
     CLAUDE_WIN_PLAIN,
+    CODEX_NATIVE,
     CODEX_SEGMENTED,
     CODEX_WIN,
     GEMINI_WIN,
@@ -663,12 +664,13 @@ class CodexImportTest(ImportCase):
         mirror.mkdir(parents=True)
         last = (
             b'{"id":"%s","thread_name":"Site r\xc3\xa9vision","updated_at":'
-            b'"2026-08-29T08:31:20.3644826Z"}' % CODEX_WIN.encode()
+            b'"2026-08-29T08:31:20.364482Z"}' % CODEX_WIN.encode()
         )
         (mirror / "session_index.jsonl").write_bytes(
             b'{"id":"%s","thread_name":"first name","updated_at":"x"}\r\n' % CODEX_WIN.encode()
             + b'{"id":"other","thread_name":"not this one","updated_at":"y"}\n'
-            + last
+            # As a Windows Codex writes it: seven fraction digits.
+            + last.replace(b"364482Z", b"3644826Z")
             + b"\n"
         )
         index = self.home / ".codex" / "session_index.jsonl"
@@ -684,6 +686,103 @@ class CodexImportTest(ImportCase):
         )
         self.assertEqual(native.title, "Site révision")
         self.assertEqual(self.records()[0]["appended"], [str(index)])
+
+    def name_line(self, line: bytes, native: bytes | None = None) -> bytes:
+        """Import the thread with ``line`` as the last line of the source's
+        index; returns what the import added to the native one."""
+        own = self.w.profile / ".codex" / "session_index.jsonl"
+        own.write_bytes(
+            b'{"id":"%s","thread_name":"an older name","updated_at":"2026-08-01T00:00:00Z"}\n'
+            % CODEX_WIN.encode()
+            + line
+            + b"\n"
+        )
+        index = self.home / ".codex" / "session_index.jsonl"
+        if native is not None:
+            index.parent.mkdir(parents=True)
+            index.write_bytes(native)
+        self.w.scan()
+        api.import_session(CODEX_WIN)
+        self.assertTrue(self.copy.exists())
+        after = read(index) if index.exists() else b""
+        self.assertTrue(after.startswith(native or b""))
+        return after[len(native or b"") :]
+
+    MINE = b'{"id":"%s","thread_name":"mine","updated_at":"2026-10-01T00:00:00Z"}\n' % (
+        CODEX_NATIVE.encode()
+    )
+
+    def test_the_name_line_is_written_anew_and_never_copied(self):
+        """docs/AUDIT.md A-11: the line is the one write an undo never takes
+        back, and it was the source's bytes as they were. Now it is a line
+        of our own, made of three checked values and nothing else."""
+        added = self.name_line(
+            b'  {"updated_at" : "2026-08-29T09:31:15.3316788+02:00", "anything": {"else": [1, 2]},'
+            b' "thread_name": "RENAMED\\u001b[2J BY \xe2\x80\xaeTHE DRIVE", "id": "%s"}\r'
+            % CODEX_WIN.encode(),
+            self.MINE,
+        )
+        self.assertEqual(
+            added,
+            b'{"id":"%s","thread_name":"RENAMED [2J BY  THE DRIVE",'
+            b'"updated_at":"2026-08-29T07:31:15.331678Z"}\n' % CODEX_WIN.encode(),
+        )
+
+    def test_a_line_with_a_key_twice_is_not_a_name_line(self):
+        """The auditor's line: the first ``id`` is one of the user's own
+        threads, the last the thread's. Which of the two a parser takes is
+        the parser's choice; nothing of such a line is written."""
+        added = self.name_line(
+            b'{"id":"%s","thread_name":"RENAMED BY THE DRIVE","updated_at":"2099-01-01T00:00:00Z",'
+            b'"id":"%s"}' % (CODEX_NATIVE.encode(), CODEX_WIN.encode()),
+            self.MINE,
+        )
+        self.assertEqual(added, b"")
+        self.assertEqual(self.records()[-1]["appended"], [])
+
+    def test_a_name_that_is_not_utf8_is_not_written(self):
+        added = self.name_line(
+            b'{"id":"%s","thread_name":"caf\xe9 \xff\xfe name"}' % CODEX_WIN.encode(), self.MINE
+        )
+        self.assertEqual(added, b"")
+        read(self.home / ".codex" / "session_index.jsonl").decode("utf-8")  # still text
+
+    def test_a_name_that_cannot_be_written_as_text_is_not_written(self):
+        # A lone surrogate, escaped: valid JSON, and no text a tool can read back.
+        added = self.name_line(
+            b'{"id":"%s","thread_name":"a \\ud800 name"}' % CODEX_WIN.encode(), self.MINE
+        )
+        self.assertEqual(added, b"")
+
+    def test_the_name_is_bounded_and_a_time_that_is_none_is_left_out(self):
+        for line, expected in (
+            (
+                b'{"id":"%s","thread_name":"' + b"n" * 5000 + b'","updated_at":"tomorrow"}',
+                b'{"id":"%s","thread_name":"' + b"n" * 200 + b'"}\n',
+            ),
+            (
+                b'{"id":"%s","thread_name":"a name","updated_at":"9999-01-01T00:00:00Z"}',
+                b'{"id":"%s","thread_name":"a name"}\n',
+            ),
+            (
+                b'{"id":"%s","thread_name":"a name","updated_at":{"deep":[1]}}',
+                b'{"id":"%s","thread_name":"a name"}\n',
+            ),
+            (b'{"id":"%s","thread_name":"\\u0007 \\t "}', b""),  # nothing left of the name
+            (  # not a name line at all: the one before it is the thread's last
+                b'{"id":"%s","thread_name":["a name"]}',
+                b'{"id":"%s","thread_name":"an older name",'
+                b'"updated_at":"2026-08-01T00:00:00.000000Z"}\n',
+            ),
+        ):
+            with self.subTest(line=line[:60]):
+                thread = CODEX_WIN.encode()
+                added = self.name_line(line.replace(b"%s", thread))
+                self.assertEqual(added, expected.replace(b"%s", thread))
+                api.unimport(CODEX_WIN)
+                index = self.home / ".codex" / "session_index.jsonl"
+                if index.exists():
+                    index.unlink()
 
     def test_an_index_the_import_creates_is_private(self):
         """docs/REVIEW.md R-10: thread names are session data like the rest."""
@@ -813,11 +912,12 @@ class CodexSegmentImportTest(ImportCase):
         self.assertEqual(
             (native.messages, native.title, native.launchable), (source.messages, "title-168", True)
         )
-        # The name line: the last one of the source index, as it is in the file.
+        # The name line: the values of the last one of the source index,
+        # written anew (the time in our own form, six fraction digits).
         self.assertEqual(
             read(self.home / ".codex" / "session_index.jsonl"),
             b'{"id":"01a0e538-c7bb-77dd-885b-0c4d54663241","thread_name":"title-168",'
-            b'"updated_at":"2026-09-27T23:35:21.831252584Z"}\n',
+            b'"updated_at":"2026-09-27T23:35:21.831252Z"}\n',
         )
         self.assertEqual(
             files_below(self.home / ".codex"),

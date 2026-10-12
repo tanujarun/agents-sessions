@@ -249,7 +249,7 @@ class CodexIndexLineTest(UndoCase):
         self.index_file = self.home / ".codex" / "session_index.jsonl"
         self.line = (
             b'{"id":"01a0e538-c7bb-77dd-885b-0c4d54663241","thread_name":"title-168",'
-            b'"updated_at":"2026-09-27T23:35:21.831252584Z"}\n'
+            b'"updated_at":"2026-09-27T23:35:21.831252Z"}\n'
         )
 
     def test_the_store_differs_by_the_one_reported_line(self):
