@@ -1,8 +1,9 @@
 """Build and run the resume command (platform layer).
 
 The only module that starts a process. The Linux implementation opens a new
-terminal window through ``omarchy-launch-tui``, which runs
-``setsid uwsm-app -- xdg-terminal-exec --app-id=<id> -e <tool> <args>``; the
+terminal window through ``omarchy-launch-tui`` where that exists (it runs
+``setsid uwsm-app -- xdg-terminal-exec --app-id=<id> -e <tool> <args>``),
+else through the first terminal it finds (``terminal_command``); the
 terminal inherits the working directory it was started in.
 
 It also answers whether a tool is installed at all (``tool_state``). A name
@@ -37,6 +38,35 @@ if TYPE_CHECKING:
     from .providers.base import Provider
 
 LAUNCHER = "omarchy-launch-tui"
+XDG_TERMINAL = "xdg-terminal-exec"
+# A command line that opens a terminal window; the tool's command is added at
+# its end. It wins over everything ``terminal_command`` would find.
+TERMINAL_ENV = "AGENT_SESSIONS_TERMINAL"
+# The terminals that are looked for when nothing else names one, in this
+# order: the program, and what stands between it and the command it is to
+# run. Each has its own form, and the table is the one place that knows them.
+#
+# Where a form comes from: ``alacritty`` and ``kitty`` are installed on the
+# machine this was written on, and their ``--help`` says it (alacritty: "-e,
+# --command <COMMAND>...  Command and args to execute (must be last
+# argument)"; kitty: "Usage: kitty [options] [program-to-run ...]"). The
+# other six are not installed there and are taken from each terminal's own
+# documentation, not run: foot(1) "foot [OPTIONS] [command [command_arguments]]",
+# ghostty "-e <command>", "wezterm start [OPTIONS] [-- PROG...]",
+# gnome-terminal(1) "gnome-terminal [OPTION...] [-- COMMAND ...]", konsole
+# "-e <command>" (takes every argument after it), xterm(1) "-e program
+# [arguments ...]" (must be last). None was started to try it.
+TERMINALS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("alacritty", ("-e",)),
+    ("kitty", ()),
+    ("foot", ()),
+    ("ghostty", ("-e",)),
+    ("wezterm", ("start", "--")),
+    ("gnome-terminal", ("--",)),
+    ("konsole", ("-e",)),
+    ("xterm", ("-e",)),
+)
+_RUN = ("-e",)  # what a terminal the table does not know is given (``$TERMINAL -e``)
 NOTIFIER = "notify-send"
 NOTIFY_ENV = "AGENT_SESSIONS_NOTIFY"  # "0" switches desktop notifications off
 NOTIFY_TITLE = "Cannot resume session"
@@ -299,6 +329,57 @@ def _tell(reason: str) -> None:
         pass
 
 
+def terminal_command(app_id: str, argv: list[str]) -> list[str]:
+    """The command that opens a terminal window and runs ``argv`` in it.
+
+    The first of these that is there:
+
+    1. ``AGENT_SESSIONS_TERMINAL``, a command line of the user's own (split
+       the way a shell splits words, ``shlex.split``; no shell runs it);
+       ``argv`` is added at its end. It is a decision, not a hint: when it
+       cannot be split or its program is not found, that is the failure;
+    2. ``omarchy-launch-tui --app-id=<app_id> ...``, this desktop's launcher;
+    3. ``xdg-terminal-exec --app-id=<app_id> -- ...``, the desktop's default
+       terminal. The form is the usage line of its ``--help`` (0.14.3:
+       "xdg-terminal-exec [options] [--] [command [arguments ...]]", with
+       "--app-id=app-id  set app-id (Wayland) or window class (X11)");
+    4. ``$TERMINAL``, with the form the table has for that program, else
+       ``-e``. One that is not on PATH is passed over;
+    5. the first terminal of ``TERMINALS`` that is installed.
+
+    Only the first three give the window the tool's ``app_id``. Raises
+    ``LaunchFailed`` when there is none, naming the variable that settles it.
+    Files only (``shutil.which``); nothing is started.
+    """
+    chosen = os.environ.get(TERMINAL_ENV, "").strip()
+    if chosen:
+        try:
+            words = shlex.split(chosen)
+        except ValueError as exc:  # quotes that do not close
+            raise LaunchFailed(f"{TERMINAL_ENV} is not a command line ({exc})") from None
+        if not shutil.which(words[0]):
+            raise LaunchFailed(f"{TERMINAL_ENV} names a terminal that was not found: {words[0]}")
+        return [*words, *argv]
+    if shutil.which(LAUNCHER):
+        return [LAUNCHER, f"--app-id={app_id}", *argv]
+    if shutil.which(XDG_TERMINAL):
+        return [XDG_TERMINAL, f"--app-id={app_id}", "--", *argv]
+    forms = dict(TERMINALS)
+    try:
+        words = shlex.split(os.environ.get("TERMINAL", ""))
+    except ValueError:
+        words = []  # not ours to complain about: the table is tried instead
+    if words and shutil.which(words[0]):
+        return [*words, *forms.get(os.path.basename(words[0]), _RUN), *argv]
+    for program, form in TERMINALS:
+        if shutil.which(program):
+            return [program, *form, *argv]
+    raise LaunchFailed(
+        f"no terminal was found to open a window with; set {TERMINAL_ENV} to the command "
+        "that starts yours (the tool's command is added at its end)"
+    )
+
+
 def _directory(session: Session, provider: Provider) -> tuple[str, str | None]:
     """``(directory to start in, note)``. The recorded directory when it
     exists; else the home directory for a tool that finds a session by id
@@ -390,9 +471,7 @@ def plan(
     cwd, note = _directory(session, provider)
     if here:
         return LaunchPlan(cwd, argv, list(argv), note)
-    if not shutil.which(LAUNCHER):
-        raise LaunchFailed(f"{LAUNCHER} was not found; cannot open a terminal window")
-    return LaunchPlan(cwd, argv, [LAUNCHER, f"--app-id={provider.app_id}", *argv], note)
+    return LaunchPlan(cwd, argv, terminal_command(provider.app_id, argv), note)
 
 
 def launch(
@@ -441,11 +520,15 @@ __all__ = [
     "LAUNCHER",
     "NOT_FOUND",
     "NOT_INSTALLED",
+    "TERMINALS",
+    "TERMINAL_ENV",
+    "XDG_TERMINAL",
     "LaunchFailed",
     "LaunchPlan",
     "ToolState",
     "forget_tools",
     "launch",
     "plan",
+    "terminal_command",
     "tool_state",
 ]

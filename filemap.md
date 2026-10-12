@@ -91,7 +91,8 @@
   and `write` (a document into a file: temp file beside it, then moved into place, 0600, nothing replaced
   unless asked)
 - `src/agent_sessions/launch.py` — build and run the resume command (platform layer): `plan`, `launch`, the
-  `starter`/`notifier` hooks; and `tool_state` (`ToolState`: is the tool behind a command installed, or is
+  `starter`/`notifier` hooks; which terminal opens the window (`terminal_command`: `AGENT_SESSIONS_TERMINAL`,
+  `omarchy-launch-tui`, `xdg-terminal-exec`, `$TERMINAL`, the table `TERMINALS`); and `tool_state` (`ToolState`: is the tool behind a command installed, or is
   the command a wrapper that would install it; read from the wrapper's text and mise's installs, no
   program run, remembered per run, `forget_tools`)
 - `src/agent_sessions/api.py` — facade used by the CLI and the TUI: `load_index`, `scan`, `list_sessions`,
@@ -160,7 +161,9 @@
   (the drive of a session is not mounted), `MountFailed` (re-exported by `api`)
 - `tests/fixture_world.py` — `World`: fake home plus two fake drives built from the fixtures, launches and
   notifications recorded; `tree_state`, `age_access_times`, `files_below`
-- `tests/test_launch.py` — launch plans per provider, folder gone, foreign refused, `--here`, hooks
+- `tests/test_launch.py` — launch plans per provider, folder gone, foreign refused, `--here`, hooks; which
+  terminal is used, table-driven on a fake PATH (every known terminal, the order, `$TERMINAL`,
+  `AGENT_SESSIONS_TERMINAL`, none at all)
 - `tests/test_json_contract.py` — every `--json` output and the lines of `export --format json` against the
   tables of `docs/JSON.md`: key sets, types, nullability, the documented orderings, escapes, byte-identical
   repeats

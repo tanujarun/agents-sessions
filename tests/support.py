@@ -218,6 +218,9 @@ class Sandbox:
                 "AGENT_SESSIONS_NOTIFY": "0",  # a failed launch must not notify the desktop
                 # What mise has installed on this machine is not the test's business.
                 "MISE_DATA_DIR": str(self.root / "mise"),
+                # Nor which terminal its user prefers (``launch.terminal_command``).
+                "AGENT_SESSIONS_TERMINAL": "",
+                "TERMINAL": "",
             },
         )
         env.start()

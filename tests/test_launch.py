@@ -30,6 +30,10 @@ from agent_sessions.launch import LaunchPlan
 from agent_sessions.providers.gemini import Gemini
 
 TERMINAL = "omarchy-launch-tui"
+NO_TERMINAL = (
+    "no terminal was found to open a window with; set AGENT_SESSIONS_TERMINAL to the command "
+    "that starts yours (the tool's command is added at its end)"
+)
 
 
 class LaunchCase(unittest.TestCase):
@@ -165,12 +169,13 @@ class PlanTest(LaunchCase):
         self.assertEqual(self.w.started, [])
         self.assertFalse(self.w.session(CODEX_NATIVE, "native", self.w.scan()).launchable)
 
-    def test_launcher_missing(self):
+    def test_no_terminal_at_all(self):
         self.w.installed.discard(TERMINAL)
         reason = self.failure(CLAUDE_NATIVE)
-        self.assertEqual(reason, "omarchy-launch-tui was not found; cannot open a terminal window")
+        self.assertEqual(reason, NO_TERMINAL)
         self.assertEqual((self.w.started, self.w.notified), ([], [reason]))
-        # Resuming in this terminal does not need it.
+        self.assertEqual(self.failure(CLAUDE_NATIVE, dry_run=True), NO_TERMINAL)
+        # Resuming in this terminal does not need one.
         plan = api.open_session(CLAUDE_NATIVE, here=True, dry_run=True)
         self.assertEqual(plan.command, plan.argv)
 
@@ -181,6 +186,146 @@ class PlanTest(LaunchCase):
             api.open_session("claude:", dry_run=True)
         self.assertIn("matches", caught.exception.reason)
         self.assertEqual((self.w.started, self.w.notified), ([], []))
+
+
+class TerminalTest(LaunchCase):
+    """Which terminal opens the window (docs/SPEC.md "Tool detection"):
+    ``launch.terminal_command`` on a fake PATH. Nothing is started."""
+
+    foreign = ()
+    native = ("claude",)
+    ARGV = ("claude", "--resume", CLAUDE_NATIVE)
+    APP = "--app-id=org.omarchy.claude"
+    # The table, as it is specified: the program and its own way of being
+    # told which command to run.
+    FORMS = (
+        ("alacritty", ["alacritty", "-e"]),
+        ("kitty", ["kitty"]),
+        ("foot", ["foot"]),
+        ("ghostty", ["ghostty", "-e"]),
+        ("wezterm", ["wezterm", "start", "--"]),
+        ("gnome-terminal", ["gnome-terminal", "--"]),
+        ("konsole", ["konsole", "-e"]),
+        ("xterm", ["xterm", "-e"]),
+    )
+
+    def command(self, *on_path, **env) -> list[str]:
+        """What a resume would run with these programs on PATH beside the
+        tool, and these variables set."""
+        self.w.installed.clear()
+        self.w.installed.update(("claude", *on_path))
+        with mock.patch.dict(os.environ, env):
+            plan = api.open_session(CLAUDE_NATIVE, dry_run=True)
+        self.assertEqual(plan.argv, list(self.ARGV))
+        return plan.command
+
+    def refused(self, *on_path, **env) -> str:
+        with self.assertRaises(api.LaunchFailed) as caught:
+            self.command(*on_path, **env)
+        return caught.exception.reason
+
+    def test_the_table_is_what_is_specified(self):
+        self.assertEqual(
+            [(program, [program, *form]) for program, form in launch.TERMINALS], list(self.FORMS)
+        )
+
+    def test_each_known_terminal_alone_on_path(self):
+        for program, prefix in self.FORMS:
+            with self.subTest(program):
+                self.assertEqual(self.command(program), [*prefix, *self.ARGV])
+
+    def test_the_first_of_the_table_that_is_installed(self):
+        programs = [program for program, _prefix in self.FORMS]
+        for position, (_program, prefix) in enumerate(self.FORMS):
+            self.assertEqual(self.command(*programs[position:]), [*prefix, *self.ARGV])
+            self.assertEqual(self.command(*reversed(programs[position:])), [*prefix, *self.ARGV])
+
+    def test_the_order_of_everything_that_can_name_a_terminal(self):
+        everything = (TERMINAL, "xdg-terminal-exec", "myterm", "xterm", "special")
+        env = {"TERMINAL": "myterm", "AGENT_SESSIONS_TERMINAL": "special --flag"}
+        self.assertEqual(self.command(*everything, **env), ["special", "--flag", *self.ARGV])
+        env["AGENT_SESSIONS_TERMINAL"] = "  "  # blank is not set
+        self.assertEqual(self.command(*everything, **env), [TERMINAL, self.APP, *self.ARGV])
+        self.assertEqual(
+            self.command(*everything[1:], **env),
+            ["xdg-terminal-exec", self.APP, "--", *self.ARGV],
+        )
+        self.assertEqual(self.command(*everything[2:], **env), ["myterm", "-e", *self.ARGV])
+        self.assertEqual(self.command(*everything[3:], **env), ["xterm", "-e", *self.ARGV])
+        self.assertEqual(self.refused(*everything[4:], **env), NO_TERMINAL)
+
+    def test_the_users_own_command_line(self):
+        spaced = str(self.w.path.directory / "my term")  # a program by its path
+        cases = (
+            ("myterm", ["myterm"]),
+            ("myterm -e", ["myterm", "-e"]),
+            (
+                "  myterm --title 'agent sessions' -e  ",
+                ["myterm", "--title", "agent sessions", "-e"],
+            ),
+            (spaced.replace(" ", "\\ ") + ' --class="a b" --', [spaced, "--class=a b", "--"]),
+            # Nothing in it is run by a shell.
+            ("myterm -e $(reboot) ; rm", ["myterm", "-e", "$(reboot)", ";", "rm"]),
+        )
+        for line, words in cases:
+            with self.subTest(line):
+                on_path = (words[0], TERMINAL, "xterm")
+                self.assertEqual(
+                    self.command(*on_path, AGENT_SESSIONS_TERMINAL=line), [*words, *self.ARGV]
+                )
+
+    def test_a_command_line_of_the_users_that_cannot_be_used_is_the_failure(self):
+        everything = (TERMINAL, "xdg-terminal-exec", "xterm")
+        self.assertEqual(
+            self.refused(*everything, AGENT_SESSIONS_TERMINAL="myterm 'unclosed"),
+            "AGENT_SESSIONS_TERMINAL is not a command line (No closing quotation)",
+        )
+        not_found = "AGENT_SESSIONS_TERMINAL names a terminal that was not found: "
+        self.assertEqual(
+            self.refused(*everything, AGENT_SESSIONS_TERMINAL="nowhere -e"), not_found + "nowhere"
+        )
+        self.assertEqual(self.refused(*everything, AGENT_SESSIONS_TERMINAL="''"), not_found)
+        # A real attempt fails the same way, and says so on the desktop.
+        self.w.installed.update(everything)
+        with mock.patch.dict(os.environ, {"AGENT_SESSIONS_TERMINAL": "nowhere"}):
+            reason = self.failure(CLAUDE_NATIVE)
+        self.assertEqual(reason, not_found + "nowhere")
+        self.assertEqual((self.w.started, self.w.notified), ([], [reason]))
+
+    def test_the_terminal_variable(self):
+        # A terminal the table knows gets its own form, with what the variable adds.
+        self.assertEqual(
+            self.command("wezterm", "xterm", TERMINAL="wezterm"),
+            ["wezterm", "start", "--", *self.ARGV],
+        )
+        kitty = str(self.w.path.directory / "kitty")  # named by its path, with a flag
+        self.assertEqual(
+            self.command(kitty, "xterm", TERMINAL=f"{kitty} --single-instance"),
+            [kitty, "--single-instance", *self.ARGV],
+        )
+        # Any other one is given -e.
+        self.assertEqual(
+            self.command("st", "xterm", TERMINAL="st -f 'Mono 12'"),
+            ["st", "-f", "Mono 12", "-e", *self.ARGV],
+        )
+        # One that is not there, or is no command line, is passed over.
+        for value in ("st", "st 'unclosed", "''", " "):
+            self.assertEqual(self.command("xterm", TERMINAL=value), ["xterm", "-e", *self.ARGV])
+            self.assertEqual(self.refused(TERMINAL=value), NO_TERMINAL)
+
+    def test_the_window_is_opened_with_that_command(self):
+        self.w.installed.clear()
+        self.w.installed.update(("claude", "foot"))
+        plan = api.open_session(CLAUDE_NATIVE)
+        self.assertEqual(plan.command, ["foot", *self.ARGV])
+        self.assertEqual(self.w.started, [(plan.command, str(self.home / "My Proj"))])
+
+    def test_nothing_is_looked_for_when_the_tool_is_started_here(self):
+        self.w.installed.clear()
+        self.w.installed.add("claude")
+        with mock.patch.dict(os.environ, {"AGENT_SESSIONS_TERMINAL": "nowhere 'unclosed"}):
+            plan = api.open_session(CLAUDE_NATIVE, here=True, dry_run=True)
+        self.assertEqual(plan.command, list(self.ARGV))
 
 
 class GeminiTest(LaunchCase):

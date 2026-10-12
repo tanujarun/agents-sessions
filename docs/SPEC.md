@@ -446,9 +446,23 @@ an executable of that name exists there. The answer feeds `launchable`,
 not installed, so the browser never installs software) and Gemini's
 `resumable`, which becomes "the real CLI is installed" instead of a constant.
 
-Terminal: `omarchy-launch-tui` when present; else `xdg-terminal-exec`; else
-`$TERMINAL -e`; else the first of a table of known terminals. The override
-`AGENT_SESSIONS_TERMINAL` (a command; the tool's argv is appended) wins.
+Terminal (`launch.terminal_command`, for a resume and a continue alike):
+`omarchy-launch-tui --app-id=<id> …` when present; else `xdg-terminal-exec
+--app-id=<id> -- …` (the usage line of its `--help`: `[options] [--]
+[command [arguments ...]]`; `-e` is accepted there too and dropped); else
+`$TERMINAL`, with the form the table has for that program and `-e` for any
+other, passed over when it is not on PATH; else the first installed of a
+table of known terminals, each with its own way of being given a command
+(`alacritty -e`, `kitty`, `foot`, `ghostty -e`, `wezterm start --`,
+`gnome-terminal --`, `konsole -e`, `xterm -e`; the table is data in one
+place, and only the alacritty and kitty forms could be read from a `--help`
+on this machine, the rest are from each terminal's documentation). The
+override `AGENT_SESSIONS_TERMINAL` (a command line, split as a shell splits
+words and never run by one; the tool's argv is appended) wins over all of
+it, and is a decision: when it cannot be split or its program is not found,
+the launch fails and says so instead of falling back. With no terminal at
+all the failure names that variable. `open --dry-run` and `continue
+--dry-run` show the command that would run.
 
 ## Offline drives
 
