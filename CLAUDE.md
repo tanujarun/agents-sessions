@@ -10,7 +10,7 @@ Textual, from the project `.venv` (`./install.sh` creates it).
 - Lint: `make lint` (`ruff check`, `ruff format --check`, `compileall`); `make format` applies the
   formatter; `make typecheck` runs `mypy`; `make coverage`; `make check` runs lint, typecheck and
   both suites. These need the tools in `.venv`: `make dev` (installs `.[tui,dev]` editable)
-- Run: `bin/agent-sessions` (TUI) or `bin/agent-sessions <scan|list|open|import|unimport|show|status|verify|mount|forget|map>`
+- Run: `bin/agent-sessions` (TUI) or `bin/agent-sessions <scan|list|open|import|unimport|export|continue|show|status|verify|mount|forget|map>`
 - TUI tests: `make test-tui` (needs `.venv`; about 80 s)
 - Install: `./install.sh` (creates `.venv` with Textual, symlinks into
   `~/.local/bin`, installs the desktop launcher)
@@ -18,7 +18,8 @@ Textual, from the project `.venv` (`./install.sh` creates it).
 ## Rules
 
 - Read-only outside the native stores, `~/.cache/agent-sessions/`,
-  `~/.local/state/agent-sessions/` and `~/.config/agent-sessions/pathmap.json` (`map` only). Never write to a store on another drive,
+  `~/.local/state/agent-sessions/`, `~/.config/agent-sessions/pathmap.json` (`map` only) and the file
+  `export -o` names (never inside a session store). Never write to a store on another drive,
   including the Windows profile under `/run/media/tanuj/`.
 - Open SQLite files only through `providers.base.open_sqlite_ro` (in-memory
   copy; never a plain `sqlite3.connect`). A scan must not create or touch
@@ -39,6 +40,7 @@ Textual, from the project `.venv` (`./install.sh` creates it).
 - Tests never touch the real stores for writing. Use temp dirs and the env
   overrides `AGENT_SESSIONS_HOME` (fake home), `AGENT_SESSIONS_CACHE`,
   `AGENT_SESSIONS_STATE`, `AGENT_SESSIONS_MOUNTS` (fake mount list).
+- Tests never start a terminal or a tool: replace `launch.starter`, patch `os.execvp` for `--here`.
 - Do not start an agent CLI interactively or make a model call (no
   `claude -p`, `codex exec`, …). `--help` and `--version` are fine.
 - Do not send keyboard or mouse input to the desktop session.
