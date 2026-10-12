@@ -51,8 +51,8 @@ def _legacy(quiet: bool = False) -> list[dict]:
     nothing is lost by leaving it alone."""
     where = legacy_path()
     try:
-        with open(where, encoding="utf-8") as fh:
-            data = json.load(fh)
+        with fsutil.open_ro(where) as fh:  # a regular file, and no waiting
+            data = json.loads(fh.read().decode("utf-8"))
     except FileNotFoundError:
         return []
     except (OSError, ValueError, RecursionError) as exc:
@@ -80,7 +80,9 @@ def read(quiet: bool = False) -> list[dict]:
     A line that is not a JSON object is skipped with a warning in the log.
     That is expected of the last line alone, when the write that made it was
     cut short. Raises ``OSError`` when the journal is there and cannot be
-    read at all.
+    read at all; that includes a journal that is not a regular file
+    (``fsutil.NotRegularFile``): a named pipe under its name is not opened,
+    so no command waits on it.
 
     ``quiet`` leaves the warnings out: for a caller that reads the journal
     with every listing (``Index.finalise``), where the same line would be
@@ -89,7 +91,7 @@ def read(quiet: bool = False) -> list[dict]:
     records = _legacy(quiet)
     where = path()
     try:
-        with open(where, "rb") as fh:
+        with fsutil.open_ro(where) as fh:
             data = fh.read()
     except FileNotFoundError:
         return records
@@ -174,17 +176,19 @@ def open_for_append() -> tuple[int, bool]:
     """``(descriptor, created)`` of the journal, opened for appending; the
     state directory must exist. For a caller that has to know the journal
     can be written before it does something that cannot be undone
-    (``write`` follows, under the same lock). Raises ``OSError``."""
+    (``write`` follows, under the same lock). Raises ``OSError``; a journal
+    that is not a regular file is one (``fsutil.open_regular``: a record
+    written into a named pipe would be lost)."""
     where = os.fspath(path())
     flags = os.O_RDWR | os.O_APPEND | getattr(os, "O_BINARY", 0)
     try:
-        return os.open(where, flags), False
+        return fsutil.open_regular(where, flags), False
     except FileNotFoundError:
         pass
     try:
-        return os.open(where, flags | os.O_CREAT | os.O_EXCL, fsutil.PRIVATE_FILE), True
+        return fsutil.open_regular(where, flags | os.O_CREAT | os.O_EXCL), True
     except FileExistsError:  # made between the two opens
-        return os.open(where, flags), False
+        return fsutil.open_regular(where, flags), False
 
 
 def write(fd: int, record: dict) -> None:
