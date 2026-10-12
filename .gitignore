@@ -6,3 +6,8 @@ dist/
 *.egg-info/
 .cache/
 scratch/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/

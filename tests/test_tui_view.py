@@ -927,6 +927,14 @@ class EntryTest(unittest.TestCase):
                        "agent-sessions.desktop"):
             self.assertIn(needle, install)
 
+    def test_the_textual_pin_is_the_same_in_both_places(self):
+        import tomllib
+        requirements = (REPO / "requirements-tui.txt").read_text(encoding="utf-8")
+        pins = [line for line in requirements.splitlines() if line and not line.startswith("#")]
+        with open(REPO / "pyproject.toml", "rb") as handle:
+            project = tomllib.load(handle)["project"]
+        self.assertEqual(project["optional-dependencies"]["tui"], pins)
+
 
 if __name__ == "__main__":
     unittest.main()

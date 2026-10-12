@@ -7,7 +7,9 @@ Textual, from the project `.venv` (`./install.sh` creates it).
 
 - Test: `make test` (`python3 -m unittest discover -s tests -v`); TUI tests
   need `.venv/bin/python` and skip themselves when Textual is absent
-- Lint: `make lint` (`python3 -m compileall -q src tests`)
+- Lint: `make lint` (`ruff check`, `ruff format --check`, `compileall`); `make format` applies the
+  formatter; `make typecheck` runs `mypy`; `make coverage`; `make check` runs lint, typecheck and
+  both suites. These need the tools in `.venv`: `make dev` (installs `.[tui,dev]` editable)
 - Run: `bin/agent-sessions` (TUI) or `bin/agent-sessions <scan|list|open|import|show|status|verify>`
 - TUI tests: `make test-tui` (needs `.venv`; about 80 s)
 - Install: `./install.sh` (creates `.venv` with Textual, symlinks into
