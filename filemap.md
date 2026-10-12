@@ -10,6 +10,7 @@
 - `docs/JSON.md` — every `--json` output of the CLI, field by field, and its ordering, and the lines of
   `export --format json`; pinned by `tests/test_json_contract.py`
 - `docs/REVIEW.md` — the production-readiness review (findings R-01 to R-14)
+- `docs/AUDIT.md` — the acceptance audit of phase 2 (findings A-01 to A-27, nits N-01 to N-37) and what was done about each
 - `docs/PLAN.md` — task list and status
 - `docs/SECURITY.md` — the threat model, each defence with the module that implements it and the test
   that proves it, and what is not defended
