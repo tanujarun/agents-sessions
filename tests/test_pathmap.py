@@ -7,10 +7,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from support import Sandbox  # noqa: E402
+from support import Sandbox
 
-from agent_sessions.mounts import Mount  # noqa: E402
-from agent_sessions.pathmap import PathMap, Recorded, normalise  # noqa: E402
+from agent_sessions.mounts import Mount
+from agent_sessions.pathmap import PathMap, Recorded, normalise
 
 
 class NormaliseTest(unittest.TestCase):

@@ -5,14 +5,19 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, ClassVar
 
 from .. import importer
 from ..fsutil import home, listdir_ro, open_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
 from .base import NotSupported, Provider, Turn, clean_title, iter_jsonl, parse_ts, unreadable, warn
+
+if TYPE_CHECKING:
+    from ..fsutil import StrPath
+    from ..pathmap import PathMap
 
 _TRANSCRIPT = re.compile(r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
 
@@ -67,7 +72,7 @@ def encode_cwd(cwd: str) -> str:
     return f"{encoded[:ENCODED_MAX]}-{digits}"
 
 
-def _recorded_version(path) -> str | None:
+def _recorded_version(path: StrPath) -> str | None:
     """The tool version of the first record that names one, looking only at
     the head of the transcript."""
     try:
@@ -80,8 +85,9 @@ def _recorded_version(path) -> str | None:
             record = json.loads(line.decode("utf-8", "replace"))
         except (ValueError, RecursionError):
             continue
-        if isinstance(record, dict) and isinstance(record.get("version"), str):
-            return record["version"]
+        version = record.get("version") if isinstance(record, dict) else None
+        if isinstance(version, str):
+            return version
     return None
 
 
@@ -120,8 +126,8 @@ def _prompts(record: dict) -> tuple[list[str], str | None]:
         found = _COMMAND.search(flat)
         if found:
             if command is None:
-                args = _COMMAND_ARGS.search(flat)
-                args = args.group(1).strip() if args else ""
+                found_args = _COMMAND_ARGS.search(flat)
+                args = found_args.group(1).strip() if found_args else ""
                 command = f"{found.group(1)} {args}" if args else found.group(1)
             continue
         found = _BASH.search(raw)
@@ -135,7 +141,7 @@ def _prompts(record: dict) -> tuple[list[str], str | None]:
 class _Scan:
     """What one pass over a transcript collects."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.has_message = False  # a record with a parentUuid key
         self.sidechain = False  # the first such record is a sidechain one
         self.prompts = 0  # real prompt records
@@ -156,7 +162,7 @@ class _Scan:
         return self.prompts + len(self.assistant_ids) + self.assistant_anonymous
 
 
-def _scan(path) -> _Scan:
+def _scan(path: StrPath) -> _Scan:
     """Read a transcript once, line by line."""
     scan = _Scan()
     for record in iter_jsonl(path):
@@ -227,7 +233,7 @@ def _title(scan: _Scan, session_id: str) -> tuple[str, str]:
     return session_id[:8], "id"
 
 
-def _mtime(path) -> str | None:
+def _mtime(path: StrPath) -> str | None:
     try:
         return parse_ts(os.stat(path).st_mtime)
     except OSError:
@@ -241,9 +247,9 @@ class Claude(Provider):
     binary = "claude"
     app_id = "org.omarchy.claude"
     resumable = True
-    dir_names = {".claude"}
+    dir_names: ClassVar[set[str]] = {".claude"}
 
-    def native_store(self) -> Path | None:
+    def native_store(self) -> Path:
         return home() / ".claude"
 
     def is_store(self, path: Path) -> bool:
@@ -339,7 +345,7 @@ class Claude(Provider):
                         if isinstance(tool, str) and tool:
                             yield Turn("tool", tool, moment)
 
-    def import_plan(self, s: Session, pathmap) -> importer.ImportPlan:
+    def import_plan(self, s: Session, pathmap: PathMap) -> importer.ImportPlan:
         """Copy only (FORMATS section 6): the ``<id>/`` side directory first,
         the transcript last, into ``projects/<encoded mapped cwd>/``. Nothing
         is rewritten and nothing else is copied."""

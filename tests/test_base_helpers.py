@@ -11,11 +11,11 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from support import FIXTURES  # noqa: E402
+from support import FIXTURES
 
-from agent_sessions.model import Candidate, Session, Store, make_key  # noqa: E402
-from agent_sessions.providers import base  # noqa: E402
-from agent_sessions.providers.base import (  # noqa: E402
+from agent_sessions.model import Candidate, Session, Store, make_key
+from agent_sessions.providers import base
+from agent_sessions.providers.base import (
     clean_title,
     collect_warnings,
     iter_jsonl,

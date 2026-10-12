@@ -15,8 +15,14 @@ import os
 import re
 import urllib.parse
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .fsutil import config_dir, listdir_ro
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+    from .mounts import Mount
 
 OVERRIDE_FILE = "pathmap.json"
 HOST_ROOT = "/" if os.sep == "/" else None  # a Windows host has drive roots
@@ -44,7 +50,7 @@ class Recorded:
     parts: tuple  # the segments below the root
 
 
-def normalise(recorded) -> Recorded | None:
+def normalise(recorded: object) -> Recorded | None:
     """Reduce a recorded path to root and segments; None when it has no root
     that can be mapped (relative, UNC, empty, not a string).
 
@@ -75,7 +81,7 @@ def normalise(recorded) -> Recorded | None:
     return None
 
 
-def _mount_path(mount) -> str:
+def _mount_path(mount: Mount | str) -> str:
     return mount if isinstance(mount, str) else mount.path
 
 
@@ -86,7 +92,9 @@ def _join(base: str, name: str) -> str:
 class PathMap:
     """Use ``PathMap.build(mounts, evidence)``."""
 
-    def __init__(self, mounts, overrides=None):
+    def __init__(
+        self, mounts: Iterable[Mount | str], overrides: Mapping[str, object] | None = None
+    ) -> None:
         self.mounts = sorted({_mount_path(m) for m in mounts})
         self.warnings: list[str] = []
         self._root_overrides: dict[str, str] = {}
@@ -98,7 +106,12 @@ class PathMap:
         self._load_overrides(overrides)
 
     @classmethod
-    def build(cls, mounts, evidence, overrides=None) -> "PathMap":
+    def build(
+        cls,
+        mounts: Iterable[Mount | str],
+        evidence: Iterable[tuple[object, Mount | str | None]],
+        overrides: Mapping[str, object] | None = None,
+    ) -> PathMap:
         """``evidence``: every ``(recorded cwd, source mount)`` pair known.
         ``overrides`` replaces the override file (a dict like its content)."""
         pathmap = cls(mounts, overrides)
@@ -117,7 +130,9 @@ class PathMap:
 
     # --- public -------------------------------------------------------------
 
-    def to_local(self, recorded_cwd, source_mount=None) -> tuple[str | None, bool]:
+    def to_local(
+        self, recorded_cwd: object, source_mount: Mount | str | None = None
+    ) -> tuple[str | None, bool]:
         """``(local path, True)`` when the recorded directory exists here, in
         its on-disk spelling; ``(None, False)`` otherwise. A parent that
         exists is never substituted."""
@@ -132,7 +147,9 @@ class PathMap:
         hit = self._find(base, rec.parts) if base is not None else None
         return (hit, True) if hit else (None, False)
 
-    def letter_for_mount(self, mount, source_mount=None) -> str | None:
+    def letter_for_mount(
+        self, mount: Mount | str, source_mount: Mount | str | None = None
+    ) -> str | None:
         """The drive letter (``"C:"``) of a mount, or None when unknown.
 
         Without ``source_mount`` the mount's own stores decide, then any other
@@ -140,7 +157,7 @@ class PathMap:
         """
         mount = _mount_path(mount)
 
-        def letters(source):
+        def letters(source: str | None) -> dict[str, int]:
             found = {
                 root: count
                 for (src, root), (base, _how, count) in self._roots.items()
@@ -190,7 +207,7 @@ class PathMap:
 
     # --- overrides ----------------------------------------------------------
 
-    def _load_overrides(self, overrides) -> None:
+    def _load_overrides(self, overrides: Mapping[str, object] | None) -> None:
         if overrides is None:
             path = config_dir() / OVERRIDE_FILE
             try:
@@ -229,7 +246,7 @@ class PathMap:
 
     # --- roots --------------------------------------------------------------
 
-    def _settle(self, key, paths) -> None:
+    def _settle(self, key: tuple[str, str], paths: list[tuple[str, ...]]) -> None:
         source, root = key
         if root in self._root_overrides:
             self._roots[key] = (self._root_overrides[root], "override", len(paths))
@@ -262,13 +279,19 @@ class PathMap:
         else:
             self._unsettled(key, "no evidence", (), paths)
 
-    def _unsettled(self, key, reason, candidates, paths) -> None:
+    def _unsettled(
+        self,
+        key: tuple[str, str],
+        reason: str,
+        candidates: Iterable[str],
+        paths: list[tuple[str, ...]],
+    ) -> None:
         self._open[key] = {"reason": reason, "candidates": sorted(candidates), "paths": len(paths)}
 
     def _base(self, root: str, source: str | None) -> str | None:
         if root in self._root_overrides:
             return self._root_overrides[root]
-        if (source, root) in self._roots:
+        if source is not None and (source, root) in self._roots:
             return self._roots[(source, root)][0]
         if (source, root) in self._open:
             return None
@@ -321,7 +344,7 @@ class PathMap:
                     break
         return None
 
-    def _resolve(self, base: str, parts: tuple, wild=()) -> str | None:
+    def _resolve(self, base: str, parts: tuple, wild: range = range(0)) -> str | None:
         """Follow ``parts`` below ``base`` comparing names case-insensitively;
         the result is spelled as on disk. Indexes in ``wild`` may end in "*"."""
         current = base

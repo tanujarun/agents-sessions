@@ -8,13 +8,13 @@ import shlex
 import shutil
 import sys
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fixture_world import (  # noqa: E402
+from fixture_world import (
     AGY_WIN,
     CLAUDE_NATIVE,
     CLAUDE_WIN,
@@ -26,12 +26,12 @@ from fixture_world import (  # noqa: E402
     World,
     files_below,
 )
-from support import Sandbox  # noqa: E402
+from support import Sandbox
 
-from agent_sessions import api, cli, launch  # noqa: E402
-from agent_sessions.fsutil import cache_file  # noqa: E402
-from agent_sessions.index import Index  # noqa: E402
-from agent_sessions.model import make_key  # noqa: E402
+from agent_sessions import api, cli, launch
+from agent_sessions.fsutil import cache_file
+from agent_sessions.index import Index
+from agent_sessions.model import make_key
 
 
 def run(*argv):
@@ -59,7 +59,7 @@ class CliTest(unittest.TestCase):
         )
         which.start()
         self.addCleanup(which.stop)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         stamp = lambda **ago: (now - timedelta(**ago)).isoformat()  # noqa: E731
         self.box.session(
             self.native,
@@ -646,7 +646,7 @@ class SessionCommandsTest(unittest.TestCase):
         keys = [s.key for s in api.list_sessions(index=self.index)]
         self.assertEqual(len(plain), len(keys))
         self.assertEqual([line.split()[-1] for line in keyed], keys)
-        for short, long, key in zip(plain, keyed, keys):
+        for short, long, key in zip(plain, keyed, keys, strict=False):
             self.assertNotIn(key, short)
             self.assertTrue(long.startswith(short.rstrip()[:10]))
             self.assertEqual(" ".join(long.split()[:-1]), " ".join(short.split()))
@@ -707,7 +707,7 @@ class FindSessionTest(unittest.TestCase):
 
 class AgeTest(unittest.TestCase):
     def test_ages(self):
-        now = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 10, 12, 12, 0, tzinfo=UTC)
         cases = [
             (timedelta(seconds=5), "now"),
             (timedelta(minutes=7), "7m"),

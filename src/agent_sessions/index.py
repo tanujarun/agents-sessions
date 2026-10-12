@@ -15,16 +15,23 @@ import os
 import shutil
 import sys
 import time
-from datetime import datetime, timezone
+from collections.abc import Collection, Iterable
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from . import discover
 from .discover import Skipped
 from .fsutil import cache_file
 from .model import Candidate, Session, Store
-from .mounts import NATIVE_LABEL
+from .mounts import NATIVE_LABEL, Mount
 from .pathmap import PathMap
 from .providers import base
+
+if TYPE_CHECKING:
+    import threading
+
+    from .fsutil import StrPath
 
 CACHE_VERSION = 1
 DEEP_MAX_AGE = 24 * 3600  # seconds; an older deep pass is repeated by `scan`
@@ -41,10 +48,10 @@ _CONVERSATION = {  # field -> accepted types, as stored per candidate
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def signature(paths) -> list:
+def signature(paths: Iterable[str]) -> list:
     """``[path, mtime_ns, size]`` for every path, sorted; a missing path gets
     nulls. Only ``stat`` is called, which leaves access times alone."""
     rows = []
@@ -57,13 +64,14 @@ def signature(paths) -> list:
     return rows
 
 
-def reader_id(provider) -> str:
+def reader_id(provider: base.Provider) -> str:
     """Changes whenever the adapter's code does, so that parses cached by an
     older reader are not reused."""
     marks = []
     for name in (type(provider).__module__, base.__name__):
         try:
-            st = os.stat(sys.modules[name].__file__)
+            # A module without a file gives None here: the TypeError is handled below.
+            st = os.stat(sys.modules[name].__file__)  # type: ignore[arg-type]
             marks.append(f"{st.st_mtime_ns}.{st.st_size}")
         except (KeyError, AttributeError, TypeError, OSError):
             marks.append("?")
@@ -74,7 +82,7 @@ def _store_key(store: Store) -> str:
     return f"{store.provider}:{store.root}"
 
 
-def _conversation(session) -> dict | None:
+def _conversation(session: object) -> dict | None:
     """The adapter-owned fields of a parsed session, or None when the adapter
     returned something that is not a usable session."""
     if not isinstance(session, Session):
@@ -85,7 +93,7 @@ def _conversation(session) -> dict | None:
     return row if _is_conversation(row) and row["id"] else None
 
 
-def _is_conversation(row) -> bool:
+def _is_conversation(row: object) -> bool:
     return (
         isinstance(row, dict)
         and set(row) == set(_CONVERSATION)
@@ -96,14 +104,14 @@ def _is_conversation(row) -> bool:
     )
 
 
-def _strings(items) -> list[str]:
+def _strings(items: object) -> list[str]:
     if not isinstance(items, list) or not all(isinstance(i, str) for i in items):
         raise ValueError("not a list of strings")
     return items
 
 
 class Index:
-    def __init__(self, path=None):
+    def __init__(self, path: StrPath | None = None) -> None:
         self.path = Path(path) if path is not None else None
         # persisted
         self.stores: list[Store] = []  # every store remembered
@@ -122,28 +130,30 @@ class Index:
         self.store_rows: list[dict] = []
         self.warnings: list[str] = []
         self.pathmap: PathMap = PathMap([], {})
-        self.current_mounts: list = []
+        self.current_mounts: list[Mount] = []
 
     # --- file ---------------------------------------------------------------
 
     @classmethod
-    def load(cls, path=None) -> "Index":
+    def load(cls, path: StrPath | None = None) -> Index:
         """Read the cache; a missing, corrupt or old-version file gives an
         empty index, and ``load_error`` says which it was."""
-        index = cls(path if path is not None else cache_file())
+        where = Path(path) if path is not None else cache_file()
+        index = cls(where)
+        # ``__init__`` again empties the index in place, whatever _adopt had set.
         try:
-            with open(index.path, encoding="utf-8") as fh:
+            with open(where, encoding="utf-8") as fh:
                 index._adopt(json.load(fh))
         except FileNotFoundError:
-            index.__init__(index.path)
+            index.__init__(where)  # type: ignore[misc]  # same class: cls(where) made it
             index.load_error = "missing"
         except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
-            index.__init__(index.path)
+            index.__init__(where)  # type: ignore[misc]  # same class: cls(where) made it
             reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
             index.load_error = f"unreadable: {reason or type(exc).__name__}"
         return index
 
-    def _adopt(self, data) -> None:
+    def _adopt(self, data: Any) -> None:  # the parsed cache file: any JSON value
         if data["version"] != CACHE_VERSION:
             raise ValueError("other cache version")
         self.stores = [
@@ -159,6 +169,7 @@ class Index:
                 zip(
                     ("path", "label", "fstype", "device"),
                     _strings([d["path"], d["label"], d["fstype"], d["device"]]),
+                    strict=False,
                 )
             )
             for d in data["mounts"]
@@ -229,18 +240,27 @@ class Index:
 
     # --- scan ---------------------------------------------------------------
 
-    def needs_deep(self, mounts) -> bool:
+    def needs_deep(self, mounts: Iterable[Mount]) -> bool:
         """Scan policy: a deep pass is due when none completed yet, when the
         set of mounts changed since the last one, or when it is over 24 h old."""
         if self.last_deep is None:
             return True
         if sorted(m.path for m in mounts) != sorted(self.deep_mounts):
             return True
-        last = datetime.fromisoformat(base.parse_ts(self.last_deep).replace("Z", "+00:00"))
-        age = (datetime.now(timezone.utc) - last).total_seconds()
+        # last_deep is a time: utc_now() wrote it, or _adopt checked it.
+        stamp = base.parse_ts(self.last_deep)
+        last = datetime.fromisoformat(stamp.replace("Z", "+00:00"))  # type: ignore[union-attr]
+        age = (datetime.now(UTC) - last).total_seconds()
         return age < 0 or age > DEEP_MAX_AGE
 
-    def scan(self, providers, mounts, deep=None, progress=None, cancel=None) -> dict:
+    def scan(
+        self,
+        providers: Iterable[base.Provider],
+        mounts: Iterable[Mount],
+        deep: bool | None = None,
+        progress: discover.Progress | None = None,
+        cancel: threading.Event | None = None,
+    ) -> dict:
         """Refresh stores and the parse cache, save, finalise; return a
         summary. ``deep=None`` follows ``needs_deep``. A set ``cancel`` event
         stops the walk or the parsing; what was done until then is kept."""
@@ -274,10 +294,10 @@ class Index:
             key = (old.provider, old.root)
             if key not in stores and old.origin != "native" and old.mount not in present:
                 stores[key] = old
-        for old in self.skipped:
-            key = (old.provider, old.root)
-            if key not in skipped and old.mount not in present:
-                skipped[key] = old
+        for old_skip in self.skipped:
+            key = (old_skip.provider, old_skip.root)
+            if key not in skipped and old_skip.mount not in present:
+                skipped[key] = old_skip
         self.stores = [stores[k] for k in sorted(stores)]
         self.skipped = [skipped[k] for k in sorted(skipped) if k not in stores]
         self.mounts = [
@@ -337,7 +357,14 @@ class Index:
             "warnings": self.warnings,
         }
 
-    def _parse(self, stores, providers, cancel, counts, out) -> bool:
+    def _parse(
+        self,
+        stores: Iterable[Store],
+        providers: Iterable[base.Provider],
+        cancel: threading.Event | None,
+        counts: dict[str, int],
+        out: dict[str, dict],
+    ) -> bool:
         """Fill ``out`` (store key -> cache entry) for ``stores``, parsing
         only candidates whose signature changed. Returns True when cancelled."""
         by_name = {p.name: p for p in providers}
@@ -351,7 +378,12 @@ class Index:
                     out[key] = old
                 continue
             reader = reader_id(provider)
-            entry = {"reader": reader, "implemented": True, "warnings": [], "candidates": {}}
+            entry: dict[str, Any] = {
+                "reader": reader,
+                "implemented": True,
+                "warnings": [],
+                "candidates": {},
+            }
             out[key] = entry
             reusable = old["candidates"] if old and old["reader"] == reader else {}
             with base.collect_warnings() as listing:
@@ -412,7 +444,7 @@ class Index:
 
     # --- derived view -------------------------------------------------------
 
-    def finalise(self, providers, mounts) -> None:
+    def finalise(self, providers: Iterable[base.Provider], mounts: Collection[Mount]) -> None:
         """Derive the session list, store rows, path map and warnings from the
         cache and the mounts present now. Parses nothing."""
         providers = list(providers)
@@ -422,12 +454,13 @@ class Index:
         sessions: list[Session] = []
         rows = []
         warnings: set[str] = set()
-        found = []  # (row, store, conversation), in order
+        # (row, store, conversation), in order
+        found: list[tuple[dict[str, Any], Store, dict[str, Any]]] = []
         best: dict[tuple[str, str, str], tuple[str, int]] = {}  # (origin, provider, id)
         for store in sorted(self.stores, key=_store_key):
             entry = self.parsed.get(_store_key(store)) or {}
             cached = entry.get("candidates", {})
-            row = {
+            row: dict[str, Any] = {
                 "provider": store.provider,
                 "root": store.root,
                 "origin": store.origin,
@@ -499,7 +532,9 @@ class Index:
         return f"{place} · imported" if session.imported_as else place
 
 
-def fresh(providers, mounts, found: discover.Discovery) -> Index:
+def fresh(
+    providers: Collection[base.Provider], mounts: Collection[Mount], found: discover.Discovery
+) -> Index:
     """An index built from ``found`` with no cache behind it: every candidate
     is parsed. Nothing is saved. ``verify`` compares it with the real one."""
     index = Index()

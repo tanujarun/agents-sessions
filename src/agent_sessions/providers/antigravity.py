@@ -8,8 +8,9 @@ import os
 import re
 import sqlite3
 import urllib.parse
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from ..fsutil import home, listdir_ro
 from ..model import Candidate, Session, Store
@@ -26,6 +27,11 @@ from .base import (
     unreadable,
     warn,
 )
+
+if TYPE_CHECKING:
+    from .. import importer
+    from ..fsutil import StrPath
+    from ..pathmap import PathMap
 
 IDE_NOTE = "Antigravity IDE conversation: list only"
 # The verdict of FORMATS section 6, shown to the user as it is.
@@ -56,7 +62,7 @@ _PBTXT_SIMPLE = {
 # --- protobuf without a schema ----------------------------------------------
 
 
-def _varint(data: bytes, pos: int):
+def _varint(data: bytes, pos: int) -> tuple[int | None, int]:
     """``(value, next position)``; value is None when the bytes run out or
     the varint is longer than ten bytes."""
     value = shift = 0
@@ -70,7 +76,7 @@ def _varint(data: bytes, pos: int):
     return None, pos
 
 
-def pb_fields(data) -> list[tuple[int, int, object]]:
+def pb_fields(data: object) -> list[tuple[int, int, object]]:
     """Decode one protobuf message into ``(field number, wire type, value)``
     triples, in order.
 
@@ -84,6 +90,7 @@ def pb_fields(data) -> list[tuple[int, int, object]]:
         return []
     data = bytes(data)
     out: list[tuple[int, int, object]] = []
+    value: object
     pos, size = 0, len(data)
     while pos < size:
         key, pos = _varint(data, pos)
@@ -114,7 +121,7 @@ def pb_fields(data) -> list[tuple[int, int, object]]:
     return out
 
 
-def pb_all(data, *path) -> list:
+def pb_all(data: object, *path: int) -> list[object]:
     """Every value at a nested field path, e.g. ``pb_all(blob, 20, 7, 2)``;
     repeated fields are followed at each level."""
     values = [data]
@@ -128,22 +135,25 @@ def pb_all(data, *path) -> list:
     return values
 
 
-def pb_first(data, *path):
+def pb_first(data: object, *path: int) -> object:
     """The first value at a nested field path, or None."""
     values = pb_all(data, *path)
     return values[0] if values else None
 
 
-def pb_text(value) -> str | None:
+def pb_text(value: object) -> str | None:
     """A length-delimited value as text; None for anything else."""
     return value.decode("utf-8", "replace") if isinstance(value, bytes) else None
 
 
-def pb_timestamp(value) -> tuple[int, int] | None:
+def pb_timestamp(value: object) -> tuple[int, int] | None:
     """A ``{1: seconds, 2: nanos}`` message as ``(seconds, nanos)``; None
     when it is missing, cut off or not after the epoch (Go's zero time)."""
-    seconds = nanos = None
+    seconds: int | None = None
+    nanos: int | None = None
     for number, wire, found in pb_fields(value):
+        if not isinstance(found, int):
+            continue  # only wire type 0 gives an int
         if wire == 0 and number == 1 and seconds is None:
             seconds = found - (1 << 64) if found >= 1 << 63 else found
         elif wire == 0 and number == 2 and nanos is None:
@@ -156,7 +166,7 @@ def pb_timestamp(value) -> tuple[int, int] | None:
 # --- small values -----------------------------------------------------------
 
 
-def uri_to_path(uri) -> str | None:
+def uri_to_path(uri: object) -> str | None:
     """A ``file://`` URI as the path it names; a Windows drive keeps its
     form (``file:///F:/My%20Site`` gives ``F:/My Site``). Text without a
     scheme is taken as a path already; any other scheme gives None."""
@@ -176,7 +186,7 @@ def uri_to_path(uri) -> str | None:
     return path or None
 
 
-def _read_small(path) -> bytes | None:
+def _read_small(path: StrPath) -> bytes | None:
     try:
         with open_ro(path) as fh:
             return fh.read(_SMALL_FILE)
@@ -184,14 +194,14 @@ def _read_small(path) -> bytes | None:
         return None
 
 
-def _pbtxt_title(path) -> str:
+def _pbtxt_title(path: StrPath) -> str:
     """The ``title:"…"`` value of an annotations text proto, or ''."""
     raw = _read_small(path)
     found = _PBTXT_TITLE.search(raw) if raw else None
     if not found:
         return ""
 
-    def unescape(match):
+    def unescape(match: re.Match[bytes]) -> bytes:
         code = match.group(1)
         if len(code) > 1 and code[:1] == b"x":
             return bytes([int(code[1:], 16)])
@@ -202,7 +212,7 @@ def _pbtxt_title(path) -> str:
     return _PBTXT_ESCAPE.sub(unescape, found.group(1)).decode("utf-8", "replace")
 
 
-def _user_request(content) -> str:
+def _user_request(content: object) -> str:
     """What the user typed in a USER_INPUT ``content``: the inside of
     ``<USER_REQUEST>``, which is followed by injected metadata blocks."""
     if not isinstance(content, str):
@@ -211,31 +221,32 @@ def _user_request(content) -> str:
     return (wrapped.group(1) if wrapped else content).strip()
 
 
-def _mtime(path) -> str | None:
+def _mtime(path: StrPath) -> str | None:
     try:
         return parse_ts(os.stat(path).st_mtime)
     except OSError:
         return None
 
 
-def _text(value) -> str:
+def _text(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _count(value) -> int:
+def _count(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-def _connect(path) -> sqlite3.Connection:
+def _connect(path: StrPath) -> sqlite3.Connection:
     con = open_sqlite_ro(path)
     con.text_factory = lambda raw: raw.decode("utf-8", "replace")
     return con
 
 
-def _optional(con, sql):
+def _optional(con: sqlite3.Connection, sql: str) -> tuple[Any, ...] | None:
     """First row of a query on a table that may not exist, or None."""
     try:
-        return con.execute(sql).fetchone()
+        row: tuple[Any, ...] | None = con.execute(sql).fetchone()
+        return row
     except sqlite3.Error:
         return None
 
@@ -247,9 +258,9 @@ class Antigravity(Provider):
     binary = "agy"
     app_id = "org.omarchy.agy"
     resumable = True
-    dir_names = {"antigravity-cli", "antigravity-ide"}
+    dir_names: ClassVar[set[str]] = {"antigravity-cli", "antigravity-ide"}
 
-    def native_store(self) -> Path | None:
+    def native_store(self) -> Path:
         return home() / ".gemini" / "antigravity-cli"
 
     def is_store(self, path: Path) -> bool:
@@ -422,13 +433,13 @@ class Antigravity(Provider):
                 row = cursor.fetchone()
                 if row is None:
                     return {}
-                return dict(zip((column[0] for column in cursor.description), row))
+                return dict(zip((column[0] for column in cursor.description), row, strict=False))
         except sqlite3.Error as exc:
             warn(f"conversation summaries not readable: {exc}", path)
             return {}
 
     @staticmethod
-    def _workspace(value) -> str | None:
+    def _workspace(value: object) -> str | None:
         """cwd from ``workspace_uris``: a JSON list of file URIs, or ''."""
         if not isinstance(value, str) or not value.strip():
             return None
@@ -526,5 +537,5 @@ class Antigravity(Provider):
                     if name:
                         yield Turn("tool", name, ts)
 
-    def import_plan(self, s: Session, pathmap):
+    def import_plan(self, s: Session, pathmap: PathMap) -> importer.ImportPlan:
         raise NotSupported(IMPORT_UNSAFE)

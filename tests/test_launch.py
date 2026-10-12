@@ -13,7 +13,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fixture_world import (  # noqa: E402
+from fixture_world import (
     AGY_NO_CWD,
     AGY_WIN,
     CLAUDE_NATIVE,
@@ -23,18 +23,18 @@ from fixture_world import (  # noqa: E402
     GROK_NATIVE,
     World,
 )
-from support import FIXTURES  # noqa: E402
+from support import FIXTURES
 
-from agent_sessions import api, launch  # noqa: E402
-from agent_sessions.launch import LaunchPlan  # noqa: E402
-from agent_sessions.providers.gemini import Gemini  # noqa: E402
+from agent_sessions import api, launch
+from agent_sessions.launch import LaunchPlan
+from agent_sessions.providers.gemini import Gemini
 
 TERMINAL = "omarchy-launch-tui"
 
 
 class LaunchCase(unittest.TestCase):
-    foreign = ("claude",)
-    native = ("claude", "codex", "grok")
+    foreign: tuple[str, ...] = ("claude",)
+    native: tuple[str, ...] = ("claude", "codex", "grok")
 
     def setUp(self):
         self.w = World(self, self.foreign, self.native)

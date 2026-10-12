@@ -23,31 +23,43 @@ import signal
 import threading
 import time
 from bisect import bisect_right
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime, tzinfo
 from functools import partial
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from rich.segment import Segment
 from textual import events, on
 from textual.app import App, ComposeResult
-from textual.binding import Binding
+from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical
-from textual.geometry import Size
+from textual.geometry import Region, Size
 from textual.message import Message
 from textual.screen import ModalScreen, Screen
 from textual.scroll_view import ScrollView
 from textual.strip import Strip
 from textual.widgets import Input, Static
-from textual.worker import get_current_worker
+from textual.worker import Worker, get_current_worker
 
 from . import view
 from .engine import Engine
+
+if TYPE_CHECKING:
+    from textual.timer import Timer
+
+    from ..index import Index
+    from ..model import Session
+
+Clock = Callable[[], datetime]
 
 THEME = "ansi-dark"
 """Textual's ANSI theme: every colour is one of the terminal's own sixteen
 (or its default foreground/background), so the app follows the terminal."""
 
-STARTUP_SCAN_DEEP = None  # the engine decides: a full walk when the drives changed or the last one is over a day old
+# The engine decides: a full walk when the drives changed or the last one is
+# over a day old.
+STARTUP_SCAN_DEEP = None
 PROGRESS_INTERVAL = 0.1  # seconds between progress updates sent to the UI
 VERDICT_DELAY = 0.15  # seconds a row must stay selected before can_import runs
 CLOCK_INTERVAL = 30.0  # seconds between refreshes of the ages on screen
@@ -56,14 +68,14 @@ PAGER_SLICE = 0.01  # seconds of wrapping before the pager yields to input
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class UiCall(Message):
     """A callback a worker thread wants run on the UI thread. Posting a
     message is thread-safe and never blocks, also while the app is closing."""
 
-    def __init__(self, callback) -> None:
+    def __init__(self, callback: Callable[[], object]) -> None:
         super().__init__()
         self.callback = callback
 
@@ -71,7 +83,11 @@ class UiCall(Message):
 class _UiCalls:
     """Mixin for a screen: ``_ui(fn, *args)`` from any thread."""
 
-    def _ui(self, function, *args) -> None:
+    if TYPE_CHECKING:
+        # What the screen this is mixed into provides.
+        def post_message(self, message: Message) -> bool: ...
+
+    def _ui(self, function: Callable[..., object], *args: object) -> None:
         self.post_message(UiCall(partial(function, *args)))
 
     async def on_ui_call(self, message: UiCall) -> None:
@@ -88,7 +104,7 @@ class SessionList(ScrollView, can_focus=True):
     """The list of sessions, drawn line by line: only the visible rows are
     formatted, so thousands of rows cost the same as twenty."""
 
-    COMPONENT_CLASSES = {
+    COMPONENT_CLASSES: ClassVar[set[str]] = {
         "session-list--row",  # a native row
         "session-list--foreign",  # a row from another drive
         "session-list--cursor",  # the selected row (added to one of the above)
@@ -118,7 +134,7 @@ class SessionList(ScrollView, can_focus=True):
             super().__init__()
             self.header = header
 
-    def __init__(self, clock=_utc_now, **kwargs) -> None:
+    def __init__(self, clock: Clock = _utc_now, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.clock = clock
         self.rows: list[view.Row] = []
@@ -130,7 +146,7 @@ class SessionList(ScrollView, can_focus=True):
         self.show_project = True
         self.empty_text = ""
         self._pad = (0, 0)
-        self._header = None
+        self._header: str | None = None
         self._fit_width = -1
 
     @property
@@ -143,14 +159,14 @@ class SessionList(ScrollView, can_focus=True):
 
     def set_rows(
         self,
-        rows,
-        key=None,
+        rows: list[view.Row],
+        key: str | None = None,
         *,
-        show_provider=False,
-        provider_labels=None,
-        widths=None,
-        empty_text="",
-        from_top=False,
+        show_provider: bool = False,
+        provider_labels: dict[str, str] | None = None,
+        widths: dict[str, int] | None = None,
+        empty_text: str = "",
+        from_top: bool = False,
     ) -> None:
         """Replace the rows, keeping the selection on ``key`` when it is
         still listed and near its old place when it is not (``from_top``:
@@ -212,7 +228,7 @@ class SessionList(ScrollView, can_focus=True):
         self.fit()
         self._show_cursor()
 
-    def render_lines(self, crop):
+    def render_lines(self, crop: Region) -> list[Strip]:
         # The content gets a column narrower when the scrollbar appears, and
         # no Resize says so: check before drawing.
         if self.size.width != self._fit_width:
@@ -280,15 +296,15 @@ class TabLabel(Static):
 class Snapshot:
     """Everything the main screen shows, read from the engine in one go."""
 
-    index: object = None
-    sessions: dict = field(default_factory=dict)  # key -> Session
-    rows: list = field(default_factory=list)  # newest first, as the engine lists
-    providers: list = field(default_factory=list)  # [(name, label)]
+    index: Index | None = None
+    sessions: dict[str, Session] = field(default_factory=dict)  # key -> Session
+    rows: list[view.Row] = field(default_factory=list)  # newest first, as the engine lists
+    providers: list[tuple[str, str]] = field(default_factory=list)  # [(name, label)]
     drives: int = 0
     last_scan: str | None = None
 
 
-def build_snapshot(engine) -> Snapshot:
+def build_snapshot(engine: Engine) -> Snapshot:
     """Read the index through the engine. Called in a worker thread."""
     index = engine.load_index()
     sessions = list(engine.list_sessions(index=index))
@@ -310,7 +326,7 @@ def build_snapshot(engine) -> Snapshot:
 class MainScreen(_UiCalls, Screen):
     """Status line, provider tabs, the list, the detail pane, key hints."""
 
-    def __init__(self, engine, clock=_utc_now, tz=None) -> None:
+    def __init__(self, engine: Engine, clock: Clock = _utc_now, tz: tzinfo | None = None) -> None:
         super().__init__(id="main")
         self.engine = engine
         self.clock = clock
@@ -332,9 +348,9 @@ class MainScreen(_UiCalls, Screen):
         self._scan: dict | None = None  # {"deep": bool, "cancel": Event}
         self._importing = False
         self._opening = False
-        self._verdicts: dict[str, tuple] = {}
+        self._verdicts: dict[str, view.Verdict] = {}
         self._verdict_pending: set[str] = set()
-        self._verdict_timer = None
+        self._verdict_timer: Timer | None = None
 
     # --- widgets ---------------------------------------------------------
 
@@ -387,7 +403,9 @@ class MainScreen(_UiCalls, Screen):
         if self._scan is not None:
             self._scan["cancel"].set()
 
-    def _work(self, function, *args, group: str = "default"):
+    def _work(
+        self, function: Callable[..., object], *args: object, group: str = "default"
+    ) -> Worker[object]:
         return self.run_worker(
             partial(function, *args), thread=True, group=group, exit_on_error=False
         )
@@ -476,7 +494,7 @@ class MainScreen(_UiCalls, Screen):
         extra = labels[0].styles.gutter.width + labels[0].styles.margin.width
         room = self.size.width - container.styles.gutter.width - container.styles.margin.width
         texts = view.fit_tab_labels(self.tabs, self.tab_index, room, extra)
-        for index, (label, text) in enumerate(zip(labels, texts)):
+        for index, (label, text) in enumerate(zip(labels, texts, strict=False)):
             label.update(text)
             label.set_class(index == self.tab_index, "-active")
 
@@ -547,7 +565,7 @@ class MainScreen(_UiCalls, Screen):
     def _listed_under(row: view.Row, provider: str) -> bool:
         return provider == view.ALL or row.provider == provider
 
-    def current_session(self):
+    def current_session(self) -> Session | None:
         row = self.session_list.current
         return self.snapshot.sessions.get(row.key) if row else None
 
@@ -607,7 +625,8 @@ class MainScreen(_UiCalls, Screen):
         self._verdict_pending.add(key)
         self._work(self._verdict_thread, key, session, self.snapshot.index, group="verdict")
 
-    def _verdict_thread(self, key, session, index) -> None:
+    def _verdict_thread(self, key: str, session: Session, index: Index | None) -> None:
+        verdict: view.Verdict
         try:
             possible, reason = self.engine.can_import(session, index=index)
             verdict = (bool(possible), reason or "")
@@ -615,7 +634,7 @@ class MainScreen(_UiCalls, Screen):
             verdict = (None, view.error_text(exc))
         self._ui(self._verdict_done, key, index, verdict)
 
-    def _verdict_done(self, key, index, verdict) -> None:
+    def _verdict_done(self, key: str, index: Index | None, verdict: view.Verdict) -> None:
         self._verdict_pending.discard(key)
         if index is not self.snapshot.index:
             self._schedule_verdict()  # the index moved on; ask again if still selected
@@ -641,42 +660,42 @@ class MainScreen(_UiCalls, Screen):
         self.clear_message()
         getattr(self, f"do_{action}")(event)
 
-    def do_cursor_up(self, event=None) -> None:
+    def do_cursor_up(self, event: events.Key | None = None) -> None:
         self.session_list.move("up")
 
-    def do_cursor_down(self, event=None) -> None:
+    def do_cursor_down(self, event: events.Key | None = None) -> None:
         self.session_list.move("down")
 
-    def do_cursor_pageup(self, event=None) -> None:
+    def do_cursor_pageup(self, event: events.Key | None = None) -> None:
         self.session_list.move("pageup")
 
-    def do_cursor_pagedown(self, event=None) -> None:
+    def do_cursor_pagedown(self, event: events.Key | None = None) -> None:
         self.session_list.move("pagedown")
 
-    def do_cursor_home(self, event=None) -> None:
+    def do_cursor_home(self, event: events.Key | None = None) -> None:
         self.session_list.move("home")
 
-    def do_cursor_end(self, event=None) -> None:
+    def do_cursor_end(self, event: events.Key | None = None) -> None:
         self.session_list.move("end")
 
-    def do_tab_prev(self, event=None) -> None:
+    def do_tab_prev(self, event: events.Key | None = None) -> None:
         self.select_tab(view.cycle_tab(self.tab_index, -1, len(self.tabs)))
 
-    def do_tab_next(self, event=None) -> None:
+    def do_tab_next(self, event: events.Key | None = None) -> None:
         self.select_tab(view.cycle_tab(self.tab_index, 1, len(self.tabs)))
 
-    def do_tab_digit(self, event) -> None:
+    def do_tab_digit(self, event: events.Key) -> None:
         index = view.tab_for_digit(self.tabs, event.character or "")
         if index is not None:
             self.select_tab(index)
 
-    def do_quit(self, event=None) -> None:
+    def do_quit(self, event: events.Key | None = None) -> None:
         self.app.exit(return_code=0)
 
-    def do_help(self, event=None) -> None:
+    def do_help(self, event: events.Key | None = None) -> None:
         self.app.push_screen(HelpScreen())
 
-    def do_escape(self, event=None) -> None:
+    def do_escape(self, event: events.Key | None = None) -> None:
         """Esc: stop a full rescan, else clear the filter, else stop a quick scan."""
         if self._scan is not None and self._scan["deep"]:
             self._cancel_scan()
@@ -687,15 +706,15 @@ class MainScreen(_UiCalls, Screen):
 
     # --- filter ----------------------------------------------------------
 
-    def do_filter(self, event=None) -> None:
+    def do_filter(self, event: events.Key | None = None) -> None:
         self.query_one("#filterbar").display = True
         self.filter_input.focus()
 
-    def do_filter_accept(self, event=None) -> None:
+    def do_filter_accept(self, event: events.Key | None = None) -> None:
         self.query_one("#filterbar").display = bool(self.needle)
         self.session_list.focus()
 
-    def do_filter_clear(self, event=None) -> None:
+    def do_filter_clear(self, event: events.Key | None = None) -> None:
         self.filter_input.value = ""
         self._set_needle("")
         self.query_one("#filterbar").display = False
@@ -721,7 +740,7 @@ class MainScreen(_UiCalls, Screen):
 
     # --- prompts (the line over the key hints) ----------------------------
 
-    def _open_prompt(self, mode: str, session, stay: bool = False) -> None:
+    def _open_prompt(self, mode: str, session: Session, stay: bool = False) -> None:
         row = self.session_list.current
         self.mode = mode
         self._prompt_key = session.key
@@ -754,31 +773,31 @@ class MainScreen(_UiCalls, Screen):
         self._close_prompt()
         return key, stay
 
-    def do_prompt_cancel(self, event=None) -> None:
+    def do_prompt_cancel(self, event: events.Key | None = None) -> None:
         self._close_prompt()
 
-    def do_prompt_import_resume(self, event=None) -> None:
+    def do_prompt_import_resume(self, event: events.Key | None = None) -> None:
         key, stay = self._take_prompt()
         self._start_import(key, then_open=True, stay=stay)
 
-    def do_prompt_import_only(self, event=None) -> None:
+    def do_prompt_import_only(self, event: events.Key | None = None) -> None:
         key, _stay = self._take_prompt()
         self._start_import(key, then_open=False, stay=True)
 
-    def do_prompt_view(self, event=None) -> None:
+    def do_prompt_view(self, event: events.Key | None = None) -> None:
         key, _stay = self._take_prompt()
         self._view(key)
 
-    def do_confirm_yes(self, event=None) -> None:
+    def do_confirm_yes(self, event: events.Key | None = None) -> None:
         key, _stay = self._take_prompt()
         self._start_import(key, then_open=False, stay=True)
 
-    def do_confirm_no(self, event=None) -> None:
+    def do_confirm_no(self, event: events.Key | None = None) -> None:
         self._close_prompt()
 
     # --- resume ----------------------------------------------------------
 
-    def do_resume(self, event=None, stay: bool = False) -> None:
+    def do_resume(self, event: events.Key | None = None, stay: bool = False) -> None:
         """Enter: a native session resumes; a foreign one resumes its native
         copy when it has one, else asks what to do."""
         session = self.current_session()
@@ -791,7 +810,7 @@ class MainScreen(_UiCalls, Screen):
         else:
             self._open_prompt("foreign", session, stay)
 
-    def do_resume_stay(self, event=None) -> None:
+    def do_resume_stay(self, event: events.Key | None = None) -> None:
         self.do_resume(stay=True)
 
     def _start_open(self, key: str, title: str, stay: bool) -> None:
@@ -807,7 +826,7 @@ class MainScreen(_UiCalls, Screen):
             group="open",
         )
 
-    def _open_thread(self, key, title, stay, index) -> None:
+    def _open_thread(self, key: str, title: str, stay: bool, index: Index | None) -> None:
         try:
             plan = self.engine.open_session(key, index=index)
         except Exception as exc:
@@ -819,7 +838,7 @@ class MainScreen(_UiCalls, Screen):
         self._opening = False
         self.set_message(reason, error=True)
 
-    def _opened(self, title: str, note, stay: bool) -> None:
+    def _opened(self, title: str, note: str | None, stay: bool) -> None:
         self._opening = False
         if not stay:
             self.app.exit(result=note or None, return_code=0)
@@ -828,7 +847,7 @@ class MainScreen(_UiCalls, Screen):
 
     # --- import ----------------------------------------------------------
 
-    def do_import(self, event=None) -> None:
+    def do_import(self, event: events.Key | None = None) -> None:
         """``i``: import the selected foreign session, after a y/n."""
         session = self.current_session()
         if session is None:
@@ -845,9 +864,9 @@ class MainScreen(_UiCalls, Screen):
             return
         self._open_prompt("confirm", session)
 
-    def _start_import(self, key, then_open: bool, stay: bool) -> None:
-        session = self.snapshot.sessions.get(key)
-        if session is None:
+    def _start_import(self, key: str | None, then_open: bool, stay: bool) -> None:
+        session = self.snapshot.sessions.get(key) if key is not None else None
+        if key is None or session is None:
             return
         if self._importing:
             self.set_message("an import is already running")
@@ -867,10 +886,12 @@ class MainScreen(_UiCalls, Screen):
             group="import",
         )
 
-    def _import_thread(self, key, title, then_open, stay, index) -> None:
+    def _import_thread(
+        self, key: str, title: str, then_open: bool, stay: bool, index: Index | None
+    ) -> None:
         last = [0.0]
 
-        def progress(done, total):
+        def progress(done: int, total: int) -> None:
             now = time.monotonic()
             if now - last[0] >= PROGRESS_INTERVAL:
                 last[0] = now
@@ -882,7 +903,10 @@ class MainScreen(_UiCalls, Screen):
             self._ui(self._import_done, title, None, None, False, None, view.error_text(exc), stay)
             return
         new_key = getattr(copy, "key", None)
-        snapshot, opened, note, error = None, False, None, None
+        snapshot: Snapshot | None = None
+        opened = False
+        note: str | None = None
+        error: str | None = None
         try:
             # The engine has indexed the copy; read the index again to list it.
             snapshot = build_snapshot(self.engine)
@@ -896,7 +920,16 @@ class MainScreen(_UiCalls, Screen):
                 error = view.error_text(exc)
         self._ui(self._import_done, title, new_key or key, snapshot, opened, note, error, stay)
 
-    async def _import_done(self, title, new_key, snapshot, opened, note, error, stay) -> None:
+    async def _import_done(
+        self,
+        title: str,
+        new_key: str | None,
+        snapshot: Snapshot | None,
+        opened: bool,
+        note: str | None,
+        error: str | None,
+        stay: bool,
+    ) -> None:
         """``new_key`` is None when the import itself failed (``error`` says
         why); otherwise the copy exists and ``error`` is what went wrong after
         (reading the index again, or the launch)."""
@@ -905,7 +938,7 @@ class MainScreen(_UiCalls, Screen):
         if snapshot is not None:
             await self._apply_snapshot(snapshot, select_key=new_key)
         if new_key is None:
-            self.set_message(error, error=True)
+            self.set_message(error or "", error=True)
         elif opened and not stay:
             self.app.exit(result=note or None, return_code=0)
         elif error:
@@ -916,14 +949,14 @@ class MainScreen(_UiCalls, Screen):
 
     # --- view ------------------------------------------------------------
 
-    def do_view(self, event=None) -> None:
+    def do_view(self, event: events.Key | None = None) -> None:
         session = self.current_session()
         if session is not None:
             self._view(session.key)
 
-    def _view(self, key) -> None:
-        session = self.snapshot.sessions.get(key)
-        if session is None:
+    def _view(self, key: str | None) -> None:
+        session = self.snapshot.sessions.get(key) if key is not None else None
+        if key is None or session is None:
             return
         self.app.push_screen(
             TranscriptScreen(
@@ -941,7 +974,7 @@ class MainScreen(_UiCalls, Screen):
             return
         self._ui(self._loaded, snapshot, None)
 
-    async def _loaded(self, snapshot, error) -> None:
+    async def _loaded(self, snapshot: Snapshot | None, error: str | None) -> None:
         """The cached index is on screen; now bring it up to date."""
         self._set_activity("")
         if snapshot is not None:
@@ -949,13 +982,13 @@ class MainScreen(_UiCalls, Screen):
         else:
             self.loaded = True
             self._refresh_rows()
-            self.set_message(error, error=True)
+            self.set_message(error or "", error=True)
         self.start_scan(STARTUP_SCAN_DEEP, announce=False)
 
-    def do_rescan(self, event=None) -> None:
+    def do_rescan(self, event: events.Key | None = None) -> None:
         self.start_scan(False)
 
-    def do_full_rescan(self, event=None) -> None:
+    def do_full_rescan(self, event: events.Key | None = None) -> None:
         self.start_scan(True)
 
     def start_scan(self, deep: bool | None, announce: bool = True) -> None:
@@ -975,10 +1008,10 @@ class MainScreen(_UiCalls, Screen):
             self._scan["cancel"].set()
             self.set_message(f"stopping the scan{view.ELLIPSIS}")
 
-    def _scan_thread(self, deep, cancel, announce) -> None:
+    def _scan_thread(self, deep: bool | None, cancel: threading.Event, announce: bool) -> None:
         last = [0.0]
 
-        def progress(label, dirs):
+        def progress(label: str, dirs: int) -> None:
             now = time.monotonic()
             if now - last[0] >= PROGRESS_INTERVAL:
                 last[0] = now
@@ -992,7 +1025,9 @@ class MainScreen(_UiCalls, Screen):
             return
         self._ui(self._scan_done, summary, snapshot, None, announce)
 
-    async def _scan_done(self, summary, snapshot, error, announce) -> None:
+    async def _scan_done(
+        self, summary: dict | None, snapshot: Snapshot | None, error: str | None, announce: bool
+    ) -> None:
         self._scan = None
         self._set_activity("")
         if snapshot is not None:
@@ -1058,7 +1093,7 @@ class TranscriptView(ScrollView, can_focus=True):
     wrapped a slice at a time, so neither a long session nor a resize holds
     the keyboard up."""
 
-    COMPONENT_CLASSES = {
+    COMPONENT_CLASSES: ClassVar[set[str]] = {
         "transcript--role-user",
         "transcript--role-assistant",
         "transcript--role-tool",
@@ -1067,7 +1102,7 @@ class TranscriptView(ScrollView, can_focus=True):
         "transcript--blank",
     }
 
-    def __init__(self, tz=None, **kwargs) -> None:
+    def __init__(self, tz: tzinfo | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.tz = tz
         self.turns: list[tuple] = []
@@ -1078,7 +1113,7 @@ class TranscriptView(ScrollView, can_focus=True):
         self._wrapping = False
         self._rewrap_due = False
 
-    def add_turns(self, turns) -> None:
+    def add_turns(self, turns: Iterable[tuple]) -> None:
         self.turns.extend(turns)
         if not self._wrapping:
             self._wrap_some()
@@ -1086,7 +1121,7 @@ class TranscriptView(ScrollView, can_focus=True):
     def on_resize(self, event: events.Resize) -> None:
         self._rewrap()
 
-    def render_lines(self, crop):
+    def render_lines(self, crop: Region) -> list[Strip]:
         # A scrollbar that appears narrows the content without a Resize.
         if self.size.width != self._width and not self._rewrap_due:
             self._rewrap_due = True
@@ -1144,7 +1179,13 @@ class TranscriptScreen(_UiCalls, Screen):
     """The built-in pager: one session's transcript, read in a worker."""
 
     def __init__(
-        self, engine, key: str, title: str, index=None, tz=None, max_turns: int | None = None
+        self,
+        engine: Engine,
+        key: str,
+        title: str,
+        index: Index | None = None,
+        tz: tzinfo | None = None,
+        max_turns: int | None = None,
     ) -> None:
         super().__init__(id="pager")
         self.engine = engine
@@ -1185,7 +1226,8 @@ class TranscriptScreen(_UiCalls, Screen):
         worker = get_current_worker()
         batch: list[tuple] = []
         count, last = 0, time.monotonic()
-        capped, error = False, None
+        capped = False
+        error: str | None = None
         try:
             for turn in self.engine.transcript(self.key, index=self.index):
                 if self._gone or worker.is_cancelled:
@@ -1204,7 +1246,7 @@ class TranscriptScreen(_UiCalls, Screen):
         self._ui(self._append, batch)
         self._ui(self._finished, capped, error)
 
-    def _append(self, batch) -> None:
+    def _append(self, batch: list[tuple]) -> None:
         if batch:
             self.turn_count += len(batch)
             self.body.add_turns(batch)
@@ -1247,9 +1289,17 @@ class SessionsApp(App):
     CSS_PATH = "app.tcss"
     TITLE = view.APP_TITLE
     ENABLE_COMMAND_PALETTE = False
-    BINDINGS = [Binding("ctrl+c", "quit", "Quit", show=False, priority=True)]
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("ctrl+c", "quit", "Quit", show=False, priority=True)
+    ]
 
-    def __init__(self, engine=None, clock=_utc_now, tz=None, **kwargs) -> None:
+    def __init__(
+        self,
+        engine: Engine | None = None,
+        clock: Clock = _utc_now,
+        tz: tzinfo | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.engine = engine if engine is not None else Engine()
         self.clock = clock

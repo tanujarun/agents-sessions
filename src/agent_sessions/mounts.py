@@ -14,6 +14,12 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from .fsutil import StrPath
 
 ENV = "AGENT_SESSIONS_MOUNTS"
 MOUNTINFO = "/proc/self/mountinfo"
@@ -168,13 +174,13 @@ def mount_points() -> set[str]:
     return set(_entries(_read_mountinfo()))
 
 
-def find_mount(path, mounts) -> Mount | None:
+def find_mount(path: StrPath, mounts: Iterable[Mount]) -> Mount | None:
     """The mount that holds ``path``: the longest mountpoint that is a prefix."""
     text = os.fspath(path)
     best = None
     for mount in mounts:
         base = mount.path.rstrip("/")
-        if text == mount.path or text.startswith(base + "/"):
+        if text == mount.path or text.startswith(base + "/"):  # noqa: SIM102  (two questions)
             if best is None or len(mount.path) > len(best.path):
                 best = mount
     return best

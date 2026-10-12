@@ -2,7 +2,6 @@
 
 import contextlib
 import io
-import re
 import sys
 import unittest
 from pathlib import Path

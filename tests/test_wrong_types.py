@@ -21,15 +21,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from support import FIXTURES  # noqa: E402
+from support import FIXTURES
 
-from agent_sessions.model import Store  # noqa: E402
-from agent_sessions.providers.antigravity import Antigravity  # noqa: E402
-from agent_sessions.providers.base import collect_warnings  # noqa: E402
-from agent_sessions.providers.claude import Claude  # noqa: E402
-from agent_sessions.providers.codex import Codex  # noqa: E402
-from agent_sessions.providers.gemini import Gemini  # noqa: E402
-from agent_sessions.providers.grok import Grok  # noqa: E402
+from agent_sessions.model import Store
+from agent_sessions.providers.antigravity import Antigravity
+from agent_sessions.providers.base import Provider, collect_warnings
+from agent_sessions.providers.claude import Claude
+from agent_sessions.providers.codex import Codex
+from agent_sessions.providers.gemini import Gemini
+from agent_sessions.providers.grok import Grok
 
 # Values of a type no reader expects for a field that holds text or a
 # number, plus the nested ones. BAD_TIME stands in for the numbers where a
@@ -113,7 +113,7 @@ class Edit:
 
 
 class WrongTypesCase(unittest.TestCase):
-    provider = None
+    provider: Provider = None  # type: ignore[assignment]  # every subclass sets one
     stores: tuple = ()  # fixture store roots
     jsonl = ""  # glob, below the store, of the JSONL files read
     first_line = 0  # lines of such a file that must stay first
@@ -717,8 +717,9 @@ class AntigravityWrongTypesTest(WrongTypesCase):
                     row = [f"junk-{number}" if c == "conversation_id" else value for c in columns]
                     try:
                         con.execute(
-                            "INSERT INTO conversation_summaries VALUES (%s)"
-                            % ", ".join("?" * len(columns)),
+                            "INSERT INTO conversation_summaries VALUES ({})".format(
+                                ", ".join("?" * len(columns))
+                            ),
                             row,
                         )
                     except sqlite3.Error:

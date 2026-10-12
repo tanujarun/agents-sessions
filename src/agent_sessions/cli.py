@@ -8,11 +8,18 @@ import os
 import re
 import shlex
 import sys
-from datetime import datetime, timezone
+from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from . import __version__, api
 from .mounts import MountsError
 from .providers import all_providers
+
+if TYPE_CHECKING:
+    from .index import Index
+    from .launch import LaunchPlan
+    from .model import Session
 
 PROG = "agent-sessions"
 
@@ -80,18 +87,18 @@ def _out(text: str) -> None:
         sys.stdout.write(text.encode(encoding, "backslashreplace").decode(encoding) + "\n")
 
 
-def _json(value) -> None:
+def _json(value: object) -> None:
     _out(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False))
 
 
-def _table(rows, indent: str = "") -> None:
+def _table(rows: Iterable[Iterable[object]], indent: str = "") -> None:
     """Print rows of cells in aligned columns."""
-    rows = [[str(cell) for cell in row] for row in rows]
-    if not rows:
+    table = [[str(cell) for cell in row] for row in rows]
+    if not table:
         return
-    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
-    for row in rows:
-        cells = [cell.ljust(width) for cell, width in zip(row, widths)]
+    widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
+    for row in table:
+        cells = [cell.ljust(width) for cell, width in zip(row, widths, strict=False)]
         _out((indent + "  ".join(cells)).rstrip())
 
 
@@ -139,7 +146,7 @@ def _project(cwd: str | None) -> str:
     return parts[-1] if parts else "-"
 
 
-def _walk_rows(mounts, walks) -> list[list[str]]:
+def _walk_rows(mounts: list[dict], walks: dict | None) -> list[list[str]]:
     rows = []
     for mount in mounts:
         walk = walks.get(mount["path"]) if walks else None
@@ -161,11 +168,11 @@ def _walk_rows(mounts, walks) -> list[list[str]]:
 # --- commands ---------------------------------------------------------------
 
 
-def _scan(args) -> int:
+def _scan(args: argparse.Namespace) -> int:
     progress = None
     if sys.stderr.isatty() and not args.json:
 
-        def progress(label, dirs):
+        def progress(label: str, dirs: int) -> None:
             sys.stderr.write(f"\r\033[Kscanning {label}… {dirs:,} dirs")
             sys.stderr.flush()
 
@@ -204,7 +211,7 @@ def _scan(args) -> int:
     return 0
 
 
-def _list(args) -> int:
+def _list(args: argparse.Namespace) -> int:
     index = api.load_index()
     if index.load_error is not None:
         # No cache, or one that cannot be used: an empty listing would look
@@ -218,7 +225,7 @@ def _list(args) -> int:
         return 0
     if index.last_quick is None:
         print(f"{PROG}: no index yet; run `{PROG} scan`", file=sys.stderr)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     _table(
         [
             [
@@ -235,7 +242,7 @@ def _list(args) -> int:
     return 0
 
 
-def _status(args) -> int:
+def _status(args: argparse.Namespace) -> int:
     status = api.status()
     if args.json:
         _json(status)
@@ -350,11 +357,11 @@ def _status(args) -> int:
     return 0
 
 
-def _verify(args) -> int:
+def _verify(args: argparse.Namespace) -> int:
     progress = None
     if sys.stderr.isatty():
 
-        def progress(label, dirs):
+        def progress(label: str, dirs: int) -> None:
             sys.stderr.write(f"\r\033[Kwalking {label}… {dirs:,} dirs")
             sys.stderr.flush()
 
@@ -386,14 +393,14 @@ def _verify(args) -> int:
     return 0
 
 
-def _print_plan(plan) -> None:
+def _print_plan(plan: LaunchPlan) -> None:
     """A launch plan as a line a shell could run, and its note."""
     _out(f"cd {shlex.quote(plan.cwd)} && {shlex.join(plan.command)}")
     if plan.note:
         _out(f"note: {plan.note}")
 
 
-def _resume(ref, here: bool, dry_run: bool, index=None) -> int:
+def _resume(ref: Session | str, here: bool, dry_run: bool, index: Index | None = None) -> int:
     if here and not dry_run:
         # exec replaces this process: say what runs before it does.
         try:
@@ -407,11 +414,11 @@ def _resume(ref, here: bool, dry_run: bool, index=None) -> int:
     return 0
 
 
-def _open(args) -> int:
+def _open(args: argparse.Namespace) -> int:
     return _resume(args.key, args.here, args.dry_run)
 
 
-def _import(args) -> int:
+def _import(args: argparse.Namespace) -> int:
     index = api.load_index()
     if args.dry_run:
         plan = api.import_plan(args.key, index=index)
@@ -445,7 +452,7 @@ def _import(args) -> int:
     progress = None
     if sys.stderr.isatty():
 
-        def progress(done, total):
+        def progress(done: int, total: int) -> None:
             share = 100 * done // total if total else 100
             sys.stderr.write(f"\r\033[Kcopying… {share}% of {_size(total)}")
             sys.stderr.flush()
@@ -470,11 +477,11 @@ def _import(args) -> int:
     return 0
 
 
-def _show(args) -> int:
+def _show(args: argparse.Namespace) -> int:
     index = api.load_index()
     session = api.find_session(args.key, index=index)
     label = next((p.label for p in all_providers() if p.name == session.provider), session.provider)
-    rows = [
+    rows: list[list[object]] = [
         ["title", session.title or "-"],
         ["provider", label],
         ["where", index.where(session)],
@@ -529,7 +536,7 @@ _COMMANDS = {
 }
 
 
-def main(argv=None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command is None:

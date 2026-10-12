@@ -5,14 +5,19 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
 from .. import importer
 from ..fsutil import home, listdir_ro, open_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
 from .base import NotSupported, Provider, Turn, clean_title, iter_jsonl, parse_ts, unreadable, warn
+
+if TYPE_CHECKING:
+    from ..fsutil import StrPath
+    from ..pathmap import PathMap
 
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 # Groups: local time, thread id, segment id (or None), ".zst" (or None).
@@ -36,7 +41,7 @@ _CWD_KEYS = {
 }
 
 
-def _subdirs(path) -> list[str]:
+def _subdirs(path: StrPath) -> list[str]:
     try:
         return sorted(subdirs(path))
     except OSError as exc:
@@ -115,7 +120,9 @@ def _read(path: str, tools: bool = False) -> _Rollout:
             if payload.get("type") != "item_completed":
                 continue
             item = payload.get("item")
-            role = item.get("type") if isinstance(item, dict) else None
+            if not isinstance(item, dict):
+                continue
+            role = item.get("type")
             role = _ROLES.get(role) if isinstance(role, str) else None
             if role == "user":
                 rollout.turns.append((ordinal, Turn(role, _item_text(item, " "), moment)))
@@ -212,13 +219,13 @@ class _CwdRewrite(importer.Rewrite):
 
     label = "working directories in session_meta and turn_context records"
 
-    def __init__(self, pathmap, mount):
+    def __init__(self, pathmap: PathMap, mount: str) -> None:
         super().__init__()
         self._pathmap = pathmap
         self._mount = mount
         self._seen: dict[tuple[str, str, str, str], int] = {}
 
-    def _local(self, value):
+    def _local(self, value: Any) -> Any:  # a JSON value: itself, or the mapped path
         if not isinstance(value, str) or not value:
             return value
         local, exists = self._pathmap.to_local(value, self._mount)
@@ -247,7 +254,7 @@ class _CwdRewrite(importer.Rewrite):
                     changed.append((kind, f"payload.{key}", value, mapped))
             elif isinstance(value, list):
                 mapped = [self._local(item) for item in value]
-                for old, new in zip(value, mapped):
+                for old, new in zip(value, mapped, strict=False):
                     if old != new:
                         changed.append((kind, f"payload.{key}[]", old, new))
                 payload[key] = mapped
@@ -263,7 +270,7 @@ class _CwdRewrite(importer.Rewrite):
             self._seen[change] = self._seen.get(change, 0) + 1
         return out.encode("utf-8") + raw[len(body) :]
 
-    def apply(self, reader) -> Iterator[bytes]:
+    def apply(self, reader: BinaryIO) -> Iterator[bytes]:
         self._seen = {}
         self.changes = []
         for raw in reader:
@@ -282,7 +289,7 @@ def _is_subagent(meta: dict) -> bool:
     return "agent_nickname" in meta or "agent_role" in meta
 
 
-def _mtime(path) -> str | None:
+def _mtime(path: StrPath) -> str | None:
     try:
         return parse_ts(os.stat(path).st_mtime)
     except OSError:
@@ -296,9 +303,9 @@ class Codex(Provider):
     binary = "codex"
     app_id = "org.omarchy.codex"
     resumable = True
-    dir_names = {".codex"}
+    dir_names: ClassVar[set[str]] = {".codex"}
 
-    def native_store(self) -> Path | None:
+    def native_store(self) -> Path:
         return home() / ".codex"
 
     # The directory name tells a Codex store from a Grok one: both hold
@@ -397,7 +404,7 @@ class Codex(Provider):
                 rollouts.append(_read(path, tools=True))
         yield from _surviving(_ordered(rollouts))
 
-    def import_plan(self, s: Session, pathmap) -> importer.ImportPlan:
+    def import_plan(self, s: Session, pathmap: PathMap) -> importer.ImportPlan:
         """Every rollout of the thread to the same ``YYYY/MM/DD/<name>``
         (FORMATS section 6). A thread in one file has its working directories
         rewritten; a thread with segments keeps the base file (and any middle

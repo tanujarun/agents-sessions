@@ -9,12 +9,22 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import mounts as mounts_mod
 from .fsutil import home, subdirs
 from .model import Store
+
+if TYPE_CHECKING:
+    import threading
+
+    from .mounts import Mount
+    from .providers.base import Provider
+
+Progress = Callable[[str, int], None]  # progress(mount_label, dirs_seen)
 
 
 @dataclass(frozen=True)
@@ -140,9 +150,9 @@ class Discovery:
 class _Found:
     """Collects stores, deduplicated by real path, sorted on the way out."""
 
-    def __init__(self, mounts, providers):
+    def __init__(self, mounts: Iterable[Mount], providers: Iterable[Provider]) -> None:
         self.mounts = list(mounts)
-        self.native = {}
+        self.native: dict[str, str] = {}
         for p in providers:
             try:
                 root = p.native_store()
@@ -153,7 +163,7 @@ class _Found:
         self.stores: dict[tuple[str, str], Store] = {}
         self.skipped: dict[tuple[str, str], Skipped] = {}
 
-    def check(self, provider, path: str) -> bool:
+    def check(self, provider: Provider, path: str) -> bool:
         """Record ``path`` if it is a store of ``provider``; say whether it is."""
         try:
             if not provider.is_store(Path(path)):
@@ -180,7 +190,9 @@ class _Found:
         )
         return True
 
-    def result(self, stats=None, cancelled=False) -> Discovery:
+    def result(
+        self, stats: dict[str, WalkStats] | None = None, cancelled: bool = False
+    ) -> Discovery:
         return Discovery(
             stores=[self.stores[k] for k in sorted(self.stores)],
             skipped=[self.skipped[k] for k in sorted(self.skipped)],
@@ -201,8 +213,8 @@ def _skip_reason(provider_name: str, root: str) -> str | None:
     return None
 
 
-def _by_dir_name(providers) -> dict[str, list]:
-    table: dict[str, list] = {}
+def _by_dir_name(providers: Iterable[Provider]) -> dict[str, list[Provider]]:
+    table: dict[str, list[Provider]] = {}
     for p in sorted(providers, key=lambda p: p.name):
         for name in p.dir_names:
             table.setdefault(name, []).append(p)
@@ -213,7 +225,7 @@ def _join(parent: str, name: str) -> str:
     return parent + name if parent.endswith(os.sep) else parent + os.sep + name
 
 
-def _homes(mounts) -> list[str]:
+def _homes(mounts: Iterable[Mount]) -> list[str]:
     found = {str(home())}
     for mount in mounts:
         parents = [_join(mount.path, name) for name in HOME_PARENTS]
@@ -227,7 +239,11 @@ def _homes(mounts) -> list[str]:
     return sorted(found)
 
 
-def fast_pass(mounts, providers, remembered=()) -> Discovery:
+def fast_pass(
+    mounts: Iterable[Mount],
+    providers: Iterable[Provider],
+    remembered: Iterable[tuple[str, str]] = (),
+) -> Discovery:
     """Check the known store locations without walking anything.
 
     Looked at: every native store, every provider directory name directly
@@ -253,7 +269,15 @@ def fast_pass(mounts, providers, remembered=()) -> Discovery:
     return found.result()
 
 
-def _walk(mount, table, found, stops, prune, progress, cancel) -> tuple[WalkStats, bool]:
+def _walk(
+    mount: Mount,
+    table: dict[str, list[Provider]],
+    found: _Found,
+    stops: set[str],
+    prune: PruneList | None,
+    progress: Progress | None,
+    cancel: threading.Event | None,
+) -> tuple[WalkStats, bool]:
     stats = WalkStats()
     started = last = time.monotonic()
     root_fs = mount.path == os.sep
@@ -300,7 +324,12 @@ def _walk(mount, table, found, stops, prune, progress, cancel) -> tuple[WalkStat
     return stats, cancelled
 
 
-def deep_pass(mounts, providers, progress=None, cancel=None) -> Discovery:
+def deep_pass(
+    mounts: Iterable[Mount],
+    providers: Iterable[Provider],
+    progress: Progress | None = None,
+    cancel: threading.Event | None = None,
+) -> Discovery:
     """Walk every mount completely and return the stores on them.
 
     Symlinks are not followed, other mountpoints are not crossed, ``PRUNE`` is
@@ -325,7 +354,12 @@ def deep_pass(mounts, providers, progress=None, cancel=None) -> Discovery:
     return found.result(stats, cancelled)
 
 
-def brute_pass(mounts, providers, progress=None, cancel=None) -> Discovery:
+def brute_pass(
+    mounts: Iterable[Mount],
+    providers: Iterable[Provider],
+    progress: Progress | None = None,
+    cancel: threading.Event | None = None,
+) -> Discovery:
     """The slow walk ``verify`` compares the index with.
 
     Written apart from ``deep_pass`` on purpose: no prune list, and nothing is
@@ -383,7 +417,7 @@ def brute_pass(mounts, providers, progress=None, cancel=None) -> Discovery:
     return found.result(stats, cancelled)
 
 
-def nested_stores(stores) -> list[Store]:
+def nested_stores(stores: list[Store]) -> list[Store]:
     """The stores that lie inside another store of the list. A store under a
     directory named in ``ALWAYS_DESCEND`` is not nested: that one is descended
     by design."""

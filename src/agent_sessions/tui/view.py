@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime, tzinfo
+from typing import Any, Protocol
 
 APP_TITLE = "agent-sessions"
 ELLIPSIS = "…"
@@ -33,6 +35,29 @@ DETAIL_MIN_HEIGHT = 20
 PAGER_MAX_TURNS = 2000
 PAGER_MAX_TURN_CHARS = 20000
 """Transcript pager limits: turns loaded, characters shown of one turn."""
+
+
+class SessionLike(Protocol):
+    """The fields of an engine ``Session`` that the view reads."""
+
+    id: str
+    key: str
+    provider: str
+    title: str
+    cwd: str | None
+    cwd_local: str | None
+    cwd_exists: bool
+    started: str | None
+    updated: str | None
+    messages: int | None
+    store: str
+    origin: str
+    imported_as: str | None
+    note: str | None
+
+
+Verdict = tuple[bool | None, str]
+"""``can_import``'s answer; ``(None, why)`` when asking failed."""
 
 
 # --- display width ----------------------------------------------------------
@@ -58,7 +83,7 @@ def text_width(text: str) -> int:
     return sum(char_width(ch) for ch in text)
 
 
-def clean(text) -> str:
+def clean(text: object) -> str:
     """One printable line: control characters (newline, tab, escape) become
     spaces, so no value can break a row or move the cursor."""
     text = "" if text is None else str(text)
@@ -99,7 +124,7 @@ def pad(text: str, width: int, align: str = "left") -> str:
 # --- time -------------------------------------------------------------------
 
 
-def parse_stamp(stamp) -> datetime | None:
+def parse_stamp(stamp: object) -> datetime | None:
     """An ISO 8601 time as an aware datetime; None when absent or malformed."""
     if not stamp or not isinstance(stamp, str):
         return None
@@ -108,11 +133,11 @@ def parse_stamp(stamp) -> datetime | None:
     except ValueError:
         return None
     if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
+        moment = moment.replace(tzinfo=UTC)
     return moment
 
 
-def age_text(stamp, now: datetime) -> str:
+def age_text(stamp: object, now: datetime) -> str:
     """``now``, ``5m``, ``3h``, ``2d``, ``3w``, ``2mo``, ``1y``. The steps are
     the ones `agent-sessions list` prints: seconds under a minute are ``now``,
     days up to 13, weeks up to 59 days, months up to a year."""
@@ -136,7 +161,7 @@ def age_text(stamp, now: datetime) -> str:
     return f"{days // 365}y"
 
 
-def local_time(stamp, tz=None) -> str:
+def local_time(stamp: object, tz: tzinfo | None = None) -> str:
     """``2026-10-10 17:58`` in the local zone (or ``tz``); ``-`` when unknown."""
     moment = parse_stamp(stamp)
     if moment is None:
@@ -162,14 +187,14 @@ class Row:
     haystack: str  # casefolded title, project and cwd, for the filter
 
 
-def project_name(cwd) -> str:
+def project_name(cwd: str | None) -> str:
     """The folder a session ran in: the last segment of its recorded cwd,
     whichever separator it was written with."""
     parts = [part for part in re.split(r"[\\/]+", cwd or "") if part]
     return clean(parts[-1]) if parts else EMPTY
 
 
-def make_row(session, where: str) -> Row:
+def make_row(session: SessionLike, where: str) -> Row:
     """The row for a session; ``where`` is the engine's WHERE text."""
     title = clean(session.title).strip() or EMPTY
     project = project_name(session.cwd)
@@ -193,14 +218,14 @@ def matches(row: Row, needle: str) -> bool:
     return not needle or needle in row.haystack
 
 
-def filter_rows(rows, provider=None, needle: str = "") -> list[Row]:
+def filter_rows(rows: Iterable[Row], provider: str | None = None, needle: str = "") -> list[Row]:
     """The rows of one provider (``None`` or ``ALL``: every provider) that
     match the filter, in the order given."""
     everyone = provider is None or provider == ALL
     return [row for row in rows if (everyone or row.provider == provider) and matches(row, needle)]
 
 
-def select_index(rows, key, previous: int = 0) -> int:
+def select_index(rows: Sequence[Row], key: str | None, previous: int = 0) -> int:
     """Index of the row with ``key``. When it is gone, the row now at the old
     position (clamped), so the selection stays where the eye was. ``-1`` for
     an empty list."""
@@ -252,14 +277,14 @@ class Tab:
     digit: str  # the key that selects it; "" when there is none
 
 
-def build_tabs(providers, rows) -> list[Tab]:
+def build_tabs(providers: Iterable[tuple[str, str]], rows: Sequence[Row]) -> list[Tab]:
     """One tab per provider in the SPEC order, unknown providers after in the
     order given, then All. ``providers`` is ``[(name, label)]``. Digits ``1``
     to ``9`` select the provider tabs, ``0`` selects All."""
     counts: dict[str, int] = {}
     for row in rows:
         counts[row.provider] = counts.get(row.provider, 0) + 1
-    labels = {}
+    labels: dict[str, str] = {}
     for name, label in providers:
         labels.setdefault(name, label or name)
     ordered = [name for name in PROVIDER_ORDER if name in labels]
@@ -272,7 +297,7 @@ def build_tabs(providers, rows) -> list[Tab]:
     return tabs
 
 
-def tab_for_digit(tabs, digit: str) -> int | None:
+def tab_for_digit(tabs: Iterable[Tab], digit: str) -> int | None:
     """Index of the tab a digit key selects, or None."""
     for index, tab in enumerate(tabs):
         if tab.digit and tab.digit == digit:
@@ -298,7 +323,7 @@ def _tab_label(tab: Tab, level: int, active: bool) -> str:
     return tab.digit or tab.label[:1]
 
 
-def fit_tab_labels(tabs, active: int, available: int, extra: int = 0) -> list[str]:
+def fit_tab_labels(tabs: Sequence[Tab], active: int, available: int, extra: int = 0) -> list[str]:
     """Tab texts that fit in ``available`` cells when every tab also takes
     ``extra`` cells of its own (padding, margin). Tried in turn: full
     (``1 Claude 41``), without counts, three-letter names, digits only, each
@@ -336,12 +361,14 @@ _ORDER = ("title", "provider", "project", "age", "where")
 _DROP_ORDER = ("project", "where", "provider", "age")
 
 
-def column_widths(rows, provider_labels=None) -> dict[str, int]:
+def column_widths(
+    rows: Collection[Row], provider_labels: Mapping[str, str] | None = None
+) -> dict[str, int]:
     """Natural widths of the PROJECT, WHERE and PROVIDER columns for a set of
     rows: the widest value, at least the heading, at most ``MAX_SIDE_WIDTH``."""
     provider_labels = provider_labels or {}
 
-    def widest(values, heading):
+    def widest(values: Iterable[str], heading: str) -> int:
         longest = max((text_width(value) for value in values), default=0)
         return min(max(longest, len(heading)), MAX_SIDE_WIDTH)
 
@@ -356,7 +383,7 @@ def column_widths(rows, provider_labels=None) -> dict[str, int]:
 
 def fit_columns(
     width: int,
-    widths=None,
+    widths: Mapping[str, int] | None = None,
     *,
     show_provider: bool = False,
     show_project: bool = True,
@@ -377,7 +404,7 @@ def fit_columns(
     if show_provider:
         sides["provider"] = widths.get("provider", len(_HEADINGS["provider"]))
 
-    def title_width():
+    def title_width() -> int:
         return width - cell_pad - sum(size + cell_pad for size in sides.values())
 
     for name in _DROP_ORDER:
@@ -388,20 +415,27 @@ def fit_columns(
     return [Column(name, _HEADINGS[name], sides[name]) for name in _ORDER if name in sides]
 
 
-def _cells(values, columns, pad_left: int, pad_right: int) -> str:
+def _cells(
+    values: Mapping[str, str], columns: Iterable[Column], pad_left: int, pad_right: int
+) -> str:
     return "".join(
         " " * pad_left + pad(values.get(column.name, ""), column.width) + " " * pad_right
         for column in columns
     )
 
 
-def format_header(columns, pad_left: int = 0, pad_right: int = 0) -> str:
+def format_header(columns: Sequence[Column], pad_left: int = 0, pad_right: int = 0) -> str:
     """The column header line."""
     return _cells({column.name: column.title for column in columns}, columns, pad_left, pad_right)
 
 
 def format_row(
-    row: Row, columns, now: datetime, provider_labels=None, pad_left: int = 0, pad_right: int = 0
+    row: Row,
+    columns: Iterable[Column],
+    now: datetime,
+    provider_labels: Mapping[str, str] | None = None,
+    pad_left: int = 0,
+    pad_right: int = 0,
 ) -> str:
     """One list line: every cell clipped with an ellipsis and padded to its
     column, by display width."""
@@ -478,7 +512,7 @@ def short_count(count: int) -> str:
     return f"{count / 1_000_000:.1f}M"
 
 
-def bytes_text(count) -> str:
+def bytes_text(count: float | None) -> str:
     """``812 B``, ``3.1 kB``, ``12.0 MB``, ``1.4 GB``."""
     count = max(int(count or 0), 0)
     if count < 1000:
@@ -491,7 +525,7 @@ def bytes_text(count) -> str:
     return f"{size:.1f} GB"
 
 
-def drive_count(mounts) -> int:
+def drive_count(mounts: Iterable[Mapping[str, Any]] | None) -> int:
     """Drives in a status report: mounted entries, one per label (``/`` and
     ``/home`` are both ``Linux``)."""
     return len(
@@ -503,7 +537,7 @@ def drive_count(mounts) -> int:
     )
 
 
-def summary_variants(drives: int, sessions: int, last_scan, now: datetime) -> list[str]:
+def summary_variants(drives: int, sessions: int, last_scan: object, now: datetime) -> list[str]:
     """The right-hand status text, longest first, for ``status_parts`` to
     pick from: ``5 drives · 63 sessions · scanned 2m ago``."""
     if parse_stamp(last_scan) is None:
@@ -516,7 +550,7 @@ def summary_variants(drives: int, sessions: int, last_scan, now: datetime) -> li
 
 
 def status_parts(
-    left: str, variants, width: int, gap: int = 2, keep_left: bool = False
+    left: str, variants: Sequence[str], width: int, gap: int = 2, keep_left: bool = False
 ) -> tuple[str, str]:
     """Share the status line between the left text (the app name, or a
     message) and the longest right text that still fits beside it. When none
@@ -531,19 +565,19 @@ def status_parts(
     return "", clip(variants[-1], width)
 
 
-def scan_progress_text(label, dirs: int) -> str:
+def scan_progress_text(label: object, dirs: int) -> str:
     """``scanning Zephyro… 41k dirs``."""
     return f"scanning {clean(label)}{ELLIPSIS} {short_count(int(dirs or 0))} dirs"
 
 
-def import_progress_text(done, total) -> str:
+def import_progress_text(done: float | None, total: float | None) -> str:
     """``importing… 3.1 MB of 12.0 MB``."""
     if not total:
         return f"importing{ELLIPSIS} {bytes_text(done)}"
     return f"importing{ELLIPSIS} {bytes_text(done)} of {bytes_text(total)}"
 
 
-def scan_message(summary) -> str:
+def scan_message(summary: Mapping[str, Any] | None) -> str:
     """One line for a finished scan."""
     summary = summary or {}
     name = "full rescan" if summary.get("mode") == "deep" else "rescan"
@@ -572,7 +606,7 @@ def error_text(exc: BaseException) -> str:
 DETAIL_FIELDS = ("id", "messages", "updated", "cwd", "local", "store", "note", "import")
 
 
-def verdict_text(session, verdict) -> str:
+def verdict_text(session: SessionLike, verdict: Verdict | None) -> str:
     """The import line of the detail pane. ``verdict`` is ``can_import``'s
     answer for a foreign session, ``(None, why)`` when asking failed, or None
     while it is being worked out."""
@@ -591,11 +625,13 @@ def verdict_text(session, verdict) -> str:
     return f"not possible: {reason}" if reason else "not possible"
 
 
-def detail_fields(session, verdict=None, tz=None) -> dict[str, str]:
+def detail_fields(
+    session: SessionLike | None, verdict: Verdict | None = None, tz: tzinfo | None = None
+) -> dict[str, str]:
     """The detail pane for a session, one value per ``DETAIL_FIELDS`` name;
     all ``-`` when nothing is selected."""
     if session is None:
-        return {name: EMPTY for name in DETAIL_FIELDS}
+        return dict.fromkeys(DETAIL_FIELDS, EMPTY)
     found = "(exists)" if session.cwd_exists else "(not found)"
     local = f"{clean(session.cwd_local)}   {found}" if session.cwd_local else found
     return {
@@ -618,7 +654,7 @@ def drive_of(where: str) -> str:
     return where.split(" · ")[0].strip() or "another drive"
 
 
-def fit_first(variants, width: int | None) -> str:
+def fit_first(variants: Sequence[str], width: int | None) -> str:
     """The first text that fits in ``width`` cells; the last one, clipped,
     when none does. ``None`` for the width means no limit."""
     if width is None:
@@ -853,7 +889,12 @@ def wrap_text(text: str, width: int) -> list[str]:
 
 
 def transcript_lines(
-    role, text, ts, width: int, tz=None, max_chars: int = PAGER_MAX_TURN_CHARS
+    role: str,
+    text: object,
+    ts: object,
+    width: int,
+    tz: tzinfo | None = None,
+    max_chars: int = PAGER_MAX_TURN_CHARS,
 ) -> list[tuple[str, str]]:
     """One turn as pager lines, each ``(kind, text)``: a ``role-<role>``
     heading, wrapped ``text`` lines, a closing ``blank``. A tool turn is its

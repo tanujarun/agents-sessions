@@ -6,8 +6,9 @@ import json
 import os
 import re
 import urllib.parse
+from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
 from .. import importer
 from ..fsutil import home, listdir_ro, subdirs
@@ -25,6 +26,10 @@ from .base import (
     warn,
 )
 
+if TYPE_CHECKING:
+    from ..fsutil import StrPath
+    from ..pathmap import PathMap
+
 _SUMMARY = "summary.json"
 _CHAT = "chat_history.jsonl"
 _CWD = ".cwd"
@@ -41,7 +46,7 @@ _GROUP_NAME_MAX = 255  # bytes; longer names get a slug and a hash [docs]
 ENCODING_UNVERIFIED = "Grok's directory encoding of '-', '.', '_', '~' is unverified"
 
 
-def _load_json(path):
+def _load_json(path: StrPath) -> tuple[Any, str | None]:
     """``(value, None)``, or ``(None, reason)`` when the file is missing
     (reason ``"missing"``), empty, too large or not JSON."""
     try:
@@ -69,18 +74,18 @@ class _SummaryRewrite(importer.Rewrite):
 
     label = "info.cwd and grok_home in summary.json"
 
-    def __init__(self, cwd: str, grok_home: str):
+    def __init__(self, cwd: str, grok_home: str) -> None:
         super().__init__()
         self._cwd = cwd
         self._home = grok_home
 
     @staticmethod
-    def _dump(value, pretty: bool) -> bytes:
+    def _dump(value: object, pretty: bool) -> bytes:
         if pretty:
             return json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
         return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
-    def apply(self, reader) -> Iterator[bytes]:
+    def apply(self, reader: BinaryIO) -> Iterator[bytes]:
         self.changes = []
         raw = reader.read(_SMALL_FILE + 1)
         try:
@@ -110,14 +115,14 @@ class _SummaryRewrite(importer.Rewrite):
         yield out
 
 
-def _mtime(path) -> str | None:
+def _mtime(path: StrPath) -> str | None:
     try:
         return parse_ts(os.stat(path).st_mtime)
     except OSError:
         return None
 
 
-def _text(content) -> str:
+def _text(content: object) -> str:
     """The text of a ``content`` value: a string, or the ``text`` parts of a
     list (image parts are left out)."""
     if isinstance(content, str):
@@ -133,7 +138,7 @@ def _text(content) -> str:
     return ""
 
 
-def _is_prompt(record) -> bool:
+def _is_prompt(record: dict[str, Any]) -> bool:
     """A real user prompt: a user record that has ``prompt_index`` and no
     ``synthetic_reason`` (FORMATS section 4)."""
     return (
@@ -143,7 +148,7 @@ def _is_prompt(record) -> bool:
     )
 
 
-def _prompt_text(record) -> str | None:
+def _prompt_text(record: dict[str, Any]) -> str | None:
     """What the user typed in a user record, or None for injected context.
 
     The text sits inside ``<user_query>…</user_query>``, which can follow an
@@ -163,7 +168,7 @@ def _prompt_text(record) -> str | None:
     return None if text.startswith(_INJECTED) else text
 
 
-def _names_session(value, session_id, key="") -> bool:
+def _names_session(value: object, session_id: str, key: str = "") -> bool:
     """True when a ``meta.json`` value holds ``session_id`` as a string,
     anywhere but under a key that names a parent."""
     if "parent" in key.lower():
@@ -177,7 +182,7 @@ def _names_session(value, session_id, key="") -> bool:
     return False
 
 
-def _is_child(session_id, session_dir, meta_paths) -> bool:
+def _is_child(session_id: str, session_dir: Path, meta_paths: Iterable[str]) -> bool:
     """True when another session's ``subagents/<child>/meta.json`` names
     ``session_id``, by its directory name or by a value inside the file."""
     for path in meta_paths:
@@ -202,9 +207,9 @@ class Grok(Provider):
     binary = "grok"
     app_id = "org.omarchy.grok"
     resumable = True
-    dir_names = {".grok"}
+    dir_names: ClassVar[set[str]] = {".grok"}
 
-    def native_store(self) -> Path | None:
+    def native_store(self) -> Path:
         return home() / ".grok"
 
     # Same signature as Codex; the directory name decides.
@@ -295,12 +300,11 @@ class Grok(Provider):
         if not isinstance(summary, dict):
             warn("summary.json skipped: not a JSON object", summary_path)
             return None
-        info = summary.get("info") if isinstance(summary.get("info"), dict) else {}
-        session_id = (
-            info.get("id")
-            if isinstance(info.get("id"), str) and info.get("id")
-            else session_dir.name
-        )
+        info = summary.get("info")
+        if not isinstance(info, dict):
+            info = {}
+        ident = info.get("id")
+        session_id = ident if isinstance(ident, str) and ident else session_dir.name
         if _is_child(session_id, session_dir, c.paths[_FIXED_PATHS:]):
             return None
 
@@ -315,6 +319,7 @@ class Grok(Provider):
         chat_path = session_dir / _CHAT
         prompts = replies = 0
         first_prompt = ""
+        messages: int | None
         if os.path.exists(chat_path):
             for record in iter_jsonl(chat_path):
                 kind = record.get("type")
@@ -408,7 +413,7 @@ class Grok(Provider):
                 if isinstance(name, str) and name:
                     yield Turn("tool", name, None)
 
-    def import_plan(self, s: Session, pathmap) -> importer.ImportPlan:
+    def import_plan(self, s: Session, pathmap: PathMap) -> importer.ImportPlan:
         """The session directory without ``*.lock``, into the group directory
         of the mapped cwd, with ``summary.json`` rewritten (FORMATS section
         6). Allowed only when the group directory name is certain: a native

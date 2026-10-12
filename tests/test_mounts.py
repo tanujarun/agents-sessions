@@ -9,10 +9,10 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import support  # noqa: E402,F401  (puts src on sys.path)
+import support  # noqa: F401  (puts src on sys.path)
 
-from agent_sessions import mounts  # noqa: E402
-from agent_sessions.mounts import Mount, find_mount, parse_mountinfo  # noqa: E402
+from agent_sessions import mounts
+from agent_sessions.mounts import Mount, find_mount, parse_mountinfo
 
 # Trimmed from a real /proc/self/mountinfo (user name changed).
 MOUNTINFO = r"""

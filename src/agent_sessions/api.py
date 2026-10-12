@@ -5,13 +5,12 @@ from __future__ import annotations
 
 import shutil
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Iterator
+from typing import TYPE_CHECKING
 
-from . import discover
-from . import importer
+from . import discover, importer, launch
 from . import index as index_mod
-from . import launch
 from . import providers as registry
 from .errors import ApiError, ImportFailed, LaunchFailed, NotFound
 from .fsutil import cache_file
@@ -20,7 +19,10 @@ from .launch import LaunchPlan
 from .model import Session, make_key
 from .mounts import NATIVE_LABEL, list_mounts
 from .providers import all_providers
-from .providers.base import NotSupported, Turn, parse_ts
+from .providers.base import NotSupported, Provider, Turn, parse_ts
+
+if TYPE_CHECKING:
+    import threading
 
 # Agent CLIs that may be installed but have no adapter (SPEC non-goals).
 NO_READER_TOOLS = ("copilot", "crush", "cursor-agent", "opencode")
@@ -34,7 +36,11 @@ def load_index() -> Index:
     return index
 
 
-def scan(deep=None, progress=None, cancel=None) -> dict:
+def scan(
+    deep: bool | None = None,
+    progress: discover.Progress | None = None,
+    cancel: threading.Event | None = None,
+) -> dict:
     """Refresh the index and return a summary.
 
     ``deep=True`` walks every mount, ``False`` only checks the known store
@@ -45,7 +51,7 @@ def scan(deep=None, progress=None, cancel=None) -> dict:
     return Index.load().scan(all_providers(), list_mounts(), deep, progress, cancel)
 
 
-def list_sessions(provider=None, index=None) -> list[Session]:
+def list_sessions(provider: str | None = None, index: Index | None = None) -> list[Session]:
     """Listed sessions, newest ``updated`` first, ties by key. ``provider``
     is a provider name; an unknown one raises ValueError."""
     if provider is not None and provider not in {p.name for p in all_providers()}:
@@ -54,7 +60,7 @@ def list_sessions(provider=None, index=None) -> list[Session]:
     return [s for s in index.sessions if provider is None or s.provider == provider]
 
 
-def status(index=None) -> dict:
+def status(index: Index | None = None) -> dict:
     """Mounts, stores and counts, drive letters, skipped stores, tools with
     no reader, warnings. Every list is sorted."""
     index = index if index is not None else load_index()
@@ -124,24 +130,27 @@ def status(index=None) -> dict:
     }
 
 
-def _newer_than(sig, moment: str | None) -> bool:
+def _newer_than(sig: list, moment: str | None) -> bool:
     """True when a file of the signature is missing or was modified at or
     after ``moment`` (an ISO time)."""
     if moment is None:
         return True
     limit = parse_ts(moment)
+    # Both sides are times: ``moment`` is the index's last_quick, the other a file's mtime.
     return any(
-        mtime_ns is None or parse_ts(mtime_ns // 1_000_000) >= limit
+        mtime_ns is None or parse_ts(mtime_ns // 1_000_000) >= limit  # type: ignore[operator]
         for _path, mtime_ns, _size in sig
     )
 
 
-def _moved_on(sig) -> bool:
+def _moved_on(sig: list) -> bool:
     """True when the files of a recorded signature are different now."""
     return index_mod.signature([row[0] for row in sig]) != sig
 
 
-def verify(progress=None, cancel=None) -> dict:
+def verify(
+    progress: discover.Progress | None = None, cancel: threading.Event | None = None
+) -> dict:
     """Compare the index with a slow, independent look at the disks.
 
     Every mount is walked with no prune list and no cache, every candidate of
@@ -254,7 +263,7 @@ def verify(progress=None, cancel=None) -> dict:
 MATCHES_SHOWN = 8  # keys named in an "ambiguous" message
 
 
-def find_session(ref, index=None) -> Session:
+def find_session(ref: Session | str, index: Index | None = None) -> Session:
     """The session ``ref`` names: a full key, a key prefix that only one
     session has, or a bare session id. A ``Session`` is returned as it is.
 
@@ -288,20 +297,20 @@ def find_session(ref, index=None) -> Session:
     raise NotFound(f"{text!r} matches {len(keys)} sessions: {shown}{more}")
 
 
-def _provider(session: Session):
+def _provider(session: Session) -> Provider:
     try:
         return registry.get(session.provider)
     except KeyError:
         raise NotFound(f"no reader for provider {session.provider!r}") from None
 
 
-def _native_copy(session: Session, index) -> Session | None:
+def _native_copy(session: Session, index: Index) -> Session | None:
     """The native session with the same provider and id, as the index has it.
 
     For a foreign session that is its imported copy. A native session is its
     own copy only when a foreign session of that id is listed too: then it
     was imported (a bare id names the native side of such a pair)."""
-    wanted = "native" if session.origin != "native" else "foreign"
+    wanted: str | None = "native" if session.origin != "native" else "foreign"
     found = None
     for other in index.sessions:
         if other.provider == session.provider and other.id == session.id:
@@ -312,7 +321,7 @@ def _native_copy(session: Session, index) -> Session | None:
     return found if wanted is None else None
 
 
-def transcript(ref, index=None) -> Iterator[Turn]:
+def transcript(ref: Session | str, index: Index | None = None) -> Iterator[Turn]:
     """The conversation as ``Turn(role, text, ts)``, oldest first: ``user``
     and ``assistant`` text, and one ``tool`` turn per tool call whose text is
     the tool's name. Read lazily. Raises ``NotFound``."""
@@ -320,7 +329,9 @@ def transcript(ref, index=None) -> Iterator[Turn]:
     return iter(_provider(session).transcript(session))
 
 
-def open_session(ref, here=False, dry_run=False, index=None) -> LaunchPlan:
+def open_session(
+    ref: Session | str, here: bool = False, dry_run: bool = False, index: Index | None = None
+) -> LaunchPlan:
     """Resume a session in a new terminal window, in its project directory.
 
     A foreign session that was imported resumes its native copy; any other
@@ -352,7 +363,7 @@ class ImportReport:
     bytes: int = 0
 
 
-def _plan(session: Session, index) -> importer.ImportPlan:
+def _plan(session: Session, index: Index) -> importer.ImportPlan:
     """The import plan for a foreign session. Raises ``ImportFailed``."""
     if session.origin == "native":
         raise ImportFailed(f"this session is already on {NATIVE_LABEL}")
@@ -364,7 +375,7 @@ def _plan(session: Session, index) -> importer.ImportPlan:
         raise ImportFailed(exc.reason) from None
 
 
-def can_import(session, index=None) -> tuple[bool, str]:
+def can_import(session: Session | str, index: Index | None = None) -> tuple[bool, str]:
     """``(True, "")`` when ``import_session`` would copy this session, else
     ``(False, reason)``: it is native, already imported, its provider cannot
     be imported, its project folder is not on any mounted drive, its id is
@@ -381,7 +392,7 @@ def can_import(session, index=None) -> tuple[bool, str]:
     return True, ""
 
 
-def import_plan(ref, index=None) -> dict:
+def import_plan(ref: Session | str, index: Index | None = None) -> dict:
     """What ``import_session`` would do, as plain data, for a dry run:
     ``already`` (the native key when it is imported already, else None),
     ``copies``, ``rewrites`` (with the changes each would make), ``appends``,
@@ -407,7 +418,9 @@ def import_plan(ref, index=None) -> dict:
     return dict(importer.describe(plan), already=None)
 
 
-def import_report(ref, progress=None, index=None) -> ImportReport:
+def import_report(
+    ref: Session | str, progress: importer.Progress | None = None, index: Index | None = None
+) -> ImportReport:
     """``import_session`` with the details: whether anything was copied (a
     session imported before is returned with ``created=False``) and which
     files were put in place."""
@@ -444,7 +457,9 @@ def import_report(ref, progress=None, index=None) -> ImportReport:
     return ImportReport(copy, True, files, size)
 
 
-def import_session(ref, progress=None, index=None) -> Session:
+def import_session(
+    ref: Session | str, progress: importer.Progress | None = None, index: Index | None = None
+) -> Session:
     """Copy a foreign session into the native store and return the native
     copy, indexed and launchable. A session that was imported before is
     returned as it is; nothing is copied twice and nothing is overwritten.
@@ -458,12 +473,12 @@ def import_session(ref, progress=None, index=None) -> Session:
 
 
 __all__ = [
+    "NO_READER_TOOLS",
     "ApiError",
     "ImportFailed",
     "ImportReport",
     "LaunchFailed",
     "LaunchPlan",
-    "NO_READER_TOOLS",
     "NotFound",
     "Turn",
     "cache_file",

@@ -14,13 +14,18 @@ import re
 import sqlite3
 import threading
 import urllib.parse
-from datetime import datetime, timedelta, timezone
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Iterator, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 from .. import importer
 from ..fsutil import open_ro
 from ..model import Candidate, Session, Store
+
+if TYPE_CHECKING:
+    from ..fsutil import StrPath
+    from ..pathmap import PathMap
 
 __all__ = [
     "Candidate",
@@ -62,10 +67,9 @@ class Provider:
     binary: str = ""  # executable to resume with
     app_id: str = ""  # omarchy-launch-tui --app-id value
     resumable: bool = True  # False when no usable binary exists
-    resume_needs_cwd: bool = (
-        False  # True when the tool finds a session only from its project directory
-    )
-    dir_names: set[str] = set()  # directory names that may be a store root
+    # True when the tool finds a session only from its project directory
+    resume_needs_cwd: bool = False
+    dir_names: ClassVar[set[str]] = set()  # directory names that may be a store root
 
     def native_store(self) -> Path | None:
         raise NotImplementedError
@@ -108,7 +112,7 @@ class Provider:
         """
         raise NotImplementedError
 
-    def import_plan(self, s: Session, pathmap) -> "importer.ImportPlan":
+    def import_plan(self, s: Session, pathmap: PathMap) -> importer.ImportPlan:
         """What importing foreign session ``s`` into the native store would
         copy, rewrite and append, as an ``importer.ImportPlan``. Reads the
         source only, writes nothing. Raises ``NotSupported(reason)`` when the
@@ -116,7 +120,9 @@ class Provider:
         cannot be (its project folder is not on any mounted drive)."""
         raise NotSupported(f"{self.label or self.name} sessions cannot be imported")
 
-    def import_session(self, s: Session, pathmap, progress=None) -> Session:
+    def import_session(
+        self, s: Session, pathmap: PathMap, progress: importer.Progress | None = None
+    ) -> Session:
         """Copy foreign session ``s`` into the native store and return the
         native copy as ``parse`` reads it (the index fills the other fields).
 
@@ -144,17 +150,17 @@ class Provider:
 class Warnings:
     """Messages recorded while one candidate (or one scan step) is read."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.items: list[str] = []
 
-    def add(self, message: str, path=None) -> None:
+    def add(self, message: str, path: StrPath | None = None) -> None:
         self.items.append(f"{path}: {message}" if path is not None else str(message))
 
 
 _active = threading.local()
 
 
-def warn(message: str, path=None) -> None:
+def warn(message: str, path: StrPath | None = None) -> None:
     """Record a warning for the scan in progress; ``scan`` reports it.
 
     The index caches it with the candidate it was raised for. Outside a
@@ -165,7 +171,7 @@ def warn(message: str, path=None) -> None:
         stack[-1].add(message, path)
 
 
-def unreadable(path, exc=None) -> None:
+def unreadable(path: StrPath, exc: BaseException | None = None) -> None:
     """Report a directory ``candidates`` could not list. One that is not
     there (any more) is not reported: nothing in it can be missed."""
     if not isinstance(exc, (FileNotFoundError, NotADirectoryError)):
@@ -173,7 +179,7 @@ def unreadable(path, exc=None) -> None:
 
 
 @contextlib.contextmanager
-def collect_warnings():
+def collect_warnings() -> Iterator[Warnings]:
     """Collect the ``warn`` calls made on this thread inside the block."""
     collector = Warnings()
     stack = getattr(_active, "stack", None)
@@ -191,7 +197,7 @@ def collect_warnings():
 _BOM = b"\xef\xbb\xbf"
 
 
-def iter_jsonl(path):
+def iter_jsonl(path: StrPath) -> Iterator[dict[str, Any]]:
     """Yield the JSON objects of a JSONL file, one line at a time.
 
     Blank lines, lines that do not parse (a half-written last line of a live
@@ -233,7 +239,7 @@ _SQLITE_MAGIC = b"SQLite format 3\x00"
 _SQLITE_HEADER = 100
 
 
-def _sqlite_in_memory(path) -> sqlite3.Connection | None:
+def _sqlite_in_memory(path: StrPath) -> sqlite3.Connection | None:
     """A read-only in-memory copy of a SQLite file, or None when the file is
     missing, too large, not a database, or this Python cannot load one.
 
@@ -276,7 +282,7 @@ def _sqlite_in_memory(path) -> sqlite3.Connection | None:
         return None
 
 
-def open_sqlite_ro(path) -> sqlite3.Connection:
+def open_sqlite_ro(path: StrPath) -> sqlite3.Connection:
     """Open a SQLite file for reading without leaving a trace.
 
     Files up to 64 MB are read through ``open_ro`` and loaded into an
@@ -298,7 +304,7 @@ def open_sqlite_ro(path) -> sqlite3.Connection:
 
 # --- values -----------------------------------------------------------------
 
-_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _TS = re.compile(
     r"^\s*(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})(?:[.,](\d+))?"
     r"\s*(?:([Zz])|([+-])(\d{2}):?(\d{2}))?\s*$"
@@ -318,7 +324,7 @@ def _from_epoch(seconds: int, micros: int = 0) -> str | None:
     return _iso(moment)
 
 
-def _from_number(value) -> str | None:
+def _from_number(value: float) -> str | None:
     if value != value or value in (float("inf"), float("-inf")):
         return None
     # Magnitude tells the unit: 1e11 s is the year 5138, 1e11 ms is 1973.
@@ -334,7 +340,7 @@ def _from_number(value) -> str | None:
     return _from_epoch(0, int(value * scale))
 
 
-def parse_ts(value) -> str | None:
+def parse_ts(value: object) -> str | None:
     """Normalise a recorded timestamp to ``YYYY-MM-DDTHH:MM:SS.ffffffZ`` (UTC).
 
     Accepts ISO text with ``Z`` or an offset and any number of fraction
@@ -373,7 +379,7 @@ def parse_ts(value) -> str | None:
     year, month, day, hour, minute, second = (int(g) for g in m.groups()[:6])
     micros = int((m.group(7) or "0")[:6].ljust(6, "0"))
     try:
-        moment = datetime(year, month, day, hour, minute, second, micros, tzinfo=timezone.utc)
+        moment = datetime(year, month, day, hour, minute, second, micros, tzinfo=UTC)
         if m.group(9):
             offset = timedelta(hours=int(m.group(10)), minutes=int(m.group(11)))
             moment = moment - offset if m.group(9) == "+" else moment + offset
@@ -385,7 +391,7 @@ def parse_ts(value) -> str | None:
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
-def clean_title(text) -> str:
+def clean_title(text: object) -> str:
     """One line, whitespace collapsed, control characters removed, at most
     80 characters. None gives an empty string."""
     if text is None:

@@ -33,14 +33,22 @@ import re
 import shutil
 import stat
 import time
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Iterator
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, BinaryIO
 
 from . import __version__
 from .errors import ImportFailed
 from .fsutil import listdir_ro, open_ro, state_dir
 from .model import make_key
+
+if TYPE_CHECKING:
+    from .fsutil import StrPath
+    from .model import Session
+    from .pathmap import PathMap
+
+Progress = Callable[[int, int], None]  # progress(done_bytes, total_bytes)
 
 CHUNK = 1024 * 1024
 HEADROOM = 10  # per cent of the copy size that must stay free on top
@@ -58,7 +66,7 @@ class Exists(ImportFailed):
     """The session id, or a destination path, is already in the native
     store. ``paths`` are what was found. Nothing was written."""
 
-    def __init__(self, paths):
+    def __init__(self, paths: Iterable[str]) -> None:
         self.paths = sorted(paths)
         more = f" (and {len(self.paths) - 1} more)" if len(self.paths) > 1 else ""
         super().__init__(
@@ -76,13 +84,13 @@ class Rewrite:
 
     label = ""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.changes: list[str] = []
 
-    def apply(self, reader) -> Iterator[bytes]:
+    def apply(self, reader: BinaryIO) -> Iterator[bytes]:
         raise NotImplementedError
 
-    def preview(self, src) -> list[str]:
+    def preview(self, src: StrPath) -> list[str]:
         """What ``apply`` would change in ``src``; writes nothing."""
         try:
             with open_ro(src) as reader:
@@ -158,7 +166,7 @@ class ImportPlan:
 # --- helpers for adapters ---------------------------------------------------
 
 
-def start_plan(session, native_root, pathmap) -> ImportPlan:
+def start_plan(session: Session, native_root: StrPath, pathmap: PathMap) -> ImportPlan:
     """A plan with everything but the copies filled in. Raises ``ImportFailed``
     when the session's project folder is not on any mounted drive: an import
     without it would resume in the wrong place."""
@@ -180,7 +188,7 @@ def start_plan(session, native_root, pathmap) -> ImportPlan:
     )
 
 
-def file_copy(src, rel: str = "", rewrite: Rewrite | None = None) -> FileCopy:
+def file_copy(src: StrPath, rel: str = "", rewrite: Rewrite | None = None) -> FileCopy:
     """A copy of one regular file. Raises ``ImportFailed`` when it is not one."""
     src = os.fspath(src)
     try:
@@ -192,7 +200,9 @@ def file_copy(src, rel: str = "", rewrite: Rewrite | None = None) -> FileCopy:
     return FileCopy(src, rel, st.st_size, rewrite)
 
 
-def tree(src_dir, skip=None) -> tuple[list[str], list[FileCopy]]:
+def tree(
+    src_dir: StrPath, skip: Callable[[str], bool] | None = None
+) -> tuple[list[str], list[FileCopy]]:
     """``(sub-directories, files)`` below ``src_dir``, as relative paths in
     sorted order, parents before children. Symbolic links and special files
     are left out, and so is every file whose name ``skip(name)`` accepts.
@@ -225,12 +235,12 @@ def tree(src_dir, skip=None) -> tuple[list[str], list[FileCopy]]:
     return dirs, files
 
 
-def only_changed(before, after, allowed) -> bool:
+def only_changed(before: object, after: object, allowed: Iterable[tuple[str, ...]]) -> bool:
     """True when two parsed JSON values are equal once the values at the
     ``allowed`` key paths are left out. A path is a tuple of object keys; a
     list on the way stands for each of its elements."""
 
-    def blank(value, path):
+    def blank(value: object, path: tuple[str, ...]) -> object:
         if not path:
             return None
         if isinstance(value, dict):
@@ -246,7 +256,7 @@ def only_changed(before, after, allowed) -> bool:
     return _text(before) == _text(after)
 
 
-def _text(value) -> str:
+def _text(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -370,7 +380,7 @@ def describe(plan: ImportPlan) -> dict:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _make_dirs(path: str, made: list[str]) -> None:
@@ -388,7 +398,7 @@ def _make_dirs(path: str, made: list[str]) -> None:
         made.append(directory)
 
 
-def _copy(item: FileCopy, target: str, tick) -> None:
+def _copy(item: FileCopy, target: str, tick: Callable[[int], None]) -> None:
     """Write one staged file: the source's bytes, or what its rewrite yields;
     flushed to disk, with the source's modification time."""
     with open_ro(item.src) as reader:
@@ -499,7 +509,7 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def sweep_staging(native_root) -> list[str]:
+def sweep_staging(native_root: StrPath) -> list[str]:
     """Remove the staging directories an import that died left at the root
     of a native store; returns the paths it removed.
 
@@ -507,7 +517,7 @@ def sweep_staging(native_root) -> list[str]:
     staging directory, whose process is gone and which was last changed over
     an hour ago. Anything that cannot be listed or removed is left alone."""
     native_root = os.fspath(native_root)
-    removed = []
+    removed: list[str] = []
     try:
         names = sorted(os.listdir(native_root))
     except OSError:
@@ -532,7 +542,7 @@ def sweep_staging(native_root) -> list[str]:
     return removed
 
 
-def execute(plan: ImportPlan, progress=None) -> dict:
+def execute(plan: ImportPlan, progress: Progress | None = None) -> dict:
     """Carry out a plan and return its provenance record.
 
     ``progress(done_bytes, total_bytes)`` is called as the copy advances.
@@ -592,14 +602,14 @@ def execute(plan: ImportPlan, progress=None) -> dict:
             fh.flush()
             os.fsync(fh.fileno())
 
-        for unit, target in zip(plan.units, staged):
+        for unit, target in zip(plan.units, staged, strict=False):
             _make_dirs(os.path.dirname(unit.dst), made_dirs)
             if os.path.lexists(unit.dst):
                 raise Exists([unit.dst])
             os.replace(target, unit.dst)
             placed.append(unit.dst)
-        for item in plan.appends:
-            _append(item)
+        for addition in plan.appends:
+            _append(addition)
         os.replace(record_tmp, path)
         record_tmp = None
         finished = True

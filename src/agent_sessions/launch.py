@@ -18,9 +18,14 @@ import shutil
 import subprocess
 import threading
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .errors import LaunchFailed
 from .fsutil import home
+
+if TYPE_CHECKING:
+    from .model import Session
+    from .providers.base import Provider
 
 LAUNCHER = "omarchy-launch-tui"
 NOTIFIER = "notify-send"
@@ -36,10 +41,10 @@ class LaunchPlan:
     note: str | None = None
 
 
-def _detached(command, cwd=None) -> None:
+def _detached(command: list[str], cwd: str | None = None) -> None:
     """Start ``command`` in its own session with no terminal attached, and
     collect its exit status in the background so no zombie is left."""
-    proc = subprocess.Popen(
+    proc = subprocess.Popen(  # noqa: S603  (an argv list built by this module, no shell)
         command,
         cwd=cwd,
         stdin=subprocess.DEVNULL,
@@ -50,7 +55,7 @@ def _detached(command, cwd=None) -> None:
     threading.Thread(target=proc.wait, daemon=True).start()
 
 
-def _spawn(command, cwd) -> None:
+def _spawn(command: list[str], cwd: str | None) -> None:
     _detached(command, cwd)
 
 
@@ -71,11 +76,11 @@ def _tell(reason: str) -> None:
     """Best effort: a notification that fails never hides the real failure."""
     try:
         notifier(reason)
-    except Exception:
+    except Exception:  # noqa: S110  (best effort, see the docstring)
         pass
 
 
-def _directory(session, provider) -> tuple[str, str | None]:
+def _directory(session: Session, provider: Provider) -> tuple[str, str | None]:
     """``(directory to start in, note)``. The recorded directory when it
     exists; else the home directory for a tool that finds a session by id
     from anywhere. A parent of the recorded directory is never used."""
@@ -93,7 +98,9 @@ def _directory(session, provider) -> tuple[str, str | None]:
     return start, f"project folder {state}; starting in the home directory"
 
 
-def plan(session, provider, where: str | None = None, here: bool = False) -> LaunchPlan:
+def plan(
+    session: Session, provider: Provider, where: str | None = None, here: bool = False
+) -> LaunchPlan:
     """The resume command for ``session``; starts nothing.
 
     ``where`` names the place a foreign session is on, for the refusal.
@@ -120,7 +127,11 @@ def plan(session, provider, where: str | None = None, here: bool = False) -> Lau
 
 
 def launch(
-    session, provider, where: str | None = None, here: bool = False, dry_run: bool = False
+    session: Session,
+    provider: Provider,
+    where: str | None = None,
+    here: bool = False,
+    dry_run: bool = False,
 ) -> LaunchPlan:
     """Resume ``session``: in a new terminal window, or with ``here`` in this
     process (``chdir`` then ``exec``; it does not return). ``dry_run`` only
@@ -136,7 +147,7 @@ def launch(
                 before = None
             os.chdir(made.cwd)
             try:
-                os.execvp(made.argv[0], made.argv)
+                os.execvp(made.argv[0], made.argv)  # noqa: S606  (the provider's resume argv, no shell)
             except OSError:
                 if before is not None:
                     os.chdir(before)

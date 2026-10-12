@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 from collections import namedtuple
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 _SRC = str(Path(__file__).resolve().parent.parent / "src")
@@ -16,7 +16,7 @@ if _SRC not in sys.path:
 
 from agent_sessions.model import Session  # noqa: E402
 
-NOW = datetime(2026, 10, 12, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 12, 12, 0, 0, tzinfo=UTC)
 PROVIDERS = [
     ("antigravity", "Antigravity"),
     ("claude", "Claude"),

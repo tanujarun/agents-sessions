@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from .base import NotSupported, Provider
 
-__all__ = ["NotSupported", "Provider", "register", "all_providers", "get"]
+__all__ = ["NotSupported", "Provider", "all_providers", "get", "register"]
 
 _REGISTRY: dict[str, type[Provider]] = {}
 

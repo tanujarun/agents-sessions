@@ -21,7 +21,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fixture_world import (  # noqa: E402
+from fixture_world import (
     AGY_NO_CWD,
     AGY_WIN,
     CLAUDE_NATIVE,
@@ -36,16 +36,16 @@ from fixture_world import (  # noqa: E402
     files_below,
     tree_state,
 )
-from support import FIXTURES  # noqa: E402
+from support import FIXTURES
 
-from agent_sessions import api, importer  # noqa: E402
-from agent_sessions.model import make_key  # noqa: E402
-from agent_sessions.providers import antigravity, gemini  # noqa: E402
-from agent_sessions.providers import grok as grok_mod  # noqa: E402
-from agent_sessions.providers.base import NotSupported  # noqa: E402
-from agent_sessions.providers.claude import Claude, encode_cwd  # noqa: E402
-from agent_sessions.providers.codex import Codex, _CwdRewrite  # noqa: E402
-from agent_sessions.providers.grok import Grok, _SummaryRewrite  # noqa: E402
+from agent_sessions import api, importer
+from agent_sessions.model import make_key
+from agent_sessions.providers import antigravity, gemini
+from agent_sessions.providers import grok as grok_mod
+from agent_sessions.providers.base import NotSupported
+from agent_sessions.providers.claude import Claude, encode_cwd
+from agent_sessions.providers.codex import _CwdRewrite
+from agent_sessions.providers.grok import Grok, _SummaryRewrite
 
 CODEX_ROLLOUT = "rollout-2026-08-29T13-57-23-01a04ca1-6e27-7817-9f54-07105f962073.jsonl"
 SEGMENT_BASE = "rollout-2026-09-28T05-04-58-01a0e538-c7bb-77dd-885b-0c4d54663241.jsonl"
@@ -83,7 +83,7 @@ def codex_line_diff(case, source, copy, allowed=CODEX_ALLOWED) -> list[tuple]:
     old_lines, new_lines = read(source).split(b"\n"), read(copy).split(b"\n")
     case.assertEqual(len(old_lines), len(new_lines))
     changed = []
-    for number, (old, new) in enumerate(zip(old_lines, new_lines)):
+    for number, (old, new) in enumerate(zip(old_lines, new_lines, strict=False)):
         if old == new:
             continue
         before, after = json.loads(old), json.loads(new)
@@ -107,8 +107,8 @@ def codex_line_diff(case, source, copy, allowed=CODEX_ALLOWED) -> list[tuple]:
 
 
 class ImportCase(unittest.TestCase):
-    foreign = ("antigravity", "claude", "codex", "gemini", "grok")
-    native = ()
+    foreign: tuple[str, ...] = ("antigravity", "claude", "codex", "gemini", "grok")
+    native: tuple[str, ...] = ()
 
     def setUp(self):
         self.w = World(self, self.foreign, self.native)
@@ -751,7 +751,9 @@ class CodexSegmentImportTest(ImportCase):
 
 class CodexRewriteTest(unittest.TestCase):
     def rewrite(self, data: bytes, table=None):
-        rewrite = _CwdRewrite(StubMap(table or {"C:\\w": "/mnt/w", "D:\\x y": "/mnt/x y"}), None)
+        stub = StubMap(table or {"C:\\w": "/mnt/w", "D:\\x y": "/mnt/x y"})
+        # A stand-in with to_local only, and no mount: all the rewrite uses.
+        rewrite = _CwdRewrite(stub, None)  # type: ignore[arg-type]
         import io
 
         out = b"".join(rewrite.apply(io.BytesIO(data)))
@@ -817,7 +819,7 @@ class CodexRewriteTest(unittest.TestCase):
                 "base_instructions": {"text": "C:\\w"},
             },
         )
-        self.assertIn("café 😀".encode("utf-8"), lines[0])  # not \\u-escaped
+        self.assertIn("café 😀".encode(), lines[0])  # not \\u-escaped
         self.assertTrue(lines[8].endswith(b"\r"))
         self.assertEqual(
             json.loads(lines[8])["payload"],
@@ -1069,13 +1071,18 @@ class GrokImportTest(ImportCase):
         old_lines, new_lines = pretty.split(b"\n"), out.split(b"\n")
         self.assertEqual(len(old_lines), len(new_lines))
         self.assertEqual(
-            [n for n, pair in enumerate(zip(old_lines, new_lines)) if pair[0] != pair[1]], [3, 6]
+            [
+                n
+                for n, pair in enumerate(zip(old_lines, new_lines, strict=False))
+                if pair[0] != pair[1]
+            ],
+            [3, 6],
         )
         self.assertEqual(
             json.loads(out),
             dict(data, info={"id": "i", "cwd": "/mnt/P"}, grok_home="/home/u/.grok"),
         )
-        self.assertIn("Révision ✓".encode("utf-8"), out)
+        self.assertIn("Révision ✓".encode(), out)
         self.assertEqual(
             rewrite.changes,
             ["info.cwd: F:\\P -> /mnt/P", "grok_home: C:\\Users\\u\\.grok -> /home/u/.grok"],

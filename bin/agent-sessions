@@ -26,7 +26,7 @@ def run_tui(argv) -> int:
             env = dict(os.environ)
             env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC, env.get("PYTHONPATH")]))
             command = [str(python), "-m", "agent_sessions.tui", *argv]
-            os.execve(command[0], command, env)
+            os.execve(command[0], command, env)  # noqa: S606  (the venv's own Python, fixed argv)
     # No venv: this Python will do if it has Textual; if not, the TUI says
     # how to install it and exits 1.
     sys.path.insert(0, SRC)

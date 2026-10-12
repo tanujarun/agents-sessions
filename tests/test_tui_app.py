@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 import unittest
-from datetime import timezone
+from datetime import UTC
 from pathlib import Path
 from unittest import mock
 
@@ -23,12 +23,13 @@ import tui_support as support  # noqa: E402
 from tui_support import FakeEngine, FakeError, Turn, make_session, screen_text, settle  # noqa: E402
 
 try:
-    import textual  # noqa: F401
+    import textual
 except ImportError:
-    textual = None
+    textual = None  # type: ignore[assignment]  # the suite then skips itself
 
 if textual is not None:
     from rich.cells import cell_len
+
     from agent_sessions.tui import app as app_mod
     from agent_sessions.tui import view
     from agent_sessions.tui.app import (
@@ -69,7 +70,7 @@ class TuiCase(unittest.IsolatedAsyncioTestCase):
     def make_app(self, engine=None):
         if engine is not None:
             self.engine = engine
-        self.app = SessionsApp(engine=self.engine, clock=lambda: support.NOW, tz=timezone.utc)
+        self.app = SessionsApp(engine=self.engine, clock=lambda: support.NOW, tz=UTC)
         return self.app
 
     def started(self, size=None, engine=None):
@@ -159,7 +160,26 @@ class StartTest(TuiCase):
             self.assertIn("2 drives · 34 sessions · scanned", lines[0])
             self.assertEqual(
                 lines[1].split(),
-                "1 Claude 20 2 Codex 7 3 Grok 5 4 Antigravity 2 5 Gemini 0 0 All 34".split(),
+                [
+                    "1",
+                    "Claude",
+                    "20",
+                    "2",
+                    "Codex",
+                    "7",
+                    "3",
+                    "Grok",
+                    "5",
+                    "4",
+                    "Antigravity",
+                    "2",
+                    "5",
+                    "Gemini",
+                    "0",
+                    "0",
+                    "All",
+                    "34",
+                ],
             )
             self.assertEqual(lines[3].split(), ["TITLE", "PROJECT", "AGE", "WHERE"])
             self.assertEqual(lines[4].split(), ["Already", "imported", "project-90", "1m", "Linux"])
@@ -384,7 +404,7 @@ class MoveTest(TuiCase):
             self.assertIn(session.id, text)
             self.assertIn("/home/user/code/project-0   (exists)", text)
             self.assertIn("/home/user/.claude", text)
-            self.assertIn(view.local_time(session.updated, timezone.utc), text)
+            self.assertIn(view.local_time(session.updated, UTC), text)
             self.assertEqual(str(self.main.query_one("#detail-import").render()), "-")
             await self.select(pilot, FOREIGN)
             text = self.text()

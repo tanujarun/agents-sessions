@@ -4,7 +4,7 @@ the system Python: nothing here needs Textual."""
 import subprocess
 import sys
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -16,6 +16,7 @@ if str(REPO / "tests") not in sys.path:
     sys.path.insert(0, str(REPO / "tests"))
 
 import tui_support as support  # noqa: E402
+
 from agent_sessions.tui import engine as engine_mod  # noqa: E402
 from agent_sessions.tui import view  # noqa: E402
 
@@ -131,7 +132,7 @@ class AgeTest(unittest.TestCase):
     def test_local_time(self):
         tz = timezone(timedelta(hours=5, minutes=30))
         self.assertEqual(view.local_time("2026-10-10T12:28:00Z", tz), "2026-10-10 17:58")
-        self.assertEqual(view.local_time("2026-10-10T12:28:00Z", timezone.utc), "2026-10-10 12:28")
+        self.assertEqual(view.local_time("2026-10-10T12:28:00Z", UTC), "2026-10-10 12:28")
         self.assertEqual(view.local_time(None), "-")
         self.assertEqual(view.local_time("nope"), "-")
 
@@ -614,7 +615,7 @@ class StatusTest(unittest.TestCase):
 
 
 class DetailTest(unittest.TestCase):
-    tz = timezone.utc
+    tz = UTC
 
     def test_native(self):
         session = support.make_session("claude", 2, messages=1214)
@@ -673,7 +674,7 @@ class DetailTest(unittest.TestCase):
         self.assertEqual(view.verdict_text(support.make_session("grok", 1), (False, "x")), "-")
 
     def test_nothing_selected(self):
-        self.assertEqual(view.detail_fields(None), {name: "-" for name in view.DETAIL_FIELDS})
+        self.assertEqual(view.detail_fields(None), dict.fromkeys(view.DETAIL_FIELDS, "-"))
 
 
 class PromptAndKeyTest(unittest.TestCase):
@@ -880,7 +881,7 @@ class TranscriptTest(unittest.TestCase):
         self.assertEqual(view.wrap_text("", 80), [""])
 
     def test_transcript_lines(self):
-        tz = timezone.utc
+        tz = UTC
         lines = view.transcript_lines("user", "hello\nworld", "2026-10-10T17:58:00Z", 40, tz)
         self.assertEqual(
             lines,
@@ -906,14 +907,14 @@ class TranscriptTest(unittest.TestCase):
         )
 
     def test_long_turn_is_cut_and_says_so(self):
-        lines = view.transcript_lines("assistant", "x" * 250, None, 50, timezone.utc, max_chars=100)
+        lines = view.transcript_lines("assistant", "x" * 250, None, 50, UTC, max_chars=100)
         self.assertEqual(
             [kind for kind, _ in lines], ["role-assistant", "text", "text", "note", "blank"]
         )
         self.assertEqual(lines[3][1], "[… 150 more characters not shown]")
         for width in (5, 20, 80):
             for kind, text in view.transcript_lines(
-                "user", "word " * 400, "2026-10-10T17:58:00Z", width, timezone.utc, max_chars=300
+                "user", "word " * 400, "2026-10-10T17:58:00Z", width, UTC, max_chars=300
             ):
                 self.assertLessEqual(view.text_width(text), width, (width, kind))
 

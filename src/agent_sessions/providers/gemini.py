@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, ClassVar
 
 from ..fsutil import home, listdir_ro, subdirs
 from ..model import Candidate, Session, Store
@@ -22,6 +23,11 @@ from .base import (
     unreadable,
     warn,
 )
+
+if TYPE_CHECKING:
+    from .. import importer
+    from ..fsutil import StrPath
+    from ..pathmap import PathMap
 
 # The verdict of FORMATS section 6, shown to the user as it is.
 IMPORT_UNSAFE = (
@@ -54,7 +60,7 @@ def _id_group(name: str) -> str:
     return found.group(1) if found else name
 
 
-def _content_string(value) -> str:
+def _content_string(value: object) -> str:
     """A message ``content`` as the tool's own listing rule sees it: text,
     with a marker for every part that is not text."""
     if not value:
@@ -71,7 +77,7 @@ def _content_string(value) -> str:
     return value["text"] if isinstance(value.get("text"), str) else ""
 
 
-def _plain_text(value) -> str:
+def _plain_text(value: object) -> str:
     """The text parts of a message ``content``, nothing else."""
     if isinstance(value, str):
         return value
@@ -89,7 +95,7 @@ def _is_ignored(text: str) -> bool:
     return not text or text.startswith(_IGNORED_STARTS)
 
 
-def _has_items(value) -> bool:
+def _has_items(value: object) -> bool:
     return isinstance(value, (list, str)) and len(value) > 0
 
 
@@ -123,11 +129,11 @@ def _usable_meta(patch: dict) -> dict:
     }
 
 
-def _is_message(record) -> bool:
+def _is_message(record: object) -> bool:
     return isinstance(record, dict) and isinstance(record.get("id"), str)
 
 
-def apply_records(records) -> tuple[dict, list[dict]]:
+def apply_records(records: Iterable[object]) -> tuple[dict, list[dict]]:
     """Replay a chat file's records in order; returns ``(metadata, messages)``.
 
     A ``$rewindTo`` drops that message and every later one (all of them when
@@ -200,14 +206,14 @@ def _load(path: Path) -> tuple[dict, list[dict]] | None:
     return legacy, [m for m in found if isinstance(m, dict)] if isinstance(found, list) else []
 
 
-def _mtime(path) -> str | None:
+def _mtime(path: StrPath) -> str | None:
     try:
         return parse_ts(os.stat(path).st_mtime)
     except OSError:
         return None
 
 
-def _read_text(path) -> str:
+def _read_text(path: StrPath) -> str:
     try:
         with open_ro(path) as fh:
             return fh.read(_SMALL_FILE).decode("utf-8-sig", "replace").strip()
@@ -225,9 +231,9 @@ class Gemini(Provider):
     resumable = False
     # Resume searches only the chats of the process cwd's project (section 5).
     resume_needs_cwd = True
-    dir_names = {".gemini"}
+    dir_names: ClassVar[set[str]] = {".gemini"}
 
-    def native_store(self) -> Path | None:
+    def native_store(self) -> Path:
         return home() / ".gemini"
 
     def is_store(self, path: Path) -> bool:
@@ -298,6 +304,7 @@ class Gemini(Provider):
             if newer or (same and Path(other_path).name < path.name):
                 return None
         slug_dir = path.parent.parent
+        cwd: str | None
         cwd, cwd_source = _read_text(slug_dir / ".project_root"), ".project_root"
         if not cwd:
             cwd, cwd_source = self._registered(Path(c.paths[2]), slug_dir.name), "projects.json"
@@ -397,5 +404,5 @@ class Gemini(Provider):
                     if isinstance(name, str) and name:
                         yield Turn("tool", name, parse_ts(call.get("timestamp")) or ts)
 
-    def import_plan(self, s: Session, pathmap):
+    def import_plan(self, s: Session, pathmap: PathMap) -> importer.ImportPlan:
         raise NotSupported(IMPORT_UNSAFE)

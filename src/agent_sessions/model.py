@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import asdict, dataclass, field, fields
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .fsutil import StrPath
 
 
-def make_key(provider: str, store_root, session_id: str) -> str:
+def make_key(provider: str, store_root: StrPath, session_id: str) -> str:
     """Return ``<provider>:<store-hash8>:<id>``.
 
     hash8 is the first 8 hex chars of the sha1 of the store root path string.
     """
-    digest = hashlib.sha1(str(store_root).encode("utf-8", "surrogateescape")).hexdigest()
+    digest = hashlib.sha1(
+        str(store_root).encode("utf-8", "surrogateescape"), usedforsecurity=False
+    ).hexdigest()
     return f"{provider}:{digest[:8]}:{session_id}"
 
 
@@ -71,7 +77,7 @@ class Session:
         messages: int | None = None,
         files: list[str] | None = None,
         note: str | None = None,
-    ) -> "Session":
+    ) -> Session:
         """Build a session from the conversation fields an adapter knows.
 
         The fields the index owns (``cwd_local``, ``cwd_exists``,
@@ -97,7 +103,7 @@ class Session:
         )
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Session":
+    def from_dict(cls, data: dict) -> Session:
         """Inverse of ``to_dict``; unknown keys are ignored."""
         known = {f.name for f in fields(cls)}
         values = {k: v for k, v in data.items() if k in known}

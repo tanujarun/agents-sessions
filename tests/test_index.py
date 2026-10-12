@@ -10,14 +10,15 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from support import FakeProvider, OtherProvider, Sandbox  # noqa: E402
+from support import FakeProvider, OtherProvider, Sandbox
 
-from agent_sessions import api, discover, index as index_mod, providers  # noqa: E402
-from agent_sessions.fsutil import cache_file  # noqa: E402
-from agent_sessions.index import Index  # noqa: E402
-from agent_sessions.model import make_key  # noqa: E402
-from agent_sessions.providers.base import Provider  # noqa: E402
-from agent_sessions.providers.claude import Claude  # noqa: E402
+from agent_sessions import api, discover, providers
+from agent_sessions import index as index_mod
+from agent_sessions.fsutil import cache_file
+from agent_sessions.index import Index
+from agent_sessions.model import make_key
+from agent_sessions.providers.base import Provider
+from agent_sessions.providers.claude import Claude
 
 
 def listing() -> str:
@@ -85,7 +86,7 @@ class ParseCacheTest(IndexCase):
         FakeProvider.parsed.clear()
         self.assertEqual(api.scan()["parsed"], 0)
         self.assertEqual(FakeProvider.parsed, [])
-        row = [r for r in api.status()["stores"] if r["root"] == str(self.native)][0]
+        row = next(r for r in api.status()["stores"] if r["root"] == str(self.native))
         self.assertEqual((row["listed"], row["candidates"], row["skipped"]), (1, 2, 1))
 
     def test_new_and_removed_candidates(self):
