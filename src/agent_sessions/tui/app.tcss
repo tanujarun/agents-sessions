@@ -15,7 +15,10 @@
  *     #header                      column headings
  *     SessionList#list             component classes below
  *     #detail > .detail-row > .detail-label, .detail-value#detail-<field>
- *     #prompt                      foreign-row prompt, import y/n
+ *     #prompt                      the prompts: one line, or two to four (a
+ *                                  reason, a warning) over the choices
+ *     #folderbar > #folder-label, Input#folder
+ *                                  a folder to type, in the prompt's place
  *     #filterbar > #filter-label, Input#filter
  *     #hints
  *   HelpScreen > #help > #help-title, #help-text, #help-hint
@@ -153,25 +156,25 @@ Screen {
 /* --- prompt, filter, hints ------------------------------------------------------- */
 
 #prompt {
-    height: 1;
+    height: auto;
     padding: 0 1;
     text-style: bold;
     text-wrap: nowrap;
     text-overflow: ellipsis;
 }
 
-#filterbar {
+#filterbar, #folderbar {
     height: 1;
 }
 
-#filter-label {
+#filter-label, #folder-label {
     width: auto;
     height: 1;
     padding: 0 0 0 1;
     text-style: bold;
 }
 
-#filter {
+#filter, #folder {
     width: 1fr;
     height: 1;
     border: none;
@@ -180,7 +183,7 @@ Screen {
     color: ansi_default;
 }
 
-#filter:focus {
+#filter:focus, #folder:focus {
     border: none;
 }
 

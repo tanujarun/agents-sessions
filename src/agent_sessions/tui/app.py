@@ -3,10 +3,12 @@ the engine.
 
 Rules this module keeps:
 
-- No engine logic. Every list, scan, import, launch and transcript is a call
-  on ``self.engine`` (``tui/engine.py``), made in a thread worker; the worker
-  hands its result back with ``_ui``. An engine exception becomes a status
-  line message.
+- No engine logic. Every list, scan, import, undo, mount, launch and
+  transcript is a call on ``self.engine`` (``tui/engine.py``), made in a
+  thread worker; the worker hands its result back with ``_ui``. An engine
+  exception becomes a status line message. What touches a disk for the
+  folder input (a listing, a look whether a folder is there) runs in a
+  worker too.
 - No view logic. What a row says, which columns fit, what a key means: all of
   it is in ``tui/view.py``.
 - No styling. Colours, borders and spacing are in ``app.tcss``; this module
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import re
 import signal
 import threading
@@ -61,7 +64,7 @@ THEME = "ansi-dark"
 # over a day old.
 STARTUP_SCAN_DEEP = None
 PROGRESS_INTERVAL = 0.1  # seconds between progress updates sent to the UI
-VERDICT_DELAY = 0.15  # seconds a row must stay selected before can_import runs
+VERDICT_DELAY = 0.15  # seconds a row must stay selected before import_options runs
 CLOCK_INTERVAL = 30.0  # seconds between refreshes of the ages on screen
 PAGER_BATCH = 50  # turns handed to the pager at once
 PAGER_SLICE = 0.01  # seconds of wrapping before the pager yields to input
@@ -305,6 +308,27 @@ class Snapshot:
     last_scan: str | None = None
 
 
+@dataclass
+class Question:
+    """What the prompt on screen, or the folder input, is about: one session,
+    and what the steps before this one settled."""
+
+    key: str
+    title: str
+    where: str
+    stay: bool = False  # asked with ``o``: the TUI stays open after a resume
+    verdict: view.Verdict = field(default_factory=view.Verdict)  # what its import can be
+    then_open: bool = False  # the warning: resume the copy once it is imported
+    target: str | None = None  # the warning: the folder chosen before it
+    purpose: str = ""  # the folder input: what the folder is for (view.FOLDER_LABELS)
+    tools: tuple[tuple[str, str], ...] = ()  # continue: the tools, as (name, label)
+    tool: int = 0  # continue: the one chosen
+    folder: str = ""  # continue: the folder to suggest, then the one accepted
+    files: int = 0  # undo: the files a dry run would remove
+    size: int = 0  # undo: their bytes
+    differ: int = 0  # undo: the files that differ in a copy that was used since
+
+
 def build_snapshot(engine: Engine) -> Snapshot:
     """Read the index through the engine. Called in a worker thread."""
     index = engine.load_index()
@@ -339,17 +363,26 @@ class MainScreen(_UiCalls, Screen):
         self.tab_index = 0
         self.tab_name: str | None = None
         self.needle = ""
-        self.mode = "list"  # "list" | "foreign" | "confirm"
-        self._prompt_key: str | None = None
-        self._prompt_stay = False
-        self._prompt_about = ("", "")  # (title, where) of the prompt's session
+        self.home = os.path.expanduser("~")  # what ``~`` in the folder input means
+        self.mode = "list"  # "list", or what has the keys: a table of view.KEYMAPS
+        self._question: Question | None = None  # what the prompt or the folder input asks
+        # Counts key presses and clicks: what a worker answers to a question
+        # asked before the last one is dropped, not shown.
+        self._asked = 0
+        # (session key, "prompt" | "import" | "folder", stay, _asked): a key
+        # that waits for the import verdict of its row.
+        self._asking: tuple[str, str, bool, int] | None = None
+        self._completed = ""  # the folder input's text as a completion left it
         self._selected: dict[str, str] = {}  # tab name -> selected session key
         self._message = ""
         self._message_error = False
         self._activity = ""
         self._scan: dict | None = None  # {"deep": bool, "cancel": Event}
+        self._mount: dict | None = None  # {"drive": str, "cancel": Event, "scanning": bool}
         self._importing = False
+        self._undoing = False
         self._opening = False
+        self._continuing = False
         self._verdicts: dict[str, view.Verdict] = {}
         self._verdict_pending: set[str] = set()
         self._verdict_timer: Timer | None = None
@@ -377,6 +410,10 @@ class MainScreen(_UiCalls, Screen):
                         view.EMPTY, id=f"detail-{name}", classes="detail-value", markup=False
                     )
         yield Static("", id="prompt", markup=False)
+        with Horizontal(id="folderbar"):
+            yield Static("", id="folder-label", markup=False)
+            # The text it opens with is a start to type after, not to replace.
+            yield Input(id="folder", select_on_focus=False)
         with Horizontal(id="filterbar"):
             yield Static("/", id="filter-label", markup=False)
             yield Input(id="filter", placeholder="title, project or folder")
@@ -390,8 +427,13 @@ class MainScreen(_UiCalls, Screen):
     def filter_input(self) -> Input:
         return self.query_one("#filter", Input)
 
+    @property
+    def folder_input(self) -> Input:
+        return self.query_one("#folder", Input)
+
     def on_mount(self) -> None:
         self.query_one("#prompt").display = False
+        self.query_one("#folderbar").display = False
         self.query_one("#filterbar").display = False
         self.session_list.focus()
         self._apply_layout()
@@ -402,8 +444,9 @@ class MainScreen(_UiCalls, Screen):
     def on_unmount(self) -> None:
         # A scan in a thread cannot be killed; ask it to stop so quitting
         # does not wait for a walk of every drive.
-        if self._scan is not None:
-            self._scan["cancel"].set()
+        for job in (self._scan, self._mount):
+            if job is not None:
+                job["cancel"].set()
 
     def _work(
         self, function: Callable[..., object], *args: object, group: str = "default"
@@ -532,7 +575,7 @@ class MainScreen(_UiCalls, Screen):
         self.tab_name = self.tabs[self.tab_index].name
         if new_names != names:
             await self._rebuild_tabs()
-        if self._prompt_key is not None and self._prompt_key not in snapshot.sessions:
+        if self._question is not None and self._question.key not in snapshot.sessions:
             self._close_prompt()
         self._render_tabs()
         self._refresh_rows(select_key)
@@ -593,8 +636,11 @@ class MainScreen(_UiCalls, Screen):
             self.do_resume()
 
     def on_click(self, event: events.Click) -> None:
-        # A click anywhere else takes a pending prompt away too.
-        self._close_prompt()
+        # A click anywhere else takes a pending prompt away too. One in the
+        # folder input only moves its cursor.
+        bar = self.query_one("#folderbar")
+        if event.widget is None or bar not in event.widget.ancestors_with_self:
+            self._close_prompt()
 
     # --- detail pane -----------------------------------------------------
 
@@ -605,8 +651,8 @@ class MainScreen(_UiCalls, Screen):
             self.query_one(f"#detail-{name}", Static).update(value)
 
     def _schedule_verdict(self) -> None:
-        """Ask the engine whether the selected foreign session can be
-        imported, once the selection has settled on it."""
+        """Ask the engine what an import of the selected foreign session can
+        be, once the selection has settled on it."""
         if self._verdict_timer is not None:
             self._verdict_timer.stop()
             self._verdict_timer = None
@@ -632,12 +678,10 @@ class MainScreen(_UiCalls, Screen):
         self._work(self._verdict_thread, key, session, self.snapshot.index, group="verdict")
 
     def _verdict_thread(self, key: str, session: Session, index: Index | None) -> None:
-        verdict: view.Verdict
         try:
-            possible, reason = self.engine.can_import(session, index=index)
-            verdict = (bool(possible), reason or "")
+            verdict = view.make_verdict(self.engine.import_options(session, index=index))
         except Exception as exc:  # shown in the detail pane, never fatal
-            verdict = (None, view.error_text(exc))
+            verdict = view.failed_verdict(exc)
         self._ui(self._verdict_done, key, index, verdict)
 
     def _verdict_done(self, key: str, index: Index | None, verdict: view.Verdict) -> None:
@@ -647,14 +691,51 @@ class MainScreen(_UiCalls, Screen):
             return
         self._verdicts[key] = verdict
         self._render_detail()
+        if self._asking is not None and self._asking[0] == key:
+            _key, what, stay, asked = self._asking
+            self._asking = None
+            session = self._still_wanted(asked, key)
+            if session is not None:
+                self._answer_import(session, verdict, what, stay)
+
+    def _ask_import(self, session: Session, what: str, stay: bool = False) -> None:
+        """Enter (``what`` is ``prompt``), ``i`` (``import``) or ``t``
+        (``folder``) on a foreign row: each starts from what the engine says
+        the import can be. That is known already when the row was selected
+        for a moment; otherwise the key waits for the answer, and the next
+        key press forgets it. An answer that failed is asked for again."""
+        verdict = self._verdicts.get(session.key)
+        if verdict is not None and verdict.known:
+            self._answer_import(session, verdict, what, stay)
+            return
+        self._verdicts.pop(session.key, None)
+        self._asking = (session.key, what, stay, self._asked)
+        if self._verdict_timer is not None:
+            self._verdict_timer.stop()
+            self._verdict_timer = None
+        self._start_verdict(session.key)
+
+    def _answer_import(
+        self, session: Session, verdict: view.Verdict, what: str, stay: bool
+    ) -> None:
+        if not verdict.known:  # asking failed: the reason, and nothing to choose from
+            self.set_message(verdict.reason, error=True)
+            return
+        question = self._about(session, stay=stay, verdict=verdict)
+        step = "prompt" if what == "prompt" else view.import_step(verdict, what)
+        if step == "prompt":
+            self._open_prompt(view.foreign_mode(verdict), question)
+        elif step == "refuse":
+            self.set_message(verdict.reason or "this session cannot be imported", error=True)
+        elif step == "folder":
+            self._open_folder(question, "import")
+        else:  # "warn" or "confirm": the question of that name
+            self._open_prompt(step, question)
 
     # --- keys ------------------------------------------------------------
 
     def on_key(self, event: events.Key) -> None:
-        if isinstance(self.focused, Input):
-            mode = "filter"
-        else:
-            mode = self.mode
+        mode = "filter" if self.focused is self.filter_input else self.mode
         action = view.key_action(mode, event.key, event.character)
         if action is None:
             if mode in view.MODAL_MODES:
@@ -664,7 +745,23 @@ class MainScreen(_UiCalls, Screen):
         event.stop()
         event.prevent_default()
         self.clear_message()
+        self._forget()
         getattr(self, f"do_{action}")(event)
+
+    def _forget(self) -> None:
+        """A key was pressed, or something clicked: whatever a worker still
+        has to answer to an earlier key is not wanted any more."""
+        self._asked += 1
+        self._asking = None
+
+    def _still_wanted(self, asked: int, key: str) -> Session | None:
+        """The session a worker's answer is about, when the answer is still
+        wanted: nothing was pressed since, no prompt came up and nothing is
+        being typed, and the row is still the selected one."""
+        if asked != self._asked or self.mode != "list" or isinstance(self.focused, Input):
+            return None
+        session = self.current_session()
+        return session if session is not None and session.key == key else None
 
     def do_cursor_up(self, event: events.Key | None = None) -> None:
         self.session_list.move("up")
@@ -702,13 +799,17 @@ class MainScreen(_UiCalls, Screen):
         self.app.push_screen(HelpScreen())
 
     def do_escape(self, event: events.Key | None = None) -> None:
-        """Esc: stop a full rescan, else clear the filter, else stop a quick scan."""
+        """Esc: stop a full rescan, else clear the filter, else stop a quick
+        scan, or the scan that follows a mount."""
         if self._scan is not None and self._scan["deep"]:
             self._cancel_scan()
         elif self.needle:
             self.do_filter_clear()
         elif self._scan is not None:
             self._cancel_scan()
+        elif self._mount is not None and self._mount["scanning"]:
+            self._mount["cancel"].set()
+            self.set_message(f"stopping the scan{view.ELLIPSIS}")
 
     # --- filter ----------------------------------------------------------
 
@@ -736,77 +837,246 @@ class MainScreen(_UiCalls, Screen):
             self._refresh_rows()
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
-        if isinstance(event.widget, Input):
+        if event.widget is self.filter_input:
             self._close_prompt()
 
     def on_descendant_blur(self, event: events.DescendantBlur) -> None:
-        # The filter box left by a click: an empty one has nothing to show.
-        if isinstance(event.widget, Input) and not self.needle:
-            self.query_one("#filterbar").display = False
+        if event.widget is self.filter_input:
+            # The filter box left by a click: an empty one has nothing to show.
+            if not self.needle:
+                self.query_one("#filterbar").display = False
+        elif (
+            self.mode == "folder"
+            and self.focused is not self.folder_input
+            and self.app.app_focus  # the terminal lost the focus: it comes back
+        ):
+            # The folder input left by a click: its question goes with it.
+            self._close_prompt()
 
-    # --- prompts (the line over the key hints) ----------------------------
+    # --- prompts (the lines over the key hints) ---------------------------
 
-    def _open_prompt(self, mode: str, session: Session, stay: bool = False) -> None:
+    def _about(self, session: Session, **facts: Any) -> Question:
+        """A question about the selected session."""
         row = self.session_list.current
+        where = row.where if row is not None and row.key == session.key else ""
+        return Question(session.key, view.clean(session.title) or session.id, where, **facts)
+
+    def _open_prompt(self, mode: str, question: Question) -> None:
+        """Show a prompt; ``mode`` names its keys (``view.KEYMAPS``)."""
+        self._hide_folder()
         self.mode = mode
-        self._prompt_key = session.key
-        self._prompt_stay = stay
-        self._prompt_about = (view.clean(session.title) or session.id, row.where if row else "")
+        self._question = question
         self._render_prompt()
         self.query_one("#prompt").display = True
 
     def _render_prompt(self) -> None:
         """Word the prompt for the width there is."""
-        if self.mode == "list":
+        question = self._question
+        if question is None or self.mode in ("list", "folder"):
             return
         prompt = self.query_one("#prompt", Static)
         room = self.size.width - prompt.styles.gutter.width - prompt.styles.margin.width
-        title, where = self._prompt_about
-        if self.mode == "foreign":
-            prompt.update(view.foreign_prompt(where, room))
-        else:
-            prompt.update(view.confirm_prompt(title, where, room))
+        prompt.update("\n".join(self._prompt_lines(self.mode, question, room)))
+
+    @staticmethod
+    def _prompt_lines(mode: str, question: Question, room: int) -> list[str]:
+        if mode == "mount":
+            return [view.mount_prompt(question.where, room)]
+        if mode == "warn":
+            return view.warn_prompt(question.verdict.warning, room)
+        if mode in ("tool", "start"):
+            label = question.tools[question.tool][1]
+            if mode == "tool":
+                return [view.tool_prompt(label, room)]
+            return [view.start_prompt(label, question.folder, room)]
+        if mode == "undo":
+            return [view.undo_prompt(question.files, question.size, room)]
+        if mode == "undo_used":
+            return [view.undo_used_prompt(question.differ, room)]
+        if mode == "confirm":
+            return [view.confirm_prompt(question.title, question.where, room)]
+        return view.foreign_prompt(question.where, question.verdict, room)
 
     def _close_prompt(self) -> None:
+        """Take the prompt or the folder input away, with its question."""
+        self._forget()
         if self.mode == "list":
             return
         self.mode = "list"
-        self._prompt_key = None
+        self._question = None
         self.query_one("#prompt").display = False
+        self._hide_folder()
 
-    def _take_prompt(self) -> tuple[str | None, bool]:
-        key, stay = self._prompt_key, self._prompt_stay
+    def _take_prompt(self) -> Question | None:
+        question = self._question
         self._close_prompt()
-        return key, stay
+        return question
 
     def do_prompt_cancel(self, event: events.Key | None = None) -> None:
         self._close_prompt()
 
     def do_prompt_import_resume(self, event: events.Key | None = None) -> None:
-        key, stay = self._take_prompt()
-        self._start_import(key, then_open=True, stay=stay)
+        question = self._take_prompt()
+        if question is not None:
+            self._start_import(question.key, then_open=True, stay=question.stay)
 
     def do_prompt_import_only(self, event: events.Key | None = None) -> None:
-        key, _stay = self._take_prompt()
-        self._start_import(key, then_open=False, stay=True)
+        question = self._take_prompt()
+        if question is not None:
+            self._start_import(question.key, then_open=False, stay=True)
+
+    def do_prompt_warn_resume(self, event: events.Key | None = None) -> None:
+        self._warn(then_open=True)
+
+    def do_prompt_warn_only(self, event: events.Key | None = None) -> None:
+        self._warn(then_open=False)
+
+    def _warn(self, then_open: bool) -> None:
+        """An experimental import asks a second time, with its warning."""
+        question = self._question
+        if question is not None:
+            question.then_open = then_open
+            self._open_prompt("warn", question)
+
+    def do_warn_yes(self, event: events.Key | None = None) -> None:
+        question = self._take_prompt()
+        if question is not None:
+            self._start_import(
+                question.key,
+                then_open=question.then_open,
+                stay=question.stay or not question.then_open,
+                target=question.target,
+                experimental=True,
+            )
+
+    def do_prompt_folder(self, event: events.Key | None = None) -> None:
+        if self._question is not None:
+            self._open_folder(self._question, "import")
+
+    def do_prompt_continue(self, event: events.Key | None = None) -> None:
+        question = self._take_prompt()
+        if question is not None:
+            self._start_continue(question.key)
 
     def do_prompt_view(self, event: events.Key | None = None) -> None:
-        key, _stay = self._take_prompt()
-        self._view(key)
+        question = self._take_prompt()
+        if question is not None:
+            self._view(question.key)
+
+    def do_prompt_mount(self, event: events.Key | None = None) -> None:
+        question = self._take_prompt()
+        session = self.snapshot.sessions.get(question.key) if question is not None else None
+        if question is not None and session is not None:
+            self._start_mount(session, view.drive_of(question.where))
 
     def do_confirm_yes(self, event: events.Key | None = None) -> None:
-        key, _stay = self._take_prompt()
-        self._start_import(key, then_open=False, stay=True)
+        question = self._take_prompt()
+        if question is not None:
+            self._start_import(question.key, then_open=False, stay=True)
 
     def do_confirm_no(self, event: events.Key | None = None) -> None:
         self._close_prompt()
+
+    # --- the folder input (in the prompt's place) --------------------------
+
+    def _open_folder(self, question: Question, purpose: str) -> None:
+        """Ask for a folder: to import into, or to start a tool in."""
+        question.purpose = purpose
+        self.query_one("#prompt").display = False
+        self.mode = "folder"
+        self._question = question
+        text = (question.folder if purpose == "continue" else "") or view.FOLDER_START
+        self._completed = text
+        self.query_one("#folder-label", Static).update(view.FOLDER_LABELS[purpose])
+        box = self.folder_input
+        box.value = text
+        box.cursor_position = len(text)
+        self.query_one("#folderbar").display = True
+        box.focus()
+
+    def _hide_folder(self) -> None:
+        bar = self.query_one("#folderbar")
+        if bar.display:
+            bar.display = False
+            if self.focused is None or self.focused is self.folder_input:
+                self.session_list.focus()
+
+    def do_folder_cancel(self, event: events.Key | None = None) -> None:
+        self._close_prompt()
+
+    def do_folder_stay(self, event: events.Key | None = None) -> None:
+        """Shift-Tab: the focus stays in the folder input."""
+
+    @on(Input.Changed, "#folder")
+    def _folder_changed(self, message: Input.Changed) -> None:
+        # Typing takes the last answer away; a completion's own change
+        # leaves the names it has just shown.
+        if message.value != self._completed:
+            self.clear_message()
+
+    def do_folder_complete(self, event: events.Key | None = None) -> None:
+        """Tab: complete the folder's last name. The listing is a worker's."""
+        self._work(self._complete_thread, self._asked, self.folder_input.value, group="folder")
+
+    def _complete_thread(self, asked: int, text: str) -> None:
+        try:
+            completion = view.complete_folder(text, self.engine.list_folder, self.home)
+        except Exception as exc:  # not the listing's own failure: that one is in the answer
+            completion = view.Completion(text, error=view.error_text(exc))
+        self._ui(self._completed_folder, asked, text, completion)
+
+    def _completed_folder(self, asked: int, text: str, completion: view.Completion) -> None:
+        box = self.folder_input
+        if asked != self._asked or self.mode != "folder" or box.value != text:
+            return  # typed on, or gone, while the folder was listed
+        if completion.error:
+            self.set_message(completion.error, error=True)
+            return
+        self._completed = completion.text
+        box.value = completion.text
+        box.cursor_position = len(completion.text)
+        if len(completion.matches) > 1:
+            self.set_message(view.completions_text(completion.matches))
+
+    def do_folder_accept(self, event: events.Key | None = None) -> None:
+        """Enter: take the folder when it is one. Looked at in a worker."""
+        text = self.folder_input.value
+        path = view.expand_folder(text.strip(), self.home)
+        self._work(self._folder_thread, self._asked, text, path, group="folder")
+
+    def _folder_thread(self, asked: int, text: str, path: str) -> None:
+        folder = ""
+        try:
+            if path and os.path.isabs(path) and os.path.isdir(path):
+                folder = os.path.normpath(path)
+        except (OSError, ValueError):  # a NUL in the text
+            folder = ""
+        self._ui(self._folder_known, asked, text, path, folder)
+
+    def _folder_known(self, asked: int, text: str, path: str, folder: str) -> None:
+        question = self._question
+        if asked != self._asked or self.mode != "folder" or question is None:
+            return
+        if self.folder_input.value != text:
+            return
+        if not folder:
+            self.set_message(view.folder_error(path), error=True)  # and the input stays
+        elif question.purpose == "continue":
+            question.folder = folder
+            self._open_prompt("start", question)
+        elif question.verdict.experimental:
+            question.target, question.then_open = folder, False
+            self._open_prompt("warn", question)
+        else:
+            self._close_prompt()
+            self._start_import(question.key, then_open=False, stay=True, target=folder)
 
     # --- resume ----------------------------------------------------------
 
     def do_resume(self, event: events.Key | None = None, stay: bool = False) -> None:
         """Enter: a native session resumes; a foreign one resumes its native
-        copy when it has one, else asks what to do. One whose drive is not
-        mounted has nothing to ask about: the engine's refusal is shown."""
+        copy when it has one, else asks what to do: about its drive when
+        that is not mounted, else about the import."""
         session = self.current_session()
         if session is None:
             return
@@ -815,32 +1085,126 @@ class MainScreen(_UiCalls, Screen):
         elif session.imported_as:
             self._start_open(session.imported_as, session.title, stay)
         elif session.offline:
-            self._start_refusal(session, "open")
+            self._work(
+                self._volume_thread,
+                self._asked,
+                session.key,
+                session.mount,
+                self.snapshot.index,
+                group="volume",
+            )
         else:
-            self._open_prompt("foreign", session, stay)
+            self._ask_import(session, "prompt", stay)
 
     def do_resume_stay(self, event: events.Key | None = None) -> None:
         self.do_resume(stay=True)
 
     def _start_refusal(self, session: Session, what: str) -> None:
         """For a session whose drive is not mounted: ask the engine to
-        ``open``, ``view`` or ``import`` it and show what it answers in the
-        status line. Nothing is started: the engine refuses all three."""
+        ``view`` or ``import`` it and show what it answers in the status
+        line. Nothing is started: the engine refuses both."""
         self._work(self._refusal_thread, session, what, self.snapshot.index, group="refusal")
 
     def _refusal_thread(self, session: Session, what: str, index: Index | None) -> None:
         reason = ""
         try:
             if what == "import":
-                possible, why = self.engine.can_import(session, index=index)
-                reason = "" if possible else why or ""
-            elif what == "view":
+                options = self.engine.import_options(session, index=index)
+                reason = "" if options.possible else options.reason or ""
+            else:
                 next(iter(self.engine.transcript(session.key, index=index)), None)
-            else:  # a dry run: whatever the engine answers, no window opens
-                self.engine.open_session(session.key, dry_run=True, index=index)
         except Exception as exc:
             reason = view.error_text(exc)
         self._ui(self.set_message, reason or view.clean(session.note) or "drive not mounted", True)
+
+    # --- mount -------------------------------------------------------------
+
+    def _volume_thread(self, asked: int, key: str, mount: str, index: Index | None) -> None:
+        """Enter on a session whose drive is not mounted: is the drive there
+        to be mounted at all?"""
+        try:
+            state = view.volume_state(self.engine.volumes(index=index), mount)
+        except Exception as exc:
+            self._ui(self._volume_known, asked, key, None, view.error_text(exc))
+            return
+        self._ui(self._volume_known, asked, key, state, None)
+
+    def _volume_known(self, asked: int, key: str, state: str | None, error: str | None) -> None:
+        session = self._still_wanted(asked, key)
+        if session is None:
+            return
+        question = self._about(session)
+        if error:
+            self.set_message(error, error=True)
+        elif state == view.VOLUME_ABSENT:
+            self.set_message(view.not_attached_text(view.drive_of(question.where)), error=True)
+        else:
+            self._open_prompt("mount", question)
+
+    def do_mount(self, event: events.Key | None = None) -> None:
+        """``m``: mount the drive of the selected session."""
+        session = self.current_session()
+        if session is None:
+            return
+        if not session.offline:
+            self.set_message(view.DRIVE_IS_MOUNTED)
+            return
+        self._start_mount(session, view.drive_of(self._about(session).where))
+
+    def _job(self) -> str | None:
+        """The job under way that ends in a scan, if any: one at a time."""
+        if self._scan is not None:
+            return "scan"
+        if self._importing:
+            return "import"
+        if self._mount is not None:
+            return "mount"
+        return "undo" if self._undoing else None
+
+    def _start_mount(self, session: Session, drive: str) -> None:
+        if self._mount is not None:
+            self.set_message(view.already_mounting_text(self._mount["drive"]))
+            return
+        running = self._job()
+        if running is not None:
+            self.set_message(view.busy_text(running, "mount"))
+            return
+        cancel = threading.Event()
+        self._mount = {"drive": drive, "cancel": cancel, "scanning": False}
+        self._set_activity(view.mount_activity_text(drive))
+        self._work(self._mount_thread, session.mount, drive, cancel, group="mount")
+
+    def _mount_thread(self, mount: str, drive: str, cancel: threading.Event) -> None:
+        last = [0.0]
+
+        def progress(label: str, dirs: int) -> None:  # of the scan that follows the mount
+            now = time.monotonic()
+            if now - last[0] >= PROGRESS_INTERVAL:
+                last[0] = now
+                self._ui(self._mount_scanning, view.scan_progress_text(label, dirs))
+
+        try:
+            self.engine.mount_drive(mount, progress=progress, cancel=cancel)
+            snapshot = build_snapshot(self.engine)
+        except Exception as exc:
+            self._ui(self._mount_done, drive, None, view.error_text(exc))
+            return
+        self._ui(self._mount_done, drive, snapshot, None)
+
+    def _mount_scanning(self, text: str) -> None:
+        if self._mount is not None:
+            self._mount["scanning"] = True
+            self._set_activity(text)
+
+    async def _mount_done(self, drive: str, snapshot: Snapshot | None, error: str | None) -> None:
+        self._mount = None
+        self._set_activity("")
+        if snapshot is not None:
+            await self._apply_snapshot(snapshot)
+        if error:
+            self.set_message(error, error=True)
+        else:
+            self.set_message(view.mounted_text(drive))
 
     def _start_open(self, key: str, title: str, stay: bool) -> None:
         if self._opening:
@@ -877,34 +1241,43 @@ class MainScreen(_UiCalls, Screen):
     # --- import ----------------------------------------------------------
 
     def do_import(self, event: events.Key | None = None) -> None:
-        """``i``: import the selected foreign session, after a y/n."""
+        """``i``: import the selected foreign session, after a y/n; into a
+        folder that is asked for when it needs one; after its warning when
+        the import is an experimental one."""
+        self._import_key("import")
+
+    def do_import_folder(self, event: events.Key | None = None) -> None:
+        """``t``: import the selected foreign session into a folder that is
+        asked for."""
+        self._import_key("folder")
+
+    def _import_key(self, what: str) -> None:
         session = self.current_session()
         if session is None:
             return
         if session.origin == "native":
             self.set_message("already on Linux; nothing to import")
-            return
-        if session.imported_as:
+        elif session.imported_as:
             self.set_message("already imported; Enter resumes the Linux copy")
-            return
-        if session.offline:
+        elif session.offline:
             self._start_refusal(session, "import")
-            return
-        verdict = self._verdicts.get(session.key)
-        if verdict is not None and verdict[0] is False:
-            self.set_message(verdict[1] or "this session cannot be imported", error=True)
-            return
-        self._open_prompt("confirm", session)
+        else:
+            self._ask_import(session, what)
 
-    def _start_import(self, key: str | None, then_open: bool, stay: bool) -> None:
-        session = self.snapshot.sessions.get(key) if key is not None else None
-        if key is None or session is None:
+    def _start_import(
+        self,
+        key: str,
+        then_open: bool,
+        stay: bool,
+        target: str | None = None,
+        experimental: bool = False,
+    ) -> None:
+        session = self.snapshot.sessions.get(key)
+        if session is None:
             return
-        if self._importing:
-            self.set_message("an import is already running")
-            return
-        if self._scan is not None:
-            self.set_message("a scan is running; import when it has finished")
+        running = self._job()
+        if running is not None:
+            self.set_message(view.busy_text(running, "import"))
             return
         self._importing = True
         self._set_activity(view.import_progress_text(0, 0))
@@ -914,12 +1287,21 @@ class MainScreen(_UiCalls, Screen):
             view.clean(session.title) or key,
             then_open,
             stay,
+            target,
+            experimental,
             self.snapshot.index,
             group="import",
         )
 
     def _import_thread(
-        self, key: str, title: str, then_open: bool, stay: bool, index: Index | None
+        self,
+        key: str,
+        title: str,
+        then_open: bool,
+        stay: bool,
+        target: str | None,
+        experimental: bool,
+        index: Index | None,
     ) -> None:
         last = [0.0]
 
@@ -930,7 +1312,9 @@ class MainScreen(_UiCalls, Screen):
                 self._ui(self._set_activity, view.import_progress_text(done, total))
 
         try:
-            copy = self.engine.import_session(key, progress=progress, index=index)
+            copy = self.engine.import_session(
+                key, progress=progress, index=index, target=target, experimental=experimental
+            )
         except Exception as exc:
             self._ui(self._import_done, title, None, None, False, None, view.error_text(exc), stay)
             return
@@ -978,6 +1362,189 @@ class MainScreen(_UiCalls, Screen):
         else:
             text = f"imported and opened {title}" if opened else f"imported {title}"
             self.set_message(text + (f" · {note}" if note else ""))
+
+    # --- undo an import ---------------------------------------------------
+
+    def do_undo(self, event: events.Key | None = None) -> None:
+        """``u``: take back the import of the selected session, its native
+        copy or the session it was made from. Planned first, as a dry run:
+        every refusal comes from there, before a question is asked."""
+        session = self.current_session()
+        if session is not None:
+            self._work(
+                self._undo_plan_thread,
+                self._asked,
+                session.key,
+                self.snapshot.index,
+                group="undo",
+            )
+
+    def _undo_plan_thread(self, asked: int, key: str, index: Index | None) -> None:
+        try:
+            report = self.engine.unimport(key, dry_run=True, index=index)
+        except Exception as exc:
+            kind, differ = view.undo_refusal(exc)
+            self._ui(self._undo_planned, asked, key, kind, (0, 0, differ), view.error_text(exc))
+            return
+        self._ui(self._undo_planned, asked, key, "", view.undo_counts(report), "")
+
+    def _undo_planned(
+        self, asked: int, key: str, refusal: str, counts: tuple[int, int, int], reason: str
+    ) -> None:
+        """The dry run's answer: what would go (``refusal`` is empty), or
+        which refusal it was (``view.undo_refusal``) and its ``reason``."""
+        session = self._still_wanted(asked, key)
+        if session is None:
+            return
+        files, size, differ = counts
+        if not refusal:
+            self._open_prompt("undo", self._about(session, files=files, size=size))
+        elif refusal == "used":  # a forced undo gets past this one: ask
+            self._open_prompt("undo_used", self._about(session, differ=differ))
+        else:  # nothing recorded is an answer; anything else went wrong
+            self.set_message(reason, error=refusal != "none")
+
+    def do_undo_yes(self, event: events.Key | None = None) -> None:
+        question = self._take_prompt()
+        if question is not None:
+            self._start_undo(question.key, force=False)
+
+    def do_undo_force_yes(self, event: events.Key | None = None) -> None:
+        question = self._take_prompt()
+        if question is not None:
+            self._start_undo(question.key, force=True)
+
+    def _start_undo(self, key: str, force: bool) -> None:
+        running = self._job()
+        if running is not None:
+            self.set_message(view.busy_text(running, "undo"))
+            return
+        self._undoing = True
+        self._work(self._undo_thread, key, force, self.snapshot.index, group="undo")
+
+    def _undo_thread(self, key: str, force: bool, index: Index | None) -> None:
+        try:
+            report = self.engine.unimport(key, force=force, index=index)
+        except Exception as exc:
+            self._ui(self._undo_done, None, None, view.error_text(exc))
+            return
+        files, _size, left = view.undo_counts(report)
+        snapshot: Snapshot | None = None
+        error: str | None = None
+        try:
+            # The engine has scanned; read the index again to list what is left.
+            snapshot = build_snapshot(self.engine)
+        except Exception as exc:
+            error = view.error_text(exc)
+        self._ui(self._undo_done, view.undo_message(files, left), snapshot, error)
+
+    async def _undo_done(
+        self, removed: str | None, snapshot: Snapshot | None, error: str | None
+    ) -> None:
+        """``removed`` is None when the undo itself failed (``error`` says
+        why); otherwise the copy is gone and ``error`` is what went wrong
+        when the index was read again."""
+        self._undoing = False
+        if snapshot is not None:
+            await self._apply_snapshot(snapshot)
+        if removed is None:
+            self.set_message(error or "", error=True)
+        elif error:
+            self.set_message(f"{removed}, but: {error}", error=True)
+        else:
+            self.set_message(removed)
+
+    # --- continue as a new session -----------------------------------------
+
+    def do_continue(self, event: events.Key | None = None) -> None:
+        """``c``: carry the selected session on as a new session of a tool."""
+        session = self.current_session()
+        if session is not None:
+            self._start_continue(session.key)
+
+    def _start_continue(self, key: str) -> None:
+        self._work(
+            self._continue_options_thread, self._asked, key, self.snapshot.index, group="continue"
+        )
+
+    def _continue_options_thread(self, asked: int, key: str, index: Index | None) -> None:
+        try:
+            options = self.engine.continue_options(key, index=index)
+            tools = tuple((str(name), view.clean(label)) for name, label in options.tools)
+            answer = (bool(options.possible), view.clean(options.reason), tools)
+            start = (view.tool_start(tools, options.default_tool), options.folder or "")
+        except Exception as exc:
+            self._ui(self._continue_asked, asked, key, (False, view.error_text(exc), ()), (0, ""))
+            return
+        self._ui(self._continue_asked, asked, key, answer, start)
+
+    def _continue_asked(
+        self,
+        asked: int,
+        key: str,
+        answer: tuple[bool, str, tuple[tuple[str, str], ...]],
+        start: tuple[int, str],
+    ) -> None:
+        session = self._still_wanted(asked, key)
+        if session is None:
+            return
+        possible, reason, tools = answer
+        # A row this list shows as offline is not started, whatever a
+        # listing that is behind the engine made it answer.
+        if not possible or not tools or session.offline:
+            self.set_message(reason or view.clean(session.note) or "cannot be continued", True)
+            return
+        tool, folder = start
+        self._open_prompt("tool", self._about(session, tools=tools, tool=tool, folder=folder))
+
+    def do_tool_prev(self, event: events.Key | None = None) -> None:
+        self._turn_tool(-1)
+
+    def do_tool_next(self, event: events.Key | None = None) -> None:
+        self._turn_tool(1)
+
+    def _turn_tool(self, step: int) -> None:
+        question = self._question
+        if question is not None:
+            question.tool = view.cycle_tab(question.tool, step, len(question.tools))
+            self._render_prompt()
+
+    def do_tool_accept(self, event: events.Key | None = None) -> None:
+        if self._question is not None:
+            self._open_folder(self._question, "continue")
+
+    def do_start_yes(self, event: events.Key | None = None) -> None:
+        question = self._take_prompt()
+        if question is None or self._continuing:
+            return
+        name, label = question.tools[question.tool]
+        self._continuing = True
+        self._work(
+            self._continue_thread,
+            question.key,
+            name,
+            label,
+            question.folder,
+            self.snapshot.index,
+            group="continue",
+        )
+
+    def _continue_thread(
+        self, key: str, tool: str, label: str, folder: str, index: Index | None
+    ) -> None:
+        try:
+            self.engine.continue_session(key, tool=tool, folder=folder, index=index)
+        except Exception as exc:
+            self._ui(self._continued, label, view.error_text(exc))
+            return
+        self._ui(self._continued, label, None)
+
+    def _continued(self, label: str, error: str | None) -> None:
+        self._continuing = False
+        if error:
+            self.set_message(error, error=True)
+        else:
+            self.set_message(view.started_text(label))
 
     # --- view ------------------------------------------------------------
 
@@ -1027,11 +1594,9 @@ class MainScreen(_UiCalls, Screen):
         self.start_scan(True)
 
     def start_scan(self, deep: bool | None, announce: bool = True) -> None:
-        if self._scan is not None:
-            self.set_message("a scan is already running")
-            return
-        if self._importing:
-            self.set_message("an import is running; rescan when it has finished")
+        running = self._job()
+        if running is not None:
+            self.set_message(view.busy_text(running, "scan"))
             return
         cancel = threading.Event()
         self._scan = {"deep": bool(deep), "cancel": cancel}

@@ -391,6 +391,44 @@ class WhichRecordTest(UndoCase):
                 api.unimport("claude:nope", dry_run=dry_run)
             self.assertIn("no session matches 'claude:nope'", caught.exception.reason)
 
+    def test_the_refusal_says_that_it_is_this_one_without_its_text(self):
+        """What a front end reads: ``no_record``, in every place it is
+        raised, and nothing that reads as a copy that was used."""
+        for ref in (self.source(), CLAUDE_WIN):  # nothing recorded
+            for dry_run in (True, False):
+                with self.assertRaises(api.UndoFailed) as caught:
+                    api.unimport(ref, dry_run=dry_run)
+                self.assertIs(caught.exception.no_record, True)
+                self.assertEqual(caught.exception.differences, [])
+        api.import_session(self.source())
+        api.unimport(CLAUDE_WIN)
+        with self.assertRaises(api.UndoFailed) as caught:  # recorded, and undone since
+            api.unimport(CLAUDE_WIN, dry_run=True)
+        self.assertIs(caught.exception.no_record, True)
+
+    def test_a_provider_without_a_native_store_has_no_record_either(self):
+        source = self.source()
+        with (
+            mock.patch.object(Claude, "native_store", return_value=None),
+            self.assertRaises(api.UndoFailed) as caught,
+        ):
+            api.unimport(source, dry_run=True)
+        self.assertEqual(
+            (caught.exception.reason, caught.exception.no_record), (unimport.NO_RECORD, True)
+        )
+
+    def test_any_other_refusal_is_marked_as_neither(self):
+        plain = api.UndoFailed("the import record is damaged")
+        self.assertEqual(plain.reason, "the import record is damaged")
+        self.assertEqual((plain.no_record, plain.differences), (False, []))
+        api.import_session(self.source())
+        os.unlink(journal.path())
+        journal.path().mkdir()
+        with self.assertRaises(api.UndoFailed) as caught:
+            api.unimport(CLAUDE_WIN, dry_run=True)
+        self.assertIn("cannot be read", caught.exception.reason)
+        self.assertEqual((caught.exception.no_record, caught.exception.differences), (False, []))
+
     def test_a_copy_whose_session_is_not_listed_any_more_is_found_in_the_journal(self):
         source = self.source()
         native = api.import_session(source)
@@ -476,6 +514,37 @@ class UsedSinceTest(UndoCase):
         reason = self.refused(CLAUDE_WIN)
         self.assertEqual(reason.count(" is gone"), unimport.DIFFERENCES_SHOWN)
         self.assertIn("gone-4 is gone; and 3 more. Nothing was removed", reason)
+
+    def test_the_refusal_carries_every_difference(self):
+        """All of them, as a list: the reason names the first few only, and
+        a front end counts them without reading it."""
+        for number in range(8):
+            self.rewrite_journal(
+                lambda record, number=number: record["manifest"]["files"].append(
+                    {"path": str(self.target / f"gone-{number}"), "size": 1, "mtime_ns": 1}
+                )
+            )
+        with open(self.transcript, "ab") as fh:
+            fh.write(b"more\n")
+        forced = api.unimport(CLAUDE_WIN, force=True, dry_run=True).differences
+        for dry_run in (True, False):
+            with self.assertRaises(api.UndoFailed) as caught:
+                api.unimport(CLAUDE_WIN, dry_run=dry_run)
+            refusal = caught.exception
+            self.assertIs(refusal.no_record, False)
+            self.assertEqual(len(refusal.differences), 9)
+            self.assertEqual(refusal.differences, forced)
+            for text in refusal.differences[: unimport.DIFFERENCES_SHOWN]:
+                self.assertIn(text, refusal.reason)  # the message is what it was
+        self.assertTrue(self.transcript.exists())
+
+    def test_the_report_counts_the_files_apart_from_the_directories(self):
+        planned = api.unimport(CLAUDE_WIN, dry_run=True)
+        self.assertGreater(len(planned.removed), planned.files)  # directories go too
+        self.assertEqual(planned.files, len([p for p in planned.removed if os.path.isfile(p)]))
+        self.assertTrue(all(os.path.isfile(p) for p in planned.removed[: planned.files]))
+        report = api.unimport(CLAUDE_WIN)
+        self.assertEqual((report.files, report.removed), (planned.files, planned.removed))
 
     def test_force_removes_it_all_the_same_and_says_what_differed(self):
         with open(self.transcript, "ab") as fh:

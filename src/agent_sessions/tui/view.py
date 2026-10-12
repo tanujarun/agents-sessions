@@ -9,9 +9,10 @@ value: those are in ``app.tcss``.
 
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
 from typing import Any, Protocol
@@ -59,8 +60,18 @@ class SessionLike(Protocol):
     note: str | None
 
 
-Verdict = tuple[bool | None, str]
-"""``can_import``'s answer; ``(None, why)`` when asking failed."""
+@dataclass(frozen=True)
+class Verdict:
+    """What the engine answered about importing a session (the fields of its
+    ``ImportOptions``), as the view reads it. ``known`` is False when asking
+    failed; ``reason`` then says why."""
+
+    possible: bool = False
+    reason: str = ""
+    needs_folder: bool = False  # it would work into a folder the user chooses
+    experimental: bool = False  # it works only as an experimental import
+    warning: str = ""  # what is shown before an experimental import
+    known: bool = True
 
 
 # --- display width ----------------------------------------------------------
@@ -462,10 +473,16 @@ class Layout:
 
 
 HINTS_FULL = (
-    "↑↓ move  ←→ provider  Enter resume  o resume, keep open  i import  v view",
-    "/ filter  r rescan  R full rescan  ? help  q quit",
+    "↑↓ move  ←→ provider  Enter resume  o resume, keep open  i import  t import into folder"
+    "  v view",
+    "c continue  u undo import  m mount  / filter  r rescan  R full rescan  ? help  q quit",
+)
+HINTS_MEDIUM = (  # the same keys in the 80 columns of a standard terminal
+    "↑↓ move  ←→ provider  Enter resume  o keep open  i import  t into folder",
+    "v view  c continue  u undo  m mount  / filter  r R rescan  ? help  q quit",
 )
 HINTS_SHORT = (
+    "Enter resume  i import  c continue  v view  / filter  ? help  q quit",
     "Enter resume  i import  v view  / filter  ? help  q quit",
     "Enter resume  / filter  ? help  q quit",
     "Enter resume  ? help  q quit",
@@ -474,11 +491,12 @@ HINTS_SHORT = (
 
 
 def hint_lines(width: int, roomy: bool = True) -> tuple[str, ...]:
-    """Key hints for a width: the two full lines when they fit and the
-    terminal is tall enough (``roomy``), else the longest one-line version
-    that fits."""
-    if roomy and all(text_width(line) <= width for line in HINTS_FULL):
-        return HINTS_FULL
+    """Key hints for a width: two lines with every key when they fit and the
+    terminal is tall enough (``roomy``), in full or in shorter words, else
+    the longest one-line version that fits."""
+    for lines in (HINTS_FULL, HINTS_MEDIUM) if roomy else ():
+        if all(text_width(line) <= width for line in lines):
+            return lines
     for line in HINTS_SHORT:
         if text_width(line) <= width:
             return (line,)
@@ -584,6 +602,23 @@ def import_progress_text(done: float | None, total: float | None) -> str:
     return f"importing{ELLIPSIS} {bytes_text(done)} of {bytes_text(total)}"
 
 
+_JOBS = {  # a job that ends in a scan: (what is running, what is asked for)
+    "scan": ("a scan", "rescan"),
+    "import": ("an import", "import"),
+    "mount": ("a mount", "mount"),
+    "undo": ("an undo", "undo"),
+}
+
+
+def busy_text(running: str, wanted: str) -> str:
+    """Why a job is not started while another runs (one at a time: each ends
+    in a scan): ``a scan is running; import when it has finished``."""
+    article = _JOBS[running][0]
+    if running == wanted:
+        return f"{article} is already running"
+    return f"{article} is running; {_JOBS[wanted][1]} when it has finished"
+
+
 def scan_message(summary: Mapping[str, Any] | None) -> str:
     """One line for a finished scan."""
     summary = summary or {}
@@ -613,22 +648,42 @@ def error_text(exc: BaseException) -> str:
 DETAIL_FIELDS = ("id", "messages", "updated", "cwd", "local", "store", "note", "import")
 
 
+def make_verdict(options: object) -> Verdict:
+    """The verdict in an engine's ``ImportOptions``, read field by field."""
+    return Verdict(
+        possible=bool(getattr(options, "possible", False)),
+        reason=clean(getattr(options, "reason", "") or "").strip(),
+        needs_folder=bool(getattr(options, "needs_folder", False)),
+        experimental=bool(getattr(options, "experimental", False)),
+        warning=str(getattr(options, "warning", "") or ""),  # cleaned where it is wrapped
+    )
+
+
+def failed_verdict(exc: BaseException) -> Verdict:
+    """The verdict when asking the engine failed."""
+    return Verdict(reason=error_text(exc), known=False)
+
+
 def verdict_text(session: SessionLike, verdict: Verdict | None) -> str:
-    """The import line of the detail pane. ``verdict`` is ``can_import``'s
-    answer for a foreign session, ``(None, why)`` when asking failed, or None
-    while it is being worked out."""
+    """The import line of the detail pane. ``verdict`` is the engine's
+    answer for a foreign session, or None while it is being worked out."""
     if session.origin == "native":
         return EMPTY
     if session.imported_as:
         return "already imported; Enter resumes the Linux copy"
     if verdict is None:
         return f"checking{ELLIPSIS}"
-    possible, reason = verdict
-    reason = clean(reason or "").strip()
-    if possible is None:  # the question itself failed
+    reason = clean(verdict.reason or "").strip()
+    if not verdict.known:  # the question itself failed
         return f"unknown: {reason}" if reason else "unknown"
-    if possible:
-        return f"possible · {reason}" if reason else "possible"
+    if verdict.possible:
+        return "possible"
+    if verdict.needs_folder and verdict.experimental:
+        return "experimental only, into a folder you choose"
+    if verdict.needs_folder:
+        return "possible into a folder you choose"
+    if verdict.experimental:
+        return "experimental only"
     return f"not possible: {reason}" if reason else "not possible"
 
 
@@ -672,21 +727,108 @@ def fit_first(variants: Sequence[str], width: int | None) -> str:
     return clip(variants[-1], width)
 
 
-def foreign_prompt(where: str, width: int | None = None) -> str:
-    """``On Zephyro: [i] import and resume …``; a drive letter brings its own
-    colon (``On C: [i] …``). Shorter wordings for a narrow terminal, so no
-    choice is cut off."""
-    drive = drive_of(where)
-    lead = drive if drive.endswith(":") else f"{drive}:"
+def clip_left(text: str, width: int) -> str:
+    """``text`` cut to at most ``width`` cells from the left, so that its end
+    stays (what tells one path from another); a cut starts with an ellipsis."""
+    if width <= 0:
+        return ""
+    if text_width(text) <= width:
+        return text
+    return ELLIPSIS + _take(text[::-1], width - 1)[::-1]
+
+
+def _lead(drive: str) -> str:
+    """A drive in front of what is said of it; a drive letter brings its own
+    colon (``C:``, ``Zephyro:``)."""
+    return drive if drive.endswith(":") else f"{drive}:"
+
+
+# The choices of a prompt, each as (key, long, shorter, shortest wording).
+_CONTINUE = ("[c]", "continue as new", "continue", "new")
+_VIEW = ("[v]", "view", "view", "view")
+_CANCEL = ("[Esc]", "cancel", "", "")
+_CHOICES = {
+    "foreign": (
+        ("[i]", "import and resume", "import+resume", "resume"),
+        ("[I]", "import only", "import", "import"),
+        ("[t]", "into another folder", "folder", "folder"),
+        _CONTINUE,
+        _VIEW,
+        _CANCEL,
+    ),
+    "foreign_folder": (
+        ("[t]", "import into another folder", "import into folder", "folder"),
+        _CONTINUE,
+        _VIEW,
+        _CANCEL,
+    ),
+    "foreign_experimental": (
+        ("[i]", "import and resume (experimental)", "import+resume (exp.)", "resume"),
+        ("[I]", "import only (experimental)", "import (exp.)", "import"),
+        _CONTINUE,
+        _VIEW,
+        _CANCEL,
+    ),
+    "foreign_none": (_CONTINUE, _VIEW, _CANCEL),
+    "mount": (("[m]", "mount", "mount", "mount"), _CANCEL),
+}
+
+
+def _choice_line(mode: str, lead: str, width: int | None) -> str:
+    """The choices of a prompt on one line: in full after ``lead``, then in
+    shorter words, then without the lead, last the keys alone, so that no
+    choice is cut off on a narrow terminal."""
+    choices = _CHOICES[mode]
+
+    def worded(level: int, gap: str) -> str:
+        return gap.join(f"{choice[0]} {choice[level]}".rstrip() for choice in choices)
+
     return fit_first(
         (
-            f"On {lead} [i] import and resume  [I] import only  [v] view  [Esc] cancel",
-            f"On {lead} [i] import+resume  [I] import  [v] view  [Esc]",
-            "[i] resume [I] import [v] view [Esc]",
-            "[i] [I] [v] [Esc]",
+            lead + worded(1, "  "),
+            lead + worded(2, "  "),
+            worded(3, " "),
+            " ".join(choice[0] for choice in choices),
         ),
         width,
     )
+
+
+def foreign_mode(verdict: Verdict) -> str:
+    """Which prompt Enter on a foreign row opens, by what its import can be:
+    the name of its key table and of its choices."""
+    if verdict.possible:
+        return "foreign"
+    if verdict.needs_folder:
+        return "foreign_folder"
+    if verdict.experimental:
+        return "foreign_experimental"
+    return "foreign_none"
+
+
+def foreign_prompt(where: str, verdict: Verdict, width: int | None = None) -> list[str]:
+    """The foreign-row prompt, one or two lines: when the session cannot be
+    imported as it is, the reason; then the choices that apply (``On C: [i]
+    import and resume  [I] import only …``)."""
+    mode = foreign_mode(verdict)
+    lead = f"On {_lead(drive_of(where))} " if mode == "foreign" else ""
+    lines = [_choice_line(mode, lead, width)]
+    reason = clean(verdict.reason or "").strip()
+    if reason and not verdict.possible:
+        lines.insert(0, reason if width is None else clip(reason, width))
+    return lines
+
+
+def import_step(verdict: Verdict, key: str) -> str:
+    """What ``i`` (``key`` is ``import``) or ``t`` (``folder``) on a foreign
+    row leads to: ``refuse`` (the reason is shown), ``folder`` (the folder
+    input), ``warn`` (the warning of an experimental import) or ``confirm``
+    (the y/n)."""
+    if not (verdict.possible or verdict.needs_folder or verdict.experimental):
+        return "refuse"
+    if key == "folder" or verdict.needs_folder:
+        return "folder"
+    return "warn" if verdict.experimental else "confirm"
 
 
 def confirm_prompt(title: str, where: str, width: int | None = None) -> str:
@@ -700,6 +842,270 @@ def confirm_prompt(title: str, where: str, width: int | None = None) -> str:
         ),
         width,
     )
+
+
+WARNING_LINES = 3
+"""How many lines of an experimental import's warning a prompt shows."""
+
+
+def warning_lines(warning: str, width: int | None, limit: int = WARNING_LINES) -> list[str]:
+    """A warning wrapped to ``width`` cells, at most ``limit`` lines; one
+    that is longer ends in an ellipsis."""
+    lines = [line for line in wrap_text(warning, width or 0) if line.strip()]
+    if len(lines) <= limit:
+        return lines
+    last = lines[limit - 1] + ELLIPSIS
+    return lines[: limit - 1] + [last if not width else clip(last, width)]
+
+
+def warn_prompt(warning: str, width: int | None = None) -> list[str]:
+    """The second question of an experimental import: its warning, then
+    ``Import anyway? y/n``."""
+    question = fit_first(("Import anyway? y/n", "Import? y/n"), width)
+    return [*warning_lines(warning, width), question]
+
+
+# --- drives that are not mounted ----------------------------------------------
+
+DRIVE_IS_MOUNTED = "this session's drive is mounted"
+VOLUME_ABSENT = "absent"
+"""The ``state`` of a row of the engine's ``volumes``: the device is not there."""
+
+
+def volume_state(volumes: Iterable[Mapping[str, Any]] | None, mount: str | None) -> str | None:
+    """The state of the volume at a mount path in the engine's ``volumes``
+    (``mounted``, ``attached``, ``absent``); None when it is not listed."""
+    for volume in volumes or ():
+        if volume.get("path") == mount:
+            state = volume.get("state")
+            return state if isinstance(state, str) else None
+    return None
+
+
+def mount_prompt(where: str, width: int | None = None) -> str:
+    """``C: is not mounted: [m] mount  [Esc] cancel``."""
+    return _choice_line("mount", f"{drive_of(where)} is not mounted: ", width)
+
+
+def mount_activity_text(drive: str) -> str:
+    """``mounting Zephyro: answer the password prompt…``."""
+    return f"mounting {_lead(drive)} answer the password prompt{ELLIPSIS}"
+
+
+def mounted_text(drive: str) -> str:
+    return f"{drive} mounted"
+
+
+def already_mounting_text(drive: str) -> str:
+    return f"already mounting {drive}"
+
+
+def not_attached_text(drive: str) -> str:
+    return f"{drive} is not attached"
+
+
+# --- a folder the user types ----------------------------------------------------
+
+FOLDER_LABELS = {"import": "Import into:", "continue": "Start in:"}
+"""The label of the folder input, by what the folder is for."""
+
+FOLDER_START = "~/"
+"""What the folder input holds when it opens with no folder to suggest."""
+
+COMPLETIONS_SHOWN = 6
+"""How many names the status line shows when several folders match."""
+
+_SEPARATORS = tuple(sep for sep in (os.sep, os.altsep) if sep)
+
+
+@dataclass(frozen=True)
+class Completion:
+    """What Tab makes of the text in the folder input."""
+
+    text: str  # the text afterwards; as it was when there is nothing to add
+    matches: tuple[str, ...] = ()  # the folders that match, in order
+    error: str = ""  # why the folder could not be listed
+
+
+def expand_folder(text: str, home: str) -> str:
+    """The path a typed folder means: ``~`` and ``~/…`` are the home
+    directory, anything else is taken as it was typed."""
+    if text == "~":
+        return home
+    if text[:1] == "~" and text[1:2] in _SEPARATORS:
+        return home.rstrip("".join(_SEPARATORS)) + text[1:]
+    return text
+
+
+def complete_folder(
+    text: str, list_folder: Callable[[str], Iterable[tuple[str, bool]]], home: str
+) -> Completion:
+    """Complete the last name of a typed folder, as Tab does in a shell.
+
+    ``list_folder(directory)`` gives the entries of a directory as ``(name,
+    is a directory)`` and may raise ``OSError``; it is the only I/O, and the
+    caller's. Only directories count, and hidden ones only when the name
+    being typed starts with a dot. One match is completed and gets a
+    separator; several are completed as far as they agree, and are named in
+    ``matches``. Nothing is listed for an empty text or a relative one."""
+    if text == "~":
+        return Completion(text + os.sep)
+    cut = max(text.rfind(sep) for sep in _SEPARATORS) + 1
+    head, typed = text[:cut], text[cut:]
+    directory = expand_folder(head, home)
+    if not head or not os.path.isabs(directory):
+        return Completion(text)
+    try:
+        entries = list(list_folder(directory))
+    except OSError as exc:
+        return Completion(text, error=f"cannot list {clean(directory)}: {exc.strerror or exc}")
+    names = sorted(
+        name
+        for name, is_dir in entries
+        if is_dir and name.startswith(typed) and (typed[:1] == "." or name[:1] != ".")
+    )
+    if len(names) == 1:
+        return Completion(head + names[0] + os.sep, tuple(names))
+    if not names:
+        return Completion(text)
+    # As far as they agree: sorted, so the first and the last differ soonest.
+    first, last = names[0], names[-1]
+    agreed = next(
+        (n for n, (a, b) in enumerate(zip(first, last, strict=False)) if a != b), len(first)
+    )
+    return Completion(head + first[:agreed], tuple(names))
+
+
+def completions_text(names: Sequence[str], shown: int = COMPLETIONS_SHOWN) -> str:
+    """The first few of the folders that match, for the status line:
+    ``alpha  alps  alto  … 4 more``."""
+    text = "  ".join(clean(name) for name in names[:shown])
+    more = len(names) - shown
+    return f"{text}  {ELLIPSIS} {more:,} more" if more > 0 else text
+
+
+def folder_error(path: str) -> str:
+    """What Enter answers for a text that is not a folder."""
+    return f"not an existing folder: {clean(path)}" if path else "type a folder"
+
+
+# --- continue as a new session ----------------------------------------------------
+
+
+def tool_start(tools: Sequence[tuple[str, str]], default: str | None) -> int:
+    """Where the choice of a tool starts: at the engine's default, else at
+    the first one."""
+    for index, (name, _label) in enumerate(tools):
+        if name == default:
+            return index
+    return 0
+
+
+TOOL_MARKS = ("\u2039", "\u203a")
+"""The single angle quotation marks round the tool that is chosen."""
+
+
+def tool_prompt(label: str, width: int | None = None) -> str:
+    """The first step of a continue: ``Continue with:``, the chosen tool
+    between ``TOOL_MARKS``, then ``←→ change  Enter next  Esc cancel``."""
+    choice = f"{TOOL_MARKS[0]} {clean(label)} {TOOL_MARKS[1]}"
+    return fit_first(
+        (
+            f"Continue with: {choice}   ←→ change  Enter next  Esc cancel",
+            f"{choice}  ←→ change  Enter next  Esc cancel",
+            f"{choice} ←→ Enter Esc",
+            choice,
+        ),
+        width,
+    )
+
+
+MIN_FOLDER_WIDTH = 12
+"""A folder is not shown in fewer cells than this: it would say nothing."""
+
+
+def start_prompt(label: str, folder: str, width: int | None = None) -> str:
+    """``Start Claude in /home/me/site and send a first message to the
+    model? y/n``; on a narrow terminal the folder keeps its end, then goes."""
+    tool, folder = clean(label), clean(folder)
+    question = "and send a first message to the model? y/n"
+    variants = [f"Start {tool} in {folder} {question}"]
+    if width is not None:
+        room = width - text_width(f"Start {tool} in  {question}")
+        if room >= MIN_FOLDER_WIDTH:
+            variants.append(f"Start {tool} in {clip_left(folder, room)} {question}")
+    variants += [
+        f"Start {tool} {question}",
+        f"Start {tool} and send a first message? y/n",
+        f"Start {tool}? y/n",
+        "Start? y/n",
+    ]
+    return fit_first(variants, width)
+
+
+def started_text(label: str) -> str:
+    return f"started {clean(label)} in a new window"
+
+
+# --- undo an import ---------------------------------------------------------------
+
+
+def undo_refusal(exc: BaseException) -> tuple[str, int]:
+    """Which refusal of an undo this is, from what the engine marked on it
+    (``UndoFailed.no_record``, ``.differences``) and never from its text:
+    ``("none", 0)`` when no import is recorded, ``("used", n)`` when the copy
+    was used since the import and ``n`` of its files differ, else
+    ``("other", 0)``."""
+    differences = getattr(exc, "differences", None)
+    if isinstance(differences, (list, tuple)) and differences:
+        return "used", len(differences)
+    if getattr(exc, "no_record", False) is True:
+        return "none", 0
+    return "other", 0
+
+
+def undo_counts(report: object) -> tuple[int, int, int]:
+    """``(files, bytes, left)`` of an engine's ``UnimportReport``: the files
+    it removes (everything it removes, for a report that does not count
+    them), their size, and how many things stay in place."""
+    files = getattr(report, "files", None)
+    if not isinstance(files, int):
+        files = len(getattr(report, "removed", None) or ())
+    return files, int(getattr(report, "bytes", 0) or 0), len(getattr(report, "left", None) or ())
+
+
+def undo_prompt(files: int, size: float, width: int | None = None) -> str:
+    """``Remove the imported copy (12 files, 3.1 MB)? y/n``."""
+    return fit_first(
+        (
+            f"Remove the imported copy ({plural(files, 'file')}, {bytes_text(size)})? y/n",
+            "Remove the imported copy? y/n",
+            "Remove the copy? y/n",
+            "Remove? y/n",
+        ),
+        width,
+    )
+
+
+def undo_used_prompt(differ: int, width: int | None = None) -> str:
+    """The question for a copy that was used since its import: removing it
+    loses what was added."""
+    files = f"{plural(differ, 'file')} {'differs' if differ == 1 else 'differ'}"
+    return fit_first(
+        (
+            f"The copy was used since the import ({files}). Remove it and lose its new turns? y/n",
+            "The copy was used since the import. Remove it and lose its new turns? y/n",
+            "Used since the import. Remove it and lose its new turns? y/n",
+            "Used since the import. Remove it? y/n",
+            "Remove it? y/n",
+        ),
+        width,
+    )
+
+
+def undo_message(files: int, left: int = 0) -> str:
+    """``removed 12 files, 1 left in place``."""
+    return f"removed {plural(files, 'file')}" + (f", {left:,} left in place" if left else "")
 
 
 # --- keys -------------------------------------------------------------------
@@ -724,6 +1130,10 @@ _LIST_KEYS = {
     "enter": "resume",
     "o": "resume_stay",
     "i": "import",
+    "t": "import_folder",
+    "c": "continue",
+    "u": "undo",
+    "m": "mount",
     "v": "view",
     "/": "filter",
     "r": "rescan",
@@ -734,21 +1144,57 @@ _LIST_KEYS = {
 }
 _LIST_KEYS.update({str(digit): "tab_digit" for digit in range(10)})
 
+# What every foreign-row prompt offers, whatever the import can be.
+_FOREIGN_KEYS = {"c": "prompt_continue", "v": "prompt_view", "escape": "prompt_cancel"}
+
+
+def _yes_no(yes: str) -> dict[str, str]:
+    """The keys of a y/n question whose ``y`` means the action ``yes``."""
+    return {"y": yes, "Y": yes, "n": "confirm_no", "N": "confirm_no", "escape": "confirm_no"}
+
+
 KEYMAPS = {
     "list": _LIST_KEYS,
-    # The foreign-row prompt and the import confirmation take over the keys.
+    # A prompt takes over the keys. The foreign-row prompt is one of four,
+    # by what the import can be (``foreign_mode``): possible as it is, ...
     "foreign": {
         "i": "prompt_import_resume",
         "I": "prompt_import_only",
-        "v": "prompt_view",
+        "t": "prompt_folder",
+        **_FOREIGN_KEYS,
+    },
+    # ... possible into a folder the user chooses, ...
+    "foreign_folder": {"t": "prompt_folder", **_FOREIGN_KEYS},
+    # ... only as an experimental import (its warning comes first), ...
+    "foreign_experimental": {
+        "i": "prompt_warn_resume",
+        "I": "prompt_warn_only",
+        **_FOREIGN_KEYS,
+    },
+    # ... or not at all.
+    "foreign_none": dict(_FOREIGN_KEYS),
+    "mount": {"m": "prompt_mount", "escape": "prompt_cancel"},
+    # The y/n questions: import, an experimental import after its warning,
+    # start a tool, remove an imported copy, remove one that was used since.
+    "confirm": _yes_no("confirm_yes"),
+    "warn": _yes_no("warn_yes"),
+    "start": _yes_no("start_yes"),
+    "undo": _yes_no("undo_yes"),
+    "undo_used": _yes_no("undo_force_yes"),
+    # Continue as new, first step: the tool.
+    "tool": {
+        "left": "tool_prev",
+        "right": "tool_next",
+        "enter": "tool_accept",
         "escape": "prompt_cancel",
     },
-    "confirm": {
-        "y": "confirm_yes",
-        "Y": "confirm_yes",
-        "n": "confirm_no",
-        "N": "confirm_no",
-        "escape": "confirm_no",
+    # While the folder input has the keyboard it takes every printable key
+    # and the ones that edit; Shift-Tab must not carry the focus away.
+    "folder": {
+        "escape": "folder_cancel",
+        "enter": "folder_accept",
+        "tab": "folder_complete",
+        "shift+tab": "folder_stay",
     },
     # While the filter box has the keyboard it takes every printable key.
     "filter": {
@@ -789,8 +1235,21 @@ KEYMAPS = {
     },
 }
 
-MODAL_MODES = ("foreign", "confirm")
-"""Modes in which a key with no meaning is swallowed, not passed on."""
+MODAL_MODES = (
+    "foreign",
+    "foreign_folder",
+    "foreign_experimental",
+    "foreign_none",
+    "mount",
+    "confirm",
+    "warn",
+    "start",
+    "undo",
+    "undo_used",
+    "tool",
+)
+"""The prompts: modes in which a key with no meaning is swallowed, not
+passed on. (Not ``folder``: the keys that edit its text must reach it.)"""
 
 
 def key_action(mode: str, key: str, character: str | None = None) -> str | None:
@@ -812,6 +1271,10 @@ HELP = (
     ("Enter", "resume in a new terminal window and quit; a session on another drive asks first"),
     ("o", "the same, and stay here"),
     ("i", "import a session from another drive to Linux (asks y/n)"),
+    ("t", "import it into a folder you choose (Tab completes, ~ is your home folder)"),
+    ("c", "continue as a new session: choose the tool and the folder; asks before it starts"),
+    ("u", "undo an import: remove the imported copy (asks y/n)"),
+    ("m", "mount the drive of an offline session (the desktop asks for the password)"),
     ("v", "view the transcript (q or Esc returns)"),
     ("/", "filter by title, project and folder; Esc clears"),
     ("r", "rescan the known stores"),

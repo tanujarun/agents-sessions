@@ -621,22 +621,33 @@ class ReadBackTest(AgyImportCase):
 
 class WhatTheBrowserShowsTest(AgyImportCase):
     """The TUI asks the engine and shows its answer (``tui/engine.py``,
-    ``tui/view.py``; neither needs Textual). Its own prompt for an
-    experimental import comes later: until then ``i`` on an Antigravity row
-    ends in the refusal, which names the flag."""
+    ``tui/view.py``; neither needs Textual): an experimental import has a
+    prompt of its own, which asks a second time with the warning."""
 
-    def test_the_detail_pane_and_the_import_key_show_the_refusal(self):
+    def test_the_detail_pane_the_prompt_and_the_warning(self):
         from agent_sessions.tui import engine as engine_mod
         from agent_sessions.tui import view
 
         engine = engine_mod.Engine()
         source = self.source()
-        verdict = engine.can_import(source, index=self.index)
-        self.assertEqual(verdict, (False, agy_mod.EXPERIMENTAL_ONLY))
-        line = view.verdict_text(source, verdict)
-        self.assertEqual(line, f"not possible: {agy_mod.EXPERIMENTAL_ONLY}")
-        self.assertIn("--experimental", line)
-        # What `i`, then `y`, does: the engine's import, and its reason in the status line.
+        verdict = view.make_verdict(engine.import_options(source, index=self.index))
+        self.assertEqual(
+            verdict,
+            view.Verdict(
+                False, agy_mod.EXPERIMENTAL_ONLY, experimental=True, warning=agy_mod.IMPORT_WARNING
+            ),
+        )
+        self.assertEqual(view.verdict_text(source, verdict), "experimental only")
+        self.assertEqual(view.foreign_mode(verdict), "foreign_experimental")
+        self.assertEqual(view.import_step(verdict, "import"), "warn")
+        reason, choices = view.foreign_prompt("C:", verdict)
+        self.assertEqual(reason, agy_mod.EXPERIMENTAL_ONLY)
+        self.assertIn("[i] import and resume (experimental)", choices)
+        # The warning is whole in the three lines a prompt gives it at 120 columns.
+        lines = view.warn_prompt(verdict.warning, 118)
+        self.assertEqual(" ".join(lines[:-1]), agy_mod.IMPORT_WARNING)
+        self.assertEqual(lines[-1], "Import anyway? y/n")
+        # Without the `y` the engine still refuses: its reason in the status line.
         with self.assertRaises(api.ImportFailed) as caught:
             engine.import_session(source.key, progress=None, index=self.index)
         self.assertEqual(view.error_text(caught.exception), agy_mod.EXPERIMENTAL_ONLY)

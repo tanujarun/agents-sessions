@@ -1,8 +1,10 @@
 """Scaffolding for the TUI tests: a fake engine that records every call and
-never touches a store or starts a tool, a set of fake sessions, and a way to
-read the screen as text. Imports no Textual at module level."""
+never touches a store, mounts a drive or starts a tool, a set of fake
+sessions, and a way to read the screen as text. Imports no Textual at module
+level."""
 
 import io
+import os
 import sys
 import threading
 import time
@@ -14,6 +16,8 @@ _SRC = str(Path(__file__).resolve().parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+from agent_sessions.api import ContinueOptions, ImportOptions, UnimportReport  # noqa: E402
+from agent_sessions.errors import UndoFailed  # noqa: E402
 from agent_sessions.model import Session  # noqa: E402
 
 NOW = datetime(2026, 10, 12, 12, 0, 0, tzinfo=UTC)
@@ -26,6 +30,13 @@ PROVIDERS = [
 ]
 WINDOWS = "/run/media/user/WINVOL"
 NOT_MOUNTED = "the drive WINVOL is not mounted"  # the engine's refusal for an offline session
+# The engine's refusals of an undo, and the tools it finds installed.
+NO_RECORD = "no import of this session is recorded; nothing was removed"
+USED_SINCE = (
+    "the imported copy was used since the import: /home/user/.claude/x.jsonl was modified. "
+    "Nothing was removed (--force removes it all the same)"
+)
+TOOLS = (("claude", "Claude"), ("codex", "Codex"), ("grok", "Grok"))
 NATIVE_HASH = "aaaaaaaa"
 FOREIGN_HASH = "bbbbbbbb"
 
@@ -134,14 +145,24 @@ class FakeIndex:
 
 class FakeEngine:
     """The methods of ``tui.engine.Engine``. ``calls`` records every call as
-    ``(name, argument)``; ``fail[name]`` is raised by that method."""
+    ``(name, argument)``; ``fail[name]`` is raised by that method. Nothing is
+    mounted, started, imported or removed: the sessions it lists change, and
+    that is all."""
 
     def __init__(self, sessions=None, providers=PROVIDERS):
         self.sessions = list(default_sessions() if sessions is None else sessions)
         self.provider_list = list(providers)
         self.calls = []
         self.fail = {}
-        self.verdicts = {}  # key -> (bool, reason); default (True, "")
+        self.options = {}  # key -> ImportOptions; default: possible as it is
+        self.import_args = []  # (key, target, experimental) of every import
+        self.continue_answers = {}  # key -> ContinueOptions; default: every tool of TOOLS
+        self.continue_folder = None  # the folder the default answer suggests
+        self.used_since = {}  # native key -> what differs in a copy used since its import
+        self.undo_left = []  # what an undo leaves in place: [(path, why)]
+        self.volume_state = None  # of the drive in `volumes`; default: by what is listed
+        self.mount_gate = None  # an Event: mount_drive waits for it
+        self.listing_threads = []  # the thread of every list_folder call
         self.turns = {}  # key -> list of Turn
         self.default_turns = [
             Turn("user", "hello there", stamp(minutes=5)),
@@ -217,11 +238,54 @@ class FakeEngine:
         self._record("find_session", ref)
         return self.by_key(ref)
 
-    def can_import(self, session, index=None):
-        self._record("can_import", session.key)
+    def import_options(self, ref, index=None, target=None):
+        # A session that is handed over is judged as it is, as the engine does.
+        session = ref if isinstance(ref, Session) else self.by_key(ref)
+        self._record("import_options", session.key)
+        if session.origin == "native":
+            return ImportOptions(False, "this session is already on Linux")
+        if session.imported_as:
+            return ImportOptions(False, "already imported")
         if session.offline:
-            return False, NOT_MOUNTED
-        return self.verdicts.get(session.key, (True, ""))
+            return ImportOptions(False, NOT_MOUNTED)
+        return self.options.get(session.key, ImportOptions(True))
+
+    def continue_options(self, ref, index=None):
+        self._record("continue_options", ref)
+        session = self.by_key(ref)
+        if ref in self.continue_answers:
+            return self.continue_answers[ref]
+        if session.offline:
+            return ContinueOptions(False, NOT_MOUNTED)
+        tools = tuple(sorted(TOOLS, key=lambda tool: tool[0] != session.provider))
+        default = session.provider if tools[0][0] == session.provider else None
+        return ContinueOptions(True, "", tools, default, self.continue_folder)
+
+    def volumes(self, index=None):
+        self._record("volumes")
+        offline = any(session.offline for session in self.sessions)
+        return [
+            {
+                "path": WINDOWS,
+                "label": "WINVOL",
+                "fs_label": "Windows",
+                "uuid": "0123-ABCD",
+                "fstype": "ntfs3",
+                "letter": "C:",
+                "state": self.volume_state or ("attached" if offline else "mounted"),
+                "last_seen": self.last_quick,
+                "stores": 1,
+                "sessions": sum(1 for session in self.sessions if session.mount == WINDOWS),
+            }
+        ]
+
+    def list_folder(self, directory):
+        """A real listing (the tests complete in temp directories); which
+        thread asked is kept, since it must never be the UI's."""
+        self._record("list_folder", directory)
+        self.listing_threads.append(threading.current_thread())
+        with os.scandir(directory) as entries:
+            return [(entry.name, entry.is_dir()) for entry in entries]
 
     def transcript(self, ref, index=None):
         self._record("transcript", ref)
@@ -253,11 +317,19 @@ class FakeEngine:
             "warnings": [],
         }
 
-    def import_session(self, ref, progress=None, index=None):
+    def import_session(self, ref, progress=None, index=None, target=None, experimental=False):
         self._record("import_session", ref)
+        self.import_args.append((ref, target, experimental))
         source = self.by_key(ref)
         if source.imported_as:  # a second import reports the existing copy
             return self.by_key(source.imported_as)
+        options = self.options.get(ref, ImportOptions(True))
+        if not options.possible and not (
+            (options.needs_folder or options.experimental)
+            and (target is not None or not options.needs_folder)
+            and (experimental or not options.experimental)
+        ):
+            raise FakeError(options.reason)  # without what it needs, as the engine refuses
         if progress is not None:
             progress(0, self.import_bytes)
             progress(self.import_bytes, self.import_bytes)
@@ -269,6 +341,68 @@ class FakeEngine:
         source.imported_as = copy.key
         self.sessions.append(copy)
         return copy
+
+    def unimport(self, ref, force=False, dry_run=False, index=None):
+        """An import is "recorded" for every foreign session that has a
+        native copy; taking it back unlists the copy."""
+        self._record("unimport", (ref, force, dry_run))
+        session = self.by_key(ref)
+        if session.origin == "native":
+            copy = session
+            source = next((s for s in self.sessions if s.imported_as == copy.key), None)
+        else:
+            source = session
+            copy = next((s for s in self.sessions if s.key == source.imported_as), None)
+        if source is None or copy is None:
+            raise UndoFailed(NO_RECORD, no_record=True)
+        differences = list(self.used_since.get(copy.key, ()))
+        if differences and not force:
+            raise UndoFailed(USED_SINCE, differences=differences)
+        files = [f"{copy.store}/sessions/{copy.id}.jsonl", f"{copy.store}/sessions/{copy.id}/a.txt"]
+        report = UnimportReport(
+            provider=copy.provider,
+            id=copy.id,
+            native_key=copy.key,
+            source_key=source.key,
+            removed=files + [f"{copy.store}/sessions/{copy.id}"],
+            files=len(files),
+            left=list(self.undo_left),
+            differences=differences,
+            forced=force,
+            dry_run=dry_run,
+            bytes=self.import_bytes,
+        )
+        if not dry_run:
+            self.sessions = [s for s in self.sessions if s is not copy]
+            source.imported_as = None
+        return report
+
+    def mount_drive(self, ref, progress=None, cancel=None):
+        """Nothing is mounted: the sessions listed at ``ref`` stop being
+        offline, as a scan after a mount would find them."""
+        self._record("mount_drive", ref)
+        if self.mount_gate is not None:
+            deadline = time.monotonic() + 10
+            while not self.mount_gate.is_set() and time.monotonic() < deadline:
+                if cancel is not None and cancel.is_set():  # the app is quitting
+                    break
+                time.sleep(0.005)
+        for label, dirs in self.scan_progress:
+            if progress is not None:
+                progress(label, dirs)
+        for session in self.sessions:
+            if session.mount == ref and session.offline:
+                session.offline, session.note = False, None
+                session.cwd_exists, session.cwd_local = True, f"{ref}/Work/{session.id}"
+        self.last_quick = stamp(seconds=1)
+        return {"mount_point": ref, "scan": {"mode": "quick", "cancelled": False}}
+
+    def continue_session(self, ref, tool=None, folder=None, index=None):
+        self._record("continue_session", (ref, tool, folder))
+        if self.by_key(ref).offline:
+            raise FakeError(NOT_MOUNTED)
+        command = [tool, "Continue an earlier session."]
+        return Plan(folder, command, ["omarchy-launch-tui", *command], None)
 
     def open_session(self, ref, here=False, dry_run=False, index=None):
         # A dry run opens nothing: it is recorded under a name of its own.

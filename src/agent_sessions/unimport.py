@@ -237,7 +237,8 @@ def plan(
     Raises ``UndoFailed`` for everything an undo refuses: a record for
     another native store, a damaged one, a path outside the native store, a
     record without a manifest (unless ``force``), and files that differ from
-    the record (unless ``force``)."""
+    the record (unless ``force``; the exception's ``differences`` lists them
+    all, the reason names the first few)."""
     root = os.fspath(native_root)
     ident = journal.ident(record)
     if ident is None:
@@ -266,7 +267,8 @@ def plan(
                 "the imported copy was used since the import: "
                 + shown
                 + (f"; and {more} more" if more > 0 else "")
-                + ". Nothing was removed (--force removes it all the same)"
+                + ". Nothing was removed (--force removes it all the same)",
+                differences=made.differences,
             )
         for item in items:
             _removable(item["path"], going, made.left)
@@ -384,7 +386,7 @@ def undo(
     extras = list(extras)
     record = find_record(read_records(), provider, session_id)
     if record is None:
-        raise UndoFailed(NO_RECORD)
+        raise UndoFailed(NO_RECORD, no_record=True)
     if dry_run:
         return plan(record, native_root, extras, force), None
     try:
@@ -392,7 +394,7 @@ def undo(
         with fsutil.lock():
             record = find_record(read_records(), provider, session_id)
             if record is None:  # undone by someone else while this one waited
-                raise UndoFailed(NO_RECORD)
+                raise UndoFailed(NO_RECORD, no_record=True)
             made = plan(record, native_root, extras, force)
             # Opened before anything goes: what can still fail for the
             # journal afterwards is one small write.

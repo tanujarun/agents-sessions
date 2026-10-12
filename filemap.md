@@ -162,7 +162,8 @@
 - `tests/fixtures/claude/not-a-store/`, `tests/fixtures/gemini/native-no-chats/` — negative cases for `is_store`
 - `scratch/` — throwaway investigation scripts (git-ignored): `walk.py`, `*_count.py`, `drives.py`, `build_fixtures.py`
 - `src/agent_sessions/errors.py` — `ApiError`, `NotFound`, `LaunchFailed`, `ImportFailed`, `UndoFailed` (an
-  import could not be taken back), `ExportFailed` (a transcript could not be written to a file), `Offline`
+  import could not be taken back; `no_record` and `differences` mark the two refusals a front end answers
+  in its own way), `ExportFailed` (a transcript could not be written to a file), `Offline`
   (the drive of a session is not mounted), `MountFailed` (re-exported by `api`)
 - `tests/fixture_world.py` — `World`: fake home plus two fake drives built from the fixtures, launches and
   notifications recorded; `tree_state`, `age_access_times`, `files_below`
@@ -237,18 +238,22 @@
 - `src/agent_sessions/tui/__main__.py` — `python -m agent_sessions.tui`: run the app, exit 1 with the hint when
   Textual is missing
 - `src/agent_sessions/tui/engine.py` — `Engine`: the object the app calls the engine through (forwards to
-  `agent_sessions.api`, looked up at call time), `EngineError`; tests pass a fake in its place
+  `agent_sessions.api`, looked up at call time; `list_folder`: a directory's entries for the folder input,
+  through `fsutil.listdir_ro`), `EngineError`; tests pass a fake in its place
 - `src/agent_sessions/tui/view.py` — pure view logic, no Textual: rows, ages, display width and clipping,
-  column fitting, filter, tabs, selection by key, small-terminal layout, status and prompt texts, key table
-  (`KEYMAPS`), help, transcript wrapping
+  column fitting, filter, tabs, selection by key, small-terminal layout and key hints, status texts, the
+  import verdict (`Verdict`, from `import_options`), every prompt's wording at every width (foreign row,
+  mount, warning, tool, start, undo), the folder a user types (`expand_folder`, `complete_folder`), which
+  refusal of an undo it is (`undo_refusal`), one key table per mode (`KEYMAPS`), help, transcript wrapping
 - `src/agent_sessions/tui/app.py` — `SessionsApp`, `MainScreen` (workers for load, scan, import, open,
-  `can_import`), `SessionList` and `TranscriptView` (line-drawn, virtual), `TabLabel`, `HelpScreen`,
-  `TranscriptScreen` (the pager)
+  `import_options`, mount, continue, undo, and the folder input's listing and check; `Question`: what the
+  prompt on screen is about), `SessionList` and `TranscriptView` (line-drawn, virtual), `TabLabel`,
+  `HelpScreen`, `TranscriptScreen` (the pager)
 - `src/agent_sessions/tui/app.tcss` — every colour, border and spacing value; the widget tree it styles is
   listed at its top
 - `requirements-tui.txt` — the pinned Textual version `install.sh` installs into `.venv`
-- `tests/tui_support.py` — `FakeEngine` (records calls, never launches or imports; refuses an offline
-  session the way the engine does), fake sessions, `screen_text`, `settle`
+- `tests/tui_support.py` — `FakeEngine` (records calls, never mounts, launches, imports or removes; refuses
+  an offline session and an undo the way the engine does), fake sessions, `screen_text`, `settle`
 - `tests/test_tui_view.py` — every function of `tui/view.py`, `tui/engine.py`, the launcher and import rules;
   runs on the system Python
 - `tests/test_tui_app.py` — the app under Textual's pilot with the fake engine (`make test-tui`; skips itself
