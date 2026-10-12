@@ -24,7 +24,7 @@ from agent_sessions.index import Index
 
 NOW = datetime(2026, 10, 12, 12, 0, tzinfo=UTC)
 # What a cache or a store may hold where a time, a size or a folder is expected.
-ODD = (
+ODD: tuple[object, ...] = (
     None,
     "",
     "garbage",

@@ -33,7 +33,7 @@
 - `src/agent_sessions/__init__.py` — package marker, `__version__`
 - `src/agent_sessions/model.py` — `Session` (`for_store`, `from_dict`; `offline`: listed from the cache, its
   drive is not mounted), `Store`, `Candidate`, `make_key`, `UUID_PATTERN` (the default session id grammar)
-- `src/agent_sessions/fsutil.py` — our own locations (`home`, `cache_file`, `cache_dir`, `state_dir`, `config_dir`,
+- `src/agent_sessions/fsutil.py` — our own locations (`home`, `cache_file`, `state_dir`, `config_dir`,
   `log_file`, `lock_file`, `handoff_dir`, env overrides), the check of a folder a user named
   (`existing_folder`: what `import --to` and `continue --in` take) and trace-free reads (`open_ro`, `subdirs`, `listdir_ro`: `O_NOATIME` where the
   platform has it). `open_ro` never waits and reads regular files only: `NotRegularFile` for a named pipe, a

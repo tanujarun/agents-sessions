@@ -14,8 +14,6 @@ from collections.abc import Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, TextIO
 
 from . import __version__, api, fmt, logs, textsafe
-from .mounts import MountsError
-from .providers import all_providers
 
 if TYPE_CHECKING:
     from .index import Index
@@ -186,8 +184,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--provider",
         metavar="P",
-        help="only this provider: " + ", ".join(provider.name for provider in all_providers()),
-        choices=[provider.name for provider in all_providers()],
+        help="only this provider: " + ", ".join(provider.name for provider in api.all_providers()),
+        choices=[provider.name for provider in api.all_providers()],
     )
     p.add_argument("--json", action="store_true", help="JSON output")
     p.add_argument("--keys", action="store_true", help="add the session key as a last column")
@@ -346,7 +344,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TOOL",
         help=(
             "the tool to start instead of the session's own: "
-            + ", ".join(provider.name for provider in all_providers())
+            + ", ".join(provider.name for provider in api.all_providers())
         ),
     )
     p.add_argument(
@@ -835,7 +833,8 @@ def _map(args: argparse.Namespace) -> int:
     if args.dir is None:
         _err(f"map: say which directory {args.letter} stands for, or use --remove")
         return 2
-    letter, directory = api.set_letter(args.letter, args.dir)
+    # ``~`` is expanded here, as for every folder this command line takes.
+    letter, directory = api.set_letter(args.letter, os.path.expanduser(args.dir))
     _out(f"{letter} -> {directory}")
     return 0
 
@@ -874,9 +873,28 @@ def _verify(args: argparse.Namespace) -> int:
     return 0
 
 
+# Said below a printed command whose text is not the command: a folder's name
+# can hold characters that are not shown (they are printed as spaces).
+_NOT_AS_SHOWN = (
+    "note: the folder's name holds characters that cannot be shown; they are printed as "
+    "spaces, so the line above is not exactly what runs"
+)
+
+
+def _as_shown(*texts: str) -> bool:
+    """Whether every text is printed as it is: nothing in it is replaced on
+    the way out."""
+    return all(textsafe.clean(text) == text for text in texts)
+
+
 def _print_plan(plan: LaunchPlan) -> None:
-    """A launch plan as a line a shell could run, and its note."""
-    _out(f"cd {shlex.quote(plan.cwd)} && {shlex.join(plan.command)}")
+    """A launch plan as a line a shell could run, quoted for one
+    (``shlex``), and its note. When the line cannot be printed as it is,
+    that is said too."""
+    line = f"cd {shlex.quote(plan.cwd)} && {shlex.join(plan.command)}"
+    _out(line)
+    if not _as_shown(line):
+        _out(_NOT_AS_SHOWN)
     if plan.note:
         _out(f"note: {plan.note}")
 
@@ -1061,7 +1079,9 @@ def _unimport(args: argparse.Namespace) -> int:
 def _show(args: argparse.Namespace) -> int:
     index = api.load_index()
     session = api.find_session(args.key, index=index)
-    label = next((p.label for p in all_providers() if p.name == session.provider), session.provider)
+    label = next(
+        (p.label for p in api.all_providers() if p.name == session.provider), session.provider
+    )
     rows: list[list[object]] = [
         ["title", session.title or "-"],
         ["provider", label],
@@ -1122,8 +1142,11 @@ def _continue(args: argparse.Namespace) -> int:
         plan = api.continue_session(
             args.key, tool=args.tool, folder=folder, here=args.here, dry_run=True
         )
+        command = shlex.join(plan.command)
         _out(f"folder: {plan.cwd}")
-        _out(f"command: {shlex.join(plan.command)}")
+        _out(f"command: {command}")
+        if not _as_shown(plan.cwd, command):
+            _out(_NOT_AS_SHOWN)
         _out(f"transcript: {plan.handoff}")
         _out(_FIRST_MESSAGE)
         return 0
@@ -1164,11 +1187,6 @@ def _on_a_terminal() -> bool:
         return sys.stdin.isatty() and sys.stdout.isatty()
     except (AttributeError, ValueError):  # a stream that was closed or replaced
         return False
-
-
-def _not_implemented(args: argparse.Namespace) -> int:
-    _err(f"{args.command}: not implemented")
-    return 1
 
 
 def _quiet_stdout() -> None:
@@ -1273,7 +1291,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # signal does to it stays what it is under the launcher script.
             return _tui(args)
         with _signals():
-            code = _COMMANDS.get(command, _not_implemented)(args)
+            code = _COMMANDS[command](args)
             sys.stdout.flush()
         return code
     except BrokenPipeError:
@@ -1282,7 +1300,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except api.ApiError as exc:
         _err(_reason(exc))
         return 1
-    except MountsError as exc:
+    except api.MountsError as exc:
         _err(exc)
         return 1
     except KeyboardInterrupt:

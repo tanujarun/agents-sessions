@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import re
 import shlex
 import shutil
 import sys
@@ -26,9 +27,9 @@ from fixture_world import (
     World,
     files_below,
 )
-from support import FakePath, Sandbox, state_names
+from support import FakePath, Sandbox, claude_transcript, state_names
 
-from agent_sessions import api, cli, launch
+from agent_sessions import api, cli, fsutil, launch, mounts, providers
 from agent_sessions.fsutil import cache_file
 from agent_sessions.index import CACHE_VERSION, Index
 from agent_sessions.model import make_key
@@ -381,6 +382,34 @@ class SessionCommandsTest(unittest.TestCase):
         self.assertEqual(
             run("open", CODEX_SEGMENTED, "--dry-run"),
             (0, self.command(CODEX_SEGMENTED, self.home, "codex", "resume"), ""),
+        )
+        self.assertEqual((self.w.started, self.w.notified), ([], []))
+
+    def test_open_dry_run_says_when_the_line_is_not_what_would_run(self):
+        """AUDIT N-22: the control characters of a folder's name are printed
+        as spaces, so the ``cd`` line of such a folder is not the command."""
+        odd = self.home / "ev\x1b[2Jil \u202edir"
+        odd.mkdir()
+        session_id = "aaaaaaaa-0000-4000-8000-0000000000e1"
+        claude_transcript(self.home / ".claude", session_id, str(odd))
+        self.w.scan()
+        code, out, err = run("open", session_id, "--dry-run")
+        self.assertEqual((code, err), (0, ""))
+        lines = out.splitlines()
+        self.assertEqual(len(lines), 2)
+        shown = shlex.quote(str(odd)).replace("\x1b", " ").replace("\u202e", " ")
+        self.assertEqual(
+            lines[0],
+            f"cd {shown} && omarchy-launch-tui --app-id=org.omarchy.claude claude "
+            f"--resume {session_id}",
+        )
+        self.assertNotIn("\x1b", out)
+        self.assertEqual(lines[1], cli._NOT_AS_SHOWN)
+        self.assertIn("not exactly what runs", lines[1])
+        # A name with a space or a quote is shown exactly, quoted: no note.
+        code, out, err = run("open", CLAUDE_NATIVE, "--dry-run")
+        self.assertEqual(
+            out.splitlines(), [self.command(CLAUDE_NATIVE, self.home / "My Proj")[:-1]]
         )
         self.assertEqual((self.w.started, self.w.notified), ([], []))
 
@@ -765,6 +794,34 @@ class FindSessionTest(unittest.TestCase):
         turns = [api.Turn("user", "hello", None)]
         with mock.patch("support.FakeProvider.transcript", return_value=turns, create=True):
             self.assertEqual(list(api.transcript("aaa-1", self.index)), turns)
+
+
+class BehindTheFacadeTest(unittest.TestCase):
+    def test_the_command_line_reaches_the_engine_through_the_facade_alone(self):
+        """AUDIT N-16: SPEC says neither front end reaches behind ``api``;
+        ``cli`` imported ``mounts.MountsError`` and ``providers.all_providers``."""
+        source = Path(cli.__file__).read_text(encoding="utf-8")
+        engine = {"api", "fmt", "logs", "textsafe", "__version__", "tui"}
+        imported = set()
+        for line in source.splitlines():
+            found = re.match(r"\s*from \.(\w*) import (.+)", line)
+            if found and found.group(1):
+                imported.add(found.group(1))
+            elif found:
+                imported |= {name.strip() for name in found.group(2).split(",")}
+        typing_only = {"index", "launch", "model"}  # under TYPE_CHECKING: names for annotations
+        self.assertEqual(imported - typing_only, engine)
+        self.assertIs(api.MountsError, mounts.MountsError)
+        self.assertIs(api.all_providers, providers.all_providers)
+        self.assertLessEqual({"MountsError", "all_providers"}, set(api.__all__))
+        self.assertFalse(hasattr(cli, "MountsError") or hasattr(cli, "all_providers"))
+
+    def test_no_dead_code_is_left(self):
+        """AUDIT N-18: three functions nothing called."""
+        self.assertFalse(hasattr(cli, "_not_implemented"))
+        self.assertFalse(hasattr(fsutil, "cache_dir"))
+        self.assertFalse(hasattr(launch, "_spawn"))
+        self.assertIs(launch.starter, launch._detached)  # the hook's default, under its one name
 
 
 class AgeTest(unittest.TestCase):

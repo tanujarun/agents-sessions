@@ -9,7 +9,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
-from .. import importer
+from .. import fmt, importer
 from ..fsutil import home, listdir_ro, open_ro, subdirs
 from ..model import Candidate, Session, Store
 from ..pathmap import normalise
@@ -21,6 +21,7 @@ from .base import (
     Turn,
     clean_title,
     iter_jsonl,
+    mtime,
     parse_ts,
     read_lines,
     unreadable,
@@ -187,7 +188,7 @@ def _index_too_large(path: str) -> bool:
     except OSError:
         return False  # whoever reads it reports that
     if large:
-        warn(f"larger than {importer.human_size(_INDEX_MAX)}; thread names not read", path)
+        warn(f"larger than {fmt.size(_INDEX_MAX)}; thread names not read", path)
     return large
 
 
@@ -380,13 +381,6 @@ def _is_subagent(meta: dict) -> bool:
     return "agent_nickname" in meta or "agent_role" in meta
 
 
-def _mtime(path: StrPath) -> str | None:
-    try:
-        return parse_ts(os.stat(path).st_mtime, unit="s")
-    except OSError:
-        return None
-
-
 @register
 class Codex(Provider):
     name = "codex"
@@ -479,7 +473,7 @@ class Codex(Provider):
             title=title,
             cwd=cwd,
             started=parse_ts(meta.get("timestamp")) or base.first_ts,
-            updated=last.last_ts or _mtime(last.path),
+            updated=last.last_ts or mtime(last.path),
             messages=len(turns),
             files=[r.path for r in ordered],
         )

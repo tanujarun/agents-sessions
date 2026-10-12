@@ -22,6 +22,7 @@ from .base import (
     between,
     clean_title,
     iter_jsonl,
+    mtime,
     parse_ts,
     read_small,
     unreadable,
@@ -257,13 +258,6 @@ def _title(scan: _Scan, session_id: str) -> tuple[str, str]:
     return clean_title(session_id[:8]), "id"
 
 
-def _mtime(path: StrPath) -> str | None:
-    try:
-        return parse_ts(os.stat(path).st_mtime, unit="s")
-    except OSError:
-        return None
-
-
 @register
 class Claude(Provider):
     name = "claude"
@@ -325,7 +319,7 @@ class Claude(Provider):
             files.append(side)
         fallback = None
         if scan.started is None or scan.updated is None:
-            fallback = _mtime(path)
+            fallback = mtime(path)
         return Session.for_store(
             store,
             id=session_id,

@@ -432,7 +432,7 @@ class StarterTest(LaunchCase):
     def test_default_starter_is_detached(self):
         proc = mock.Mock()
         with (
-            mock.patch.object(launch, "starter", launch._spawn),
+            mock.patch.object(launch, "starter", launch._detached),
             mock.patch.object(launch.subprocess, "Popen", return_value=proc) as popen,
         ):
             plan = api.open_session(CLAUDE_NATIVE)

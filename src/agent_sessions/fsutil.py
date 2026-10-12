@@ -54,10 +54,6 @@ def cache_file() -> Path:
     return path if path.suffix == ".json" else path / "index.json"
 
 
-def cache_dir() -> Path:
-    return cache_file().parent
-
-
 def state_dir() -> Path:
     value = os.environ.get("AGENT_SESSIONS_STATE")
     return Path(value) if value else home() / ".local" / "state" / "agent-sessions"

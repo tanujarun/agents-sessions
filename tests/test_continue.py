@@ -829,6 +829,22 @@ class CommandTest(ContinueCase):
         self.assertEqual(shlex.split(out.splitlines()[1]), ["command:", "claude", prompt])
         self.assert_nothing_done()
 
+    def test_dry_run_says_when_the_folder_cannot_be_shown(self):
+        """AUDIT N-22: a folder's name with characters that are printed as
+        spaces is not the folder that would be used."""
+        odd = self.home / "Work" / "ev\x1b[2Jil"
+        odd.mkdir()
+        code, out, err = run("continue", CLAUDE_NATIVE, "--in", str(odd), "--dry-run")
+        self.assertEqual((code, err), (0, ""))
+        lines = out.splitlines()
+        self.assertEqual(lines[0], f"folder: {self.home / 'Work'}/ev [2Jil")
+        self.assertEqual(lines[2], cli._NOT_AS_SHOWN)
+        self.assertEqual(len(lines), 5)
+        self.assertNotIn("\x1b", out)
+        code, out, err = run("continue", CLAUDE_NATIVE, "--in", str(self.work), "--dry-run")
+        self.assertEqual(len(out.splitlines()), 4)  # a space in the name: shown as it is
+        self.assert_nothing_done()
+
     def test_dry_run_shows_the_terminal_that_would_be_used(self):
         self.w.installed.discard(TERMINAL)
         self.w.installed.add("wezterm")

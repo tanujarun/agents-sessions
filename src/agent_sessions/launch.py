@@ -312,10 +312,6 @@ def _detached(command: list[str], cwd: str | None = None) -> None:
     threading.Thread(target=proc.wait, daemon=True).start()
 
 
-def _spawn(command: list[str], cwd: str | None) -> None:
-    _detached(command, cwd)
-
-
 def _notice(reason: object) -> str:
     """The text of a notification: one line with nothing a terminal or a
     notification daemon would act on (``textsafe.clean``), and never an
@@ -336,7 +332,7 @@ def _notify(reason: str) -> None:
         _detached([tool, "--app-name=agent-sessions", NOTIFY_TITLE, _notice(reason)])
 
 
-starter = _spawn  # starter(command, cwd): open the terminal window
+starter = _detached  # starter(command, cwd): open the terminal window
 notifier = _notify  # notifier(reason): tell the desktop about a failure
 
 

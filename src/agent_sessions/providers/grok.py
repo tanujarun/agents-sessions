@@ -21,6 +21,7 @@ from .base import (
     between,
     clean_title,
     iter_jsonl,
+    mtime,
     open_ro,
     parse_ts,
     read_small,
@@ -162,13 +163,6 @@ class _SummaryRewrite(importer.Rewrite):
                 "summary.json did not survive rewriting unchanged; nothing was imported"
             )
         yield out
-
-
-def _mtime(path: StrPath) -> str | None:
-    try:
-        return parse_ts(os.stat(path).st_mtime, unit="s")
-    except OSError:
-        return None
 
 
 def _text(content: object) -> str:
@@ -405,11 +399,11 @@ class Grok(Provider):
         if not isinstance(cwd, str) or not cwd:
             cwd, cwd_source = self._group_cwd(session_dir.parent)
 
-        started = parse_ts(summary.get("created_at")) or _mtime(session_dir)
+        started = parse_ts(summary.get("created_at")) or mtime(session_dir)
         updated = (
             parse_ts(summary.get("updated_at"))
             or parse_ts(summary.get("last_active_at"))
-            or _mtime(summary_path)
+            or mtime(summary_path)
         )
         return {
             "id": session_id,

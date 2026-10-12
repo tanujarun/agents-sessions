@@ -403,25 +403,31 @@ class ParseTsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "f"
             path.write_text("x", encoding="utf-8")
-            from agent_sessions.providers import antigravity, claude, codex, gemini, grok
+            os.utime(path, (1790000000, 1790000000))
+            self.assertEqual(base.mtime(str(path)), "2026-09-21T14:13:20.000000Z")
+            self.assertEqual(base.mtime(path), "2026-09-21T14:13:20.000000Z")
+            self.assertIsNone(base.mtime(path / "missing"))
+            # A clock that was at zero when the file was written: no time, not 1970.
+            os.utime(path, (5, 5))
+            self.assertIsNone(base.mtime(str(path)))
+            # A damaged time far in the future is seconds too, and so no
+            # time: taken for milliseconds it would read as the year 2026.
+            try:
+                os.utime(path, (1790000000123, 1790000000123))
+            except (OSError, OverflowError):
+                return  # this filesystem cannot hold such a time
+            if os.stat(path).st_mtime == 1790000000123:
+                self.assertIsNone(base.mtime(str(path)))
+                self.assertEqual(parse_ts(os.stat(path).st_mtime), "2026-09-21T14:13:20.123000Z")
 
-            for module in (antigravity, claude, codex, gemini, grok):
-                os.utime(path, (1790000000, 1790000000))
-                self.assertEqual(module._mtime(str(path)), "2026-09-21T14:13:20.000000Z")
-                # A clock that was at zero when the file was written: no time, not 1970.
-                os.utime(path, (5, 5))
-                self.assertIsNone(module._mtime(str(path)))
-                # A damaged time far in the future is seconds too, and so no
-                # time: taken for milliseconds it would read as the year 2026.
-                try:
-                    os.utime(path, (1790000000123, 1790000000123))
-                except (OSError, OverflowError):
-                    continue  # this filesystem cannot hold such a time
-                if os.stat(path).st_mtime == 1790000000123:
-                    self.assertIsNone(module._mtime(str(path)))
-                    self.assertEqual(
-                        parse_ts(os.stat(path).st_mtime), "2026-09-21T14:13:20.123000Z"
-                    )
+    def test_the_adapters_share_that_one_helper(self):
+        """AUDIT N-17: each of the five had a copy of its own."""
+        from agent_sessions.providers import antigravity, claude, codex, gemini, grok
+
+        for module in (antigravity, claude, codex, gemini, grok):
+            with self.subTest(module=module.__name__):
+                self.assertIs(module.mtime, base.mtime)
+                self.assertFalse(hasattr(module, "_mtime"))
 
     def test_protobuf_pair(self):
         self.assertEqual(parse_ts({1: 1790000000, 2: 987654321}), "2026-09-21T14:13:20.987654Z")

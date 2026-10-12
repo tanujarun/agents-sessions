@@ -20,7 +20,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar, NamedTuple
 
-from .. import importer, textsafe
+from .. import fmt, importer, textsafe
 from ..fsutil import NotRegularFile, open_ro
 from ..model import UUID_PATTERN, Candidate, Session, Store
 
@@ -41,6 +41,7 @@ __all__ = [
     "clean_title",
     "collect_warnings",
     "iter_jsonl",
+    "mtime",
     "open_ro",
     "open_sqlite_ro",
     "parse_ts",
@@ -352,7 +353,7 @@ def read_small(path: StrPath, limit: int) -> bytes | None:
     except OSError:
         return None
     if len(data) > limit:
-        warn(f"larger than {importer.human_size(limit)}; not read", path)
+        warn(f"larger than {fmt.size(limit)}; not read", path)
         return None
     return data
 
@@ -383,7 +384,7 @@ def iter_jsonl(path: StrPath) -> Iterator[dict[str, Any]]:
                 return
             if raw is None:
                 first = False
-                size = importer.human_size(JSONL_LINE_MAX)
+                size = fmt.size(JSONL_LINE_MAX)
                 warn(f"a line longer than {size} was skipped", path)
                 continue
             if not raw:
@@ -662,6 +663,17 @@ def parse_ts(value: object, unit: str | None = None) -> str | None:
     except (OverflowError, ValueError):
         return None
     return _iso(moment)
+
+
+def mtime(path: StrPath) -> str | None:
+    """A file's modification time as ``parse_ts`` writes one, or None: the
+    time an adapter falls back to when the session's own records give none.
+    The filesystem counts in seconds, and that unit is said, so a damaged
+    time far in the future is no time instead of a guess at milliseconds."""
+    try:
+        return parse_ts(os.stat(path).st_mtime, unit="s")
+    except OSError:
+        return None
 
 
 def between(text: str, opening: str, closing: str) -> str | None:
