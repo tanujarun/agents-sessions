@@ -384,6 +384,31 @@ class SessionCommandsTest(unittest.TestCase):
         )
         self.assertEqual((self.w.started, self.w.notified), ([], []))
 
+    def test_open_dry_run_shows_the_terminal_that_would_be_used(self):
+        cd = f"cd {shlex.quote(str(self.home / 'My Proj'))} && "
+        tail = f"claude --resume {CLAUDE_NATIVE}\n"
+        self.w.installed.discard("omarchy-launch-tui")
+        self.w.installed.update(("xdg-terminal-exec", "wezterm"))
+        self.assertEqual(
+            run("open", CLAUDE_NATIVE, "--dry-run"),
+            (0, f"{cd}xdg-terminal-exec --app-id=org.omarchy.claude -- {tail}", ""),
+        )
+        self.w.installed.discard("xdg-terminal-exec")
+        self.assertEqual(
+            run("open", CLAUDE_NATIVE, "--dry-run"), (0, f"{cd}wezterm start -- {tail}", "")
+        )
+        with mock.patch.dict("os.environ", {"AGENT_SESSIONS_TERMINAL": "myterm --title 'a b' -e"}):
+            self.w.installed.add("myterm")
+            self.assertEqual(
+                run("open", CLAUDE_NATIVE, "--dry-run"),
+                (0, f"{cd}myterm --title 'a b' -e {tail}", ""),
+            )
+        self.w.installed.difference_update(("wezterm", "myterm"))
+        code, out, err = run("open", CLAUDE_NATIVE, "--dry-run")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("set AGENT_SESSIONS_TERMINAL to the command that starts yours", err)
+        self.assertEqual((self.w.started, self.w.notified), ([], []))
+
     def test_open_launches_and_prints_the_plan(self):
         code, out, err = run("open", GROK_NATIVE)
         self.assertEqual(
@@ -579,7 +604,7 @@ class SessionCommandsTest(unittest.TestCase):
                 1,
                 "",
                 "agent-sessions: the project folder F:\\Proj\\My Site was not found on any "
-                "mounted drive\n",
+                "mounted drive; use --to DIR to import it into a folder you choose\n",
             ),
         )
         self.assertEqual(self.w.started, [])

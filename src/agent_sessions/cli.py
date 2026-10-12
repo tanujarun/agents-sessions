@@ -118,6 +118,73 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("show", help="plain-text transcript to stdout")
     p.add_argument("key", help=key_help)
 
+    p = sub.add_parser(
+        "export",
+        help="the transcript as Markdown or JSON lines",
+        description=(
+            "Print the transcript of a session as a document: Markdown (a header, then a "
+            "section per turn and a line per tool call) or JSON lines (one object per turn: "
+            "role, text, ts). With -o it is written to a file that only you can read."
+        ),
+    )
+    p.add_argument("key", help=key_help)
+    p.add_argument(
+        "-o",
+        dest="output",
+        metavar="FILE",
+        help="write to this file instead of stdout; a file that exists is not replaced",
+    )
+    p.add_argument(
+        "--format",
+        choices=api.EXPORT_FORMATS,
+        default=api.EXPORT_FORMATS[0],
+        help="md: Markdown (the default); json: JSON lines",
+    )
+    p.add_argument("--force", action="store_true", help="with -o: replace a file that exists")
+
+    p = sub.add_parser(
+        "continue",
+        help="carry a session on as a new session, in its own tool or another",
+        description=(
+            "Start a tool as a NEW session that continues an old one: for a session that "
+            "cannot be resumed where it is wanted. The transcript is exported to a file in "
+            "the state directory, and the tool is started with a fixed first message that "
+            "names that file. The tool sends that message to its model as soon as it starts."
+        ),
+    )
+    p.add_argument("key", help=key_help)
+    p.add_argument(
+        "--with",
+        dest="tool",
+        metavar="TOOL",
+        help=(
+            "the tool to start instead of the session's own: "
+            + ", ".join(provider.name for provider in all_providers())
+        ),
+    )
+    p.add_argument(
+        "--in",
+        dest="folder",
+        metavar="DIR",
+        help=(
+            "start in this folder instead of the session's own "
+            "(an absolute path, or one that starts with ~; the folder must exist)"
+        ),
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "print the folder, the command and where the transcript would be written; "
+            "write nothing and start nothing"
+        ),
+    )
+    p.add_argument(
+        "--here",
+        action="store_true",
+        help="start the tool in this terminal instead of a new window",
+    )
+
     p = sub.add_parser("status", help="mounts, stores, counts per provider, warnings")
     p.add_argument("--json", action="store_true", help="JSON output")
 
@@ -196,6 +263,13 @@ def _json(value: object) -> None:
     """Print a value as JSON: exact data, with the characters a terminal
     would act on written as ``\\uXXXX`` escapes."""
     document = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False)
+    _emit(sys.stdout, textsafe.json_escape(document))
+
+
+def _json_line(document: str) -> None:
+    """Print one line of JSON text the engine made (``export --format
+    json``): exact data, and like ``_json`` with nothing in it a terminal
+    would act on."""
     _emit(sys.stdout, textsafe.json_escape(document))
 
 
@@ -673,7 +747,21 @@ def _folder_line(plan: dict) -> str:
     return line + ")"
 
 
+# What ``import`` adds to the engine's reason when the session's own folder is
+# not there to import into (``importer.NoFolder``): the way out is this
+# command's flag, which another front end does not have.
+_TO_HINT = "use --to DIR to import it into a folder you choose"
+
+
 def _import(args: argparse.Namespace) -> int:
+    try:
+        return _import_into(args)
+    except api.NoFolder as exc:
+        _err(f"{exc.reason}; {_TO_HINT}")
+        return 1
+
+
+def _import_into(args: argparse.Namespace) -> int:
     # ``~`` is expanded here: the engine takes an absolute path and nothing else.
     target = os.path.expanduser(args.to) if args.to is not None else None
     index = api.load_index()
@@ -819,6 +907,59 @@ def _show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _export(args: argparse.Namespace) -> int:
+    if args.output is not None:
+        # ``~`` and a relative path are this command's to resolve: the engine
+        # takes an absolute path and nothing else.
+        path = os.path.abspath(os.path.expanduser(args.output))
+        size = api.export_file(args.key, path, fmt=args.format, force=args.force)
+        _err(f"wrote {path} ({_size(size)})")
+        return 0
+    # Refused before anything is printed, when it is; then piece by piece.
+    pieces = api.export_transcript(args.key, fmt=args.format)
+    for piece in pieces:
+        if args.format == "json":
+            _json_line(piece)
+        else:
+            _out(piece, multiline=True)
+    return 0
+
+
+# The last line of ``continue --dry-run``: what a real run does beyond
+# opening a window.
+_FIRST_MESSAGE = "starting it sends a first message to the model"
+
+
+def _continue(args: argparse.Namespace) -> int:
+    # ``~`` is expanded here: the engine takes an absolute path and nothing else.
+    folder = os.path.expanduser(args.folder) if args.folder is not None else None
+    if args.dry_run:
+        plan = api.continue_session(
+            args.key, tool=args.tool, folder=folder, here=args.here, dry_run=True
+        )
+        _out(f"folder: {plan.cwd}")
+        _out(f"command: {shlex.join(plan.command)}")
+        _out(f"transcript: {plan.handoff}")
+        _out(_FIRST_MESSAGE)
+        return 0
+    if args.here:
+        # exec replaces this process: say what runs before it does.
+        try:
+            _print_plan(
+                api.continue_session(
+                    args.key, tool=args.tool, folder=folder, here=True, dry_run=True
+                )
+            )
+            sys.stdout.flush()
+        except api.ApiError:
+            pass  # the real call below fails the same way, and says why
+    plan = api.continue_session(args.key, tool=args.tool, folder=folder, here=args.here)
+    if not args.here:
+        _print_plan(plan)
+        _err(f"the transcript was written to {plan.handoff}")
+    return 0
+
+
 def _not_implemented(args: argparse.Namespace) -> int:
     _err(f"{args.command}: not implemented")
     return 1
@@ -843,6 +984,8 @@ _COMMANDS = {
     "import": _import,
     "unimport": _unimport,
     "show": _show,
+    "export": _export,
+    "continue": _continue,
     "mount": _mount,
     "forget": _forget,
     "map": _map,

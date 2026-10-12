@@ -437,6 +437,9 @@ class Grok(Provider):
     def resume_argv(self, s: Session) -> list[str]:
         return [self.binary, "--resume", s.id]
 
+    def new_session_argv(self, prompt: str) -> list[str]:
+        return [self.binary, prompt]  # ``grok [PROMPT]``; never ``-p``
+
     def transcript(self, s: Session) -> Iterator[Turn]:
         """From ``chat_history.jsonl``, which records no times: ``ts`` is None."""
         if not s.files:

@@ -485,6 +485,11 @@ class Antigravity(Provider):
     def resume_argv(self, s: Session) -> list[str]:
         return [self.binary, "--conversation", s.id]
 
+    def new_session_argv(self, prompt: str) -> list[str]:
+        # "Run an initial prompt interactively and continue the session";
+        # never ``-p``, ``--print`` or ``--prompt``.
+        return [self.binary, "--prompt-interactive", prompt]
+
     def transcript(self, s: Session) -> Iterator[Turn]:
         """From the plain-text log in ``brain/`` when there is one, else from
         the ``steps`` table of the conversation database."""

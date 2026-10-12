@@ -3,8 +3,8 @@
 - `CLAUDE.md` — rules and commands for every agent working here
 - `docs/SPEC.md` — goals, architecture, CLI contract, TUI; phase 2 (production pass): threat model, tool
   detection, journal, logs, exit codes
-- `docs/JSON.md` — every `--json` output of the CLI, field by field, and its ordering; pinned by
-  `tests/test_json_contract.py`
+- `docs/JSON.md` — every `--json` output of the CLI, field by field, and its ordering, and the lines of
+  `export --format json`; pinned by `tests/test_json_contract.py`
 - `docs/REVIEW.md` — the production-readiness review (findings R-01 to R-14)
 - `docs/PLAN.md` — task list and status
 - `docs/FORMATS.md` — per-provider on-disk formats, resume commands, import recipes, store discovery,
@@ -21,7 +21,8 @@
 - `src/agent_sessions/model.py` — `Session` (`for_store`, `from_dict`; `offline`: listed from the cache, its
   drive is not mounted), `Store`, `Candidate`, `make_key`, `UUID_PATTERN` (the default session id grammar)
 - `src/agent_sessions/fsutil.py` — our own locations (`home`, `cache_file`, `cache_dir`, `state_dir`, `config_dir`,
-  `log_file`, `lock_file`, env overrides) and trace-free reads (`open_ro`, `subdirs`, `listdir_ro`: `O_NOATIME` where the
+  `log_file`, `lock_file`, `handoff_dir`, env overrides), the check of a folder a user named
+  (`existing_folder`: what `import --to` and `continue --in` take) and trace-free reads (`open_ro`, `subdirs`, `listdir_ro`: `O_NOATIME` where the
   platform has it). `open_ro` never waits and reads regular files only: `NotRegularFile` for a named pipe, a
   device, a directory. Our own files and directories (`open_private`: 0600, `make_private_dir`: 0700,
   `fsync_dir`) and the state directory's
@@ -32,9 +33,11 @@
   below it), `debug` (`--debug`: DEBUG level, a copy on stderr), `unexpected` (an exception with its
   traceback, once), `written`, `close`
 - `src/agent_sessions/journal.py` — the import journal `<state>/imports.jsonl`: `read` (oldest first, the
-  records of an old `imports.json` before them, a torn line skipped with a warning), `append` (lock, one
+  records of an old `imports.json` before them, a torn line skipped with a warning, or without one for a
+  caller that reads it with every listing), `append` (lock, one
   write on an appending descriptor, fsync), `open_for_append`/`write` for a caller that holds the lock; the
-  two kinds of record, `IMPORT` and `UNDO`
+  two kinds of record, `IMPORT` and `UNDO`; which imports still stand: `ident`, `not_undone` and
+  `find_record` (the last import of a session that no undo took back)
 - `src/agent_sessions/textsafe.py` — the one sanitiser for text from a store: `clean` (control and
   bidirectional characters become spaces; `multiline` keeps line feed and tab), `json_escape` (the same
   characters as `\uXXXX` in `--json` output), the set `UNSAFE`. Used by the CLI's output helpers, `clean_title`,
@@ -55,18 +58,19 @@
   (parse cache by signature, the path evidence of each store cached the same way), the `volumes` table (identity,
   drive letters and last-seen time of every volume that holds a remembered store; `forget`, `letter_for_mount`,
   a volume that came back at another path), `finalise` (derived session fields, offline sessions from the cache,
-  dedupe, order), `where`, scan policy; `fresh` (cache-free index for `verify`)
+  dedupe, order; a native copy's local folder is the folder of its import, from the standing record of the
+  journal), `where`, scan policy; `fresh` (cache-free index for `verify`)
 - `src/agent_sessions/providers/` — one adapter per provider, plus the registry
 - `src/agent_sessions/providers/__init__.py` — registry: `register`, `all_providers`, `get`; imports the five adapters
 - `src/agent_sessions/providers/base.py` — `Provider` contract (with `id_pattern`, `valid_id`, `read_back`, the
-  `resumable` property, `evidence_files` and `path_evidence`: recorded folders beyond the sessions' own, for
+  `resumable` property, `new_session_argv`: the command for a new session with a first prompt, `evidence_files` and `path_evidence`: recorded folders beyond the sessions' own, for
   the path map; `import_plan` and `import_session` with a chosen folder (`target`) and `experimental`;
   `undo_extras`: what the tool adds beside an imported session), `NotSupported`, `ExperimentalOnly` (an
   import that is done only when asked for; carries the warning to show first), shared helpers (`iter_jsonl`, `read_lines` and `JSONL_LINE_MAX`,
   `read_small`, `open_sqlite_ro`, `parse_ts` (nothing outside 1990 to 2100; `unit` for epoch numbers),
   `clean_title`, `open_ro`), warnings (`warn`, `collect_warnings`)
 - `src/agent_sessions/providers/{claude,codex,grok,antigravity,gemini}.py` — the adapters: store signature,
-  `candidates`, `parse`, `transcript`, `resume_argv`, and `import_plan` (Claude, Codex and Grok; Antigravity
+  `candidates`, `parse`, `transcript`, `resume_argv`, `new_session_argv`, and `import_plan` (Claude, Codex and Grok; Antigravity
   as an experimental import only, a plain copy; Gemini raises `NotSupported` with the reason); Claude also
   gives path evidence (the `projects` keys of the `.claude.json` beside the store); Grok names its group
   directories (`group_name`, `group_slug`); Antigravity says what its tool adds beside a conversation
@@ -78,25 +82,35 @@
   folder the user chose, `chosen_folder`; `NoFolder` when the session's own is not found), the checks
   (`check`, `contained`, and `below` for one path), `execute` (stage, place, verify, append, journal record
   with a manifest; all under the state directory's lock, rolled back on any failure), `sweep_staging`
-- `src/agent_sessions/unimport.py` — take an import back: `not_undone` and `find_record` (the last import of a
+- `src/agent_sessions/unimport.py` — take an import back: the record is `journal.find_record`'s (the last import of a
   session that no undo took back), `plan` (what would be removed and left, read from the record's manifest
   and the disk; refuses a copy that was used since, a damaged record, a path outside the native store),
   `undo` (plan and removal under the state directory's lock, files then empty directories, an `undo` record
   in the journal)
+- `src/agent_sessions/export.py` — a transcript as a document, made piece by piece: `markdown` (header, a
+  section per turn, a line per tool call; cleaned text), `json_lines` (one object per turn, exact data),
+  and `write` (a document into a file: temp file beside it, then moved into place, 0600, nothing replaced
+  unless asked)
 - `src/agent_sessions/launch.py` — build and run the resume command (platform layer): `plan`, `launch`, the
-  `starter`/`notifier` hooks; and `tool_state` (`ToolState`: is the tool behind a command installed, or is
+  `starter`/`notifier` hooks; which terminal opens the window (`terminal_command`: `AGENT_SESSIONS_TERMINAL`,
+  `omarchy-launch-tui`, `xdg-terminal-exec`, `$TERMINAL`, the table `TERMINALS`); a new session that
+  continues an old one (`FIRST_PROMPT`, `handoff_file`, `plan_new`: the prompt is made here and is the only
+  element of the command that is not the adapter's own word, `launch_new`, `ContinuePlan`); and `tool_state` (`ToolState`: is the tool behind a command installed, or is
   the command a wrapper that would install it; read from the wrapper's text and mise's installs, no
   program run, remembered per run, `forget_tools`)
 - `src/agent_sessions/api.py` — facade used by the CLI and the TUI: `load_index`, `scan`, `list_sessions`,
-  `status`, `verify`, `find_session`, `transcript`, `open_session`, `import_options` (`ImportOptions`: what an
+  `status`, `verify`, `find_session`, `transcript`, `export_transcript` and `export_file` (the transcript as
+  Markdown or JSON lines; never into a session store), `continue_options` (`ContinueOptions`) and
+  `continue_session` (the transcript to `<state>/handoff/`, old ones swept, then a tool started as a new
+  session), `open_session`, `import_options` (`ImportOptions`: what an
   import of a session can be), `can_import`, `import_plan`, `import_report`, `import_session` (each with a
   chosen folder and the experimental flag), `unimport` (`UnimportReport`); the drives: `volumes`, `find_volume`, `mount_drive`, `forget_drive`,
   `set_letter`, `remove_letter`; what needs a session's files refuses an offline one (`Offline`); what goes
-  into the log is written here (scan summary and warnings, imports, undos, launches, mounts, forgotten
-  drives, unexpected exceptions)
+  into the log is written here (scan summary and warnings, imports, undos, launches, continues, mounts,
+  forgotten drives, unexpected exceptions)
 - `src/agent_sessions/cli.py` — argparse entry: `scan`, `list`, `open`, `import` (`--to`, `--experimental`),
-  `unimport`, `show`, `status`, `verify`, `mount`, `forget`, `map` (`tui` is started by the launcher, not
-  here), the global flags `--version` and `--debug`, the output helpers that make text safe (`_ask` for a
+  `unimport`, `show`, `export` (`-o`, `--format`, `--force`), `continue` (`--with`, `--in`, `--dry-run`,
+  `--here`), `status`, `verify`, `mount`, `forget`, `map` (`tui` is started by the launcher, not here), the global flags `--version` and `--debug`, the output helpers that make text safe (`_ask` for a
   question), and what ends a command:
   exit codes, Ctrl-C and SIGTERM/SIGHUP (`_signals`), the `internal error` line
 - `src/agent_sessions/tui/` — Textual front end: `app.py`, `view.py` (pure view logic), `app.tcss` (all styling)
@@ -148,13 +162,16 @@
 - `tests/fixtures/claude/not-a-store/`, `tests/fixtures/gemini/native-no-chats/` — negative cases for `is_store`
 - `scratch/` — throwaway investigation scripts (git-ignored): `walk.py`, `*_count.py`, `drives.py`, `build_fixtures.py`
 - `src/agent_sessions/errors.py` — `ApiError`, `NotFound`, `LaunchFailed`, `ImportFailed`, `UndoFailed` (an
-  import could not be taken back), `Offline` (the drive of a session is not mounted), `MountFailed`
-  (re-exported by `api`)
+  import could not be taken back), `ExportFailed` (a transcript could not be written to a file), `Offline`
+  (the drive of a session is not mounted), `MountFailed` (re-exported by `api`)
 - `tests/fixture_world.py` — `World`: fake home plus two fake drives built from the fixtures, launches and
   notifications recorded; `tree_state`, `age_access_times`, `files_below`
-- `tests/test_launch.py` — launch plans per provider, folder gone, foreign refused, `--here`, hooks
-- `tests/test_json_contract.py` — every `--json` output against the tables of `docs/JSON.md`: key sets,
-  types, nullability, the documented orderings, escapes, byte-identical repeats
+- `tests/test_launch.py` — launch plans per provider, folder gone, foreign refused, `--here`, hooks; which
+  terminal is used, table-driven on a fake PATH (every known terminal, the order, `$TERMINAL`,
+  `AGENT_SESSIONS_TERMINAL`, none at all)
+- `tests/test_json_contract.py` — every `--json` output and the lines of `export --format json` against the
+  tables of `docs/JSON.md`: key sets, types, nullability, the documented orderings, escapes, byte-identical
+  repeats
 - `tests/test_tools.py` — `launch.tool_state` on a fake PATH and a fake mise tree: the wrappers' text and
   what is not one, where the executable may lie, the install directory's name, `MISE_DATA_DIR` and
   `XDG_DATA_HOME`, the per-run cache, and the answer in the index, `status` and `launch.plan`
@@ -165,6 +182,18 @@
   is used, a copy that was used since, `--force`, what is left and why, the provider's extras, a journal
   that names paths outside the native store or is damaged, a record without a manifest, the lock (real
   processes), the undo record, the command and its question
+- `tests/test_resume_folder.py` — an imported copy is resumed in the folder of its import: the chosen folder
+  (Claude, Antigravity), the mapped one while the source drive is away, an import that was undone, records
+  and journals that are malformed or unreadable (no failure, no warning), the journal read once per listing
+- `tests/test_continue.py` — `continue`: every adapter's new-session command against FORMATS Q3, the plan
+  (`launch.plan_new`: the prompt and nothing else from outside the adapter, the handoff file's name, the
+  folder, a tool that is not installed), `continue_options`, `continue_session` (the transcript written
+  private and replaced in one step, another tool, a foreign session, a hostile session, `--here`), every
+  refusal, the sweep of old handoff files, the log, the command
+- `tests/test_export.py` — `export`: the Markdown and the JSON lines (structure, what is not known, hostile
+  values, laziness), `export.write` (private, whole or not at all, nothing replaced unless asked, paths
+  that will not do), the facade on every provider's fixture, offline sessions, no write into a session
+  store, the command
 - `tests/test_importer.py` — imports per provider (bytes, rewrites, idempotence, collisions, roll back, free
   space, provenance, source times), `encode_cwd`, refusals
 - `tests/test_import_folder.py` — imports into a folder the user chose (`target`, `import --to`): what is

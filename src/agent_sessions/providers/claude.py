@@ -361,6 +361,9 @@ class Claude(Provider):
     def resume_argv(self, s: Session) -> list[str]:
         return [self.binary, "--resume", s.id]
 
+    def new_session_argv(self, prompt: str) -> list[str]:
+        return [self.binary, prompt]  # ``claude [prompt]``; never ``-p``
+
     def transcript(self, s: Session) -> Iterator[Turn]:
         path = next((f for f in s.files if f.endswith(".jsonl")), None)
         if path is None:

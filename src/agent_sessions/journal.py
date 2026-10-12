@@ -21,6 +21,7 @@ import errno
 import json
 import logging
 import os
+from collections.abc import Iterable
 from pathlib import Path
 
 from . import fsutil
@@ -43,11 +44,11 @@ def legacy_path() -> Path:
     return fsutil.state_dir() / LEGACY_NAME
 
 
-def _legacy() -> list[dict]:
+def _legacy(quiet: bool = False) -> list[dict]:
     """The records of an ``imports.json`` from before the journal, each
     marked as an import of version 1. A file that cannot be used gives none
-    and a warning: it is not ours to repair, and nothing is lost by leaving
-    it alone."""
+    and a warning (none with ``quiet``): it is not ours to repair, and
+    nothing is lost by leaving it alone."""
     where = legacy_path()
     try:
         with open(where, encoding="utf-8") as fh:
@@ -55,11 +56,15 @@ def _legacy() -> list[dict]:
     except FileNotFoundError:
         return []
     except (OSError, ValueError, RecursionError) as exc:
-        _log.warning("the old import record %s cannot be read (%s); left as it is", where, exc)
+        if not quiet:
+            _log.warning("the old import record %s cannot be read (%s); left as it is", where, exc)
         return []
     items = data.get("imports") if isinstance(data, dict) else None
     if not isinstance(items, list):
-        _log.warning("the old import record %s is not in the expected form; left as it is", where)
+        if not quiet:
+            _log.warning(
+                "the old import record %s is not in the expected form; left as it is", where
+            )
         return []
     return [
         {"record": IMPORT, "version": LEGACY_VERSION, **item}
@@ -68,7 +73,7 @@ def _legacy() -> list[dict]:
     ]
 
 
-def read() -> list[dict]:
+def read(quiet: bool = False) -> list[dict]:
     """Every record, oldest first: those of an old ``imports.json``, then
     the lines of the journal. Reads only.
 
@@ -76,8 +81,12 @@ def read() -> list[dict]:
     That is expected of the last line alone, when the write that made it was
     cut short. Raises ``OSError`` when the journal is there and cannot be
     read at all.
+
+    ``quiet`` leaves the warnings out: for a caller that reads the journal
+    with every listing (``Index.finalise``), where the same line would be
+    reported each time.
     """
-    records = _legacy()
+    records = _legacy(quiet)
     where = path()
     try:
         with open(where, "rb") as fh:
@@ -95,11 +104,58 @@ def read() -> list[dict]:
             record = None
         if isinstance(record, dict):
             records.append(record)
+        elif quiet:
+            continue
         elif number > complete:
             _log.warning("%s: the last line is incomplete (a write was cut short); skipped", where)
         else:
             _log.warning("%s: line %d is not a record; skipped", where, number)
     return records
+
+
+def _text(record: dict, key: str) -> str | None:
+    value = record.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def ident(record: dict) -> tuple[str, str] | None:
+    """``(provider, session id)`` of a record, or None when it has not both."""
+    provider, session_id = _text(record, "provider"), _text(record, "id")
+    return None if provider is None or session_id is None else (provider, session_id)
+
+
+def not_undone(records: Iterable[dict]) -> list[dict]:
+    """The import records no later undo took back, oldest first.
+
+    An undo always takes back the last import of its provider and session id
+    that is still standing, so the records are settled in order: an ``undo``
+    cancels the nearest import before it of the same provider and id."""
+    standing: list[dict] = []
+    for record in records:
+        kind = record.get("record")
+        whose = ident(record)
+        if whose is None:
+            continue
+        if kind == IMPORT:
+            standing.append(record)
+        elif kind == UNDO:
+            for position in range(len(standing) - 1, -1, -1):
+                if ident(standing[position]) == whose:
+                    del standing[position]
+                    break
+    return standing
+
+
+def find_record(records: Iterable[dict], provider: str, session_id: str) -> dict | None:
+    """The record that stands for this session: its last import that was not
+    undone; None when there is none. It is what an undo takes back
+    (``unimport``) and what says which folder the copy was made for
+    (``Index.finalise``)."""
+    found = None
+    for record in not_undone(records):
+        if ident(record) == (provider, session_id):
+            found = record
+    return found
 
 
 def _line(record: dict) -> bytes:
@@ -183,7 +239,10 @@ __all__ = [
     "UNDO",
     "VERSION",
     "append",
+    "find_record",
+    "ident",
     "legacy_path",
+    "not_undone",
     "open_for_append",
     "path",
     "read",

@@ -202,19 +202,13 @@ def chosen_folder(target: object) -> str:
     It is the user's own input, not a name from a store, and it must be an
     absolute path of a directory that exists. Raises ``ImportFailed`` for
     anything else: text with a NUL, a relative path (``~`` is the caller's
-    to expand), a path that is not there, a file. Reads only."""
-    if not isinstance(target, str) or not target:
-        raise ImportFailed("the folder to import into is not a path")
-    if "\0" in target:
-        raise ImportFailed("the folder to import into has a NUL character in its path")
-    if not os.path.isabs(target):
-        raise ImportFailed(f"the folder to import into must be an absolute path: {target}")
-    folder = os.path.normpath(target)
-    if not os.path.lexists(folder):
-        raise ImportFailed(f"the folder to import into does not exist: {folder}")
-    if not os.path.isdir(folder):
-        raise ImportFailed(f"the folder to import into is not a directory: {folder}")
-    return folder
+    to expand), a path that is not there, a file. Reads only. The check is
+    ``fsutil.existing_folder``, which the folder a session is continued in
+    goes through too."""
+    try:
+        return fsutil.existing_folder(target, "the folder to import into")
+    except ValueError as exc:
+        raise ImportFailed(str(exc)) from None
 
 
 def start_plan(

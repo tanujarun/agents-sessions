@@ -1,12 +1,12 @@
 """The facade the CLI and the TUI call: load, scan, list, status, verify,
-find, open, import, unimport, transcript, and the drives: volumes, mount,
-forget, the drive letters.
+find, open, import, unimport, transcript, export, continue, and the drives:
+volumes, mount, forget, the drive letters.
 
 What is worth a line in the log is written here, so both front ends log
 alike (``logs``): the summary and the warnings of a scan, an import or an
-undo and how it ended, a launch with the exact command, a mount, a drive
-that is forgotten, and any exception that is not one of the failures this
-module reports (``ApiError``), with its traceback.
+undo and how it ended, a launch or a continue with the exact command, a
+mount, a drive that is forgotten, and any exception that is not one of the
+failures this module reports (``ApiError``), with its traceback.
 """
 
 from __future__ import annotations
@@ -15,19 +15,22 @@ import functools
 import os
 import re
 import shlex
+import stat
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
-from . import discover, importer, launch, logs, pathmap
+from . import discover, fsutil, importer, launch, logs, pathmap
+from . import export as exporting
 from . import index as index_mod
 from . import mounts as mounts_mod
 from . import providers as registry
 from . import unimport as undoing
 from .errors import (
     ApiError,
+    ExportFailed,
     ImportFailed,
     LaunchFailed,
     MountFailed,
@@ -36,8 +39,9 @@ from .errors import (
     UndoFailed,
 )
 from .fsutil import cache_file, home, log_file
+from .importer import NoFolder
 from .index import Index
-from .launch import LaunchPlan
+from .launch import ContinuePlan, LaunchPlan
 from .model import Session, make_key
 from .mounts import NATIVE_LABEL, MountsError, list_mounts
 from .providers import all_providers
@@ -48,6 +52,8 @@ if TYPE_CHECKING:
 
 # Agent CLIs that may be installed but have no adapter (SPEC non-goals).
 NO_READER_TOOLS = ("copilot", "crush", "cursor-agent", "opencode")
+EXPORT_FORMATS = exporting.FORMATS  # what ``export_transcript`` takes as ``fmt``
+HANDOFF_MAX_AGE = 30 * 24 * 3600  # seconds; an older handoff file goes with the next continue
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -462,6 +468,77 @@ def transcript(ref: Session | str, index: Index | None = None) -> Iterator[Turn]
 
 
 @_logged
+def export_transcript(
+    ref: Session | str, fmt: str = exporting.MARKDOWN, index: Index | None = None
+) -> Iterator[str]:
+    """The transcript of a session as a document, made lazily (it can be
+    large): pieces of one or more whole lines, each without the line break
+    that ends it.
+
+    ``fmt="md"``: Markdown. A header (the title, then the tool, the session
+    id, the folder as recorded, the times, the message count and what
+    exported it), a ``## User`` or ``## Assistant`` section per turn and a
+    line ``> tool: <name>`` per tool call; all of it text made safe to show
+    (``textsafe.clean``). ``fmt="json"``: one JSON object per turn and line
+    (``role``, ``text``, ``ts``), exact data (docs/JSON.md).
+
+    Raises at once, before anything is read: ``NotFound``, ``Offline`` for a
+    session whose drive is not mounted, ``ExportFailed`` for a format that
+    is neither."""
+    if fmt not in exporting.FORMATS:
+        raise ExportFailed(
+            f"unknown export format {fmt!r}; it is one of: {', '.join(exporting.FORMATS)}"
+        )
+    session = find_session(ref, index)
+    _need_files(session)
+    provider = _provider(session)
+    turns = provider.transcript(session)
+    if fmt == exporting.JSON_LINES:
+        return exporting.json_lines(turns)
+    return exporting.markdown(session, provider.label or provider.name, turns)
+
+
+def _in_a_store(path: str, index: Index) -> str | None:
+    """The root of the session store ``path`` lies in, or None. Whatever
+    links lead there: both are compared as the places they really are."""
+    real = os.path.realpath(path)
+    roots = [store.root for store in index.stores] + [store.root for store in index.skipped]
+    for root in sorted(roots):
+        there = os.path.realpath(root)
+        if real == there or real.startswith(there.rstrip(os.sep) + os.sep):
+            return root
+    return None
+
+
+@_logged
+def export_file(
+    ref: Session | str,
+    path: str,
+    fmt: str = exporting.MARKDOWN,
+    force: bool = False,
+    index: Index | None = None,
+) -> int:
+    """Write ``export_transcript`` to the file ``path`` and return its size
+    in bytes. The file is the user's own choice: an absolute path in a
+    directory that exists. It is written whole or not at all (a temp file
+    beside it, then moved into place), for the user alone (0600).
+
+    Raises ``ExportFailed`` when the file exists and ``force`` is not set
+    (with it, a regular file is replaced), for a path that will not do, and
+    for one inside a session store, native or not, forced or not: nothing
+    here writes into a store. And what ``export_transcript`` raises."""
+    index = index if index is not None else load_index()
+    pieces = export_transcript(ref, fmt, index)
+    if isinstance(path, str) and path and "\0" not in path and os.path.isabs(path):
+        store = _in_a_store(path, index)
+        if store is not None:
+            raise ExportFailed(
+                f"{os.path.normpath(path)} is inside the session store {store}; nothing was written"
+            )
+    return exporting.write(path, pieces, overwrite=force)
+
+
+@_logged
 def open_session(
     ref: Session | str, here: bool = False, dry_run: bool = False, index: Index | None = None
 ) -> LaunchPlan:
@@ -513,6 +590,233 @@ def open_session(
         return launch.launch(session, provider, where=where, here=here)
     except LaunchFailed as exc:
         log.warning("launch %s refused: %s", session.key, exc.reason)
+        raise
+
+
+# --- continue as a new session ------------------------------------------------
+
+NO_TOOL = "no tool that can start a new session is installed"
+
+
+@dataclass(frozen=True)
+class ContinueOptions:
+    """What continuing one session as a new one can be (``continue_options``):
+    what a front end builds its question from."""
+
+    # ``continue_session`` can start a tool for this session.
+    possible: bool
+    # Why not, in plain words; "" when ``possible``.
+    reason: str = ""
+    # The tools that can be started, as ``(name, label)``: the session's own
+    # first, then by name. ``name`` is what ``continue_session`` takes.
+    tools: tuple[tuple[str, str], ...] = ()
+    # The tool ``continue_session`` starts when none is named: the session's
+    # own. None when that one is not installed: one must be named then.
+    default_tool: str | None = None
+    # The folder it starts in when none is given: the session's own folder
+    # on this machine. None when that is gone or was not recorded: one must
+    # be given then.
+    folder: str | None = None
+
+
+def _new_session_tools(first: str | None = None) -> list[Provider]:
+    """The providers whose tool can be started as a new session here: the
+    adapter has a command for it (``Provider.new_session_argv``) and the
+    tool is installed, not merely a name on PATH (``launch.tool_state``).
+    The provider called ``first`` leads, the others follow by name."""
+    found = []
+    for provider in all_providers():
+        try:
+            argv = provider.new_session_argv("")
+        except NotImplementedError:
+            continue
+        if argv and launch.tool_state(str(argv[0])).installed:
+            found.append(provider)
+    return sorted(found, key=lambda provider: provider.name != first)  # stable: by name within
+
+
+def _own_folder(session: Session) -> str | None:
+    """The session's folder on this machine when it is there now, else None."""
+    folder = session.cwd_local
+    if folder and os.path.isabs(folder) and os.path.isdir(folder):
+        return folder
+    return None
+
+
+@_logged
+def continue_options(ref: Session | str, index: Index | None = None) -> ContinueOptions:
+    """What ``continue_session`` can do for this session: whether it is
+    ``possible`` (and the ``reason`` when not), the ``tools`` that are
+    installed, the ``default_tool`` and the ``folder`` it would use when
+    none is given. Never raises for a session that cannot be continued or
+    found: that is an answer. Reads only; writes nothing."""
+    try:
+        session = find_session(ref, index)
+        _need_files(session)
+        source = _provider(session)
+    except ApiError as exc:
+        return ContinueOptions(False, exc.reason)
+    installed = _new_session_tools(source.name)
+    tools = tuple((provider.name, provider.label or provider.name) for provider in installed)
+    folder = _own_folder(session)
+    if not tools:
+        return ContinueOptions(False, NO_TOOL, folder=folder)
+    default = source.name if installed[0].name == source.name else None
+    return ContinueOptions(True, "", tools, default, folder)
+
+
+def _continue_tool(source: Provider, tool: str | None) -> Provider:
+    """The provider whose tool continues a session of ``source``: the one
+    ``tool`` names (an adapter's name, its command or its label, in either
+    case), else ``source`` itself. Raises ``LaunchFailed`` for a name that
+    is none, and for a tool that is not installed; both name the ones that
+    are."""
+    installed = _new_session_tools(source.name)
+    names = ", ".join(sorted(provider.name for provider in installed))
+    others = f"the installed tools are: {names}" if names else NO_TOOL
+    wanted = source
+    if tool is not None:
+        text = tool.strip().lower() if isinstance(tool, str) else ""
+        known = [
+            provider
+            for provider in all_providers()
+            if text and text in (provider.name, provider.binary, provider.label.lower())
+        ]
+        if len(known) != 1:
+            raise LaunchFailed(f"unknown tool {tool!r}; {others}")
+        wanted = known[0]
+    if wanted.name not in {provider.name for provider in installed}:
+        raise LaunchFailed(f"{wanted.label or wanted.name} is not installed; {others}")
+    return wanted
+
+
+def _sweep_handoff(now: float | None = None) -> list[str]:
+    """Remove the handoff files that are older than ``HANDOFF_MAX_AGE``;
+    returns the paths it removed, sorted.
+
+    Only a regular file whose name is exactly what ``launch.handoff_file``
+    gives a session of a provider that has a reader. Anything else in the
+    directory is not this program's to judge and stays; what cannot be
+    listed or removed is left alone."""
+    directory = fsutil.handoff_dir()
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    providers = all_providers()
+    limit = (time.time() if now is None else now) - HANDOFF_MAX_AGE
+    removed = []
+    for name in names:
+        if not any(launch.handoff_session(provider, name) for provider in providers):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            st = os.lstat(path)
+            if not stat.S_ISREG(st.st_mode) or st.st_mtime >= limit:
+                continue
+            os.unlink(path)
+        except OSError:
+            continue
+        removed.append(path)
+    return removed
+
+
+def _hand_over(session: Session, source: Provider, plan: ContinuePlan) -> int:
+    """Write the transcript of ``session`` to the plan's handoff file, as
+    Markdown, and return its size. The directory is made for the user alone
+    (0700, the file 0600); the file replaces an older one of the same
+    session in one step; files past their time are swept on the way."""
+    directory = fsutil.handoff_dir()
+    try:
+        fsutil.make_private_dir(fsutil.state_dir())
+        fsutil.make_private_dir(directory)
+    except OSError as exc:
+        raise ExportFailed(
+            f"the directory {directory} cannot be made: {exc.strerror or exc}; nothing was started"
+        ) from exc
+    swept = _sweep_handoff()
+    if swept:
+        logs.logger().info(
+            "continue: %d transcripts older than %d days removed from %s",
+            len(swept),
+            HANDOFF_MAX_AGE // 86400,
+            directory,
+        )
+    pieces = exporting.markdown(session, source.label or source.name, source.transcript(session))
+    return exporting.write(plan.handoff, pieces, overwrite=True)
+
+
+@_logged
+def continue_session(
+    ref: Session | str,
+    tool: str | None = None,
+    folder: str | None = None,
+    here: bool = False,
+    dry_run: bool = False,
+    index: Index | None = None,
+) -> ContinuePlan:
+    """Carry a session on as a **new** session of a tool: for one that
+    cannot be resumed where it is wanted (another provider's tool, a
+    provider that cannot be imported, a folder that is gone).
+
+    The transcript is exported as Markdown to ``<state>/handoff/
+    <provider>-<id>.md``, and ``tool`` (an adapter's name, its command or
+    its label; default: the session's own) is started as a new interactive
+    session in ``folder`` (default: the session's folder on this machine)
+    with a fixed first prompt that names the file and says it is a record,
+    not instructions. The prompt holds no text of the session
+    (``launch.plan_new`` makes it). **The tool sends that first message to
+    its model as soon as it starts**: a front end says so before it calls
+    this.
+
+    Returns the plan: the folder, the command, the prompt and the handoff
+    file. ``dry_run=True`` only returns it: nothing is written, nothing is
+    started. ``here=True`` starts the tool in this process instead of a new
+    window (``chdir`` then ``exec``: the call does not return).
+
+    Raises ``Offline`` for a session whose drive is not mounted,
+    ``LaunchFailed`` for a tool that is unknown or not installed (the reason
+    names the installed ones), for a session whose folder is gone when none
+    is given, for a ``folder`` that is not an absolute path of a directory
+    that exists, and for whatever stops the start itself; ``ExportFailed``
+    when the transcript cannot be written; ``NotFound``. Nothing is started
+    unless the transcript was written.
+    """
+    session = find_session(ref, index)
+    log = logs.logger()
+    try:
+        _need_files(session)
+        source = _provider(session)
+        target = _continue_tool(source, tool)
+        if folder is None:
+            folder = _own_folder(session)
+            if folder is None:
+                state = "is gone" if session.cwd else "was not recorded"
+                raise LaunchFailed(f"the session's folder {state}; choose one with --in")
+        planned = launch.plan_new(target, source, session.id, folder, here)
+        if dry_run:
+            return planned
+        size = _hand_over(session, source, planned)
+    except ApiError as exc:
+        if not dry_run:
+            log.warning("continue %s refused: %s", session.key, exc.reason)
+        raise
+    # Logged before the start: with ``here`` the launch below replaces this
+    # process and nothing could be written after it.
+    log.info(
+        "continue %s with %s%s: transcript in %s (%d bytes); cd %s && %s",
+        session.key,
+        target.name,
+        " (in this terminal)" if here else "",
+        planned.handoff,
+        size,
+        shlex.quote(planned.cwd),
+        shlex.join(planned.command),
+    )
+    try:
+        return launch.launch_new(target, source, session.id, folder, here)
+    except LaunchFailed as exc:
+        log.warning("continue %s refused: %s", session.key, exc.reason)
         raise
 
 
@@ -1067,14 +1371,20 @@ def remove_letter(letter: str) -> str:
 
 
 __all__ = [
+    "EXPORT_FORMATS",
+    "HANDOFF_MAX_AGE",
     "NO_READER_TOOLS",
     "ApiError",
+    "ContinueOptions",
+    "ContinuePlan",
+    "ExportFailed",
     "ImportFailed",
     "ImportOptions",
     "ImportReport",
     "LaunchFailed",
     "LaunchPlan",
     "MountFailed",
+    "NoFolder",
     "NotFound",
     "Offline",
     "Turn",
@@ -1082,6 +1392,10 @@ __all__ = [
     "UnimportReport",
     "cache_file",
     "can_import",
+    "continue_options",
+    "continue_session",
+    "export_file",
+    "export_transcript",
     "find_session",
     "find_volume",
     "forget_drive",

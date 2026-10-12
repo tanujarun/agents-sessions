@@ -28,7 +28,7 @@ from fixture_world import (
     files_below,
     tree_state,
 )
-from support import FIXTURES, state_names
+from support import FIXTURES, claude_transcript, state_names
 
 from agent_sessions import api, blake3, cli, importer, journal
 from agent_sessions.providers import grok as grok_mod
@@ -43,6 +43,8 @@ SEGMENT_LAST = (
 RECORDED = "F:\\Proj\\My Site"  # what the Windows fixtures recorded
 NOT_FOUND = f"the project folder {RECORDED} was not found on any mounted drive"
 NOT_RECORDED = "the project folder of this session is not recorded"
+HINT = "use --to DIR to import it into a folder you choose"  # what the command adds
+NO_FOLDER = "eeeeeeee-1111-4222-8333-444444444444"  # a session that recorded no folder
 
 
 def read(path) -> bytes:
@@ -771,7 +773,7 @@ class ImportToCommandTest(FolderCase):
 
     def test_import_into_a_chosen_folder(self):
         self.lose_the_folder()
-        self.assertEqual(run("import", self.key), (1, "", f"agent-sessions: {NOT_FOUND}\n"))
+        self.assertEqual(run("import", self.key), (1, "", f"agent-sessions: {NOT_FOUND}; {HINT}\n"))
         code, out, err = run("import", self.key, "--to", str(self.chosen))
         native = self.w.session(CLAUDE_WIN, "native")
         self.assertEqual((code, out), (0, native.key + "\n"))
@@ -780,6 +782,28 @@ class ImportToCommandTest(FolderCase):
             os.listdir(self.home / ".claude" / "projects"), [encode_cwd(str(self.chosen))]
         )
         self.assertEqual(journal.read()[0]["chosen_folder"], str(self.chosen))
+
+    def test_a_refusal_for_want_of_a_folder_names_the_flag(self):
+        claude_transcript(self.w.profile / ".claude", NO_FOLDER, None, project="none")
+        self.lose_the_folder()
+        for ref, reason in ((self.key, NOT_FOUND), (NO_FOLDER, NOT_RECORDED)):
+            for extra in ((), ("--dry-run",), ("--open",), ("--experimental",)):
+                with self.subTest(reason=reason, extra=extra):
+                    self.assertEqual(
+                        run("import", ref, *extra), (1, "", f"agent-sessions: {reason}; {HINT}\n")
+                    )
+            # The engine's own text stays as it is: another front end has no such flag.
+            self.assertEqual(self.refused(ref), reason)
+            self.assertEqual(api.import_options(ref).reason, reason)
+        self.assert_nothing_written()
+        # Any other refusal is printed as it is, and with --to there is none.
+        code, _out, err = run("import", self.key, "--to", "Work")
+        self.assertEqual(
+            (code, err),
+            (1, "agent-sessions: the folder to import into must be an absolute path: Work\n"),
+        )
+        self.assertEqual(run("import", NO_FOLDER, "--to", str(self.chosen), "--dry-run")[0], 0)
+        self.assertEqual(self.w.started, [])
 
     def test_a_tilde_is_expanded_by_the_command_and_only_there(self):
         with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
