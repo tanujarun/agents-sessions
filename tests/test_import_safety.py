@@ -31,6 +31,22 @@ OTHER = "0f0f0f0f-1111-4222-8333-444444444444"
 CODEX_ROLLOUT = f"rollout-2026-08-29T13-57-23-{CODEX_WIN}.jsonl"
 
 
+def other_filesystem(case, here) -> Path | None:
+    """A fresh temp directory on another filesystem than ``here``, removed
+    with the test; None when this machine offers none."""
+    device = os.stat(here).st_dev
+    for base in ("/dev/shm", "/var/tmp"):
+        try:
+            if os.stat(base).st_dev == device or not os.access(base, os.W_OK):
+                continue
+        except OSError:
+            continue
+        holder = tempfile.TemporaryDirectory(prefix="agent-sessions-test-", dir=base)
+        case.addCleanup(holder.cleanup)
+        return Path(holder.name)
+    return None
+
+
 def snapshot(*roots) -> dict:
     """Every file and directory below the roots: a regular file with its
     bytes, anything else (a directory, a link, a named pipe) with its kind."""
@@ -170,22 +186,116 @@ class ContainedTest(SafetyCase):
             plan = dataclasses.replace(copy.deepcopy(self.good), native_root=root)
             self.assertIn("is not an absolute path", self.refused(plan))
 
-    def test_a_link_out_of_the_native_root_is_not_followed(self):
-        outside = self.w.box.root / "elsewhere"
-        outside.mkdir()
+    def test_an_import_goes_through_a_linked_sub_directory(self):
+        """``~/.claude/projects`` is a link to a directory elsewhere, the way
+        a user keeps the transcripts on another disk. The native store is
+        the user's own: the link is followed, as the tool follows it."""
+        elsewhere = self.w.box.root / "other-disk" / "claude-projects"
+        elsewhere.mkdir(parents=True)
         os.makedirs(self.root)
-        os.symlink(outside, os.path.join(self.root, "projects"))
-        reason = self.refused(self.good)
-        self.assertIn("leads out of the native store", reason)
-        self.assertIn("through a symbolic link", reason)
-        self.assertEqual(os.listdir(outside), [])
-        self.assertEqual(api.can_import(self.source(CLAUDE_WIN)), (False, reason))
-        # The same with the link one level down, at the project directory.
-        os.unlink(os.path.join(self.root, "projects"))
-        os.makedirs(os.path.join(self.root, "projects"))
-        os.symlink(outside, os.path.dirname(self.good.units[1].dst))
-        self.assertIn("leads out of the native store", self.refused(self.good))
-        self.assertEqual(os.listdir(outside), [])
+        os.symlink(elsewhere, os.path.join(self.root, "projects"))
+        importer.contained(self.good)
+        source = self.source(CLAUDE_WIN)
+        self.assertEqual(api.can_import(source), (True, ""))
+        native = api.import_session(source)
+        self.assertEqual(
+            (native.id, native.origin, native.launchable), (CLAUDE_WIN, "native", True)
+        )
+        folder = encode_cwd(str(self.w.site))
+        copied = elsewhere / folder / f"{CLAUDE_WIN}.jsonl"
+        self.assertEqual(
+            copied.read_bytes(),
+            (
+                self.w.profile / ".claude/projects/F--Proj-My-Site" / f"{CLAUDE_WIN}.jsonl"
+            ).read_bytes(),
+        )
+        self.assertTrue((elsewhere / folder / CLAUDE_WIN).is_dir())
+        # The link is still a link, and the record names the paths as the store has them.
+        self.assertTrue(os.path.islink(os.path.join(self.root, "projects")))
+        (record,) = importer.read_journal()
+        self.assertEqual(
+            record["destination_files"],
+            [
+                os.path.join(self.root, "projects", folder, CLAUDE_WIN),
+                os.path.join(self.root, "projects", folder, f"{CLAUDE_WIN}.jsonl"),
+            ],
+        )
+        self.assertEqual(sorted(os.listdir(self.root)), ["projects"])  # no staging left
+        self.assertEqual(api.import_report(self.source(CLAUDE_WIN)).created, False)
+
+    def test_a_link_the_reader_does_not_follow_ends_in_a_clean_refusal(self):
+        """The project's own directory is the link. ``contained`` lets it
+        pass, the copy is placed through it, and the read-back does not find
+        it: the Claude reader lists real project directories only
+        (``fsutil.subdirs``), in the native store as anywhere. The import is
+        taken out again and says why."""
+        elsewhere = self.w.box.root / "other-disk" / "site"
+        elsewhere.mkdir(parents=True)
+        project = os.path.dirname(self.good.units[1].dst)
+        os.makedirs(os.path.dirname(project))
+        os.symlink(elsewhere, project)
+        importer.contained(self.good)
+        before = snapshot(self.w.box.root)
+        with self.assertRaises(api.ImportFailed) as caught:
+            api.import_session(self.source(CLAUDE_WIN))
+        self.assertEqual(
+            caught.exception.reason,
+            f"the copy does not read as session {CLAUDE_WIN}; it was removed again and "
+            "nothing was left in the native store",
+        )
+        self.assertEqual(os.listdir(elsewhere), [])
+        after = snapshot(self.w.box.root)
+        cache = str(self.w.box.cache)  # the scans of this test rewrote the index
+        self.assertEqual(
+            {k: v for k, v in after.items() if not k.startswith(cache)},
+            {k: v for k, v in before.items() if not k.startswith(cache)},
+        )
+
+    def test_a_failed_import_through_a_link_leaves_the_linked_directory_as_it_was(self):
+        elsewhere = self.w.box.root / "other-disk" / "claude-projects"
+        (elsewhere / "kept").mkdir(parents=True)
+        os.makedirs(self.root)
+        os.symlink(elsewhere, os.path.join(self.root, "projects"))
+        before = snapshot(self.w.box.root)
+        with self.assertRaises(importer.ImportFailed):
+            importer.execute(self.good, verify=mock.Mock(side_effect=ValueError("no")))
+        self.assertEqual(snapshot(self.w.box.root), before)
+
+    def test_a_link_to_another_filesystem_is_refused_in_plain_words(self):
+        """The copy is staged at the root of the native store; a move from
+        there to another filesystem cannot be one step. (Simulated: the
+        error every move across filesystems gives.)"""
+        elsewhere = self.w.box.root / "other-disk" / "claude-projects"
+        elsewhere.mkdir(parents=True)
+        os.makedirs(self.root)
+        os.symlink(elsewhere, os.path.join(self.root, "projects"))
+        before = snapshot(self.w.box.root)
+        crossing = OSError(18, "Invalid cross-device link")
+        with (
+            mock.patch.object(importer.os, "link", side_effect=crossing),
+            mock.patch.object(importer.os, "replace", side_effect=crossing),
+            mock.patch.object(importer.os, "rename", side_effect=crossing),
+            self.assertRaises(importer.ImportFailed) as caught,
+        ):
+            importer.execute(self.good)
+        self.assertIn("is on another filesystem than the native store", caught.exception.reason)
+        self.assertIn(os.path.dirname(self.good.units[0].dst), caught.exception.reason)
+        self.assertEqual(snapshot(self.w.box.root), before)
+
+    def test_a_link_to_a_real_other_filesystem(self):
+        """The same with the kernel's own answer, where the machine has a
+        second filesystem to try it on."""
+        elsewhere = other_filesystem(self, self.w.box.root)
+        if elsewhere is None:
+            self.skipTest("no second writable filesystem for temp files")
+        os.makedirs(self.root)
+        os.symlink(elsewhere, os.path.join(self.root, "projects"))
+        before = snapshot(self.w.box.root)
+        with self.assertRaises(api.ImportFailed) as caught:
+            importer.execute(self.good)
+        self.assertIn("is on another filesystem than the native store", caught.exception.reason)
+        self.assertEqual(snapshot(self.w.box.root), before)
+        self.assertEqual(os.listdir(elsewhere), [])
 
     def test_a_link_that_stays_inside_the_native_root_is_fine(self):
         os.makedirs(os.path.join(self.root, "real-projects"))
@@ -212,13 +322,24 @@ class ContainedTest(SafetyCase):
         self.assertEqual((native.id, native.origin), (CLAUDE_WIN, "native"))
         copied = dotfiles / "projects" / encode_cwd(str(self.w.site)) / f"{CLAUDE_WIN}.jsonl"
         self.assertTrue(copied.is_file())
-        # A link out of it is still refused.
-        plan = self.plan("69669cf3-d7ae-4ba4-a028-c6abfd2bd622")
-        shutil.rmtree(dotfiles / "projects")
-        os.symlink(self.w.box.root, dotfiles / "projects")
-        with self.assertRaises(importer.ImportFailed) as caught:
-            importer.check(plan)
-        self.assertIn("leads out of the native store", caught.exception.reason)
+        self.assertTrue(os.path.islink(self.root))
+        # The staging directory was made, and removed, where the link leads.
+        self.assertEqual(os.listdir(dotfiles), ["projects"])
+        # And a link below it is followed too.
+        plain = "69669cf3-d7ae-4ba4-a028-c6abfd2bd622"
+        other = self.w.box.root / "other-disk"
+        shutil.move(dotfiles / "projects", other)
+        os.symlink(other, dotfiles / "projects")
+        self.assertEqual(api.import_session(self.source(plain)).id, plain)
+        self.assertTrue((other / encode_cwd(str(self.w.site)) / f"{plain}.jsonl").is_file())
+
+    def test_the_names_are_still_checked_when_links_are_about(self):
+        """Following the user's links does not loosen the rule for the names
+        a plan carries: ``..`` is refused before any link is looked at."""
+        os.makedirs(os.path.join(self.root, "projects"))
+        os.symlink(self.w.box.root, os.path.join(self.root, "up"))
+        for dst in (f"{self.root}/up/../x.jsonl", f"{self.root}/projects/../../x.jsonl"):
+            self.assertIn("nothing was imported", self.refused(self.with_dst(dst)))
 
 
 class AdapterNamesTest(SafetyCase):

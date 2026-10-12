@@ -8,8 +8,9 @@ the rules that hold for every provider, ``execute`` carries the plan out:
 - the source is only read, through ``fsutil.open_ro`` and ``listdir_ro`` (no
   access time moves on the other drive);
 - the session id must be in the form its provider's ids have, and every
-  destination must lie below the native store (``contained``): the names in
-  a plan come from the source and are not trusted;
+  destination must name a place below the native store (``contained``): the
+  names in a plan come from the source and are not trusted. Symbolic links
+  inside the native store are the user's own and are followed;
 - nothing that exists is overwritten: an id already in the native store, or a
   destination path that exists, raises ``Exists``;
 - there must be room for the copy plus 10 %;
@@ -347,10 +348,15 @@ def contained(plan: ImportPlan) -> None:
     the plan checked, every destination is checked again here: each unit,
     each directory and file below a unit, each file appended to. A
     destination must be the native root plus components none of which is
-    empty, ``.`` or ``..``, must hold no NUL, and must still be below the
-    native root once the symbolic links on the way are resolved (the links
-    in the part of the path that exists; the native root itself may be a
-    link, as a home directory kept in a dotfiles repository has it).
+    empty, ``.`` or ``..``, and must hold no NUL.
+
+    The check is on the names, not on where symbolic links lead. The native
+    store is the user's own and trusted (docs/SPEC.md "Threat model"): a
+    ``~/.claude`` kept in a dotfiles repository, or a ``projects`` directory
+    that is a link to another disk, is how that user set it up, and the
+    tool itself writes through such a link. Nothing from another store can
+    put a link there: an import creates regular files and directories only
+    (``tree``, ``file_copy``, ``_copy``).
 
     Raises ``ImportFailed``; reads only.
     """
@@ -370,18 +376,11 @@ def contained(plan: ImportPlan) -> None:
         elif len(unit.files) != 1 or unit.files[0].rel or unit.dirs:
             raise ImportFailed(f"{unit.dst} is planned as one file but is not one")
     targets += [addition.path for addition in plan.appends]
-    real_root = os.path.realpath(root)
     for path in targets:
         if not isinstance(path, str) or "\0" in path or not path.startswith(_below(root)):
             raise ImportFailed(f"{path!r} is outside the native store {root}; nothing was imported")
         if not _relative_ok(path[len(_below(root)) :]):
             raise ImportFailed(f"{path!r} is not a plain path below {root}; nothing was imported")
-        real = os.path.realpath(path)
-        if not real.startswith(_below(real_root)):
-            raise ImportFailed(
-                f"{path} leads out of the native store {root} through a symbolic link; "
-                "nothing was imported"
-            )
     for addition in plan.appends:  # a line is only ever added to a plain file
         try:
             mode = os.stat(addition.path).st_mode
@@ -863,7 +862,20 @@ def _carry_out(
         for unit, target in zip(plan.units, staged, strict=False):
             _make_dirs(os.path.dirname(unit.dst), made_dirs)
             moving = (target, unit.dst)
-            _place(target, unit.dst, unit.is_dir)
+            try:
+                _place(target, unit.dst, unit.is_dir)
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                # A link inside the native store that leads to another disk:
+                # the copy was staged on this one and cannot be moved over
+                # in one step.
+                raise ImportFailed(
+                    f"{os.path.dirname(unit.dst)} is on another filesystem than the native "
+                    f"store {plan.native_root} (a symbolic link or a mount leads there), and "
+                    "a copy cannot be moved across in one step; nothing was left in the "
+                    "native store"
+                ) from exc
             placed.append(unit.dst)
         moving = None
         _flush_placed(placed, made_dirs)

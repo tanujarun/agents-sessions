@@ -105,7 +105,8 @@
   its note, directories flushed before the record, the lock around the whole of `execute`, and two real
   processes importing the same session and different ones
 - `tests/test_import_safety.py` — what keeps an import inside the native store: `importer.contained`
-  (destinations, paths below a unit, appended files, symbolic links), the names each adapter takes from the
+  (destinations, paths below a unit, appended files; symbolic links inside the native store are followed),
+  the names each adapter takes from the
   source; the read-back of a placed copy (`Provider.read_back`, the `verify` step of `importer.execute`) and
   the roll back when it fails
 - `src/agent_sessions/tui/__init__.py` — package marker; imports no Textual; `run()`, the "run ./install.sh" hint

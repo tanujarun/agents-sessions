@@ -381,8 +381,11 @@ follow, each enforced in one place and again at the point of use:
   a UUID for all five) to be listed, launched or imported.
 - Nothing from a foreign store reaches a command line except a validated id
   and a directory that exists. No shell is ever used.
-- Every import destination stays inside the native store (checked on the
-  resolved path, independently of the adapter).
+- Every import destination is a path below the native store (checked on
+  its components, independently of the adapter). Symbolic links inside the
+  native store are followed: the store is the user's own, and nothing from
+  a foreign store can create a link there (an import writes regular files
+  and directories only).
 - Everything printed for a person passes `textsafe.clean` (control, C1 and
   bidi characters). `--json` output is exact data with those characters
   escaped.
