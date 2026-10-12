@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING
 
 from . import __version__, fsutil, importer, journal
 from .errors import UndoFailed
+from .journal import find_record, not_undone
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -90,17 +91,6 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _text(record: dict, key: str) -> str | None:
-    value = record.get(key)
-    return value if isinstance(value, str) and value else None
-
-
-def _ident(record: dict) -> tuple[str, str] | None:
-    """``(provider, session id)`` of a record, or None when it has not both."""
-    provider, session_id = _text(record, "provider"), _text(record, "id")
-    return None if provider is None or session_id is None else (provider, session_id)
-
-
 def read_records() -> list[dict]:
     """The journal, oldest first. Raises ``UndoFailed`` when it is there and
     cannot be read."""
@@ -111,38 +101,6 @@ def read_records() -> list[dict]:
             f"the import journal {journal.path()} cannot be read: {exc.strerror or exc}; "
             "nothing was removed"
         ) from exc
-
-
-def not_undone(records: Iterable[dict]) -> list[dict]:
-    """The import records no later undo took back, oldest first.
-
-    An undo always takes back the last import of its provider and session id
-    that is still standing, so the records are settled in order: an ``undo``
-    cancels the nearest import before it of the same provider and id."""
-    standing: list[dict] = []
-    for record in records:
-        kind = record.get("record")
-        ident = _ident(record)
-        if ident is None:
-            continue
-        if kind == journal.IMPORT:
-            standing.append(record)
-        elif kind == journal.UNDO:
-            for position in range(len(standing) - 1, -1, -1):
-                if _ident(standing[position]) == ident:
-                    del standing[position]
-                    break
-    return standing
-
-
-def find_record(records: Iterable[dict], provider: str, session_id: str) -> dict | None:
-    """The record an undo of this session uses: its last import that was not
-    undone; None when there is none."""
-    found = None
-    for record in not_undone(records):
-        if _ident(record) == (provider, session_id):
-            found = record
-    return found
 
 
 def _is_root_or_above(root: str, path: str) -> bool:
@@ -281,7 +239,7 @@ def plan(
     record without a manifest (unless ``force``), and files that differ from
     the record (unless ``force``)."""
     root = os.fspath(native_root)
-    ident = _ident(record)
+    ident = journal.ident(record)
     if ident is None:
         raise UndoFailed("the import record is damaged (no provider or id); nothing was removed")
     provider, session_id = ident

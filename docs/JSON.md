@@ -60,7 +60,7 @@ mounted drives alone give.
 | `key` | string | `<provider>:<8 hex of the store's path>:<id>`; the same across scans, and what `open`, `import` and `show` take |
 | `title` | string | the tool's own title when it has one, else the first real prompt; one line, at most 80 characters; may be empty |
 | `cwd` | string or null | the working directory as the tool recorded it (`F:\Proj\My Site`, `/home/u/x`); null when none is recorded |
-| `cwd_local` | string or null | that folder on this machine; null when it is not recorded, not on a mounted drive, or gone, and for every offline session |
+| `cwd_local` | string or null | that folder on this machine; for a native copy an import made, the folder of that import (the one that was chosen, else the one the recorded folder was mapped to) while the import stands and the folder exists; null when it is not recorded, not on a mounted drive, or gone, and for every offline session |
 | `cwd_exists` | boolean | true exactly when `cwd_local` is a directory that exists |
 | `started` | string or null | time of the first record |
 | `updated` | string or null | time of the last record; what the array is ordered by |

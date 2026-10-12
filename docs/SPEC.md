@@ -107,7 +107,8 @@ runs are not sessions and are skipped silently; `status` counts them.
 
 `imported_as` is derived, not stored: a foreign session is "imported" when a
 session with the same provider and id exists in the native store.
-The import journal (`imports.jsonl`) is provenance only.
+The import journal (`imports.jsonl`) is provenance, with one exception
+(phase 2, "Import"): it says which folder a native copy was imported for.
 
 ### Provider adapter contract
 
@@ -573,6 +574,17 @@ Terminal: `omarchy-launch-tui` when present; else `xdg-terminal-exec`; else
   line, appended under a lock; a record lists every file and directory the
   import created with size and modification time. An old `imports.json` is
   read, never rewritten.
+- **A copy is resumed in the folder of its import.** Claude's and
+  Antigravity's copies keep the folder as the other machine recorded it, so
+  the path map alone would lead to where that folder is found today (not
+  the chosen one), or nowhere while the drive that resolved its letter is
+  away. For a native session the index therefore looks up the import record
+  that still stands for its provider and id (the last import no undo took
+  back, made into this native store): its `chosen_folder`, else its
+  `cwd_local`, is the session's `cwd_local` when it is an absolute path of
+  a directory that exists. Otherwise the path map decides, as for every
+  other session. The journal is read once per listing; one that is missing,
+  unreadable or malformed changes nothing and is not reported there.
 - `unimport <key> [--force] [--dry-run] [--yes]`: removes what the last
   import of that session created, and nothing else. `<key>` is the native
   copy, the foreign session or the id; the record is the last import of

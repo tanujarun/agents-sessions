@@ -32,9 +32,11 @@
   below it), `debug` (`--debug`: DEBUG level, a copy on stderr), `unexpected` (an exception with its
   traceback, once), `written`, `close`
 - `src/agent_sessions/journal.py` — the import journal `<state>/imports.jsonl`: `read` (oldest first, the
-  records of an old `imports.json` before them, a torn line skipped with a warning), `append` (lock, one
+  records of an old `imports.json` before them, a torn line skipped with a warning, or without one for a
+  caller that reads it with every listing), `append` (lock, one
   write on an appending descriptor, fsync), `open_for_append`/`write` for a caller that holds the lock; the
-  two kinds of record, `IMPORT` and `UNDO`
+  two kinds of record, `IMPORT` and `UNDO`; which imports still stand: `ident`, `not_undone` and
+  `find_record` (the last import of a session that no undo took back)
 - `src/agent_sessions/textsafe.py` — the one sanitiser for text from a store: `clean` (control and
   bidirectional characters become spaces; `multiline` keeps line feed and tab), `json_escape` (the same
   characters as `\uXXXX` in `--json` output), the set `UNSAFE`. Used by the CLI's output helpers, `clean_title`,
@@ -55,7 +57,8 @@
   (parse cache by signature, the path evidence of each store cached the same way), the `volumes` table (identity,
   drive letters and last-seen time of every volume that holds a remembered store; `forget`, `letter_for_mount`,
   a volume that came back at another path), `finalise` (derived session fields, offline sessions from the cache,
-  dedupe, order), `where`, scan policy; `fresh` (cache-free index for `verify`)
+  dedupe, order; a native copy's local folder is the folder of its import, from the standing record of the
+  journal), `where`, scan policy; `fresh` (cache-free index for `verify`)
 - `src/agent_sessions/providers/` — one adapter per provider, plus the registry
 - `src/agent_sessions/providers/__init__.py` — registry: `register`, `all_providers`, `get`; imports the five adapters
 - `src/agent_sessions/providers/base.py` — `Provider` contract (with `id_pattern`, `valid_id`, `read_back`, the
@@ -78,7 +81,7 @@
   folder the user chose, `chosen_folder`; `NoFolder` when the session's own is not found), the checks
   (`check`, `contained`, and `below` for one path), `execute` (stage, place, verify, append, journal record
   with a manifest; all under the state directory's lock, rolled back on any failure), `sweep_staging`
-- `src/agent_sessions/unimport.py` — take an import back: `not_undone` and `find_record` (the last import of a
+- `src/agent_sessions/unimport.py` — take an import back: the record is `journal.find_record`'s (the last import of a
   session that no undo took back), `plan` (what would be removed and left, read from the record's manifest
   and the disk; refuses a copy that was used since, a damaged record, a path outside the native store),
   `undo` (plan and removal under the state directory's lock, files then empty directories, an `undo` record
@@ -165,6 +168,9 @@
   is used, a copy that was used since, `--force`, what is left and why, the provider's extras, a journal
   that names paths outside the native store or is damaged, a record without a manifest, the lock (real
   processes), the undo record, the command and its question
+- `tests/test_resume_folder.py` — an imported copy is resumed in the folder of its import: the chosen folder
+  (Claude, Antigravity), the mapped one while the source drive is away, an import that was undone, records
+  and journals that are malformed or unreadable (no failure, no warning), the journal read once per listing
 - `tests/test_importer.py` — imports per provider (bytes, rewrites, idempotence, collisions, roll back, free
   space, provenance, source times), `encode_cwd`, refusals
 - `tests/test_import_folder.py` — imports into a folder the user chose (`target`, `import --to`): what is

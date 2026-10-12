@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import discover, launch, textsafe
+from . import discover, journal, launch, textsafe
 from .discover import Skipped
 from .fsutil import cache_file, make_private_dir, open_private
 from .model import Candidate, Session, Store
@@ -116,6 +116,46 @@ ID_SHOWN = 40  # characters of a refused session id that a warning quotes
 CWD_MAX = 32767  # characters; the longest path Windows takes, eight times Linux's
 NOTE_MAX = 200  # characters of a session's note that are kept
 EVIDENCE_MAX = 10_000  # recorded paths of one store that are kept as path-map evidence
+
+
+def _import_folders() -> dict[tuple[str, str], tuple[object, str]]:
+    """``(provider, session id)`` -> ``(native store, folder)`` for every
+    import that stands (``journal.find_record``) and whose folder is there.
+
+    The folder is the one the copy was made for: the one the user chose for
+    the import, else the one the recorded folder was mapped to then (the
+    record's ``chosen_folder``, ``cwd_local``). A copy can keep the folder
+    as the other machine recorded it (Claude, Antigravity); the path map
+    then leads to where that folder is found today, which is not the chosen
+    one, and nowhere when the drive that resolved its letter is away.
+
+    The journal is the user's own file, trusted but possibly malformed. One
+    that is missing, cannot be read or holds something else gives nothing,
+    and no warning: this is read with every listing. A folder counts only
+    when it is text without a NUL, an absolute path, and a directory that
+    exists."""
+    try:
+        records = journal.read(quiet=True)
+    except OSError:
+        return {}
+    last: dict[tuple[str, str], dict] = {}
+    for record in journal.not_undone(records):
+        ident = journal.ident(record)
+        if ident is not None:
+            last[ident] = record
+    folders: dict[tuple[str, str], tuple[object, str]] = {}
+    for ident, record in last.items():
+        for key in ("chosen_folder", "cwd_local"):
+            folder = record.get(key)
+            if (
+                isinstance(folder, str)
+                and "\0" not in folder
+                and os.path.isabs(folder)
+                and os.path.isdir(folder)
+            ):
+                folders[ident] = (record.get("destination_store"), folder)
+                break
+    return folders
 
 
 def _id_refusal(provider: base.Provider, store: Store, hint: str, conversation: dict) -> str | None:
@@ -778,7 +818,12 @@ class Index:
         the order, in the choice between copies of one session and in
         ``imported_as`` like any other. ``offline=False`` leaves them out
         altogether, which gives the listing of the mounted volumes alone
-        (``verify`` compares that one with the disks)."""
+        (``verify`` compares that one with the disks).
+
+        A native session's local folder is where the path map finds the
+        recorded one, except for a copy an import made: that one has the
+        folder of its import while the import stands and the folder is
+        there (``_import_folders``)."""
         providers = list(providers)
         by_name = {p.name: p for p in providers}
         present = {m.path for m in mounts}
@@ -865,6 +910,7 @@ class Index:
             p.name: bool(p.resumable and p.binary and launch.tool_state(p.binary).installed)
             for p in providers
         }
+        imported = _import_folders()  # the journal, read once
         for s in sessions:
             if s.offline:
                 s.note = OFFLINE_NOTE
@@ -873,6 +919,10 @@ class Index:
             if s.cwd:
                 s.cwd_local, s.cwd_exists = self.pathmap.to_local(s.cwd, s.mount)
             if s.origin == "native":
+                # An imported copy is resumed in the folder of its import.
+                into, folder = imported.get((s.provider, s.id), (None, None))
+                if folder is not None and into == s.store:
+                    s.cwd_local, s.cwd_exists = folder, True
                 s.launchable = usable.get(s.provider, False)
                 if not s.launchable and not s.note and s.provider in by_name:
                     s.note = f"{by_name[s.provider].label} CLI is not installed"
