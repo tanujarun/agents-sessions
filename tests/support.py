@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 from pathlib import Path
 from unittest import mock
 
@@ -17,7 +18,7 @@ _SRC = str(Path(__file__).resolve().parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from agent_sessions import launch, logs, providers  # noqa: E402
+from agent_sessions import launch, logs, mounts, providers  # noqa: E402
 from agent_sessions.fsutil import home  # noqa: E402
 from agent_sessions.model import Candidate, Session  # noqa: E402
 from agent_sessions.providers.base import (  # noqa: E402
@@ -37,6 +38,16 @@ if "AGENT_SESSIONS_STATE" not in os.environ:
     _stray_state = tempfile.mkdtemp(prefix="agent-sessions-test-state-")
     os.environ["AGENT_SESSIONS_STATE"] = _stray_state
     atexit.register(shutil.rmtree, _stray_state, ignore_errors=True)
+
+
+def _no_mount(argv):
+    raise AssertionError(f"a test tried to start {argv!r}; no test mounts anything")
+
+
+# The same kind of net for mounting: nothing a test does may start the real
+# ``udisksctl``. A test of ``mounts.mount_volume`` puts its own recorder here
+# (``FakeDisks``).
+mounts.starter = _no_mount
 
 
 def write_jsonl(path, records) -> Path:
@@ -232,23 +243,26 @@ class Sandbox:
         shutil.rmtree(self.root, ignore_errors=True)
 
     def set_mounts(self, *mounts):
-        """``mounts``: ``(path, label)`` pairs; the fake home's parent is
-        always mounted as ``Linux``."""
+        """``mounts``: ``(path, label)`` pairs, or dicts as
+        ``AGENT_SESSIONS_MOUNTS`` takes them (``uuid``, ``fs_label``, …); the
+        fake home's parent is always mounted as ``Linux``."""
         self.mounts = [{"path": str(self.root / "home"), "label": "Linux"}]
-        self.mounts += [{"path": str(path), "label": label} for path, label in mounts]
+        for mount in mounts:
+            if not isinstance(mount, dict):
+                mount = {"path": mount[0], "label": mount[1]}
+            self.mounts.append(dict(mount, path=str(mount["path"])))
         os.environ["AGENT_SESSIONS_MOUNTS"] = json.dumps(self.mounts)
 
-    def mount(self, name, label=None) -> Path:
-        """Create a directory under the sandbox and add it to the mounts."""
-        path = self.root / "media" / name
+    def mount(self, name, label=None, at=None, **identity) -> Path:
+        """Create a directory under the sandbox (or take ``at``) and add it
+        to the mounts; ``identity`` is ``uuid``, ``fs_label``, ``fstype``."""
+        path = Path(at) if at is not None else self.root / "media" / name
         path.mkdir(parents=True, exist_ok=True)
-        pairs = [(m["path"], m["label"]) for m in self.mounts[1:]]
-        self.set_mounts(*pairs, (path, label or name))
+        self.set_mounts(*self.mounts[1:], dict(identity, path=path, label=label or name))
         return path
 
     def unmount(self, path):
-        pairs = [(m["path"], m["label"]) for m in self.mounts[1:] if m["path"] != str(path)]
-        self.set_mounts(*pairs)
+        self.set_mounts(*(m for m in self.mounts[1:] if m["path"] != str(path)))
 
     def store(self, parent, name=".fake") -> Path:
         """Create an empty fake store under ``parent``; return its root."""
@@ -263,6 +277,133 @@ class Sandbox:
         fields.setdefault("updated", "2026-10-01T10:00:00.000Z")
         path.write_text(json.dumps(fields), encoding="utf-8")
         return path
+
+
+class FakeProcess:
+    """What ``mounts.starter`` returns, for a test: it ends with ``code``
+    and the two outputs, or never answers (``hangs``) until it is
+    terminated; a ``stubborn`` one has to be killed."""
+
+    def __init__(self, code=0, out=b"", err=b"", hangs=False, stubborn=False):
+        self.returncode = None
+        self.result = (code, out, err)
+        self.hangs = hangs or stubborn
+        self.ends_on = "kill" if stubborn else "terminate"
+        self.calls: list = []  # what was done to it, in order
+
+    def communicate(self, timeout=None):
+        self.calls.append(("communicate", timeout))
+        if self.hangs and self.ends_on not in self.calls and "kill" not in self.calls:
+            raise subprocess.TimeoutExpired("udisksctl", timeout)
+        self.returncode = self.result[0]
+        return self.result[1], self.result[2]
+
+    def terminate(self):
+        self.calls.append("terminate")
+
+    def kill(self):
+        self.calls.append("kill")
+
+
+class FakeDisks:
+    """A machine's disks as ``mounts`` reads them, in a temp directory: the
+    ``/dev/disk/by-uuid`` and ``by-label`` links, the devices they point at
+    (plain files that count as block devices), a mount table, the udisks
+    media directory, and ``udisksctl`` on PATH. ``mounts.starter`` is a
+    recorder: ``started`` holds every argv, and ``on_start(argv)`` returns
+    the ``FakeProcess`` (by default one that succeeds, after ``mounting``
+    has put the device into the mount table, if it is set).
+
+    With ``AGENT_SESSIONS_MOUNTS`` set (a ``Sandbox``), the mount table is
+    that override and ``mount_table`` lines are not read."""
+
+    def __init__(self, case, root):
+        self.root = Path(root)
+        self.dev = self.root / "dev"
+        self.by_uuid = self.dev / "disk" / "by-uuid"
+        self.by_label = self.dev / "disk" / "by-label"
+        self.media = self.root / "run" / "media"
+        self.mountinfo = self.root / "mountinfo"
+        for directory in (self.by_uuid, self.by_label, self.media):
+            directory.mkdir(parents=True)
+        self.mountinfo.write_text("", encoding="utf-8")
+        self.block: set[str] = set()
+        self.started: list[list[str]] = []
+        self.on_start = None
+        self.mounting = None  # (device, mount point): what a successful start mounts
+        self.has_tool = True
+        self.real_is_block_device = mounts.is_block_device
+        for target, name, value in (
+            (mounts, "DEV_BY_UUID", str(self.by_uuid)),
+            (mounts, "DEV_BY_LABEL", str(self.by_label)),
+            (mounts, "MEDIA_ROOT", str(self.media)),
+            (mounts, "MOUNTINFO", str(self.mountinfo)),
+            (mounts, "is_block_device", lambda path: os.fspath(path) in self.block),
+            (mounts, "starter", self._start),
+            # What PATH holds, for ``mounts`` alone (``FakePath`` answers for
+            # everything else, and says yes to every name).
+            (
+                mounts,
+                "shutil",
+                types.SimpleNamespace(
+                    which=lambda name, *a, **k: f"/usr/bin/{name}" if self.has_tool else None
+                ),
+            ),
+        ):
+            patch = mock.patch.object(target, name, value)
+            patch.start()
+            case.addCleanup(patch.stop)
+
+    def _start(self, argv):
+        self.started.append(list(argv))
+        if self.on_start is not None:
+            return self.on_start(argv)
+        if self.mounting is not None:
+            self.mount(*self.mounting)
+        return FakeProcess()
+
+    @staticmethod
+    def udev_name(name: str) -> str:
+        """A label the way udev spells it under ``/dev/disk/by-label``."""
+        return "".join(
+            chr(byte)
+            if byte < 128 and (chr(byte).isalnum() or chr(byte) in "#+-.:=@_")
+            # udev: every other byte as \xNN
+            else f"\\x{byte:02x}"
+            for byte in name.encode("utf-8")
+        )
+
+    def device(self, name, uuid=None, label=None, block=True) -> str:
+        """Attach a device ``dev/<name>``; returns its path."""
+        device = self.dev / name
+        device.write_bytes(b"")
+        if block:
+            self.block.add(str(device))
+        if uuid is not None:
+            os.symlink(f"../../{name}", self.by_uuid / uuid)
+        if label is not None:
+            os.symlink(f"../../{name}", self.by_label / self.udev_name(label))
+        return str(device)
+
+    def detach(self, name) -> None:
+        """Take a device away, its links included."""
+        device = self.dev / name
+        for directory in (self.by_uuid, self.by_label):
+            for link in directory.iterdir():
+                if os.path.realpath(link) == str(device):
+                    link.unlink()
+        self.block.discard(str(device))
+        device.unlink()
+
+    def mount(self, device, path, fstype="ntfs3", root="/") -> None:
+        """Add a line to the mount table: ``device`` mounted at ``path``."""
+        number = 100 + len(self.mountinfo.read_text(encoding="utf-8").splitlines())
+        where = str(path).replace(" ", "\\040")
+        line = (
+            f"{number} 29 259:{number} {root} {where} rw,relatime shared:1 - {fstype} {device} rw"
+        )
+        with open(self.mountinfo, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
 
 
 LOG_NAME = "agent-sessions.log"

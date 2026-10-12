@@ -73,6 +73,7 @@ class Session:
     launchable: bool = False
     imported_as: str | None = None
     note: str | None = None
+    offline: bool = False  # listed from the cache: the drive it is on is not mounted
 
     @classmethod
     def for_store(
@@ -91,7 +92,7 @@ class Session:
         """Build a session from the conversation fields an adapter knows.
 
         The fields the index owns (``cwd_local``, ``cwd_exists``,
-        ``launchable``, ``imported_as``) start at their defaults.
+        ``launchable``, ``imported_as``, ``offline``) start at their defaults.
         """
         return cls(
             provider=store.provider,

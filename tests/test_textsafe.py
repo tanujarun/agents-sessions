@@ -124,7 +124,7 @@ class CliBoundaryTest(unittest.TestCase):
     """How forgetting is made hard: only the output helpers write to a
     stream, so a new field cannot reach the terminal around them."""
 
-    WRITERS = {"_emit", "_progress"}
+    WRITERS = {"_emit", "_progress", "_ask"}
 
     def test_only_the_output_helpers_write(self):
         source = Path(cli.__file__).read_text(encoding="utf-8")

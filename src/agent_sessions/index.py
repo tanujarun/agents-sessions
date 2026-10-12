@@ -1,11 +1,12 @@
 """Cache of stores and parsed sessions, incremental by mtime/size.
 
-The file holds what a scan found (remembered stores, the result of the last
-walk) and, per candidate, what its adapter parsed together with the
-``(path, mtime_ns, size)`` signature of the files it was parsed from. The
-session list itself is not stored: ``finalise`` derives it from the cache and
-the mounts present right now, so a drive that was unplugged since the scan
-drops out of the listing without a rescan.
+The file holds what a scan found (remembered stores, the volumes they are
+on, the result of the last walk) and, per candidate, what its adapter parsed
+together with the ``(path, mtime_ns, size)`` signature of the files it was
+parsed from. The session list itself is not stored: ``finalise`` derives it
+from the cache and the mounts present right now, so the sessions of a drive
+that was unmounted since the scan are listed as offline without a rescan,
+from the cached parse alone.
 """
 
 from __future__ import annotations
@@ -23,8 +24,8 @@ from . import discover, launch, textsafe
 from .discover import Skipped
 from .fsutil import cache_file, make_private_dir, open_private
 from .model import Candidate, Session, Store
-from .mounts import NATIVE_LABEL, Mount
-from .pathmap import PathMap
+from .mounts import NATIVE_LABEL, UUID_PATTERN, Mount, identity_from_mount_point
+from .pathmap import HOST_ROOT, PathMap, normalise
 from .providers import base
 
 if TYPE_CHECKING:
@@ -32,8 +33,16 @@ if TYPE_CHECKING:
 
     from .fsutil import StrPath
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+# Version 1 had no ``volumes`` table, no identity in ``mounts`` and no path
+# evidence per store. It is taken over (``_adopt``), not thrown away: its
+# remembered stores are what lists the sessions of a drive that is not
+# mounted when the first version 2 program runs.
+_OLD_VERSION = 1
 DEEP_MAX_AGE = 24 * 3600  # seconds; an older deep pass is repeated by `scan`
+OFFLINE_NOTE = "drive not mounted"  # the note of a session listed from the cache alone
+_MOUNT_FIELDS = ("path", "label", "fstype", "device", "uuid", "fs_label")
+_OLD_MOUNT_FIELDS = 4  # how many of them a version 1 cache has
 _CONVERSATION = {  # field -> accepted types, as stored per candidate
     "id": (str,),
     "title": (str,),
@@ -106,6 +115,7 @@ def _is_conversation(row: object) -> bool:
 ID_SHOWN = 40  # characters of a refused session id that a warning quotes
 CWD_MAX = 32767  # characters; the longest path Windows takes, eight times Linux's
 NOTE_MAX = 200  # characters of a session's note that are kept
+EVIDENCE_MAX = 10_000  # recorded paths of one store that are kept as path-map evidence
 
 
 def _id_refusal(provider: base.Provider, store: Store, hint: str, conversation: dict) -> str | None:
@@ -153,10 +163,76 @@ def _bound(store: Store, hint: str, conversation: dict) -> list[str]:
     return warnings
 
 
+def _evidence(provider: base.Provider, store: Store, old: dict | None) -> dict[str, list]:
+    """The recorded paths a store's adapter offers as evidence for the path
+    map (``Provider.path_evidence``), as cached with the store: ``sig`` is
+    the signature of the files they were read from, and while it stands the
+    files are not read again (``old`` is the store's cache entry, when the
+    same reader wrote it). The native store is not asked: its paths are
+    this machine's own and need no mapping. An adapter that fails costs the
+    evidence, never the scan, and is asked again next time."""
+    if store.origin == "native":
+        return _no_evidence()
+    with base.collect_warnings() as collected:
+        try:
+            files = [str(path) for path in provider.evidence_files(store)]
+            if not files:
+                return _no_evidence()
+            sig = signature(files)
+            cached = (old or {}).get("evidence")
+            if cached is not None and cached["sig"] == sig:
+                return dict(cached)
+            paths = provider.path_evidence(store)
+            kept = sorted({p for p in paths if isinstance(p, str) and 0 < len(p) <= CWD_MAX})
+        except Exception as exc:  # an adapter must not break the scan
+            return dict(
+                _no_evidence(),
+                warnings=[f"{store.root}: path evidence not read: {type(exc).__name__}: {exc}"],
+            )
+    warnings = sorted(set(collected.items))
+    if len(kept) > EVIDENCE_MAX:
+        warnings.append(
+            f"{store.root}: {len(kept):,} recorded paths; only {EVIDENCE_MAX:,} are used "
+            "to work out drive letters"
+        )
+        kept = kept[:EVIDENCE_MAX]
+    return {"sig": sig, "paths": kept, "warnings": warnings}
+
+
 def _strings(items: object) -> list[str]:
     if not isinstance(items, list) or not all(isinstance(i, str) for i in items):
         raise ValueError("not a list of strings")
     return items
+
+
+def _no_evidence() -> dict[str, list]:
+    """The path evidence of a store that offers none, as cached per store."""
+    return {"sig": [], "paths": [], "warnings": []}
+
+
+def _volume(data: Any) -> dict[str, Any]:  # one row of the cache's ``volumes``: any JSON value
+    """A row of the volumes table as read from the cache file; ``ValueError``
+    and friends when it is not one."""
+    label, fs_label, uuid, fstype = _strings(
+        [data["label"], data["fs_label"], data["uuid"], data["fstype"]]
+    )
+    if uuid and not UUID_PATTERN.fullmatch(uuid):
+        raise ValueError("bad volume id")
+    letters = data["letters"]
+    if not isinstance(letters, dict):
+        raise ValueError("bad drive letters")
+    _strings(list(letters.values()))
+    seen = data["last_seen"]
+    if seen is not None and base.parse_ts(seen) is None:
+        raise ValueError("bad timestamp")
+    return {
+        "label": label,
+        "fs_label": fs_label,
+        "uuid": uuid,
+        "fstype": fstype,
+        "letters": dict(letters),
+        "last_seen": seen,
+    }
 
 
 class Index:
@@ -171,6 +247,11 @@ class Index:
         self.stores: list[Store] = []  # every store remembered
         self.skipped: list[Skipped] = []  # stores found but not listed
         self.mounts: list[dict] = []  # as seen by the last scan
+        # mount path -> {label, fs_label, uuid, fstype, letters, last_seen}:
+        # the volumes that hold a remembered store. ``letters`` is what the
+        # stores on the volume call the drives (letter -> mount path), as
+        # the last scan that saw the volume resolved them.
+        self.volumes: dict[str, dict[str, Any]] = {}
         self.last_quick: str | None = None
         self.last_deep: str | None = None
         self.deep_mounts: list[str] = []  # mount paths of the last deep pass
@@ -207,8 +288,9 @@ class Index:
         return index
 
     def _adopt(self, data: Any) -> None:  # the parsed cache file: any JSON value
-        if data["version"] != CACHE_VERSION:
+        if data["version"] not in (_OLD_VERSION, CACHE_VERSION):
             raise ValueError("other cache version")
+        old = data["version"] == _OLD_VERSION
         self.stores = [
             Store(*_strings([d["provider"], d["root"], d["origin"], d["mount"], d["mount_label"]]))
             for d in data["stores"]
@@ -217,16 +299,13 @@ class Index:
             Skipped(*_strings([d["provider"], d["root"], d["reason"], d["mount"]]))
             for d in data["skipped"]
         ]
-        self.mounts = [
-            dict(
-                zip(
-                    ("path", "label", "fstype", "device"),
-                    _strings([d["path"], d["label"], d["fstype"], d["device"]]),
-                    strict=False,
-                )
-            )
-            for d in data["mounts"]
-        ]
+        self.mounts = []
+        for d in data["mounts"]:
+            row = dict.fromkeys(_MOUNT_FIELDS, "")
+            for name in _MOUNT_FIELDS[: _OLD_MOUNT_FIELDS if old else None]:
+                row[name] = d[name]
+            _strings(list(row.values()))
+            self.mounts.append(row)
         for name in ("last_quick", "last_deep"):
             value = data[name]
             if value is not None and base.parse_ts(value) is None:
@@ -256,12 +335,28 @@ class Index:
                 }
             if not isinstance(entry["reader"], str):
                 raise ValueError("bad reader id")
+            evidence = _no_evidence() if old else entry["evidence"]
+            if not isinstance(evidence["sig"], list):
+                raise ValueError("bad signature")
             self.parsed[key] = {
                 "reader": entry["reader"],
                 "implemented": bool(entry["implemented"]),
                 "warnings": _strings(entry["warnings"]),
                 "candidates": candidates,
+                "evidence": {
+                    "sig": evidence["sig"],
+                    "paths": _strings(evidence["paths"]),
+                    "warnings": _strings(evidence["warnings"]),
+                },
             }
+        if old:
+            self._volumes_of_old_cache()
+        else:
+            self.volumes = {path: _volume(row) for path, row in data["volumes"].items()}
+            # A store on a drive that is not mounted is listed by its
+            # volume's row: none may be without one.
+            for path in sorted(self._foreign_mounts() - set(self.volumes)):
+                self.volumes[path] = self._blank_volume(path)
 
     def save(self) -> None:
         """Write the cache atomically: a temp file in the same directory, then
@@ -275,6 +370,7 @@ class Index:
             "stores": [vars(s) for s in self.stores],
             "skipped": [vars(s) for s in self.skipped],
             "mounts": self.mounts,
+            "volumes": self.volumes,
             "last_quick": self.last_quick,
             "last_deep": self.last_deep,
             "deep_mounts": self.deep_mounts,
@@ -292,6 +388,155 @@ class Index:
                 os.unlink(tmp)
             except OSError:
                 pass
+
+    # --- volumes ------------------------------------------------------------
+
+    def _foreign_mounts(self) -> set[str]:
+        """Mount paths that hold something which stays remembered while its
+        drive is away: a store that is not the native one, a skipped store."""
+        return {s.mount for s in self.stores if s.origin != "native"} | {
+            s.mount for s in self.skipped
+        }
+
+    def _blank_volume(self, path: str) -> dict[str, Any]:
+        """The row of a volume nothing is known about but its mount path."""
+        label = next((s.mount_label for s in self.stores if s.mount == path), "")
+        return {
+            "label": label or os.path.basename(path) or path,
+            "fs_label": "",
+            "uuid": "",
+            "fstype": "",
+            "letters": {},
+            "last_seen": None,
+        }
+
+    def _volumes_of_old_cache(self) -> None:
+        """The volumes table for a version 1 cache, which had none, from what
+        that cache does hold: the mounts its last scan saw, the mount path
+        itself (udisks names it after the volume's label or UUID, so the
+        identity of a volume that is attached can be read back from the
+        name) and the folders its sessions recorded."""
+        seen = {mount["path"]: mount for mount in self.mounts}
+        holding = {s.mount for s in self.stores} & set(seen)
+        for path in sorted(self._foreign_mounts() | holding):
+            row = self._blank_volume(path)
+            if path in seen:
+                row.update(
+                    label=seen[path]["label"],
+                    fstype=seen[path]["fstype"],
+                    last_seen=self.last_quick,
+                )
+            row["uuid"], row["fs_label"] = identity_from_mount_point(path)
+            row["letters"] = self._letters_from_cache(path)
+            self.volumes[path] = row
+
+    def _letters_from_cache(self, mount: str) -> dict[str, str]:
+        """The drive letter of a volume, told from the cache alone (a version
+        1 cache kept no letters, and evidence cannot be gathered while the
+        volume is away): the one letter under which a session of a store on
+        the volume recorded the folder its own store is in, or a folder
+        above it. ``C:\\Users\\me`` recorded in ``<mount>/Users/me/.claude``
+        says the volume is ``C:``. Nothing when no letter or several fit."""
+        base_path = mount.rstrip(os.sep)
+        letters: set[str] = set()
+        for store in self.stores:
+            if (
+                store.mount != mount
+                or store.origin == "native"
+                or not store.root.startswith(base_path + os.sep)
+            ):
+                continue
+            below = tuple(part.lower() for part in store.root[len(base_path) + 1 :].split(os.sep))
+            entry = self.parsed.get(_store_key(store)) or {}
+            for cached in entry.get("candidates", {}).values():
+                session = cached["session"]
+                recorded = normalise(session["cwd"]) if session else None
+                if recorded is None or recorded.root == HOST_ROOT or not recorded.parts:
+                    continue
+                parts = tuple(part.lower() for part in recorded.parts)
+                if below[: len(parts)] == parts:
+                    letters.add(recorded.root)
+        return {letters.pop(): mount} if len(letters) == 1 else {}
+
+    def _drop_moved(self, mounts: Iterable[Mount]) -> None:
+        """Forget what is remembered at the old mount path of a volume that
+        is mounted somewhere else now (the same filesystem UUID at another
+        path): its stores are not there any more. The walk that a changed
+        set of mounts brings finds them where they are. A volume whose UUID
+        is not known is never matched."""
+        mounts = list(mounts)
+        present = {m.path for m in mounts}
+        here = {m.uuid for m in mounts if m.uuid}
+        moved = {
+            path
+            for path, row in self.volumes.items()
+            if path not in present and row["uuid"] and row["uuid"] in here
+        }
+        for path in sorted(moved):
+            self.forget(path)
+
+    def forget(self, path: str) -> int:
+        """Take a volume out of the index: its row, the stores remembered on
+        it (the native one is never one of them), their cached parses, the
+        skipped stores and the walk of it. Returns how many stores went.
+        Nothing is saved here."""
+        gone = [s for s in self.stores if s.mount == path and s.origin != "native"]
+        for store in gone:
+            self.parsed.pop(_store_key(store), None)
+        self.stores = [s for s in self.stores if s not in gone]
+        self.skipped = [s for s in self.skipped if s.mount != path]
+        self.volumes.pop(path, None)
+        self.walk.pop(path, None)
+        # Not part of the last walk any more: when the drive is back, the
+        # set of mounts differs from it and a walk is due.
+        self.deep_mounts = [p for p in self.deep_mounts if p != path]
+        return len(gone)
+
+    def _note_volumes(self, mounts: Iterable[Mount]) -> None:
+        """Bring the volumes table up to date after a scan found the stores:
+        a row with the identity of every mounted volume that holds one, and
+        the rows of the volumes that are away and still remembered."""
+        now = utc_now()
+        mounts = list(mounts)
+        present = {m.path for m in mounts}
+        holding = {s.mount for s in self.stores} | {s.mount for s in self.skipped}
+        table: dict[str, dict[str, Any]] = {}
+        for mount in mounts:
+            if mount.path in holding:
+                table[mount.path] = {
+                    "label": mount.label,
+                    "fs_label": mount.fs_label,
+                    "uuid": mount.uuid,
+                    "fstype": mount.fstype,
+                    "letters": (self.volumes.get(mount.path) or {}).get("letters", {}),
+                    "last_seen": now,
+                }
+        for path in sorted(self._foreign_mounts() - present):
+            table[path] = self.volumes.get(path) or self._blank_volume(path)
+        self.volumes = table
+
+    def _note_letters(self) -> None:
+        """Keep, per mounted volume, the drive letters its stores use as the
+        path map resolved them just now: what ``where`` shows of the volume
+        once it is away."""
+        resolved = self.pathmap.letters()
+        for mount in self.current_mounts:
+            row = self.volumes.get(mount.path)
+            if row is not None:
+                row["letters"] = {
+                    r["letter"]: r["mount"] for r in resolved if r["source_mount"] == mount.path
+                }
+
+    def letter_for_mount(self, path: str) -> str | None:
+        """The drive letter a mount stands for, or None: what the path map
+        says now and, for a volume that is not mounted, the letter the last
+        scan that saw it resolved for it."""
+        letter = self.pathmap.letter_for_mount(path)
+        if letter is None and path not in {m.path for m in self.current_mounts}:
+            letters = (self.volumes.get(path) or {}).get("letters", {})
+            own = sorted(name for name, target in letters.items() if target == path and name != "/")
+            letter = own[0] if own else None
+        return letter
 
     # --- scan ---------------------------------------------------------------
 
@@ -326,6 +571,7 @@ class Index:
         launch.forget_tools()  # a tool installed since the last scan is seen by this one
         providers = list(providers)
         mounts = sorted(mounts, key=lambda m: m.path)
+        self._drop_moved(mounts)
         do_deep = self.needs_deep(mounts) if deep is None else bool(deep)
         remembered = [(s.provider, s.root) for s in self.stores]
         remembered += [(s.provider, s.root) for s in self.skipped]
@@ -359,10 +605,7 @@ class Index:
                 skipped[key] = old_skip
         self.stores = [stores[k] for k in sorted(stores)]
         self.skipped = [skipped[k] for k in sorted(skipped) if k not in stores]
-        self.mounts = [
-            {"path": m.path, "label": m.label, "fstype": m.fstype, "device": m.device}
-            for m in mounts
-        ]
+        self.mounts = [{name: getattr(m, name) for name in _MOUNT_FIELDS} for m in mounts]
         counts = {"parsed": 0, "cached": 0}
         kept = {
             _store_key(s): self.parsed[_store_key(s)]
@@ -384,21 +627,24 @@ class Index:
         self.parsed = kept
         if not cancelled:
             self.last_quick = utc_now()
-        save_error = None
+        # The listing is derived before the cache is written: the drive
+        # letters the path map resolves in it are kept with the volumes.
+        self._note_volumes(mounts)
+        self.finalise(providers, mounts)
+        self._note_letters()
         try:
             self.save()
         except OSError as exc:
             save_error = f"{self.path}: cache not saved: {exc.strerror or exc}"
-        self.finalise(providers, mounts)
-        if save_error:
             self.warnings = sorted(set(self.warnings) | {save_error})
-        by_provider = {p.name: {"stores": 0, "sessions": 0} for p in providers}
+        by_provider = {p.name: {"stores": 0, "sessions": 0, "offline": 0} for p in providers}
         for row in self.store_rows:
             if row["present"] and row["provider"] in by_provider:
                 by_provider[row["provider"]]["stores"] += 1
         for session in self.sessions:
             if session.provider in by_provider:
                 by_provider[session.provider]["sessions"] += 1
+                by_provider[session.provider]["offline"] += session.offline
         return {
             "mode": "deep" if do_deep else "quick",
             "cancelled": cancelled,
@@ -410,6 +656,7 @@ class Index:
             "skipped_stores": len(self.skipped),
             "candidates": sum(row["candidates"] for row in self.store_rows if row["present"]),
             "sessions": len(self.sessions),
+            "offline": sum(1 for session in self.sessions if session.offline),
             "parsed": counts["parsed"],
             "cached": counts["cached"],
             "by_provider": by_provider,
@@ -437,14 +684,16 @@ class Index:
                     out[key] = old
                 continue
             reader = reader_id(provider)
+            same_reader = old is not None and old["reader"] == reader
             entry: dict[str, Any] = {
                 "reader": reader,
                 "implemented": True,
                 "warnings": [],
                 "candidates": {},
+                "evidence": _evidence(provider, store, old if same_reader else None),
             }
             out[key] = entry
-            reusable = old["candidates"] if old and old["reader"] == reader else {}
+            reusable = old["candidates"] if old and same_reader else {}
             with base.collect_warnings() as listing:
                 try:
                     candidates = sorted(provider.candidates(store), key=lambda c: c.id_hint)
@@ -516,9 +765,20 @@ class Index:
 
     # --- derived view -------------------------------------------------------
 
-    def finalise(self, providers: Iterable[base.Provider], mounts: Collection[Mount]) -> None:
+    def finalise(
+        self, providers: Iterable[base.Provider], mounts: Collection[Mount], offline: bool = True
+    ) -> None:
         """Derive the session list, store rows, path map and warnings from the
-        cache and the mounts present now. Parses nothing."""
+        cache and the mounts present now. Parses nothing and touches no file
+        of a store.
+
+        The sessions of a remembered store whose volume is not mounted are
+        listed from the cached parse, marked ``offline``: no local folder,
+        not launchable, the note ``drive not mounted``. They take part in
+        the order, in the choice between copies of one session and in
+        ``imported_as`` like any other. ``offline=False`` leaves them out
+        altogether, which gives the listing of the mounted volumes alone
+        (``verify`` compares that one with the disks)."""
         providers = list(providers)
         by_name = {p.name: p for p in providers}
         present = {m.path for m in mounts}
@@ -529,6 +789,7 @@ class Index:
         # (row, store, conversation), in order
         found: list[tuple[dict[str, Any], Store, dict[str, Any]]] = []
         best: dict[tuple[str, str, str], tuple[str, int]] = {}  # (origin, provider, id)
+        evidence: list[tuple[object, Mount | str | None]] = []  # (recorded path, source mount)
         for store in sorted(self.stores, key=_store_key):
             entry = self.parsed.get(_store_key(store)) or {}
             cached = entry.get("candidates", {})
@@ -546,14 +807,23 @@ class Index:
                 "duplicates": 0,
             }
             rows.append(row)
-            if not row["present"]:
+            here = row["present"]
+            if not here and not offline:
                 continue
             if not row["reader"]:
-                warnings.add(f"{store.provider}: reader not implemented")
+                if here:
+                    warnings.add(f"{store.provider}: reader not implemented")
                 continue
-            warnings.update(entry.get("warnings", []))
+            if here:
+                # What a scan could not read is said for the volumes that
+                # are there; nothing of a volume that is away was looked at.
+                warnings.update(entry.get("warnings", []))
+                gathered = entry.get("evidence") or _no_evidence()
+                warnings.update(gathered["warnings"])
+                evidence += [(path, store.mount) for path in gathered["paths"]]
             for hint in sorted(cached):
-                warnings.update(cached[hint]["warnings"])
+                if here:
+                    warnings.update(cached[hint]["warnings"])
                 conversation = cached[hint]["session"]
                 if conversation is None:
                     row["skipped"] += 1
@@ -578,8 +848,15 @@ class Index:
                 row["duplicates"] += 1
                 continue
             row["listed"] += 1
-            sessions.append(Session.for_store(store, **conversation))
-        self.pathmap = PathMap.build(mounts, [(s.cwd, s.mount) for s in sessions if s.cwd])
+            session = Session.for_store(store, **conversation)
+            session.offline = not row["present"]
+            sessions.append(session)
+        # Evidence for drive letters: the folders the sessions recorded and
+        # what the adapters add (``Provider.path_evidence``), of the mounted
+        # volumes only. Whether a folder is on a drive cannot be seen while
+        # the store that names it is away; ``letter_for_mount`` remembers.
+        evidence += [(s.cwd, s.mount) for s in sessions if s.cwd and not s.offline]
+        self.pathmap = PathMap.build(mounts, evidence)
         warnings.update(self.pathmap.warnings)
         native = {(s.provider, s.id): s.key for s in sessions if s.origin == "native"}
         # Installed, not merely on PATH (``launch.tool_state``): asked once
@@ -589,6 +866,10 @@ class Index:
             for p in providers
         }
         for s in sessions:
+            if s.offline:
+                s.note = OFFLINE_NOTE
+                s.imported_as = native.get((s.provider, s.id))
+                continue
             if s.cwd:
                 s.cwd_local, s.cwd_exists = self.pathmap.to_local(s.cwd, s.mount)
             if s.origin == "native":
@@ -606,11 +887,14 @@ class Index:
     def where(self, session: Session) -> str:
         """Where a session lives, for a listing: ``Linux`` for a native one,
         else the drive letter of its mount when known, else the mount label;
-        `` · imported`` is added once a native copy exists."""
+        `` · imported`` is added once a native copy exists, `` · offline``
+        when there is none and the drive is not mounted."""
         if session.origin == "native":
             return NATIVE_LABEL
-        place = self.pathmap.letter_for_mount(session.mount) or session.mount_label
-        return f"{place} · imported" if session.imported_as else place
+        place = self.letter_for_mount(session.mount) or session.mount_label
+        if session.imported_as:
+            return f"{place} · imported"
+        return f"{place} · offline" if session.offline else place
 
 
 def fresh(
@@ -626,4 +910,13 @@ def fresh(
     return index
 
 
-__all__ = ["CACHE_VERSION", "Candidate", "Index", "fresh", "reader_id", "signature", "utc_now"]
+__all__ = [
+    "CACHE_VERSION",
+    "OFFLINE_NOTE",
+    "Candidate",
+    "Index",
+    "fresh",
+    "reader_id",
+    "signature",
+    "utc_now",
+]

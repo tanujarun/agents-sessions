@@ -489,7 +489,10 @@ class ScanPolicyTest(IndexCase):
 
 
 class VanishedMountTest(IndexCase):
-    def test_store_stays_remembered_sessions_are_not_listed(self):
+    """The store of a mount that went away stays remembered; its sessions
+    stay listed, as offline (tests/test_offline.py has the rest)."""
+
+    def test_store_stays_remembered_sessions_are_listed_as_offline(self):
         self.box.session(self.native, "n")
         self.box.session(self.foreign, "f")
         api.scan(deep=True)
@@ -497,12 +500,19 @@ class VanishedMountTest(IndexCase):
         FakeProvider.parsed.clear()
 
         self.box.unmount(self.disk)
-        self.assertEqual(sorted(self.by_id()), ["n"])  # before any rescan
+        self.assertEqual({i: s.offline for i, s in self.by_id().items()}, {"f": True, "n": False})
+        self.assertEqual([s.id for s in api.load_index(offline=False).sessions], ["n"])
         summary = api.scan()
         self.assertEqual(
-            (summary["stores"], summary["stores_not_mounted"], summary["sessions"]), (1, 1, 1)
+            (
+                summary["stores"],
+                summary["stores_not_mounted"],
+                summary["sessions"],
+                summary["offline"],
+            ),
+            (1, 1, 2, 1),
         )
-        self.assertEqual(sorted(self.by_id()), ["n"])
+        self.assertEqual({i: s.offline for i, s in self.by_id().items()}, {"f": True, "n": False})
         rows = {r["root"]: r for r in api.status()["stores"]}
         self.assertEqual(
             (rows[str(self.foreign)]["present"], rows[str(self.native)]["present"]), (False, True)
@@ -513,9 +523,12 @@ class VanishedMountTest(IndexCase):
         self.assertIn(str(self.foreign), [s["root"] for s in api.status()["stores"]])
 
         self.box.set_mounts((self.disk, "Win Disk"))  # plugged back in
-        self.assertEqual(sorted(self.by_id()), ["f", "n"])
+        self.assertEqual({i: s.offline for i, s in self.by_id().items()}, {"f": False, "n": False})
         summary = api.scan(deep=False)
-        self.assertEqual((summary["sessions"], summary["parsed"], summary["cached"]), (2, 0, 2))
+        self.assertEqual(
+            (summary["sessions"], summary["offline"], summary["parsed"], summary["cached"]),
+            (2, 0, 0, 2),
+        )
         self.assertEqual(FakeProvider.parsed, [])
 
     def test_mount_dir_gone_entirely(self):
@@ -524,7 +537,8 @@ class VanishedMountTest(IndexCase):
         self.box.unmount(self.disk)
         os.rename(self.disk, self.box.root / "moved away")
         self.assertEqual(api.scan(deep=True)["stores_not_mounted"], 1)
-        self.assertEqual(api.list_sessions(), [])
+        self.assertEqual([(s.id, s.offline) for s in api.list_sessions()], [("f", True)])
+        self.assertEqual(api.load_index(offline=False).sessions, [])
         self.assertTrue(api.verify()["ok"])
 
     def test_skipped_store_on_a_vanished_mount_is_remembered(self):

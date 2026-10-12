@@ -18,8 +18,8 @@
 - `.github/workflows/ci.yml` — CI: lint, typecheck and both suites on Python 3.11 to 3.14 (Linux); engine
   suite on Windows, allowed to fail until the port is done
 - `src/agent_sessions/__init__.py` — package marker, `__version__`
-- `src/agent_sessions/model.py` — `Session` (`for_store`, `from_dict`), `Store`, `Candidate`, `make_key`,
-  `UUID_PATTERN` (the default session id grammar)
+- `src/agent_sessions/model.py` — `Session` (`for_store`, `from_dict`; `offline`: listed from the cache, its
+  drive is not mounted), `Store`, `Candidate`, `make_key`, `UUID_PATTERN` (the default session id grammar)
 - `src/agent_sessions/fsutil.py` — our own locations (`home`, `cache_file`, `cache_dir`, `state_dir`, `config_dir`,
   `log_file`, `lock_file`, env overrides) and trace-free reads (`open_ro`, `subdirs`, `listdir_ro`: `O_NOATIME` where the
   platform has it). `open_ro` never waits and reads regular files only: `NotRegularFile` for a named pipe, a
@@ -38,24 +38,34 @@
   bidirectional characters become spaces; `multiline` keeps line feed and tab), `json_escape` (the same
   characters as `\uXXXX` in `--json` output), the set `UNSAFE`. Used by the CLI's output helpers, `clean_title`,
   `tui/view.clean` and the desktop notification
-- `src/agent_sessions/mounts.py` — platform layer: `Mount`, `list_mounts`, `mount_points`, `find_mount`,
-  `parse_mountinfo`; the real-filesystem list `REAL_FSTYPES`; `AGENT_SESSIONS_MOUNTS` override
+- `src/agent_sessions/mounts.py` — platform layer: `Mount` (with the filesystem's `uuid` and `fs_label`, read
+  from `DEV_BY_UUID` and `DEV_BY_LABEL`), `list_mounts`, `mount_points`, `find_mount`, `parse_mountinfo`; the
+  real-filesystem list `REAL_FSTYPES`; `AGENT_SESSIONS_MOUNTS` override; a volume by its UUID: `UUID_PATTERN`,
+  `volume_state` (`mounted`, `attached`, `absent`; files only), `identity_from_mount_point` (a udisks mount
+  point's name back to UUID and label), `mount_volume` (`udisksctl mount`, through the hook `starter`; the one
+  `subprocess` use outside `launch.py`)
 - `src/agent_sessions/discover.py` — `fast_pass`, `deep_pass`, `brute_pass` (the walk `verify` uses), the prune
   list `PRUNE`, `ALWAYS_DESCEND`, `SKIP_RULES` (stores found but not listed), `PROJECT_ROOT` (stores inside this
   checkout are skipped too)
 - `src/agent_sessions/pathmap.py` — `normalise`, `PathMap` (drive letters by evidence per source mount,
-  `REDIRECTS`, override file `~/.config/agent-sessions/pathmap.json`)
-- `src/agent_sessions/index.py` — `Index`: cache file, scan (parse cache by signature), `finalise` (derived
-  session fields, dedupe, order), scan policy; `fresh` (cache-free index for `verify`)
+  `REDIRECTS`, override file `~/.config/agent-sessions/pathmap.json`); editing that file: `override_file`,
+  `set_override`, `remove_override` (validated, written atomically and 0600, an unreadable file refused)
+- `src/agent_sessions/index.py` — `Index`: cache file (version 2; a version 1 file is migrated on load), scan
+  (parse cache by signature, the path evidence of each store cached the same way), the `volumes` table (identity,
+  drive letters and last-seen time of every volume that holds a remembered store; `forget`, `letter_for_mount`,
+  a volume that came back at another path), `finalise` (derived session fields, offline sessions from the cache,
+  dedupe, order), `where`, scan policy; `fresh` (cache-free index for `verify`)
 - `src/agent_sessions/providers/` — one adapter per provider, plus the registry
 - `src/agent_sessions/providers/__init__.py` — registry: `register`, `all_providers`, `get`; imports the five adapters
 - `src/agent_sessions/providers/base.py` — `Provider` contract (with `id_pattern`, `valid_id`, `read_back`, the
-  `resumable` property), `NotSupported`, shared helpers (`iter_jsonl`, `read_lines` and `JSONL_LINE_MAX`,
+  `resumable` property, `evidence_files` and `path_evidence`: recorded folders beyond the sessions' own, for
+  the path map), `NotSupported`, shared helpers (`iter_jsonl`, `read_lines` and `JSONL_LINE_MAX`,
   `read_small`, `open_sqlite_ro`, `parse_ts` (nothing outside 1990 to 2100; `unit` for epoch numbers),
   `clean_title`, `open_ro`), warnings (`warn`, `collect_warnings`)
 - `src/agent_sessions/providers/{claude,codex,grok,antigravity,gemini}.py` — the adapters: store signature,
   `candidates`, `parse`, `transcript`, `resume_argv`, and `import_plan` (Claude, Codex and Grok; Antigravity
-  and Gemini raise `NotSupported` with the reason)
+  and Gemini raise `NotSupported` with the reason); Claude also gives path evidence (the `projects` keys of
+  the `.claude.json` beside the store)
 - `src/agent_sessions/importer.py` — copy a foreign session into the native store: plans, the checks
   (`check`, `contained`), `execute` (stage, place, verify, append, journal record with a manifest; all
   under the state directory's lock, rolled back on any failure), `sweep_staging`
@@ -65,17 +75,22 @@
   program run, remembered per run, `forget_tools`)
 - `src/agent_sessions/api.py` — facade used by the CLI and the TUI: `load_index`, `scan`, `list_sessions`,
   `status`, `verify`, `find_session`, `transcript`, `open_session`, `can_import`, `import_plan`,
-  `import_report`, `import_session`; what goes into the log is written here (scan summary and warnings,
-  imports, launches, unexpected exceptions)
-- `src/agent_sessions/cli.py` — argparse entry: `scan`, `list`, `open`, `import`, `show`, `status`, `verify`
-  (`tui` is started by the launcher, not here), the global flags `--version` and `--debug`, the output
-  helpers that make text safe, and what ends a command: exit codes, Ctrl-C and SIGTERM/SIGHUP (`_signals`),
-  the `internal error` line
+  `import_report`, `import_session`; the drives: `volumes`, `find_volume`, `mount_drive`, `forget_drive`,
+  `set_letter`, `remove_letter`; what needs a session's files refuses an offline one (`Offline`); what goes
+  into the log is written here (scan summary and warnings, imports, launches, mounts, forgotten drives,
+  unexpected exceptions)
+- `src/agent_sessions/cli.py` — argparse entry: `scan`, `list`, `open`, `import`, `show`, `status`, `verify`,
+  `mount`, `forget`, `map` (`tui` is started by the launcher, not here), the global flags `--version` and
+  `--debug`, the output helpers that make text safe (`_ask` for the one question), and what ends a command:
+  exit codes, Ctrl-C and SIGTERM/SIGHUP (`_signals`), the `internal error` line
 - `src/agent_sessions/tui/` — Textual front end: `app.py`, `view.py` (pure view logic), `app.tcss` (all styling)
 - `share/agent-sessions.desktop` — desktop launcher for the TUI
 - `tests/` — unittest suites
 - `tests/__init__.py` — puts `src` on `sys.path`
-- `tests/support.py` — `Sandbox` (fake home, cache, mounts, registry) and `FakeProvider` for the engine tests;
+- `tests/support.py` — `Sandbox` (fake home, cache, mounts with or without an identity, registry) and
+  `FakeProvider` for the engine tests; `FakeDisks` (a fake `/dev/disk` tree, mount table and `udisksctl`,
+  the mount program's start recorded) and `FakeProcess`; `mounts.starter` replaced for every suite, so no
+  test can start a real mount;
   `write_jsonl`, `claude_transcript` (a minimal transcript written from scratch); child processes for the
   tests that need real ones (`python_child`, `launcher_child`, `finish`, `wait_for`, the slow-import driver
   `SLOW_IMPORT`); `FakePath` (what PATH holds for a test: programs and installing wrappers in a temp
@@ -85,6 +100,17 @@
   (checked in a fresh interpreter)
 - `tests/test_base_helpers.py` — `iter_jsonl`, `open_sqlite_ro`, `parse_ts`, `clean_title`, warnings, model
 - `tests/test_mounts.py` — mountinfo parsing and filtering, env override, `find_mount`
+- `tests/test_volumes.py` — `mounts` on a fake `/dev/disk` tree and mount table: UUID and label of each
+  mount, udev escapes, `identity_from_mount_point`, `volume_state`, `mount_volume` (the exact command,
+  refusals before anything is run, the tool's failures, the timeout and the child's end), how the program
+  is started (tried on a Python child)
+- `tests/test_offline.py` — drives that are not mounted: offline sessions in the listing, WHERE, what is
+  refused (`Offline`), `verify`, the `volumes` table and cache version 2, the migration of a version 1
+  cache (wrong types included), a volume at another mount path, `api.volumes`, `find_volume`,
+  `mount_drive`, `forget_drive`, and the commands `list --mounted`, `scan`, `status`, `mount`, `forget`
+- `tests/test_letters.py` — path evidence: Claude's `.claude.json` (every wrong type, the size cap, what is
+  not a regular file), how the index caches it by signature and feeds the path map; the `map` command and
+  the override file (validation, atomic and private write, an unreadable file refused)
 - `tests/test_discover.py` — fast, deep and brute pass, prune list, the five store signatures on the fixtures
 - `tests/test_pathmap.py` — normalisation, letters by evidence, overrides, MSIX redirect
 - `tests/test_index.py` — parse cache, scan policy, vanished mounts, derived fields, order, `verify`
@@ -105,7 +131,8 @@
   (`claude/`, `codex/`, `grok/`, `antigravity/`, `gemini/`; SQLite fixtures are WAL-mode, open immutable)
 - `tests/fixtures/claude/not-a-store/`, `tests/fixtures/gemini/native-no-chats/` — negative cases for `is_store`
 - `scratch/` — throwaway investigation scripts (git-ignored): `walk.py`, `*_count.py`, `drives.py`, `build_fixtures.py`
-- `src/agent_sessions/errors.py` — `ApiError`, `NotFound`, `LaunchFailed`, `ImportFailed` (re-exported by `api`)
+- `src/agent_sessions/errors.py` — `ApiError`, `NotFound`, `LaunchFailed`, `ImportFailed`, `Offline` (the
+  drive of a session is not mounted), `MountFailed` (re-exported by `api`)
 - `tests/fixture_world.py` — `World`: fake home plus two fake drives built from the fixtures, launches and
   notifications recorded; `tree_state`, `age_access_times`, `files_below`
 - `tests/test_launch.py` — launch plans per provider, folder gone, foreign refused, `--here`, hooks
@@ -156,8 +183,8 @@
 - `src/agent_sessions/tui/app.tcss` — every colour, border and spacing value; the widget tree it styles is
   listed at its top
 - `requirements-tui.txt` — the pinned Textual version `install.sh` installs into `.venv`
-- `tests/tui_support.py` — `FakeEngine` (records calls, never launches or imports), fake sessions,
-  `screen_text`, `settle`
+- `tests/tui_support.py` — `FakeEngine` (records calls, never launches or imports; refuses an offline
+  session the way the engine does), fake sessions, `screen_text`, `settle`
 - `tests/test_tui_view.py` — every function of `tui/view.py`, `tui/engine.py`, the launcher and import rules;
   runs on the system Python
 - `tests/test_tui_app.py` — the app under Textual's pilot with the fake engine (`make test-tui`; skips itself

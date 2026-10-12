@@ -301,6 +301,7 @@ class Snapshot:
     rows: list[view.Row] = field(default_factory=list)  # newest first, as the engine lists
     providers: list[tuple[str, str]] = field(default_factory=list)  # [(name, label)]
     drives: int = 0
+    offline: int = 0  # sessions whose drive is not mounted
     last_scan: str | None = None
 
 
@@ -316,6 +317,7 @@ def build_snapshot(engine: Engine) -> Snapshot:
         rows=rows,
         providers=list(engine.providers()),
         drives=view.drive_count(status.get("mounts")),
+        offline=sum(1 for session in sessions if session.offline),
         last_scan=status.get("last_quick"),
     )
 
@@ -442,7 +444,11 @@ class MainScreen(_UiCalls, Screen):
             variants = [self._activity]
         else:
             variants = view.summary_variants(
-                self.snapshot.drives, len(self.snapshot.rows), self.snapshot.last_scan, self.clock()
+                self.snapshot.drives,
+                len(self.snapshot.rows),
+                self.snapshot.last_scan,
+                self.clock(),
+                self.snapshot.offline,
             )
         shown, summary = view.status_parts(
             self._message or view.APP_TITLE, variants, room, gap=0, keep_left=bool(self._message)
@@ -799,7 +805,8 @@ class MainScreen(_UiCalls, Screen):
 
     def do_resume(self, event: events.Key | None = None, stay: bool = False) -> None:
         """Enter: a native session resumes; a foreign one resumes its native
-        copy when it has one, else asks what to do."""
+        copy when it has one, else asks what to do. One whose drive is not
+        mounted has nothing to ask about: the engine's refusal is shown."""
         session = self.current_session()
         if session is None:
             return
@@ -807,11 +814,33 @@ class MainScreen(_UiCalls, Screen):
             self._start_open(session.key, session.title, stay)
         elif session.imported_as:
             self._start_open(session.imported_as, session.title, stay)
+        elif session.offline:
+            self._start_refusal(session, "open")
         else:
             self._open_prompt("foreign", session, stay)
 
     def do_resume_stay(self, event: events.Key | None = None) -> None:
         self.do_resume(stay=True)
+
+    def _start_refusal(self, session: Session, what: str) -> None:
+        """For a session whose drive is not mounted: ask the engine to
+        ``open``, ``view`` or ``import`` it and show what it answers in the
+        status line. Nothing is started: the engine refuses all three."""
+        self._work(self._refusal_thread, session, what, self.snapshot.index, group="refusal")
+
+    def _refusal_thread(self, session: Session, what: str, index: Index | None) -> None:
+        reason = ""
+        try:
+            if what == "import":
+                possible, why = self.engine.can_import(session, index=index)
+                reason = "" if possible else why or ""
+            elif what == "view":
+                next(iter(self.engine.transcript(session.key, index=index)), None)
+            else:  # a dry run: whatever the engine answers, no window opens
+                self.engine.open_session(session.key, dry_run=True, index=index)
+        except Exception as exc:
+            reason = view.error_text(exc)
+        self._ui(self.set_message, reason or view.clean(session.note) or "drive not mounted", True)
 
     def _start_open(self, key: str, title: str, stay: bool) -> None:
         if self._opening:
@@ -857,6 +886,9 @@ class MainScreen(_UiCalls, Screen):
             return
         if session.imported_as:
             self.set_message("already imported; Enter resumes the Linux copy")
+            return
+        if session.offline:
+            self._start_refusal(session, "import")
             return
         verdict = self._verdicts.get(session.key)
         if verdict is not None and verdict[0] is False:
@@ -957,6 +989,9 @@ class MainScreen(_UiCalls, Screen):
     def _view(self, key: str | None) -> None:
         session = self.snapshot.sessions.get(key) if key is not None else None
         if key is None or session is None:
+            return
+        if session.offline:
+            self._start_refusal(session, "view")
             return
         self.app.push_screen(
             TranscriptScreen(

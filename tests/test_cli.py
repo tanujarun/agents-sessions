@@ -29,7 +29,7 @@ from support import FakePath, Sandbox, state_names
 
 from agent_sessions import api, cli, launch
 from agent_sessions.fsutil import cache_file
-from agent_sessions.index import Index
+from agent_sessions.index import CACHE_VERSION, Index
 from agent_sessions.model import make_key
 
 
@@ -132,6 +132,7 @@ class CliTest(unittest.TestCase):
                 "launchable",
                 "imported_as",
                 "note",
+                "offline",
             },
         )
         f1 = rows[0]
@@ -182,7 +183,7 @@ class CliTest(unittest.TestCase):
             "{not json",
             "",
             "[]",
-            good.replace('"version":1', '"version":0'),
+            good.replace(f'"version":{CACHE_VERSION}', '"version":0'),
             good[: len(good) // 2],
         ):
             for argv, expected in ((("list",), want), (("list", "--json"), want_json)):
@@ -246,6 +247,7 @@ class CliTest(unittest.TestCase):
                 "last_quick",
                 "last_deep",
                 "mounts",
+                "volumes",
                 "providers",
                 "stores",
                 "skipped_stores",
@@ -303,6 +305,7 @@ class CliTest(unittest.TestCase):
                     "reader": True,
                     "stores": 2,
                     "sessions": 4,
+                    "offline": 0,
                 }
             ],
         )

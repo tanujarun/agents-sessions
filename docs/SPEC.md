@@ -94,7 +94,8 @@ null), `cwd_exists`, `started`, `updated` (ISO 8601 UTC), `messages` (count or
 null), `store` (root path), `origin` (`native` | `foreign`), `mount`
 (mountpoint), `mount_label`, `files` (paths belonging to the session),
 `launchable` (bool), `imported_as` (native key or null), `note` (why not
-launchable, etc.).
+launchable, etc.), `offline` (bool; phase 2: listed from the cache, the drive
+is not mounted).
 
 Title rule: the tool's own title/summary when it has one, else the first real
 user prompt, one line, whitespace collapsed, capped at 80 chars.
@@ -128,6 +129,8 @@ class Provider:
     def transcript(self, s: Session) -> Iterator[Turn]       # (role, text, ts); user, assistant, tool-name turns
     def import_session(self, s: Session, pathmap) -> Session  # may raise NotSupported(reason)
     def read_back(self, plan) -> Session                      # the placed copy, parsed like any session
+    def evidence_files(self, store: Store) -> list[str]       # phase 2: the files path_evidence reads
+    def path_evidence(self, store: Store) -> list[str]        # phase 2: more recorded folders, for drive letters
 ```
 
 `id_pattern` is the one gate for an id: the index lists no session whose id
@@ -446,38 +449,94 @@ Terminal: `omarchy-launch-tui` when present; else `xdg-terminal-exec`; else
 ## Offline drives
 
 - `Mount` gains `uuid` and `fs_label`, read from `/dev/disk/by-uuid` and
-  `/dev/disk/by-label` (FORMATS "Q4"); the override env accepts them too.
-- The cache keeps a `volumes` table: every mount path that has a remembered
-  store, with label, UUID, filesystem, drive letters as last resolved, and
-  when it was last seen. Cache version 2; a version 1 cache is migrated.
+  `/dev/disk/by-label` (FORMATS "Q4"): the names whose links resolve to the
+  device behind the mount's source (followed as a path, which also covers
+  btrfs behind `/dev/mapper`), udev's `\xNN` escapes decoded. Best effort:
+  where those directories do not exist, every mount has neither. A name
+  that is not in the form of a UUID (`[0-9A-Za-z-]{1,64}`) is not one. The
+  override env accepts both. `label` stays what a listing calls the drive
+  (`Linux`, or the mount point's name).
+- The cache keeps a `volumes` table, by mount path: label, filesystem label,
+  UUID, filesystem type, the drive letters the stores on the volume use as
+  the last scan that saw it resolved them (letter -> mount path), and when
+  it was last seen. A row exists for every mounted volume that holds a
+  store, and for every volume that is away and still holds a remembered
+  foreign or skipped store. Cache version 2.
+- A version 1 cache is migrated in memory when it is loaded (the next scan
+  writes version 2); nothing it remembers is dropped. Its volumes get their
+  label and filesystem type from the mounts the last scan saw; the identity
+  of one under `/run/media/<user>/<name>` is read back from `<name>` (a
+  label, else a UUID, of a device that is attached); and, since it kept no
+  letters, a volume's letter is told from the cache alone: the one letter
+  under which a session of a store on the volume recorded the folder its
+  own store is in, or a folder above it (`C:\Users\me` in
+  `<mount>/Users/me/.claude`). No letter, or two, gives none.
 - Sessions of a remembered store on a volume that is not mounted are
-  **listed**, from the cached parse, with `offline: true`, no `cwd_local`,
-  not launchable, note `drive not mounted`. WHERE shows `C: · offline`.
-  They are ordered and deduplicated like any other session, and an offline
-  session that was imported still resumes its native copy.
+  **listed**, from the cached parse and nothing else, with `offline: true`,
+  no `cwd_local`, not launchable, note `drive not mounted`. WHERE shows
+  `C: · offline` (`· imported` wins when a native copy exists). They are
+  ordered and deduplicated like any other session, and an offline session
+  that was imported still resumes its native copy. The warnings cached for
+  a store are shown only while its volume is mounted, and only the stores
+  of mounted volumes are evidence for the path map; the letter of a volume
+  that is away comes from the `volumes` table (or the override file).
 - Reading a transcript, importing and continuing need the files: they fail
-  with `the drive <label> is not mounted`.
+  with `the drive <label> is not mounted` (`errors.Offline`, an `ApiError`),
+  and so does `open` of an offline session that was not imported.
+- `scan` and `status` count them apart: `sessions` is every listed session,
+  `offline` how many of those are offline (JSON.md).
 - `mounts.volume_state(uuid)`: `mounted`, `attached` (the device is there),
-  `absent`. `mounts.mount_volume(uuid)` runs `udisksctl mount --block-device
-  /dev/disk/by-uuid/<uuid>` with no terminal attached (the desktop's polkit
-  agent asks for the password; these internal volumes need one), waits up to
-  120 s, and returns the mount point read back from the mount table. Failure
-  gives the tool's own message. `subprocess` is allowed in `mounts.py` for
-  this one call.
-- A volume that comes back at another mount path: its remembered stores at
-  the old path are dropped (the deep pass that a changed mount set triggers
-  finds them at the new one).
-- CLI: `mount <drive>` (label, letter, mount path or UUID), then a scan;
-  `forget <drive>` drops a volume that is not mounted from the cache.
-- `verify` compares mounted volumes only.
+  `absent`; from `/dev/disk/by-uuid` and the mount table alone.
+  `mounts.mount_volume(uuid)` checks the UUID's form and that it names an
+  attached block device before anything else; returns the mount point of a
+  volume that is mounted already without running anything; else runs
+  `udisksctl mount --block-device /dev/disk/by-uuid/<uuid>` (an argv list,
+  no shell, no stdin, output captured, a session of its own so that polkit's
+  text agent cannot ask on the terminal the TUI runs in: the desktop's
+  graphical agent asks for the password these internal volumes need), waits
+  up to 120 s, and returns the mount point read back from the mount table.
+  It raises `MountFailed` with the tool's own last line, `udisksctl is not
+  installed; mount the drive from your file manager`, or `no answer after
+  120 s (was the password prompt answered?)` (the child is then
+  terminated). `subprocess` is allowed in `mounts.py` for this one call,
+  which goes through the hook `mounts.starter`.
+- A volume that comes back at another mount path (the same UUID, mounted,
+  at a path other than the remembered one, which is not mounted): at scan
+  time its remembered stores at the old path, their cached parses and its
+  row are dropped (the deep pass that a changed mount set triggers finds
+  them at the new one). A volume whose UUID is not known is never matched.
+- `api.volumes()` is the table with each volume's state; `api.mount_drive`
+  and `api.forget_drive` take a label (the listing's or the filesystem's),
+  a drive letter, a mount path or a UUID, and refuse what is unknown or
+  names several volumes. A volume whose UUID is not known cannot be mounted
+  from here.
+- CLI: `mount <drive>`, then a scan with the usual choice of depth;
+  `forget <drive> [--yes]` drops a volume that is not mounted, its stores
+  and their cached parses from the cache. It asks `y/N` on a terminal,
+  refuses without one unless `--yes` is given, and is refused for a mounted
+  volume (a scan would find it again). `status` shows every remembered
+  volume as `mounted`, `attached, not mounted` or `not attached`, with its
+  letter and UUID (`not mounted` alone when no UUID is known).
+- `verify` compares mounted volumes only: the listing without the offline
+  sessions against the disks.
 
 ## Drive letters
 
 - Adapters may add evidence: `Provider.path_evidence(store) -> list[str]`.
   Claude returns the keys of the `projects` object of the `.claude.json`
-  beside the store, which resolves `D:` here (FORMATS "Q7").
-- `map` prints the letters; `map D: <dir>` and `map --remove D:` edit
-  `~/.config/agent-sessions/pathmap.json` (written atomically, validated).
+  beside the store, which resolves `D:` here (FORMATS "Q7"); the file is
+  read whole up to 16 MB and anything that is not that object gives nothing.
+- `Provider.evidence_files(store)` names the files that evidence is read
+  from. A scan gathers the evidence of every store that is not the native
+  one, keeps it in the cache with the store's parses under the signature of
+  those files, and reads them again only when the signature changed. The
+  path map is built from it together with the folders the sessions recorded.
+- `map` prints the letters (resolved and how, remembered for a drive that is
+  not mounted, unresolved); `map D: <dir>` and `map --remove D:` edit
+  `~/.config/agent-sessions/pathmap.json`: a drive letter and an absolute
+  directory that exists, the other entries left as they are, written to a
+  temp file and moved into place, mode 0600. A file that is there and
+  cannot be read as a JSON object is refused, not overwritten.
 
 ## Import
 
@@ -540,7 +599,7 @@ tool, an unimportable provider, a folder that is gone):
 
 ```
 agent-sessions --version | --debug
-agent-sessions mount <drive>            agent-sessions forget <drive>
+agent-sessions mount <drive>            agent-sessions forget <drive> [--yes]
 agent-sessions map [LETTER: DIR | --remove LETTER:]
 agent-sessions import <key> [--to DIR] [--experimental] [--open] [--dry-run]
 agent-sessions unimport <key> [--force] [--dry-run]

@@ -1,15 +1,18 @@
 """The facade the CLI and the TUI call: load, scan, list, status, verify,
-find, open, import, transcript.
+find, open, import, transcript, and the drives: volumes, mount, forget, the
+drive letters.
 
 What is worth a line in the log is written here, so both front ends log
 alike (``logs``): the summary and the warnings of a scan, an import and how
-it ended, a launch with the exact command, and any exception that is not one
-of the failures this module reports (``ApiError``), with its traceback.
+it ended, a launch with the exact command, a mount, a drive that is
+forgotten, and any exception that is not one of the failures this module
+reports (``ApiError``), with its traceback.
 """
 
 from __future__ import annotations
 
 import functools
+import re
 import shlex
 import time
 from collections.abc import Callable, Iterator
@@ -17,10 +20,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
-from . import discover, importer, launch, logs
+from . import discover, importer, launch, logs, pathmap
 from . import index as index_mod
+from . import mounts as mounts_mod
 from . import providers as registry
-from .errors import ApiError, ImportFailed, LaunchFailed, NotFound
+from .errors import ApiError, ImportFailed, LaunchFailed, MountFailed, NotFound, Offline
 from .fsutil import cache_file, log_file
 from .index import Index
 from .launch import LaunchPlan
@@ -58,11 +62,13 @@ def _logged(function: Callable[_P, _R]) -> Callable[_P, _R]:
 
 
 @_logged
-def load_index() -> Index:
+def load_index(offline: bool = True) -> Index:
     """The cached index, finalised against the mounts present now. Reads no
-    store; ``index.sessions`` is the listing."""
+    store; ``index.sessions`` is the listing. The sessions of a remembered
+    store on a drive that is not mounted are in it, marked ``offline``;
+    ``offline=False`` gives the listing of the mounted drives alone."""
     index = Index.load()
-    index.finalise(all_providers(), list_mounts())
+    index.finalise(all_providers(), list_mounts(), offline)
     return index
 
 
@@ -83,7 +89,7 @@ def scan(
     summary = Index.load().scan(all_providers(), list_mounts(), deep, progress, cancel)
     log.info(
         "scan %s%s: %.2f s, %d mounts, %d stores, %d candidates (%d parsed, %d from cache), "
-        "%d sessions, %d warnings",
+        "%d sessions (%d on drives not mounted), %d warnings",
         summary["mode"],
         " (cancelled)" if summary["cancelled"] else "",
         summary["seconds"],
@@ -93,6 +99,7 @@ def scan(
         summary["parsed"],
         summary["cached"],
         summary["sessions"],
+        summary["offline"],
         len(summary["warnings"]),
     )
     # Here and not in ``load_index``: once per scan, not once per listing.
@@ -112,44 +119,51 @@ def list_sessions(provider: str | None = None, index: Index | None = None) -> li
 
 @_logged
 def status(index: Index | None = None) -> dict:
-    """Mounts, stores and counts, drive letters, skipped stores, the agent
-    tools and whether each is installed, warnings, where the cache and the
-    log are. Every list is sorted.
+    """Mounts, remembered volumes, stores and counts, drive letters, skipped
+    stores, the agent tools and whether each is installed, warnings, where
+    the cache and the log are. Every list is sorted.
 
     "Installed" is ``launch.tool_state``: a command on PATH that would only
     install the tool does not count."""
     index = index if index is not None else load_index()
     present = {m.path for m in index.current_mounts}
+    remembered = volumes(index)
     mounts = [
         {
             "path": m.path,
             "label": m.label,
             "fstype": m.fstype,
             "device": m.device,
+            "uuid": m.uuid,
+            "fs_label": m.fs_label,
             "mounted": True,
-            "letter": index.pathmap.letter_for_mount(m.path),
+            "state": mounts_mod.MOUNTED,
+            "letter": index.letter_for_mount(m.path),
             "walk": index.walk.get(m.path),
         }
         for m in index.current_mounts
     ]
-    gone = {(row["mount"], row["mount_label"]) for row in index.store_rows if not row["present"]}
     mounts += [
         {
-            "path": path,
-            "label": label,
-            "fstype": "",
+            "path": volume["path"],
+            "label": volume["label"],
+            "fstype": volume["fstype"],
             "device": "",
+            "uuid": volume["uuid"],
+            "fs_label": volume["fs_label"],
             "mounted": False,
-            "letter": None,
+            "state": volume["state"],
+            "letter": volume["letter"],
             "walk": None,
         }
-        for path, label in sorted(gone)
-        if path not in present
+        for volume in remembered
+        if volume["path"] not in present
     ]
     providers = []
     readers = set()
     for p in all_providers():
-        rows = [r for r in index.store_rows if r["provider"] == p.name and r["present"]]
+        every = [r for r in index.store_rows if r["provider"] == p.name]
+        rows = [r for r in every if r["present"]]
         state = launch.tool_state(p.binary)
         readers.add(p.binary)
         providers.append(
@@ -162,7 +176,8 @@ def status(index: Index | None = None) -> dict:
                 "resumable": bool(p.resumable),
                 "reader": all(r["reader"] for r in rows),
                 "stores": len(rows),
-                "sessions": sum(r["listed"] for r in rows),
+                "sessions": sum(r["listed"] for r in every),
+                "offline": sum(r["listed"] for r in every if not r["present"]),
             }
         )
     tools = []
@@ -184,6 +199,7 @@ def status(index: Index | None = None) -> dict:
         "last_quick": index.last_quick,
         "last_deep": index.last_deep,
         "mounts": mounts,
+        "volumes": remembered,
         "providers": providers,
         "stores": index.store_rows,
         "skipped_stores": [
@@ -243,7 +259,8 @@ def _moved_on(sig: list) -> bool:
 def verify(
     progress: discover.Progress | None = None, cancel: threading.Event | None = None
 ) -> dict:
-    """Compare the index with a slow, independent look at the disks.
+    """Compare the index with a slow, independent look at the disks. Only
+    the mounted volumes are compared.
 
     Every mount is walked with no prune list and no cache, every candidate of
     every store found is parsed afresh, and the result is compared with the
@@ -256,7 +273,9 @@ def verify(
     started = time.monotonic()
     providers = all_providers()
     mounts = list_mounts()
-    index = load_index()
+    # What is on the mounted volumes, and nothing else: a session listed
+    # from the cache because its drive is away has no disk to be held against.
+    index = load_index(offline=False)
     found = discover.brute_pass(mounts, providers, progress, cancel)
     result = {
         "ok": False,
@@ -397,6 +416,13 @@ def _provider(session: Session) -> Provider:
         raise NotFound(f"no reader for provider {session.provider!r}") from None
 
 
+def _need_files(session: Session) -> None:
+    """Raise ``Offline`` for a session that is listed from the cache alone:
+    what the caller is about to do reads its files."""
+    if session.offline:
+        raise Offline(f"the drive {session.mount_label} is not mounted")
+
+
 def _native_copy(session: Session, index: Index) -> Session | None:
     """The native session with the same provider and id, as the index has it.
 
@@ -418,8 +444,10 @@ def _native_copy(session: Session, index: Index) -> Session | None:
 def transcript(ref: Session | str, index: Index | None = None) -> Iterator[Turn]:
     """The conversation as ``Turn(role, text, ts)``, oldest first: ``user``
     and ``assistant`` text, and one ``tool`` turn per tool call whose text is
-    the tool's name. Read lazily. Raises ``NotFound``."""
+    the tool's name. Read lazily. Raises ``NotFound``, and ``Offline`` at
+    once for a session whose drive is not mounted."""
     session = find_session(ref, index)
+    _need_files(session)
     return iter(_provider(session).transcript(session))
 
 
@@ -429,12 +457,14 @@ def open_session(
 ) -> LaunchPlan:
     """Resume a session in a new terminal window, in its project directory.
 
-    A foreign session that was imported resumes its native copy; any other
-    foreign session is refused. ``here=True`` starts the tool in this process
-    instead (``chdir`` then ``exec``: the call does not return).
-    ``dry_run=True`` only returns the plan. Raises ``LaunchFailed`` with the
-    reason (a real failure also sends a desktop notification) or ``NotFound``.
-    The window is opened by ``launch.starter``, which a caller may replace.
+    A foreign session that was imported resumes its native copy, whether
+    its drive is mounted or not; any other foreign session is refused.
+    ``here=True`` starts the tool in this process instead (``chdir`` then
+    ``exec``: the call does not return). ``dry_run=True`` only returns the
+    plan. Raises ``LaunchFailed`` with the reason (a real failure also sends
+    a desktop notification), ``Offline`` for a session that was not imported
+    and whose drive is not mounted, or ``NotFound``. The window is opened by
+    ``launch.starter``, which a caller may replace.
     """
     session = find_session(ref, index)
     where = None
@@ -443,6 +473,10 @@ def open_session(
         copy = _native_copy(session, index)  # imported: resume that one
         if copy is not None:
             session = copy
+        elif session.offline:
+            if not dry_run:
+                logs.logger().warning("launch %s refused: its drive is not mounted", session.key)
+            _need_files(session)
         else:
             where = index.where(session)
             if where == NATIVE_LABEL:  # another store on this machine's own disks
@@ -481,9 +515,11 @@ class ImportReport:
 
 
 def _plan(session: Session, index: Index) -> importer.ImportPlan:
-    """The import plan for a foreign session. Raises ``ImportFailed``."""
+    """The import plan for a foreign session. Raises ``ImportFailed``, and
+    ``Offline`` when its drive is not mounted."""
     if session.origin == "native":
         raise ImportFailed(f"this session is already on {NATIVE_LABEL}")
+    _need_files(session)
     try:
         return _provider(session).import_plan(session, index.pathmap)
     except NotSupported as exc:
@@ -496,9 +532,9 @@ def _plan(session: Session, index: Index) -> importer.ImportPlan:
 def can_import(session: Session | str, index: Index | None = None) -> tuple[bool, str]:
     """``(True, "")`` when ``import_session`` would copy this session, else
     ``(False, reason)``: it is native, already imported, its provider cannot
-    be imported, its project folder is not on any mounted drive, its id is
-    already in the native store, or there is too little free space. Reads
-    only; writes nothing."""
+    be imported, its drive is not mounted, its project folder is not on any
+    mounted drive, its id is already in the native store, or there is too
+    little free space. Reads only; writes nothing."""
     try:
         index = index if index is not None else load_index()
         session = find_session(session, index)
@@ -516,7 +552,8 @@ def import_plan(ref: Session | str, index: Index | None = None) -> dict:
     ``already`` (the native key when it is imported already, else None),
     ``copies``, ``rewrites`` (with the changes each would make), ``appends``,
     ``bytes``, ``needed``, ``free``. Writes nothing. Raises ``ImportFailed``
-    for everything the import itself would refuse."""
+    for everything the import itself would refuse, ``Offline`` for a session
+    whose drive is not mounted."""
     index = index if index is not None else load_index()
     session = find_session(ref, index)
     copy = _native_copy(session, index)
@@ -574,6 +611,7 @@ def _import(session: Session, progress: importer.Progress | None, index: Index) 
         return ImportReport(copy, False)
     if session.origin == "native":
         raise ImportFailed(f"this session is already on {NATIVE_LABEL}")
+    _need_files(session)
     provider = _provider(session)
     collision = None
     files: list[str] = []
@@ -616,6 +654,168 @@ def import_session(
     return import_report(ref, progress, index).session
 
 
+# --- drives: volumes, mount, forget, drive letters ----------------------------
+
+_LETTER = re.compile(r"[A-Za-z]:")  # a drive letter as a reference, with ``fullmatch``
+
+
+def volumes(index: Index | None = None) -> list[dict]:
+    """The volumes that hold a remembered store, in ascending order of
+    ``path``: ``label`` (what a listing calls the drive), ``fs_label`` and
+    ``uuid`` of the filesystem, ``fstype``, ``letter`` (the Windows drive
+    letter it stands for, or None), ``state``, ``last_seen`` (when a scan
+    last saw it mounted), ``stores`` and ``sessions`` (what is remembered
+    and listed of it).
+
+    ``state`` is ``mounted``, ``attached`` (the device is there, its
+    filesystem is not mounted) or ``absent``; read from files, nothing is
+    run. A volume whose ``uuid`` is not known and that is not mounted at its
+    path counts as ``absent``: there is nothing to look for."""
+    index = index if index is not None else load_index()
+    present = {m.path for m in index.current_mounts}
+    rows = []
+    for path in sorted(index.volumes):
+        volume = index.volumes[path]
+        if path in present:
+            state = mounts_mod.MOUNTED
+        else:
+            state = mounts_mod.volume_state(volume["uuid"])
+        rows.append(
+            {
+                "path": path,
+                "label": volume["label"],
+                "fs_label": volume["fs_label"],
+                "uuid": volume["uuid"],
+                "fstype": volume["fstype"],
+                "letter": index.letter_for_mount(path),
+                "state": state,
+                "last_seen": volume["last_seen"],
+                "stores": sum(1 for row in index.store_rows if row["mount"] == path),
+                "sessions": sum(1 for session in index.sessions if session.mount == path),
+            }
+        )
+    return rows
+
+
+def find_volume(ref: str, index: Index | None = None) -> dict:
+    """The row of ``volumes`` that ``ref`` names: a mount path, a filesystem
+    UUID, a label (the drive's name in a listing, or the filesystem's own)
+    or a drive letter (``C:``, either case). Raises ``NotFound`` when no
+    remembered volume matches, and when several do (the reason names them)."""
+    text = ref.strip() if isinstance(ref, str) else ""
+    if not text:
+        raise NotFound("no drive given")
+    rows = volumes(index)
+    path = text.rstrip("/") or "/"
+    letter = text.upper() if _LETTER.fullmatch(text) else None
+    matches = [row for row in rows if row["path"] == path]
+    if not matches:
+        matches = [
+            row
+            for row in rows
+            if text in (row["uuid"], row["label"], row["fs_label"])
+            or (letter is not None and row["letter"] == letter)
+        ]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise NotFound(f"no remembered drive matches {text!r}; `status` lists them")
+    paths = ", ".join(row["path"] for row in matches)
+    raise NotFound(f"{text!r} matches {len(matches)} drives: {paths}; name one by its mount path")
+
+
+@_logged
+def mount_drive(
+    ref: str,
+    progress: discover.Progress | None = None,
+    cancel: threading.Event | None = None,
+) -> dict:
+    """Mount the remembered volume ``ref`` names (see ``find_volume``), then
+    scan with the engine's own choice between a quick and a deep pass.
+    Returns ``{"mount_point", "scan"}``: where the volume is mounted, and
+    the summary of that scan.
+
+    The mount is ``mounts.mount_volume``: it may wait for the password the
+    desktop asks for. One that is mounted already is only scanned. Raises
+    ``NotFound``, or ``MountFailed`` with the reason. ``progress`` and
+    ``cancel`` are the scan's."""
+    index = load_index()
+    volume = find_volume(ref, index)
+    log = logs.logger()
+    if volume["path"] in {m.path for m in index.current_mounts}:
+        where = volume["path"]
+        log.info("mount %s: already mounted at %s", volume["label"], where)
+    elif not volume["uuid"]:
+        raise MountFailed(
+            f"the volume id of {volume['label']} is not known; "
+            "mount the drive from your file manager"
+        )
+    else:
+        log.info(
+            "mount %s (volume id %s, last at %s)", volume["label"], volume["uuid"], volume["path"]
+        )
+        try:
+            where = mounts_mod.mount_volume(volume["uuid"])
+        except MountFailed as exc:
+            log.warning("mount %s failed: %s", volume["label"], exc.reason)
+            raise
+        log.info("mount %s: mounted at %s", volume["label"], where)
+    return {"mount_point": where, "scan": scan(None, progress, cancel)}
+
+
+@_logged
+def forget_drive(ref: str) -> dict:
+    """Take the remembered volume ``ref`` names (see ``find_volume``) out of
+    the cache: its stores, their cached parses, its row. Its sessions leave
+    the listing. Returns ``{"path", "label", "stores", "sessions"}``.
+
+    Refused (``ApiError``) for a volume that is mounted: the next scan would
+    find it again. Raises ``NotFound``. No store is touched."""
+    index = load_index()
+    volume = find_volume(ref, index)
+    if volume["state"] == mounts_mod.MOUNTED:
+        raise ApiError(
+            f"the drive {volume['label']} is mounted; a scan would find it again. "
+            "Nothing was forgotten"
+        )
+    stores = index.forget(volume["path"])
+    try:
+        index.save()
+    except OSError as exc:
+        raise ApiError(f"{index.path}: cache not saved: {exc.strerror or exc}") from exc
+    logs.logger().info(
+        "forget %s (%s): %d stores and %d sessions dropped from the cache",
+        volume["label"],
+        volume["path"],
+        stores,
+        volume["sessions"],
+    )
+    return {
+        "path": volume["path"],
+        "label": volume["label"],
+        "stores": stores,
+        "sessions": volume["sessions"],
+    }
+
+
+@_logged
+def set_letter(letter: str, directory: str) -> tuple[str, str]:
+    """Say by hand which directory a drive letter stands for: written to
+    the override file ``pathmap.json`` of the configuration directory, where
+    it wins over evidence. Returns ``(letter, directory)`` as written.
+    Raises ``ApiError`` for something that is not a drive letter, a
+    directory that is not absolute or does not exist, and an override file
+    that is there and cannot be read (it is not overwritten)."""
+    return pathmap.set_override(letter, directory)
+
+
+@_logged
+def remove_letter(letter: str) -> str:
+    """Take a drive letter out of the override file; returns the letter.
+    Raises ``ApiError`` when the file has no entry for it."""
+    return pathmap.remove_override(letter)
+
+
 __all__ = [
     "NO_READER_TOOLS",
     "ApiError",
@@ -623,19 +823,27 @@ __all__ = [
     "ImportReport",
     "LaunchFailed",
     "LaunchPlan",
+    "MountFailed",
     "NotFound",
+    "Offline",
     "Turn",
     "cache_file",
     "can_import",
     "find_session",
+    "find_volume",
+    "forget_drive",
     "import_plan",
     "import_report",
     "import_session",
     "list_sessions",
     "load_index",
+    "mount_drive",
     "open_session",
+    "remove_letter",
     "scan",
+    "set_letter",
     "status",
     "transcript",
     "verify",
+    "volumes",
 ]
