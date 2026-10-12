@@ -1,6 +1,7 @@
 """Shared test scaffolding: a sandbox (fake home, cache, mounts) and a fake
 provider. Nothing here touches a real store."""
 
+import atexit
 import json
 import os
 import re
@@ -16,7 +17,7 @@ _SRC = str(Path(__file__).resolve().parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from agent_sessions import providers  # noqa: E402
+from agent_sessions import logs, providers  # noqa: E402
 from agent_sessions.fsutil import home  # noqa: E402
 from agent_sessions.model import Candidate, Session  # noqa: E402
 from agent_sessions.providers.base import (  # noqa: E402
@@ -27,6 +28,15 @@ from agent_sessions.providers.base import (  # noqa: E402
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+# A net below every test: the engine writes its log into the state directory
+# from many places, and a test that reaches one outside a ``Sandbox`` must
+# not write the user's real one. ``Sandbox`` puts its own directory over
+# this for the length of a test.
+if "AGENT_SESSIONS_STATE" not in os.environ:
+    _stray_state = tempfile.mkdtemp(prefix="agent-sessions-test-state-")
+    os.environ["AGENT_SESSIONS_STATE"] = _stray_state
+    atexit.register(shutil.rmtree, _stray_state, ignore_errors=True)
 
 
 def write_jsonl(path, records) -> Path:
@@ -160,6 +170,7 @@ class Sandbox:
         self.set_mounts()
 
     def _remove(self):
+        logs.close()  # the log file is in the state directory that goes now
         for base, dirs, _files in os.walk(self.root):
             for name in dirs:
                 try:
@@ -200,6 +211,27 @@ class Sandbox:
         fields.setdefault("updated", "2026-10-01T10:00:00.000Z")
         path.write_text(json.dumps(fields), encoding="utf-8")
         return path
+
+
+LOG_NAME = "agent-sessions.log"
+
+
+def state_names() -> list[str]:
+    """What the state directory holds besides the log, sorted; nothing when
+    it does not exist. Scans, imports and launches write the log, so a test
+    that says "the state directory is untouched" means everything else."""
+    try:
+        names = os.listdir(os.environ["AGENT_SESSIONS_STATE"])
+    except FileNotFoundError:
+        return []
+    return sorted(name for name in names if not name.startswith(LOG_NAME))
+
+
+def drop_state() -> None:
+    """Remove the sandbox's state directory, log included, for a test that
+    has to see whether something creates it again."""
+    logs.close()
+    shutil.rmtree(os.environ["AGENT_SESSIONS_STATE"], ignore_errors=True)
 
 
 REPO = Path(__file__).resolve().parent.parent

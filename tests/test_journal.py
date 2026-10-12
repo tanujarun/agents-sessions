@@ -19,7 +19,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fixture_world import World
-from support import Sandbox, finish, launcher_child, python_child
+from support import Sandbox, finish, launcher_child, python_child, state_names
 
 from agent_sessions import api, fsutil, journal
 
@@ -421,8 +421,7 @@ class ConcurrentImportTest(unittest.TestCase):
         index = api.load_index()
         for source in sources:
             self.assertEqual(w.session(source.id, "native", index).provider, source.provider)
-        state = Path(os.environ["AGENT_SESSIONS_STATE"])
-        self.assertEqual(os.listdir(state), ["imports.jsonl"])
+        self.assertEqual(state_names(), ["imports.jsonl"])
 
 
 if __name__ == "__main__":

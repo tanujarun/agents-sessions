@@ -36,7 +36,7 @@ from fixture_world import (
     files_below,
     tree_state,
 )
-from support import FIXTURES
+from support import FIXTURES, state_names
 
 from agent_sessions import api, importer, journal
 from agent_sessions.model import make_key
@@ -286,7 +286,7 @@ class ClaudeImportTest(ImportCase):
             },
         )
         # The journal is private, and no lock file stays behind.
-        self.assertEqual(os.listdir(self.record_file.parent), ["imports.jsonl"])
+        self.assertEqual(state_names(), ["imports.jsonl"])
         self.assertEqual(stat.S_IMODE(os.stat(self.record_file).st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(os.stat(self.record_file.parent).st_mode), 0o700)
 
@@ -409,7 +409,7 @@ class ClaudeImportTest(ImportCase):
         self.assertEqual(files_below(self.home / ".claude"), ["projects/-kept/note.txt"])
         self.assertEqual(sorted(os.listdir(self.home / ".claude")), ["projects"])
         self.assertEqual(os.listdir(self.home / ".claude" / "projects"), ["-kept"])
-        self.assertFalse(self.record_file.parent.exists() and os.listdir(self.record_file.parent))
+        self.assertEqual(state_names(), [])
 
     def test_an_interrupted_copy_leaves_nothing_behind(self):
         class Stop(Exception):
@@ -507,7 +507,7 @@ class ClaudeImportTest(ImportCase):
         self.assertIn("cannot be read", reason)
         self.assertEqual(api.can_import(self.source(CLAUDE_WIN)), (False, reason))
         self.assertFalse((self.home / ".claude").exists())
-        self.assertEqual(os.listdir(self.record_file.parent), ["imports.jsonl"])
+        self.assertEqual(state_names(), ["imports.jsonl"])
 
     def test_symlinks_in_the_side_directory_are_not_followed(self):
         outside = self.w.c / "outside.txt"

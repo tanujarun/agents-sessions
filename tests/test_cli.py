@@ -3,7 +3,6 @@
 import contextlib
 import io
 import json
-import os
 import shlex
 import shutil
 import sys
@@ -26,7 +25,7 @@ from fixture_world import (
     World,
     files_below,
 )
-from support import Sandbox
+from support import Sandbox, state_names
 
 from agent_sessions import api, cli, launch
 from agent_sessions.fsutil import cache_file
@@ -249,6 +248,7 @@ class CliTest(unittest.TestCase):
             set(status),
             {
                 "cache",
+                "log",
                 "last_quick",
                 "last_deep",
                 "mounts",
@@ -470,7 +470,7 @@ class SessionCommandsTest(unittest.TestCase):
         self.assertIn("Grok's directory encoding of '-', '.', '_', '~' is unverified", err)
 
         # Nothing was written anywhere: the stores are as the fixtures were.
-        self.assertFalse(os.path.exists(os.environ["AGENT_SESSIONS_STATE"]))
+        self.assertEqual(state_names(), [])  # the log apart
         self.assertNotIn(CLAUDE_WIN, " ".join(files_below(self.home / ".claude")))
         self.assertNotIn(CODEX_WIN, " ".join(files_below(self.home / ".codex")))
 
@@ -546,7 +546,7 @@ class SessionCommandsTest(unittest.TestCase):
             ),
         )
         self.assertEqual(self.w.started, [])
-        self.assertFalse(os.path.exists(os.environ["AGENT_SESSIONS_STATE"]))
+        self.assertEqual(state_names(), [])  # the log apart
 
     # --- show ---------------------------------------------------------------
 

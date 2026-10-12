@@ -21,7 +21,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fixture_world import CLAUDE_WIN, CODEX_WIN, GROK_WIN, World
-from support import write_jsonl
+from support import LOG_NAME, drop_state, state_names, write_jsonl
 
 from agent_sessions import api, importer
 from agent_sessions.providers.claude import encode_cwd
@@ -49,11 +49,15 @@ def other_filesystem(case, here) -> Path | None:
 
 def snapshot(*roots) -> dict:
     """Every file and directory below the roots: a regular file with its
-    bytes, anything else (a directory, a link, a named pipe) with its kind."""
+    bytes, anything else (a directory, a link, a named pipe) with its kind.
+    The log is left out: every scan and every import through the facade adds
+    to it, and it is not what an import leaves or takes back."""
     found: dict[str, bytes | int] = {}
     for root in roots:
         for base, dirs, files in os.walk(root):
             for name in dirs + files:
+                if name == LOG_NAME:
+                    continue
                 path = os.path.join(base, name)
                 mode = os.lstat(path).st_mode
                 if stat.S_ISREG(mode):
@@ -488,7 +492,7 @@ class VerifyAndRollBackTest(unittest.TestCase):
         self.w = World(self, foreign=(), native=("codex",))
         self.home = self.w.home
         self.state = Path(os.environ["AGENT_SESSIONS_STATE"])
-        self.state.mkdir()
+        self.state.mkdir(exist_ok=True)
         record = {"version": 1, "imports": [{"id": "earlier", "provider": "codex"}]}
         (self.state / "imports.json").write_text(json.dumps(record), encoding="utf-8")
         self.foreign = self.w.profile / ".codex"
@@ -497,7 +501,7 @@ class VerifyAndRollBackTest(unittest.TestCase):
 
     def unchanged(self, before):
         self.assertEqual(snapshot(self.home, self.state), before)
-        self.assertEqual(sorted(os.listdir(self.state)), ["imports.json"])
+        self.assertEqual(state_names(), ["imports.json"])
         self.assertEqual((self.native / "session_index.jsonl").read_bytes(), self.native_index)
         self.assertEqual(
             [n for n in os.listdir(self.native) if n.startswith(importer.STAGING_PREFIX)], []
@@ -562,7 +566,7 @@ class VerifyAndRollBackTest(unittest.TestCase):
         self.assertEqual([r["version"] for r in records], [1, 2])
         # The record from before the journal is read and never written.
         self.assertEqual((self.state / "imports.json").read_bytes(), old)
-        self.assertEqual(sorted(os.listdir(self.state)), ["imports.json", "imports.jsonl"])
+        self.assertEqual(state_names(), ["imports.json", "imports.jsonl"])
         added = (self.native / "session_index.jsonl").read_bytes()[len(self.native_index) :]
         self.assertEqual(json.loads(added)["thread_name"], "a name")
 
@@ -590,8 +594,8 @@ class VerifyAndRollBackTest(unittest.TestCase):
     def test_directories_made_for_the_import_are_removed_too(self):
         """Nothing native and no state directory yet: none is left."""
         shutil.rmtree(self.native)
-        shutil.rmtree(self.state)
         plan = self.good_plan()
+        drop_state()
         self.native_index = b""
         with self.assertRaises(importer.ImportFailed):
             importer.execute(plan, verify=mock.Mock(side_effect=importer.ImportFailed("no")))

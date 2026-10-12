@@ -12,7 +12,7 @@ from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, TextIO
 
-from . import __version__, api, textsafe
+from . import __version__, api, logs, textsafe
 from .mounts import MountsError
 from .providers import all_providers
 
@@ -30,6 +30,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Find, list and resume saved AI coding-agent sessions.",
     )
     parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
+    parser.add_argument(
+        "--debug", action="store_true", help="log more, and to stderr as well as to the log file"
+    )
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     sub.add_parser("tui", help="open the TUI")
@@ -275,6 +278,7 @@ def _status(args: argparse.Namespace) -> int:
         _json(status)
         return 0
     _out(f"index: {status['cache']}")
+    _out(f"log: {status['log']}")
     _out(
         f"last scan: {status['last_quick'] or 'never'}; "
         f"last deep scan: {status['last_deep'] or 'never'}"
@@ -571,6 +575,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 2
+    if args.debug:
+        logs.debug()
     try:
         code = _COMMANDS.get(args.command, _not_implemented)(args)
         sys.stdout.flush()

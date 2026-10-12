@@ -15,7 +15,15 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fixture_world import CLAUDE_WIN, CLAUDE_WIN_PLAIN, World, files_below
-from support import SLOW_IMPORT, finish, launcher_child, python_child, wait_for
+from support import (
+    SLOW_IMPORT,
+    drop_state,
+    finish,
+    launcher_child,
+    python_child,
+    state_names,
+    wait_for,
+)
 
 from agent_sessions import api, fsutil, importer, journal
 from agent_sessions.providers.claude import encode_cwd
@@ -296,18 +304,20 @@ class OneAtATimeTest(PlacingCase):
             seen.setdefault("locked", fsutil.lock_file().exists())
             return real(path)
 
+        plan = self.plan()
+        drop_state()
         with (
             mock.patch.object(importer, "_remove", remove),
             self.assertRaises(importer.ImportFailed),
         ):
-            importer.execute(self.plan(), verify=mock.Mock(side_effect=ValueError("no")))
+            importer.execute(plan, verify=mock.Mock(side_effect=ValueError("no")))
         self.assertEqual(seen, {"locked": True})
         self.assertFalse(self.native.exists())
         self.nothing_left()
         self.assertFalse(self.state.exists())  # made for the lock, removed with it
 
     def test_an_import_that_cannot_get_the_lock_is_refused(self):
-        self.state.mkdir()
+        self.state.mkdir(exist_ok=True)
         holder = python_child(HOLDER, stdin=-1)  # -1: a pipe, closed to let it go
         try:
             self.assertEqual(holder.stdout.readline(), "held\n")
@@ -324,7 +334,7 @@ class OneAtATimeTest(PlacingCase):
             f"another import is still running (process {holder.pid}); nothing was imported",
         )
         self.assertFalse(self.native.exists())
-        self.assertEqual(os.listdir(self.state), [])
+        self.assertEqual(state_names(), [])
         importer.execute(self.plan())  # and afterwards it goes through
 
     def test_two_processes_importing_the_same_session(self):
@@ -364,7 +374,7 @@ class OneAtATimeTest(PlacingCase):
             ),
         )
         self.assertEqual(os.listdir(self.native), ["projects"])
-        self.assertEqual(os.listdir(self.state), ["imports.jsonl"])
+        self.assertEqual(state_names(), ["imports.jsonl"])
 
     def test_two_processes_importing_different_sessions_take_turns(self):
         first_key, second_key = self.source().key, self.source(CLAUDE_WIN_PLAIN).key

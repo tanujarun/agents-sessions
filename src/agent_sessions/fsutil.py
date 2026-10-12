@@ -67,6 +67,11 @@ def config_dir() -> Path:
     return home() / ".config" / "agent-sessions"
 
 
+def log_file() -> Path:
+    """The log (``logs``): in the state directory, rotated there."""
+    return state_dir() / "agent-sessions.log"
+
+
 def lock_file() -> Path:
     """The file ``lock`` locks: one for everything that changes the state
     directory or puts a session into a native store."""

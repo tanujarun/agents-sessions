@@ -17,10 +17,15 @@
 - `src/agent_sessions/model.py` — `Session` (`for_store`, `from_dict`), `Store`, `Candidate`, `make_key`,
   `UUID_PATTERN` (the default session id grammar)
 - `src/agent_sessions/fsutil.py` — our own locations (`home`, `cache_file`, `cache_dir`, `state_dir`, `config_dir`,
-  `lock_file`, env overrides) and trace-free reads (`open_ro`, `subdirs`, `listdir_ro`: `O_NOATIME` where the
+  `log_file`, `lock_file`, env overrides) and trace-free reads (`open_ro`, `subdirs`, `listdir_ro`: `O_NOATIME` where the
   platform has it). `open_ro` never waits and reads regular files only: `NotRegularFile` for a named pipe, a
   device, a directory. Our own directories (`make_private_dir`: 0700, `fsync_dir`) and the state directory's
   lock (`lock`, `LockTimeout`: `flock` on POSIX, a byte-range lock on Windows, re-entrant in one thread)
+- `src/agent_sessions/logs.py` — the log `<state>/agent-sessions.log`: `logger()` (set up on first use; a
+  rotating file, 1 MB and three older ones, created 0600 when the first message is written, silent when
+  it cannot be written), `SafeFormatter` (every message through `textsafe.clean`, a traceback indented
+  below it), `debug` (`--debug`: DEBUG level, a copy on stderr), `unexpected` (an exception with its
+  traceback, once), `written`, `close`
 - `src/agent_sessions/journal.py` — the import journal `<state>/imports.jsonl`: `read` (oldest first, the
   records of an old `imports.json` before them, a torn line skipped with a warning), `append` (lock, one
   write on an appending descriptor, fsync), `open_for_append`/`write` for a caller that holds the lock
@@ -49,7 +54,9 @@
   under the state directory's lock, rolled back on any failure), `sweep_staging`
 - `src/agent_sessions/launch.py` — build and run the resume command (platform layer)
 - `src/agent_sessions/api.py` — facade used by the CLI and the TUI: `load_index`, `scan`, `list_sessions`,
-  `status`, `verify`
+  `status`, `verify`, `find_session`, `transcript`, `open_session`, `can_import`, `import_plan`,
+  `import_report`, `import_session`; what goes into the log is written here (scan summary and warnings,
+  imports, launches, unexpected exceptions)
 - `src/agent_sessions/cli.py` — argparse entry; `scan`, `list`, `status`, `verify` done, `tui`, `open`, `import`,
   `show` stubbed
 - `src/agent_sessions/tui/` — Textual front end: `app.py`, `view.py` (pure view logic), `app.tcss` (all styling)
@@ -59,7 +66,8 @@
 - `tests/support.py` — `Sandbox` (fake home, cache, mounts, registry) and `FakeProvider` for the engine tests;
   `write_jsonl`, `claude_transcript` (a minimal transcript written from scratch); child processes for the
   tests that need real ones (`python_child`, `launcher_child`, `finish`, `wait_for`, the slow-import driver
-  `SLOW_IMPORT`)
+  `SLOW_IMPORT`); `state_names`/`drop_state` (the state directory without its log); a temp
+  `AGENT_SESSIONS_STATE` for anything that runs outside a `Sandbox`
 - `tests/test_smoke.py` — imports, CLI skeleton, `make_key`
 - `tests/test_base_helpers.py` — `iter_jsonl`, `open_sqlite_ro`, `parse_ts`, `clean_title`, warnings, model
 - `tests/test_mounts.py` — mountinfo parsing and filtering, env override, `find_mount`
@@ -97,6 +105,9 @@
   databases as one skipped candidate each
 - `tests/test_hostile_values.py` — text that used to cost minutes (unclosed tags, blank lines, an endless
   "time"), `between`, long message ids, the index's bounds on a session's folder, note and title
+- `tests/test_logs.py` — `logs` (nothing created until a message is written, modes, rotation, a log that
+  cannot be written, cleaned messages and tracebacks, `--debug`) and what the facade logs (scan, warnings
+  once per scan, import, launch, unexpected exceptions)
 - `tests/test_journal.py` — `fsutil.lock` (threads, real processes, the lock file that goes again),
   `make_private_dir`, the journal (append and read, torn and foreign lines, the old `imports.json`, failed
   writes), and imports of different sessions started at once in processes of their own
