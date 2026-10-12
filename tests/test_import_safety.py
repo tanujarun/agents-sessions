@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -24,6 +25,7 @@ from support import write_jsonl
 
 from agent_sessions import api, importer
 from agent_sessions.providers.claude import encode_cwd
+from agent_sessions.providers.codex import Codex
 
 OTHER = "0f0f0f0f-1111-4222-8333-444444444444"
 CODEX_ROLLOUT = f"rollout-2026-08-29T13-57-23-{CODEX_WIN}.jsonl"
@@ -320,6 +322,173 @@ class TreeNamesTest(unittest.TestCase):
             self.assertEqual([item.rel for item in files], ["..x/...", "a/b.jsonl"])
             for rel in dirs + [item.rel for item in files]:
                 self.assertTrue(importer._relative_ok(rel), rel)
+
+
+def codex_thread(root, file_id, payload_id, name_line=None) -> Path:
+    """A foreign Codex thread: a rollout named for ``file_id`` whose first
+    line says the thread is ``payload_id``."""
+    turn = {"type": "UserMessage", "content": [{"type": "text", "text": "fix the bug"}]}
+    path = write_jsonl(
+        Path(root)
+        / "sessions"
+        / "2026"
+        / "08"
+        / "29"
+        / f"rollout-2026-08-29T13-57-23-{file_id}.jsonl",
+        [
+            {
+                "timestamp": "2026-08-29T08:31:14.474Z",
+                "ordinal": 0,
+                "type": "session_meta",
+                "payload": {"id": payload_id, "cwd": "F:\\Proj\\My Site", "source": "cli"},
+            },
+            {
+                "timestamp": "2026-08-29T08:31:15.000Z",
+                "ordinal": 1,
+                "type": "event_msg",
+                "payload": {"type": "item_completed", "item": turn},
+            },
+        ],
+    )
+    if name_line is not None:
+        write_jsonl(Path(root) / "session_index.jsonl", [name_line])
+    return path
+
+
+class VerifyAndRollBackTest(unittest.TestCase):
+    """docs/REVIEW.md R-04: an import whose copy does not read back as the
+    planned session leaves nothing behind. The native store already holds
+    sessions and an import record, so "unchanged" means something."""
+
+    FILE_ID = "01a04ca1-6e27-7817-9f54-07105f962073"
+
+    def setUp(self):
+        self.w = World(self, foreign=(), native=("codex",))
+        self.home = self.w.home
+        self.state = Path(os.environ["AGENT_SESSIONS_STATE"])
+        self.state.mkdir()
+        record = {"version": 1, "imports": [{"id": "earlier", "provider": "codex"}]}
+        (self.state / "imports.json").write_text(json.dumps(record), encoding="utf-8")
+        self.foreign = self.w.profile / ".codex"
+        self.native = self.home / ".codex"
+        self.native_index = (self.native / "session_index.jsonl").read_bytes()
+
+    def unchanged(self, before):
+        self.assertEqual(snapshot(self.home, self.state), before)
+        self.assertEqual(sorted(os.listdir(self.state)), ["imports.json"])
+        self.assertEqual((self.native / "session_index.jsonl").read_bytes(), self.native_index)
+        self.assertEqual(
+            [n for n in os.listdir(self.native) if n.startswith(importer.STAGING_PREFIX)], []
+        )
+
+    def good_plan(self) -> importer.ImportPlan:
+        name = {"id": self.FILE_ID, "thread_name": "a name", "updated_at": "2026-08-29T08:31:16Z"}
+        codex_thread(self.foreign, self.FILE_ID, self.FILE_ID, name)
+        index = self.w.scan()
+        plan = api._plan(self.w.session(self.FILE_ID, "foreign", index), index)
+        self.assertEqual(len(plan.appends), 1)
+        return plan
+
+    def test_the_reviews_scenario_leaves_the_native_store_and_the_state_untouched(self):
+        """The rollout is named for one thread and its first line names
+        another."""
+        codex_thread(self.foreign, self.FILE_ID, OTHER)
+        index = self.w.scan()
+        session = self.w.session(OTHER, "foreign", index)  # listed by the id inside
+        before = snapshot(self.home, self.state)
+        with self.assertRaises(api.ImportFailed):
+            api.import_session(session)
+        self.unchanged(before)
+        code_listing = [s.id for s in self.w.scan().sessions if s.origin == "native"]
+        self.assertNotIn(OTHER, code_listing)
+        self.assertNotIn(self.FILE_ID, code_listing)
+
+    def test_a_copy_that_reads_back_as_another_session_is_taken_out_again(self):
+        """The same, past the adapter's own check of the file name: the
+        plan says one id, the copy parses as another. The candidate the copy
+        becomes is *named* after the planned id, which is what the old check
+        looked at."""
+        plan = self.good_plan()
+        codex_thread(self.foreign, self.FILE_ID, OTHER)  # same file name, another id inside
+        before = snapshot(self.home, self.state)
+        with (
+            mock.patch.object(Codex, "import_plan", return_value=plan),
+            self.assertRaises(importer.ImportFailed) as caught,
+        ):
+            Codex().import_session(self.w.session(self.FILE_ID, "foreign"), None)
+        self.assertEqual(
+            caught.exception.reason,
+            f"the copy does not read as session {self.FILE_ID}; it was removed again and "
+            "nothing was left in the native store",
+        )
+        self.unchanged(before)
+
+    def test_the_order_is_place_verify_append_record(self):
+        plan = self.good_plan()
+        seen = {}
+
+        def verify():
+            seen["placed"] = [os.path.isfile(dst) for dst in plan.destinations]
+            seen["index"] = (self.native / "session_index.jsonl").read_bytes()
+            seen["records"] = len(importer.read_provenance())
+
+        importer.execute(plan, verify=verify)
+        self.assertEqual(seen, {"placed": [True], "index": self.native_index, "records": 1})
+        self.assertEqual(len(importer.read_provenance()), 2)
+        added = (self.native / "session_index.jsonl").read_bytes()[len(self.native_index) :]
+        self.assertEqual(json.loads(added)["thread_name"], "a name")
+
+    def test_a_failed_verification_rolls_everything_back(self):
+        plan = self.good_plan()
+        before = snapshot(self.home, self.state)
+        for failure, reason in (
+            (importer.ImportFailed("not the session"), "not the session"),
+            (
+                ValueError("boom"),
+                "the copy could not be read back (ValueError: boom); it was removed again "
+                "and nothing was left in the native store",
+            ),
+            (
+                OSError(5, "Input/output error"),
+                "the copy could not be read back (OSError: [Errno 5] Input/output error); "
+                "it was removed again and nothing was left in the native store",
+            ),
+        ):
+            with self.assertRaises(importer.ImportFailed) as caught:
+                importer.execute(plan, verify=mock.Mock(side_effect=failure))
+            self.assertEqual(caught.exception.reason, reason)
+            self.unchanged(before)
+
+    def test_directories_made_for_the_import_are_removed_too(self):
+        """Nothing native and no state directory yet: none is left."""
+        shutil.rmtree(self.native)
+        shutil.rmtree(self.state)
+        plan = self.good_plan()
+        self.native_index = b""
+        with self.assertRaises(importer.ImportFailed):
+            importer.execute(plan, verify=mock.Mock(side_effect=importer.ImportFailed("no")))
+        self.assertFalse(self.native.exists())
+        self.assertFalse(self.state.exists())
+        # And the import that verifies makes them and leaves them.
+        native = Codex().import_session(
+            self.w.session(self.FILE_ID, "foreign"), api.load_index().pathmap
+        )
+        self.assertEqual((native.id, native.title), (self.FILE_ID, "a name"))
+        self.assertTrue((self.state / "imports.json").is_file())
+
+    def test_read_back(self):
+        plan = self.good_plan()
+        with self.assertRaises(importer.ImportFailed):
+            Codex().read_back(plan)  # nothing is in place yet
+        importer.execute(plan)
+        copy = Codex().read_back(plan)
+        self.assertEqual((copy.id, copy.files), (self.FILE_ID, plan.destinations))
+        for wrong in (
+            dataclasses.replace(plan, session_id=OTHER),
+            dataclasses.replace(plan, units=[*plan.units, importer.Unit(plan.units[0].dst + ".x")]),
+        ):
+            with self.assertRaises(importer.ImportFailed):
+                Codex().read_back(wrong)
 
 
 if __name__ == "__main__":

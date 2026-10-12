@@ -139,20 +139,45 @@ class Provider:
         native copy as ``parse`` reads it (the index fills the other fields).
 
         ``progress(done_bytes, total_bytes)`` is called while copying. May
-        raise ``NotSupported(reason)``, ``ImportFailed``, or
-        ``importer.Exists`` when the id is already in the native store.
+        raise ``NotSupported(reason)`` or ``ImportFailed`` (``importer.Exists``
+        when the id is already in the native store). The copy is read back
+        (``read_back``) while the import can still be undone: when it is not
+        the session that was planned, nothing of it stays in the native
+        store.
         """
         plan = self.import_plan(s, pathmap)
-        importer.execute(plan, progress)
+        verified: list[Session] = []
+        importer.execute(plan, progress, lambda: verified.append(self.read_back(plan)))
+        try:
+            return self.read_back(plan)  # again: an appended line can change what is read
+        except importer.ImportFailed:
+            return verified[0]
+
+    def read_back(self, plan: importer.ImportPlan) -> Session:
+        """The session an import has put into the native store, read the way
+        ``parse`` reads any other.
+
+        Every candidate of the native store that is made of files the plan
+        put in place is parsed. The result must have the plan's session id
+        (the id that is parsed, not the candidate's name for it) and must be
+        made of everything that was put in place. Raises ``ImportFailed``
+        otherwise.
+        """
         store = Store(self.name, plan.native_root, "native")
-        for candidate in self.candidates(store):
-            if candidate.id_hint == plan.session_id:
-                copy = self.parse(store, candidate)
-                if copy is not None:
-                    return copy
+        placed = plan.destinations
+        for candidate in sorted(self.candidates(store), key=lambda c: c.id_hint):
+            if not any(
+                path == dst or path.startswith(dst + os.sep)
+                for path in candidate.paths
+                for dst in placed
+            ):
+                continue
+            copy = self.parse(store, candidate)
+            if copy is not None and copy.id == plan.session_id and set(placed) <= set(copy.files):
+                return copy
         raise importer.ImportFailed(
-            "the files were copied but the copy does not read as a session: "
-            + ", ".join(plan.destinations)
+            f"the copy does not read as session {plan.session_id}; it was removed again and "
+            "nothing was left in the native store"
         )
 
 

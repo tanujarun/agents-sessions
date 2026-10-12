@@ -17,10 +17,14 @@ the rules that hold for every provider, ``execute`` carries the plan out:
   native store (same filesystem, outside the directories the tool lists),
   then moved into place with ``os.replace``, in plan order, so the piece that
   makes the session visible to the tool arrives last and complete;
-- on any failure the staging directory, the pieces already in place and the
-  directories made for them are removed (a line appended to a native file is
-  the one thing that cannot be taken back, so appends come after everything
-  that can fail but the final rename of the import record);
+- once the files are in place the copy is read back the way any session of
+  the native store is read, and must be the session that was planned (the
+  ``verify`` step of ``execute``);
+- on any failure, a failed read-back included, the staging directory, the
+  pieces already in place and the directories made for them are removed (a
+  line appended to a native file is the one thing that cannot be taken back,
+  so appends come after everything that can fail but the final rename of the
+  import record);
 - a record of the import is added to ``<state dir>/imports.json``, written to
   a temp file and renamed.
 
@@ -482,7 +486,7 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _make_dirs(path: str, made: list[str]) -> None:
+def _make_dirs(path: str, made: list[str], mode: int = DIR_MODE) -> None:
     """``mkdir -p``, remembering each directory this call created."""
     missing = []
     current = os.path.abspath(path)
@@ -493,7 +497,7 @@ def _make_dirs(path: str, made: list[str]) -> None:
             break
         current = parent
     for directory in reversed(missing):
-        os.mkdir(directory, DIR_MODE)
+        os.mkdir(directory, mode)
         made.append(directory)
 
 
@@ -642,8 +646,20 @@ def sweep_staging(native_root: StrPath) -> list[str]:
     return removed
 
 
-def execute(plan: ImportPlan, progress: Progress | None = None) -> dict:
+def execute(
+    plan: ImportPlan,
+    progress: Progress | None = None,
+    verify: Callable[[], object] | None = None,
+) -> dict:
     """Carry out a plan and return its provenance record.
+
+    The order is: stage every file, move the units into place, ``verify``,
+    append, write the record. ``verify()`` is the caller's check that what
+    now lies in the native store reads back as the session that was planned
+    (``Provider.import_session`` passes one); it raises when it does not.
+    Then, as after any other failure, everything this import put in place is
+    taken out again, the directories it made included: no line is appended
+    and no record is written.
 
     ``progress(done_bytes, total_bytes)`` is called as the copy advances.
     Raises ``Exists`` or ``ImportFailed``; after a failure nothing of this
@@ -690,7 +706,7 @@ def execute(plan: ImportPlan, progress: Progress | None = None) -> dict:
         # last step that can fail for lack of space is behind us.
         record = _record(plan)
         path = provenance_file()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _make_dirs(os.path.dirname(path), made_dirs, 0o777)  # as makedirs would: the umask decides
         record_tmp = f"{path}.{os.getpid()}.tmp"
         with open(record_tmp, "w", encoding="utf-8") as fh:
             json.dump(
@@ -709,6 +725,16 @@ def execute(plan: ImportPlan, progress: Progress | None = None) -> dict:
                 raise Exists([unit.dst])
             os.replace(target, unit.dst)
             placed.append(unit.dst)
+        if verify is not None:
+            try:
+                verify()
+            except ImportFailed:
+                raise
+            except Exception as exc:  # whatever stopped the copy from being read back
+                raise ImportFailed(
+                    f"the copy could not be read back ({type(exc).__name__}: {exc}); it was "
+                    "removed again and nothing was left in the native store"
+                ) from exc
         for addition in plan.appends:
             _append(addition)
         os.replace(record_tmp, path)

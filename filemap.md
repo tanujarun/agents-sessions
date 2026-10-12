@@ -85,7 +85,8 @@
   caps of files read whole, deeply nested JSON
 - `tests/test_import_safety.py` — what keeps an import inside the native store: `importer.contained`
   (destinations, paths below a unit, appended files, symbolic links), the names each adapter takes from the
-  source
+  source; the read-back of a placed copy (`Provider.read_back`, the `verify` step of `importer.execute`) and
+  the roll back when it fails
 - `src/agent_sessions/tui/__init__.py` — package marker; imports no Textual; `run()`, the "run ./install.sh" hint
 - `src/agent_sessions/tui/__main__.py` — `python -m agent_sessions.tui`: run the app, exit 1 with the hint when
   Textual is missing
