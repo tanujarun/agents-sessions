@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fixture_world import AGY_NO_CWD, CLAUDE_WIN, World
+from fixture_world import AGY_NO_CWD, CLAUDE_NATIVE, CLAUDE_WIN, GROK_NATIVE, World
 from support import REPO, Sandbox, claude_transcript
 
 from agent_sessions import api, cli, launch
@@ -27,7 +27,9 @@ DOC = REPO / "docs" / "JSON.md"
 # What each command prints, by the name of its table. Changing an entry is
 # changing the contract.
 OUTPUTS = {"list": "array of Session", "scan": "ScanSummary", "status": "Status"}
+EXPORT_LINE = "ExportLine"  # what every line of `export --format json` is
 TABLES = {
+    EXPORT_LINE,
     "Session",
     "ScanSummary",
     "Mount",
@@ -208,6 +210,12 @@ class ContractTest(unittest.TestCase):
         self.raw = out
         return json.loads(out)
 
+    def export_lines(self, session_id) -> list[str]:
+        code, out, err = run("export", session_id, "--format", "json")
+        self.assertEqual((code, err), (0, ""), err)
+        self.assertTrue(out.endswith("\n"))
+        return out.splitlines()
+
     def checked(self, value, command) -> Checker:
         checker = Checker(self, self.tables)
         checker.check(value, OUTPUTS[command])
@@ -231,6 +239,13 @@ class ContractTest(unittest.TestCase):
             seen |= checker.seen
             null |= checker.null
             filled |= checker.filled
+        for session_id in (CLAUDE_NATIVE, GROK_NATIVE):  # with times, and without
+            for line in self.export_lines(session_id):
+                checker = Checker(self, self.tables)
+                checker.check(json.loads(line), EXPORT_LINE)
+                seen |= checker.seen
+                null |= checker.null
+                filled |= checker.filled
         # Nothing in the document went unchecked: an object of every table...
         self.assertEqual(seen, TABLES)
         # ... every field with a value, and these nullable ones both ways.
@@ -247,6 +262,7 @@ class ContractTest(unittest.TestCase):
                 ("StatusMount", "walk"),
                 ("ProviderStatus", "installed"),
                 ("Tool", "path"),
+                (EXPORT_LINE, "ts"),
             },
             null,
         )
@@ -316,6 +332,23 @@ class ContractTest(unittest.TestCase):
         )
         only = self.json("list", "--provider", "codex", "--json")
         self.assertEqual(only, [row for row in listing if row["provider"] == "codex"])
+
+    def test_export_lines(self):
+        for session_id in (CLAUDE_NATIVE, GROK_NATIVE):
+            lines = self.export_lines(session_id)
+            turns = list(api.transcript(session_id))
+            self.assertEqual([json.loads(line) for line in lines], [t._asdict() for t in turns])
+            self.assertTrue(lines)
+            for line in lines:
+                row = json.loads(line)
+                # One object, its keys in order, on one line that is not indented.
+                self.assertEqual(keys_in_order(line), [["role", "text", "ts"]])
+                self.assertEqual(line, json.dumps(row, ensure_ascii=False, sort_keys=True))
+                self.assertIn(row["role"], ("user", "assistant", "tool"))
+                if row["ts"] is not None:
+                    self.assertRegex(row["ts"], SESSION_TIME)
+            # The same index gives the same bytes.
+            self.assertEqual(self.export_lines(session_id), lines)
 
     def test_scan(self):
         deep, quick = self.scan_deep, self.scan_quick

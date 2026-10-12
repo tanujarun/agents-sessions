@@ -6,7 +6,8 @@ output against them (the exact set of keys, the type of every value, the
 orderings), so a field cannot be added, renamed, dropped or change its type
 without this file changing with it.
 
-Three commands have a JSON form: `list`, `scan` and `status`.
+Three commands have a JSON form: `list`, `scan` and `status`. A fourth,
+`export --format json`, prints JSON lines; it has its own section at the end.
 
 ## Rules for every output
 
@@ -269,6 +270,35 @@ scanned. `mount` and `forget` take any of `label`, `fs_label`, `letter`,
 |---|---|---|
 | `tool` | string | the command's name |
 | `path` | string | the command on PATH |
+
+## `export --format json`
+
+Output: one `ExportLine` per line
+
+The transcript of one session as JSON lines: one object per turn, oldest
+first, each on a line of its own, and nothing else. It is not one document
+like the outputs above, so that a transcript of any size can be read line by
+line; an empty transcript prints nothing. What differs from the rules above:
+a line is not indented (the keys are still in alphabetical order, with `, `
+and `: ` between the parts), and no line holds a line break of its own: one
+in a turn's text is the escape `\n`.
+
+The data is exact, as above: `text` is what the reader of that provider took
+from the store, and a character a terminal would act on is a `\uXXXX`
+escape. Text that is not Unicode (half of a surrogate pair out of a store's
+own JSON) is written as its `\udXXX` escape, which parses to the same text.
+With `-o FILE` the same lines are written to the file instead (created for
+the user alone; a file that exists is replaced only with `--force`), and
+stdout stays empty. `export` without `--format json` prints Markdown for a
+person, which is cleaned text and not part of this contract.
+
+### ExportLine
+
+| field | type | meaning |
+|---|---|---|
+| `role` | string | `user`, `assistant`, or `tool` for a tool call |
+| `text` | string | what was said, exactly; for a `tool` line the name of the tool that was called (its input and output are not exported) |
+| `ts` | string or null | when the turn was made, `YYYY-MM-DDTHH:MM:SS.ffffffZ`; null when the store records no time for it (Grok records none) |
 
 ## Commands without a JSON form
 

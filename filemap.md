@@ -3,8 +3,8 @@
 - `CLAUDE.md` — rules and commands for every agent working here
 - `docs/SPEC.md` — goals, architecture, CLI contract, TUI; phase 2 (production pass): threat model, tool
   detection, journal, logs, exit codes
-- `docs/JSON.md` — every `--json` output of the CLI, field by field, and its ordering; pinned by
-  `tests/test_json_contract.py`
+- `docs/JSON.md` — every `--json` output of the CLI, field by field, and its ordering, and the lines of
+  `export --format json`; pinned by `tests/test_json_contract.py`
 - `docs/REVIEW.md` — the production-readiness review (findings R-01 to R-14)
 - `docs/PLAN.md` — task list and status
 - `docs/FORMATS.md` — per-provider on-disk formats, resume commands, import recipes, store discovery,
@@ -86,20 +86,25 @@
   and the disk; refuses a copy that was used since, a damaged record, a path outside the native store),
   `undo` (plan and removal under the state directory's lock, files then empty directories, an `undo` record
   in the journal)
+- `src/agent_sessions/export.py` — a transcript as a document, made piece by piece: `markdown` (header, a
+  section per turn, a line per tool call; cleaned text), `json_lines` (one object per turn, exact data),
+  and `write` (a document into a file: temp file beside it, then moved into place, 0600, nothing replaced
+  unless asked)
 - `src/agent_sessions/launch.py` — build and run the resume command (platform layer): `plan`, `launch`, the
   `starter`/`notifier` hooks; and `tool_state` (`ToolState`: is the tool behind a command installed, or is
   the command a wrapper that would install it; read from the wrapper's text and mise's installs, no
   program run, remembered per run, `forget_tools`)
 - `src/agent_sessions/api.py` — facade used by the CLI and the TUI: `load_index`, `scan`, `list_sessions`,
-  `status`, `verify`, `find_session`, `transcript`, `open_session`, `import_options` (`ImportOptions`: what an
+  `status`, `verify`, `find_session`, `transcript`, `export_transcript` and `export_file` (the transcript as
+  Markdown or JSON lines; never into a session store), `open_session`, `import_options` (`ImportOptions`: what an
   import of a session can be), `can_import`, `import_plan`, `import_report`, `import_session` (each with a
   chosen folder and the experimental flag), `unimport` (`UnimportReport`); the drives: `volumes`, `find_volume`, `mount_drive`, `forget_drive`,
   `set_letter`, `remove_letter`; what needs a session's files refuses an offline one (`Offline`); what goes
   into the log is written here (scan summary and warnings, imports, undos, launches, mounts, forgotten
   drives, unexpected exceptions)
 - `src/agent_sessions/cli.py` — argparse entry: `scan`, `list`, `open`, `import` (`--to`, `--experimental`),
-  `unimport`, `show`, `status`, `verify`, `mount`, `forget`, `map` (`tui` is started by the launcher, not
-  here), the global flags `--version` and `--debug`, the output helpers that make text safe (`_ask` for a
+  `unimport`, `show`, `export` (`-o`, `--format`, `--force`), `status`, `verify`, `mount`, `forget`, `map`
+  (`tui` is started by the launcher, not here), the global flags `--version` and `--debug`, the output helpers that make text safe (`_ask` for a
   question), and what ends a command:
   exit codes, Ctrl-C and SIGTERM/SIGHUP (`_signals`), the `internal error` line
 - `src/agent_sessions/tui/` — Textual front end: `app.py`, `view.py` (pure view logic), `app.tcss` (all styling)
@@ -151,13 +156,14 @@
 - `tests/fixtures/claude/not-a-store/`, `tests/fixtures/gemini/native-no-chats/` — negative cases for `is_store`
 - `scratch/` — throwaway investigation scripts (git-ignored): `walk.py`, `*_count.py`, `drives.py`, `build_fixtures.py`
 - `src/agent_sessions/errors.py` — `ApiError`, `NotFound`, `LaunchFailed`, `ImportFailed`, `UndoFailed` (an
-  import could not be taken back), `Offline` (the drive of a session is not mounted), `MountFailed`
-  (re-exported by `api`)
+  import could not be taken back), `ExportFailed` (a transcript could not be written to a file), `Offline`
+  (the drive of a session is not mounted), `MountFailed` (re-exported by `api`)
 - `tests/fixture_world.py` — `World`: fake home plus two fake drives built from the fixtures, launches and
   notifications recorded; `tree_state`, `age_access_times`, `files_below`
 - `tests/test_launch.py` — launch plans per provider, folder gone, foreign refused, `--here`, hooks
-- `tests/test_json_contract.py` — every `--json` output against the tables of `docs/JSON.md`: key sets,
-  types, nullability, the documented orderings, escapes, byte-identical repeats
+- `tests/test_json_contract.py` — every `--json` output and the lines of `export --format json` against the
+  tables of `docs/JSON.md`: key sets, types, nullability, the documented orderings, escapes, byte-identical
+  repeats
 - `tests/test_tools.py` — `launch.tool_state` on a fake PATH and a fake mise tree: the wrappers' text and
   what is not one, where the executable may lie, the install directory's name, `MISE_DATA_DIR` and
   `XDG_DATA_HOME`, the per-run cache, and the answer in the index, `status` and `launch.plan`
@@ -171,6 +177,10 @@
 - `tests/test_resume_folder.py` — an imported copy is resumed in the folder of its import: the chosen folder
   (Claude, Antigravity), the mapped one while the source drive is away, an import that was undone, records
   and journals that are malformed or unreadable (no failure, no warning), the journal read once per listing
+- `tests/test_export.py` — `export`: the Markdown and the JSON lines (structure, what is not known, hostile
+  values, laziness), `export.write` (private, whole or not at all, nothing replaced unless asked, paths
+  that will not do), the facade on every provider's fixture, offline sessions, no write into a session
+  store, the command
 - `tests/test_importer.py` — imports per provider (bytes, rewrites, idempotence, collisions, roll back, free
   space, provenance, source times), `encode_cwd`, refusals
 - `tests/test_import_folder.py` — imports into a folder the user chose (`target`, `import --to`): what is

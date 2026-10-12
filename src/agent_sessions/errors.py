@@ -29,6 +29,10 @@ class UndoFailed(ApiError):
     refused."""
 
 
+class ExportFailed(ApiError):
+    """A transcript could not be exported to a file (``export.write``)."""
+
+
 class Offline(ApiError):
     """What was asked needs the files of a session whose drive is not
     mounted."""
@@ -40,6 +44,7 @@ class MountFailed(ApiError):
 
 __all__ = [
     "ApiError",
+    "ExportFailed",
     "ImportFailed",
     "LaunchFailed",
     "MountFailed",

@@ -620,9 +620,18 @@ Terminal: `omarchy-launch-tui` when present; else `xdg-terminal-exec`; else
 For a session that cannot be resumed where it is wanted (another provider's
 tool, an unimportable provider, a folder that is gone):
 
-- `export <key> [-o FILE] [--format md|json]`: the transcript as Markdown
-  (a header with title, tool, id, folder, dates; then `## User` /
-  `## Assistant` sections and one line per tool call) or as JSON lines.
+- `export <key> [-o FILE] [--format md|json] [--force]`: the transcript as
+  Markdown (a header with title, tool, id, folder, dates, message count and
+  what exported it; then a `## User` / `## Assistant` section per turn, with
+  its time when known, and one line `> tool: <name>` per tool call) or as
+  JSON lines (`role`, `text`, `ts`; JSON.md). It is made lazily, turn by
+  turn. Markdown is cleaned text (`textsafe.clean`, line breaks and tabs of
+  a turn kept); the JSON lines are exact data with the same characters
+  escaped. Without `-o` it goes to stdout. `-o FILE` writes a temp file
+  beside `FILE` and moves it into place, mode 0600; a file that exists is
+  refused unless `--force` (and is then replaced, never written through),
+  and so is a path inside a session store, forced or not. A session whose
+  drive is not mounted is refused (`Offline`).
 - `continue <key> [--with TOOL] [--in DIR] [--dry-run] [--here]`: writes the
   Markdown export to `<state>/handoff/<provider>-<id>.md` (mode 0600,
   replaced atomically; files older than 30 days are swept), then starts
@@ -644,7 +653,7 @@ agent-sessions mount <drive>            agent-sessions forget <drive> [--yes]
 agent-sessions map [LETTER: DIR | --remove LETTER:]
 agent-sessions import <key> [--to DIR] [--experimental] [--open] [--dry-run]
 agent-sessions unimport <key> [--force] [--dry-run] [--yes]
-agent-sessions export <key> [-o FILE] [--format md|json]
+agent-sessions export <key> [-o FILE] [--format md|json] [--force]
 agent-sessions continue <key> [--with TOOL] [--in DIR] [--dry-run] [--here]
 ```
 

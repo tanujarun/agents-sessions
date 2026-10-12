@@ -118,6 +118,30 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("show", help="plain-text transcript to stdout")
     p.add_argument("key", help=key_help)
 
+    p = sub.add_parser(
+        "export",
+        help="the transcript as Markdown or JSON lines",
+        description=(
+            "Print the transcript of a session as a document: Markdown (a header, then a "
+            "section per turn and a line per tool call) or JSON lines (one object per turn: "
+            "role, text, ts). With -o it is written to a file that only you can read."
+        ),
+    )
+    p.add_argument("key", help=key_help)
+    p.add_argument(
+        "-o",
+        dest="output",
+        metavar="FILE",
+        help="write to this file instead of stdout; a file that exists is not replaced",
+    )
+    p.add_argument(
+        "--format",
+        choices=api.EXPORT_FORMATS,
+        default=api.EXPORT_FORMATS[0],
+        help="md: Markdown (the default); json: JSON lines",
+    )
+    p.add_argument("--force", action="store_true", help="with -o: replace a file that exists")
+
     p = sub.add_parser("status", help="mounts, stores, counts per provider, warnings")
     p.add_argument("--json", action="store_true", help="JSON output")
 
@@ -196,6 +220,13 @@ def _json(value: object) -> None:
     """Print a value as JSON: exact data, with the characters a terminal
     would act on written as ``\\uXXXX`` escapes."""
     document = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False)
+    _emit(sys.stdout, textsafe.json_escape(document))
+
+
+def _json_line(document: str) -> None:
+    """Print one line of JSON text the engine made (``export --format
+    json``): exact data, and like ``_json`` with nothing in it a terminal
+    would act on."""
     _emit(sys.stdout, textsafe.json_escape(document))
 
 
@@ -833,6 +864,24 @@ def _show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _export(args: argparse.Namespace) -> int:
+    if args.output is not None:
+        # ``~`` and a relative path are this command's to resolve: the engine
+        # takes an absolute path and nothing else.
+        path = os.path.abspath(os.path.expanduser(args.output))
+        size = api.export_file(args.key, path, fmt=args.format, force=args.force)
+        _err(f"wrote {path} ({_size(size)})")
+        return 0
+    # Refused before anything is printed, when it is; then piece by piece.
+    pieces = api.export_transcript(args.key, fmt=args.format)
+    for piece in pieces:
+        if args.format == "json":
+            _json_line(piece)
+        else:
+            _out(piece, multiline=True)
+    return 0
+
+
 def _not_implemented(args: argparse.Namespace) -> int:
     _err(f"{args.command}: not implemented")
     return 1
@@ -857,6 +906,7 @@ _COMMANDS = {
     "import": _import,
     "unimport": _unimport,
     "show": _show,
+    "export": _export,
     "mount": _mount,
     "forget": _forget,
     "map": _map,

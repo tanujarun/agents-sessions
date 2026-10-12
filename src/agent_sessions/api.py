@@ -1,6 +1,6 @@
 """The facade the CLI and the TUI call: load, scan, list, status, verify,
-find, open, import, unimport, transcript, and the drives: volumes, mount,
-forget, the drive letters.
+find, open, import, unimport, transcript, export, and the drives: volumes,
+mount, forget, the drive letters.
 
 What is worth a line in the log is written here, so both front ends log
 alike (``logs``): the summary and the warnings of a scan, an import or an
@@ -22,12 +22,14 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
 from . import discover, importer, launch, logs, pathmap
+from . import export as exporting
 from . import index as index_mod
 from . import mounts as mounts_mod
 from . import providers as registry
 from . import unimport as undoing
 from .errors import (
     ApiError,
+    ExportFailed,
     ImportFailed,
     LaunchFailed,
     MountFailed,
@@ -49,6 +51,7 @@ if TYPE_CHECKING:
 
 # Agent CLIs that may be installed but have no adapter (SPEC non-goals).
 NO_READER_TOOLS = ("copilot", "crush", "cursor-agent", "opencode")
+EXPORT_FORMATS = exporting.FORMATS  # what ``export_transcript`` takes as ``fmt``
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -460,6 +463,77 @@ def transcript(ref: Session | str, index: Index | None = None) -> Iterator[Turn]
     session = find_session(ref, index)
     _need_files(session)
     return iter(_provider(session).transcript(session))
+
+
+@_logged
+def export_transcript(
+    ref: Session | str, fmt: str = exporting.MARKDOWN, index: Index | None = None
+) -> Iterator[str]:
+    """The transcript of a session as a document, made lazily (it can be
+    large): pieces of one or more whole lines, each without the line break
+    that ends it.
+
+    ``fmt="md"``: Markdown. A header (the title, then the tool, the session
+    id, the folder as recorded, the times, the message count and what
+    exported it), a ``## User`` or ``## Assistant`` section per turn and a
+    line ``> tool: <name>`` per tool call; all of it text made safe to show
+    (``textsafe.clean``). ``fmt="json"``: one JSON object per turn and line
+    (``role``, ``text``, ``ts``), exact data (docs/JSON.md).
+
+    Raises at once, before anything is read: ``NotFound``, ``Offline`` for a
+    session whose drive is not mounted, ``ExportFailed`` for a format that
+    is neither."""
+    if fmt not in exporting.FORMATS:
+        raise ExportFailed(
+            f"unknown export format {fmt!r}; it is one of: {', '.join(exporting.FORMATS)}"
+        )
+    session = find_session(ref, index)
+    _need_files(session)
+    provider = _provider(session)
+    turns = provider.transcript(session)
+    if fmt == exporting.JSON_LINES:
+        return exporting.json_lines(turns)
+    return exporting.markdown(session, provider.label or provider.name, turns)
+
+
+def _in_a_store(path: str, index: Index) -> str | None:
+    """The root of the session store ``path`` lies in, or None. Whatever
+    links lead there: both are compared as the places they really are."""
+    real = os.path.realpath(path)
+    roots = [store.root for store in index.stores] + [store.root for store in index.skipped]
+    for root in sorted(roots):
+        there = os.path.realpath(root)
+        if real == there or real.startswith(there.rstrip(os.sep) + os.sep):
+            return root
+    return None
+
+
+@_logged
+def export_file(
+    ref: Session | str,
+    path: str,
+    fmt: str = exporting.MARKDOWN,
+    force: bool = False,
+    index: Index | None = None,
+) -> int:
+    """Write ``export_transcript`` to the file ``path`` and return its size
+    in bytes. The file is the user's own choice: an absolute path in a
+    directory that exists. It is written whole or not at all (a temp file
+    beside it, then moved into place), for the user alone (0600).
+
+    Raises ``ExportFailed`` when the file exists and ``force`` is not set
+    (with it, a regular file is replaced), for a path that will not do, and
+    for one inside a session store, native or not, forced or not: nothing
+    here writes into a store. And what ``export_transcript`` raises."""
+    index = index if index is not None else load_index()
+    pieces = export_transcript(ref, fmt, index)
+    if isinstance(path, str) and path and "\0" not in path and os.path.isabs(path):
+        store = _in_a_store(path, index)
+        if store is not None:
+            raise ExportFailed(
+                f"{os.path.normpath(path)} is inside the session store {store}; nothing was written"
+            )
+    return exporting.write(path, pieces, overwrite=force)
 
 
 @_logged
@@ -1068,8 +1142,10 @@ def remove_letter(letter: str) -> str:
 
 
 __all__ = [
+    "EXPORT_FORMATS",
     "NO_READER_TOOLS",
     "ApiError",
+    "ExportFailed",
     "ImportFailed",
     "ImportOptions",
     "ImportReport",
@@ -1084,6 +1160,8 @@ __all__ = [
     "UnimportReport",
     "cache_file",
     "can_import",
+    "export_file",
+    "export_transcript",
     "find_session",
     "find_volume",
     "forget_drive",
