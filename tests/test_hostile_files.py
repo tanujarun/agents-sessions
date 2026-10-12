@@ -409,23 +409,46 @@ class ReadLinesTest(TempCase):
 
 @unittest.skipUnless(POSIX, "needs resource limits")
 class HugeLineTest(unittest.TestCase):
-    """The review's reproduction: one line of 200 MB."""
+    """The review's reproduction: one line of 200 MB.
+
+    What is measured is the scanning process's own peak: ``VmHWM`` of
+    ``/proc/self/status``. It belongs to the address space, so it starts
+    again when the child becomes a fresh Python (``ru_maxrss`` does not: it
+    survives ``fork`` and ``exec`` and reports the size of the test runner).
+    What is asserted is the difference to a child that scans the same store
+    without the long line, so the interpreter's own size does not count."""
 
     LINE = 200 * MB
-    CEILING_KB = 100 * 1024  # peak resident memory of the scanning process
+    # What the long line may add to the scan's peak, in kB. Measured: about
+    # 33 MB with the cap (one line of JSONL_LINE_MAX is the most that is
+    # held) and more than 200 MB when a line is held whole.
+    EXTRA_KB = 96 * 1024
+    BALLAST = 200 * MB  # held by the test runner in the test of the measure
+    PLAIN_KB = 96 * 1024  # above a scan of one small session (about 25 MB)
 
     DRIVER = (
-        "import json, resource, sys\n"
+        "import json, sys\n"
         f"sys.path.insert(0, {str(REPO / 'src')!r})\n"
         "from agent_sessions import api\n"
         "summary = api.scan(deep=True)\n"
-        "peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
+        "peak = None\n"
+        "try:\n"
+        "    with open('/proc/self/status', encoding='ascii') as fh:\n"
+        "        for line in fh:\n"
+        "            if line.startswith('VmHWM:'):\n"
+        "                peak = int(line.split()[1])\n"
+        "except (OSError, ValueError):\n"
+        "    pass\n"
         "print(json.dumps({'peak_kb': peak, 'sessions': summary['sessions'],\n"
         "                  'warnings': summary['warnings']}))\n"
     )
+    NO_PEAK = "no VmHWM in /proc/self/status: the scan's own peak cannot be measured"
 
     def setUp(self):
         self.w = World(self, foreign=())
+        self.path = claude_transcript(
+            self.w.profile / ".claude", A, "C:\\Users\\user", prompt="hello"
+        )
 
     def measure(self) -> dict:
         try:
@@ -443,7 +466,7 @@ class HugeLineTest(unittest.TestCase):
         return json.loads(done.stdout)
 
     def test_scan_memory_stays_bounded(self):
-        path = claude_transcript(self.w.profile / ".claude", A, "C:\\Users\\user", prompt="hello")
+        path = self.path
         baseline = self.measure()
         self.assertEqual((baseline["sessions"], baseline["warnings"]), (1, []))
         head, tail = b'{"type":"user","message":{"role":"user","content":"', b'"}}\n'
@@ -457,12 +480,31 @@ class HugeLineTest(unittest.TestCase):
         result = self.measure()
         self.assertEqual(result["sessions"], 1)
         self.assertTrue(warned(result, path, "a line longer than"), result["warnings"])
-        self.assertLess(result["peak_kb"], self.CEILING_KB, result)
-        self.assertLess(result["peak_kb"] * 1024, self.LINE // 2)
         # The session is still the one its other lines describe.
         index = api.load_index()
         (session,) = index.sessions
         self.assertEqual((session.title, session.messages), ("hello", 3))
+        if baseline["peak_kb"] is None or result["peak_kb"] is None:
+            self.skipTest(self.NO_PEAK)
+        extra = result["peak_kb"] - baseline["peak_kb"]
+        self.assertLess(extra, self.EXTRA_KB, (baseline, result))
+        self.assertLess(self.EXTRA_KB * 1024, self.LINE // 2)
+
+    def test_the_measure_is_the_scan_s_own_peak(self):
+        """Memory the test runner holds is not in what the child reports
+        (docs/AUDIT.md A-07)."""
+        ballast = bytearray(b"\x01") * self.BALLAST  # written, so resident
+        try:
+            result = self.measure()
+        finally:
+            held = len(ballast)
+            del ballast
+        self.assertEqual(held, self.BALLAST)
+        self.assertEqual((result["sessions"], result["warnings"]), (1, []))
+        if result["peak_kb"] is None:
+            self.skipTest(self.NO_PEAK)
+        self.assertLess(result["peak_kb"], self.PLAIN_KB, result)
+        self.assertLess(self.PLAIN_KB * 1024, self.BALLAST // 2)
 
 
 class BoundedTextTest(TempCase):
