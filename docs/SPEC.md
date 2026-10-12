@@ -1,5 +1,11 @@
 # agent-sessions — spec
 
+This document has two parts. Phase 1 (below) is the design the first version was built
+to; "Phase 2: production pass" (further down) is what was changed and added afterwards,
+and it wins wherever the two differ. Phase 1 text is kept because it explains the
+decisions; where phase 2 changed a statement, the statement is brought up to date or
+marked `(superseded: see Phase 2 …)`.
+
 ## Goal
 
 One place that finds every saved AI coding-agent session on this machine, on
@@ -15,8 +21,10 @@ Antigravity conversation, a Gemini CLI chat).
 
 - Visual polish of the TUI beyond a clear, readable layout.
 - Any change to the Omarchy shell or the SAO menu (`tanuj.menu`).
-- Readers for opencode, cursor-agent, copilot, crush: installed, but no session
-  exists on any drive to test against. `status` reports them as "no reader".
+- Readers for opencode, cursor-agent, copilot, crush: no session exists on any
+  drive to test against. `status` reports the installed ones as "no reader".
+  (Phase 1 took all four for installed; three are wrappers of tools that are not:
+  see Phase 2 "Non-goals" and "Tool detection".)
 - Resuming a session in place inside a store on another drive.
 - Cloud/web sessions (claude.ai, ChatGPT), desktop-app chat history.
 - The Windows front end. It comes later; the core must not block it (see Portability).
@@ -27,7 +35,8 @@ Python 3 (system is 3.14; code must run on 3.11+). The engine (everything but
 `tui/`) is **standard library only** and runs on the system Python. The TUI
 uses **Textual** (cross-platform, styleable, so the later look-and-feel work
 and the Windows variant build on it), installed by `install.sh` into a
-project-local `.venv`; nothing is installed system-wide. Tests with `unittest`
+project-local `.venv`; nothing is installed system-wide. (Phase 2 "Packaging":
+`pip install '.[tui]'` works too.) Tests with `unittest`
 (TUI tests use Textual's headless `run_test()` pilot). No daemon.
 
 ## Facts already established (2026-10-12)
@@ -44,40 +53,59 @@ providers under `/run/media/tanuj/22EEA841EEA80F5B/Users/arunt/`; none on the
 other three volumes today. Drive letters `C:` = `22EEA841EEA80F5B`, `D:` =
 `No Other Way`, `F:` = `Zephyro`.
 
-Provider capabilities that follow from FORMATS.md:
+Provider capabilities that follow from FORMATS.md, as they are after phase 2:
 
-| Provider | List | Resume (native) | Import |
-|---|---|---|---|
-| Claude | yes | `claude --resume <id>` | copy-only |
-| Codex | yes | `codex resume <id>` | copy + rewrite cwd in two record types |
-| Grok | yes | `grok --resume <id>` | only when the mapped cwd is `[A-Za-z0-9/ ]`, else NotSupported |
-| Antigravity | yes | `agy --conversation <id>` | NotSupported |
-| Gemini | yes | not launchable: the real CLI is not installed | NotSupported |
+| Provider | List | Resume (native) | Import | Continue as new |
+|---|---|---|---|---|
+| Claude | yes | `claude --resume <id>` | copy-only | `claude <prompt>` |
+| Codex | yes | `codex resume <id>` | copy + rewrite cwd in two record types (four fields) | `codex <prompt>` |
+| Grok | yes | `grok --resume <id>` | copy; the group directory is named by the tool's own rule | `grok <prompt>` |
+| Antigravity | yes | `agy --conversation <id>` | copy-only, only as an experimental import | `agy --prompt-interactive <prompt>` |
+| Gemini | yes | only when the real CLI is installed (it is not here) | NotSupported | `gemini -i <prompt>`, when installed |
+
+(Phase 1 imported a Grok session only when its mapped cwd was `[A-Za-z0-9/ ]`,
+refused Antigravity altogether, and had no "continue". Superseded: see Phase 2
+"Import" and "Continue as a new session".)
 
 Existing launch convention (bar launchers):
 `cd <dir> && omarchy-launch-tui --app-id=org.omarchy.<tool> <tool> <args>` with
-`<tool>` in `claude`, `codex`, `grok`, `agy`.
+`<tool>` in `claude`, `codex`, `grok`, `agy`. (Where that launcher is missing,
+another terminal is used: see Phase 2 "Tool detection".)
 
 ## Architecture
 
 ```
 src/agent_sessions/
   model.py        Session, Store dataclasses; stable session key
-  mounts.py       enumerate real mounted filesystems (platform layer)
+  mounts.py       enumerate real mounted filesystems (platform layer);
+                  phase 2: volume identity, `udisksctl mount`
   discover.py     find stores on the mounts; prune list; signatures
   pathmap.py      foreign path -> local path (drive letters, other homes)
   index.py        cache: stores + parsed sessions, incremental by mtime/size
   providers/      one adapter per provider + registry
   importer.py     copy a foreign session into the native store
-  launch.py       build and run the resume command (platform layer)
+  launch.py       build and run the resume command (platform layer);
+                  phase 2: tool detection, terminal choice, a new session
   api.py          the facade the CLI and the TUI call
   cli.py          argparse entry
-  tui/            the Textual front end (app.py, view.py, app.tcss); the only
-                  package that imports textual
+  tui/            the Textual front end (app.py, view.py, engine.py, app.tcss);
+                  the only package that imports textual
+  -- added in phase 2 --
+  errors.py       the failures the facade reports
+  fsutil.py       our own locations, trace-free reads, private files, the lock
+  textsafe.py     the one sanitiser for text from a store
+  logs.py         the log file
+  journal.py      the import journal
+  unimport.py     take an import back
+  export.py       a transcript as Markdown or JSON lines
+  blake3.py       one-chunk BLAKE3, for Grok's long group names
 bin/agent-sessions   thin launcher (symlinked to ~/.local/bin by install.sh)
+install.sh, uninstall.sh   set up from a checkout, and take that back
 share/               agent-sessions.desktop (installed by install.sh)
 tests/               unittest; fixtures are sanitised real files
 ```
+
+`filemap.md` describes every file.
 
 ### Terms
 
@@ -158,10 +186,12 @@ time. `parse` fills the conversation fields (`id`, `title`, `cwd`, `started`,
 Adapters never raise on a malformed file: `parse` skips it and records a
 warning that `scan` reports. Adapter details per provider live in
 `docs/FORMATS.md`; adapters implement what that file says and nothing guessed.
+The contract attribute by attribute, and how a reader is added, is in
+`docs/ADDING_A_PROVIDER.md`.
 
 The CLI and the TUI both go through `api.py` (load index, scan, list, status,
-verify, and later open / import / transcript); neither reaches into the
-modules behind it.
+verify, open, import, transcript, and what phase 2 added); neither reaches into
+the modules behind it.
 
 ### Discovery (the "all mounted drives, consistently" requirement)
 
@@ -201,7 +231,10 @@ keeps its sessions out of the listing but its stores stay remembered.
 ### Read-only rule
 
 Nothing outside the native stores, `~/.cache/agent-sessions/` and
-`~/.local/state/agent-sessions/` is ever written. **Every** SQLite file,
+`~/.local/state/agent-sessions/` is ever written. (Phase 2 adds two places,
+each written by one command the user gives: `~/.config/agent-sessions/pathmap.json`
+by `map`, and the file `export -o` names, never inside a store. See Phase 2
+"Drive letters" and "Continue as a new session".) **Every** SQLite file,
 native ones too, is opened with `file:<urllib-quoted path>?mode=ro&immutable=1`:
 plain `mode=ro` creates or rewrites `-shm`/`-wal` on these WAL databases.
 Session files on other drives are opened with `os.O_NOATIME` where the
@@ -225,7 +258,7 @@ resolved per source mount (the mount the foreign store is on), since two
 Windows installs can assign letters differently. Unresolved or ambiguous
 letters stay unmapped (`cwd_local = null`), and `status` lists them. A manual
 override file `~/.config/agent-sessions/pathmap.json` (`{"F:": "/run/media/…"}`)
-wins over evidence. Normalise before matching: strip a `\\?\` prefix, accept
+wins over evidence (phase 2: `map` prints the letters and edits that file). Normalise before matching: strip a `\\?\` prefix, accept
 `/` and `\`, decode `file://` URIs (drop the slash before a drive letter),
 compare the letter and every segment case-insensitively and return the
 on-disk spelling, and apply the MSIX redirect for `AppData\Roaming\Claude`
@@ -239,6 +272,12 @@ Only for `origin == native`. Runs detached:
 recorded cwd no longer exists, behaviour follows FORMATS.md for that tool
 (some tools scope resume to the cwd); when it cannot work, `open` fails with a
 clear message and a desktop notification instead of opening the wrong thing.
+
+Phase 2 keeps this and adds to it ("Threat model", "Tool detection", "Import"):
+the id must pass the provider's id grammar and nothing from the session may
+read as an option; the tool is started only when it is really installed;
+another terminal is used where `omarchy-launch-tui` is missing; and an
+imported copy is resumed in the folder of its import.
 
 ### Import
 
@@ -257,21 +296,32 @@ cannot be imported safely raises `NotSupported` with the reason, and the TUI
 shows that reason. After import the foreign row shows as imported and the
 native copy is launchable.
 
+Phase 2 "Import" adds: a folder the user chooses, the experimental import, the
+journal with a manifest, the lock, and the undo (`unimport`).
+
 ### CLI contract
 
 ```
 agent-sessions [tui]                           open the TUI (default when run with no subcommand on a terminal)
 agent-sessions scan [--deep] [--json]          refresh index; print summary
-agent-sessions list [--provider P] [--json]    sessions, newest first
-agent-sessions open <key> [--dry-run]          native: resume. foreign: exit 1 with "import first". --dry-run prints the command
-agent-sessions import <key> [--open]           import; optionally resume after
+agent-sessions list [--provider P] [--keys] [--mounted] [--json]
+                                               sessions, newest first
+agent-sessions open <key> [--dry-run] [--here] native: resume. foreign: exit 1 with "import it first".
+                                               --dry-run prints the command; --here resumes in this terminal
+agent-sessions import <key> [--open]           import; optionally resume after (more flags: "CLI additions")
 agent-sessions show <key>                      plain-text transcript to stdout
-agent-sessions status                          mounts, stores, counts per provider,
+agent-sessions status [--json]                 mounts, stores, counts per provider,
                                                unmapped drive letters, tools with no reader, warnings
 agent-sessions verify                          compare index against a brute-force walk; exit 1 on mismatch
 ```
 
-Exit codes: 0 ok, 1 failure, 2 usage. The engine functions behind these
+This is the phase 1 list, with the flags it has today; the commands phase 2
+added are under "CLI additions". `<key>` is a session key (`list --keys`), a
+unique start of one, or a session id. With no subcommand and no terminal, the
+help is printed and the exit code is 2.
+
+Exit codes: 0 ok, 1 failure, 2 usage (and, since phase 2, 130, 143 and 129
+after an interrupt: "CLI additions"). The engine functions behind these
 commands are importable; the TUI calls them directly, not through a subprocess.
 
 Text from a store is never printed as it is. Readable output replaces every
@@ -287,27 +337,44 @@ Started by `agent-sessions` with no arguments, or from the desktop launcher
 `omarchy-launch-tui --app-id=org.omarchy.sessions agent-sessions`).
 `bin/agent-sessions` re-executes itself under `.venv/bin/python` for the TUI
 when the venv exists; if Textual is missing it says how to install it and
-exits 1. Every other subcommand runs on the system Python with no venv.
+exits 1. Every other subcommand runs on the system Python with no venv. An
+installed package needs no launcher: `cli.main` starts the TUI itself (Phase 2
+"Packaging").
+
+The screen as it is built, at 80 by 24, on the `All` tab with the fourth row
+selected (drawn by the test driver with the test suite's made-up sessions; the
+selection bar and the dimming are colours and do not show here):
 
 ```
- agent-sessions                         5 drives · 63 sessions · scanned 2m ago
- 1 Claude 41 │ 2 Codex 5 │ 3 Grok 22 │ 4 Antigravity 3 │ 5 Gemini 4 │ 0 All
+ agent-sessions            2 drives · 9 sessions · 1 offline · scanned just now
+ 1 Claude 4  2 Codex 2  3 Grok 2  4 Antigravity 1  5 Gemini 0  0 All 9
 ────────────────────────────────────────────────────────────────────────────────
- TITLE                                   PROJECT          AGE   WHERE
-▸Fix the first-open lag in the menu      tanuj            2d    Linux
- Portfolio landing page hero             Website Works    5d    Linux
- Pill content site copy pass             Pill Content     3w    C: (Windows)
- Lead generation scraper                 Lead Generation  2mo   C: · imported
- …
+ TITLE                               PROVIDER     PROJECT    AGE   WHERE
+ Fix the first-open lag in the menu  Claude       project-0  1h    Linux
+ Portfolio landing page hero         Claude       project-1  3d    Linux
+ Rework the importer's roll back     Codex        project-2  5d    Linux
+ Pill content site copy pass         Claude       project-3  9d    C:
+ Benchmark the directory walk        Grok         project-4  12d   Linux
+ Lead generation scraper             Codex        project-5  2w    C:
+ Invoice parser                      Claude       project-6  4w    C: · offline
+ Sketch the settings page            Antigravity  project-7  5w    C:
+ Why is the fan curve ignored        Grok         project-8  2mo   Linux
+
 ────────────────────────────────────────────────────────────────────────────────
- id       0c7e…                      messages 214     updated 2026-10-10 17:58
- cwd      F:\AI Projects\Website Works
- local    /run/media/tanuj/Zephyro/AI Projects/Website Works   (exists)
- store    /run/media/tanuj/22EEA841EEA80F5B/Users/arunt/.claude
+ id       clf-0003                   messages 12    updated  2026-10-03 12:00
+ cwd      C:\Work\project-3
+ local    /run/media/user/WINVOL/Work/project-3   (exists)
+ store    /run/media/user/WINVOL/Users/someone/.claude
+ note     -
+ import   possible
 ────────────────────────────────────────────────────────────────────────────────
  ↑↓ move  ←→ provider  Enter resume  o keep open  i import  t into folder
  v view  c continue  u undo  m mount  / filter  r R rescan  ? help  q quit
 ```
+
+(The phase 1 mock-up that stood here had no PROVIDER column, no `note` and
+`import` lines in the detail pane and bars between the tabs; this is the built
+screen. The PROVIDER column is shown on the `All` tab only.)
 
 Regions, top to bottom: status line; provider tabs with counts (`0` = all
 providers); column header; session list (scrolls, selection bar); detail pane
@@ -370,7 +437,8 @@ Core modules (`model`, `discover`, `pathmap`, `index`, `providers`, `importer`,
 `cli`) use `pathlib`/`os` only, no POSIX-only calls, no shelling out. Everything
 platform-specific sits behind `mounts.py` and `launch.py`, each a small
 interface with a Linux implementation. `tui/` is the only Textual user and no
-engine module imports it. Textual runs on Windows unchanged. Path mapping is written direction-neutral
+engine module imports it (one exception since phase 2: `cli._tui` imports it
+when the TUI is what was asked for; see "Packaging"). Textual runs on Windows unchanged. Path mapping is written direction-neutral
 (foreign <-> local), so Windows can map `/home/tanuj/...` the other way.
 
 ## Definition of done (this phase)
@@ -382,7 +450,8 @@ engine module imports it. Textual runs on Windows unchanged. Path mapping is wri
    Grok, Antigravity) resumes from the TUI in its project directory.
 4. A foreign Claude and a foreign Codex session import and then resume on
    Linux (a supervised live test by the user; FORMATS.md "Open questions");
-   other providers import or state exactly why not.
+   other providers import or state exactly why not. (The live test is still
+   owed: Phase 2 "Definition of done", item 6, and the README's checklist.)
 5. Unmounting a drive, an unreadable folder or a corrupt session file does not
    break listing.
 6. Unit tests pass; the TUI survives resize, an empty index and a missing drive.
@@ -590,8 +659,10 @@ all the failure names that variable. `open --dry-run` and `continue
   with `--experimental` (the TUI asks a second time and says why): one
   resume by hand has not been done yet, and the tool starts a new
   conversation without an error when it cannot read a copy. No folder is
-  needed. Without the flag the refusal says what the flag is for; with it
-  the command prints the warning before it copies.
+  needed. Without the flag the import is refused: the engine's reason says
+  that it is experimental and done only when asked for, and the command line
+  adds its flag to it ("CLI additions"); with the flag the command prints the
+  warning before it copies.
 - **Gemini**: still refused (no CLI, no resumable data).
 - The journal is `imports.jsonl` in the state directory: one JSON object per
   line, appended under a lock; a record lists every file and directory the
@@ -687,8 +758,9 @@ tool, an unimportable provider, a folder that is gone):
   whose drive is not mounted; a tool that is not known or not installed
   (the reason names the installed ones; with no `--with`, the session's own
   tool not being installed is that refusal, another tool is never picked
-  silently); no folder (`the session's folder is gone; choose one with
-  --in`); a folder that is not an absolute path of a directory that exists
+  silently); no folder (`the session's folder is gone; choose a folder to
+  start in`, to which the command line adds `(--in DIR)`); a folder that is
+  not an absolute path of a directory that exists
   (the check of `import --to`, `fsutil.existing_folder`). A foreign session
   needs no import to be continued: only its transcript is read.
 - `api.continue_options(session)` tells a front end what is possible:
@@ -722,6 +794,26 @@ first. An exception nobody planned for prints `internal error: <Type>:
 <message> (details in <log>)` and exits 1; `--debug` shows the traceback.
 Every `--json` shape is documented in `docs/JSON.md` and pinned by a test.
 
+**Reasons name no flag.** A refusal's reason is made by the engine and shown
+by both front ends, so it says what is the case and never names a
+command-line flag (`…can only be undone by force`, `…choose a folder to start
+in`). Where asking in another way gets past a refusal, the error carries a
+word for it (`ApiError.remedy`: `keys`, `folder`, `force`, `overwrite`,
+`experimental`), and the command line adds its own hint for that word where it
+prints the reason (`cli._REMEDIES`: `` `list --keys` shows the keys ``,
+`(--in DIR)`, `(--force)`, `(--force replaces it)`, `--experimental imports it
+all the same`), as it does for `--to` with `importer.NoFolder`. The TUI shows
+the plain reason and offers its own keys. A test fails when a message outside
+`cli.py` names a flag.
+
+**Help.** The top-level help lists the commands in four groups (browse; act on
+a session; drives; maintenance) with one line each; every command has a
+description, and `import`, `unimport`, `continue`, `export`, `mount`, `map`,
+`list` and `open` have examples. Help is laid out for 78 columns whatever the
+terminal's width (narrower on a narrower one). Tests hold the groups to the
+parser, parse every example, and check that every command is named in this
+document's two CLI sections and in the README.
+
 ## Logs
 
 `<state>/agent-sessions.log`, rotating (1 MB, 3 files), mode 0600: scans
@@ -749,7 +841,10 @@ failure the user sees names the log. `--debug` also logs to stderr.
 - The detail pane's `import` field and the foreign-row prompt are built from
   `import_options`: `possible`, `possible into a folder you choose`,
   `experimental only`, `not possible: <reason>`. Enter opens the prompt for
-  it, the reason on the line above the choices when there is one:
+  it, the reason on the line above the choices when there is one (for an
+  experimental import that line is the fixed short text `experimental import:
+  not yet tried with a real resume; you are asked again first`, since the
+  engine's reason is a paragraph and the warning follows whole):
   - possible: the line of the "TUI" section;
   - a folder is needed: `[t] import into another folder  [c] continue as new
     [v] view  [Esc] cancel`;
@@ -777,8 +872,11 @@ failure the user sees names the log. `--debug` also logs to stderr.
   steps, Esc leaving at each: `Continue with: ‹ Claude ›   ←→ change  Enter
   next  Esc cancel` (the installed tools, starting at `default_tool`, else
   at the first); the folder input; `Start <Tool> in <folder> and send a
-  first message to the model? y/n`. `y` calls `continue_session` and says
-  `started <Tool> in a new window`; the TUI stays open.
+  first message to the model? y/n`. `y` calls `continue_session`; while
+  the engine exports the transcript and starts the tool the status line shows
+  `starting <Tool>…` (the progress of a scan or an import that runs at the
+  same time is shown instead), then `started <Tool> in a new window`; the TUI
+  stays open.
 - `u`: a dry run of `unimport` first. No import recorded: its reason in the
   status line. Else `Remove the imported copy (<N> files, <size>)? y/n`, and
   `y` removes it: `removed <N> files`, with `, <M> left in place` when the
@@ -798,6 +896,44 @@ that and nothing else may). `install.sh` keeps the checkout flow;
 `uninstall.sh` removes what it installed. `README.md`, `CHANGELOG.md`,
 `docs/JSON.md`, `docs/SECURITY.md` (threat model and what is and is not
 defended). Version 0.2.0.
+
+As built:
+
+- **Entry point.** `cli.main` starts the TUI for `tui` and for no arguments
+  when stdin and stdout are both a terminal; with no arguments and no
+  terminal it prints the help and exits 2. The import of `agent_sessions.tui`
+  is inside `cli._tui`, the one function that starts it, so `list`, `scan`
+  and every other command still load neither that package nor Textual (a
+  test runs each in a fresh interpreter). `bin/agent-sessions` is unchanged:
+  it still re-executes under the checkout's `.venv` for the TUI.
+- **Textual missing.** One line and exit 1. Which line depends on where the
+  package runs from (`tui.checkout`: the package directory is
+  `<root>/src/agent_sessions` and `<root>` holds `install.sh`, `pyproject.toml`
+  and `requirements-tui.txt`): in a checkout `run ./install.sh in <root>`,
+  in an installed package `pip install 'agent-sessions[tui]'`.
+- **Metadata.** `pyproject.toml` has `readme`, keywords and classifiers
+  (Python 3.11 to 3.14, Linux, console). There is no license field: the owner
+  has not chosen a licence, and the README says so. The wheel carries
+  `agent_sessions/tui/app.tcss`.
+- **`install.sh`.** Fails with one line when `python3` (or `$PYTHON`) is older
+  than 3.11, has no `venv` with pip, or when `~/.local/bin/agent-sessions` is
+  a file that is not a symbolic link; installs the development tools only
+  with `--dev`; warns when `~/.local/bin` is not on `PATH` and when
+  `omarchy-launch-tui`, which the desktop launcher runs, is missing; validates
+  the desktop file with `desktop-file-validate` when that exists. Safe to run
+  again.
+- **`uninstall.sh`.** Removes `~/.local/bin/agent-sessions` only when it is a
+  symbolic link to this checkout's launcher, and the desktop launcher only
+  when it is byte for byte the file this checkout installs. `--purge` also
+  removes `~/.cache/agent-sessions`, `~/.local/state/agent-sessions` and
+  `~/.config/agent-sessions` after a `y/N` question (`--yes` skips it;
+  without a terminal and without `--yes` it refuses before anything is
+  removed). It never touches a session store, the checkout or its `.venv`.
+- **Documents.** `README.md`, `CHANGELOG.md`, `docs/SECURITY.md`,
+  `docs/ADDING_A_PROVIDER.md`. Tests keep them from drifting: every command
+  in the README and in this document's CLI sections, every environment
+  variable the code reads in the README, every module in `filemap.md`, one
+  version in the package, the changelog and this section.
 
 ## Definition of done (phase 2)
 

@@ -1,5 +1,9 @@
 # File map
 
+- `README.md` — for someone who has never seen the project: what it is, what it supports, install
+  and uninstall, the TUI keys, the CLI by task, concepts, the files and environment variables, logs and
+  troubleshooting, safety, what was never run on a real tool, development
+- `CHANGELOG.md` — what changed for a user, per version (0.1.0: phase 1; 0.2.0: the production pass)
 - `CLAUDE.md` — rules and commands for every agent working here
 - `docs/SPEC.md` — goals, architecture, CLI contract, TUI; phase 2 (production pass): threat model, tool
   detection, journal, logs, exit codes
@@ -7,14 +11,22 @@
   `export --format json`; pinned by `tests/test_json_contract.py`
 - `docs/REVIEW.md` — the production-readiness review (findings R-01 to R-14)
 - `docs/PLAN.md` — task list and status
+- `docs/SECURITY.md` — the threat model, each defence with the module that implements it and the test
+  that proves it, and what is not defended
+- `docs/ADDING_A_PROVIDER.md` — the adapter contract (`providers/base.py`) attribute by attribute, what
+  the index enforces, the steps to add a reader, the state of the four tools without one
 - `docs/FORMATS.md` — per-provider on-disk formats, resume commands, import recipes, store discovery,
   drive letters, ground-truth counts, open questions
 - `bin/agent-sessions` — launcher script; no logic
-- `install.sh` — symlink the launcher into `~/.local/bin`
+- `install.sh` — set up from this checkout: `.venv` with the pinned Textual, the link in `~/.local/bin`,
+  the desktop launcher; checks the Python version and `venv` first; `--dev` adds the development tools
+- `uninstall.sh` — take the link and the desktop launcher back, each only when it is this checkout's;
+  `--purge` also removes the cache, state and configuration directories (asks, or `--yes`)
 - `Makefile` — `test`, `test-tui`, `lint`, `format`, `typecheck`, `coverage` (every suite in one run), `dev`
   (creates `.venv` with Textual and the development tools), `check` (lint, typecheck and both suites)
 - `pyproject.toml` — packaging (setuptools, `src` layout, extras `tui` and `dev`, the `agent-sessions`
-  entry point) and the ruff, mypy and coverage configuration
+  entry point, readme, keywords and classifiers; no license field yet) and the ruff, mypy and coverage
+  configuration
 - `.github/workflows/ci.yml` — CI: lint, typecheck and both suites on Python 3.11 to 3.14 (Linux); engine
   suite on Windows, allowed to fail until the port is done
 - `src/agent_sessions/__init__.py` — package marker, `__version__`
@@ -108,9 +120,14 @@
   `set_letter`, `remove_letter`; what needs a session's files refuses an offline one (`Offline`); what goes
   into the log is written here (scan summary and warnings, imports, undos, launches, continues, mounts,
   forgotten drives, unexpected exceptions)
-- `src/agent_sessions/cli.py` — argparse entry: `scan`, `list`, `open`, `import` (`--to`, `--experimental`),
+- `src/agent_sessions/cli.py` — argparse entry: `tui` (`_tui`: the one import of `agent_sessions.tui`
+  outside it, made when the TUI is asked for; also what no arguments on a terminal starts), `scan`, `list`,
+  `open`, `import` (`--to`, `--experimental`),
   `unimport`, `show`, `export` (`-o`, `--format`, `--force`), `continue` (`--with`, `--in`, `--dry-run`,
-  `--here`), `status`, `verify`, `mount`, `forget`, `map` (`tui` is started by the launcher, not here), the global flags `--version` and `--debug`, the output helpers that make text safe (`_ask` for a
+  `--here`), `status`, `verify`, `mount`, `forget`, `map`, the global flags `--version` and `--debug`;
+  the help (`GROUPS`: the commands in four groups with their summaries, descriptions, examples,
+  `_HelpFormatter`: 78 columns; `subcommands`); the flag hints the command line adds to an engine
+  refusal (`_REMEDIES`, `_reason`, `_TO_HINT`); the output helpers that make text safe (`_ask` for a
   question), and what ends a command:
   exit codes, Ctrl-C and SIGTERM/SIGHUP (`_signals`), the `internal error` line
 - `src/agent_sessions/tui/` — Textual front end: `app.py`, `view.py` (pure view logic), `app.tcss` (all styling)
@@ -128,6 +145,20 @@
   `AGENT_SESSIONS_STATE` for anything that runs outside a `Sandbox`
 - `tests/test_smoke.py` — imports, CLI skeleton, `make_key`; no engine module imports Textual or `tui`
   (checked in a fresh interpreter)
+- `tests/test_entry.py` — how the program is entered: `cli.main` starts the TUI for `tui` and for no
+  arguments on a terminal, the help and exit 2 without one; the hint when Textual is missing, in a
+  checkout and in an installed package (`tui.checkout`); every other command loads neither `tui` nor
+  Textual (a fresh interpreter, a temp home)
+- `tests/test_packaging.py` — what keeps code, help and documents in step: no message outside `cli.py`
+  names a command-line flag, the hint the CLI adds for every `remedy`; the help (groups, descriptions,
+  examples that parse, 80 columns); every command in the README and in SPEC's CLI sections, every
+  environment variable in the README, every module in this file, one version everywhere; the package
+  metadata
+- `tests/test_install_scripts.py` — `install.sh` and `uninstall.sh` run on a copy of the checkout with a
+  throwaway `HOME` and stand-ins for `python3` and the desktop tools: a first and a second run, `--dev`,
+  an old Python, no `venv`, the `PATH` warning, the desktop file's validation, what is not ours and is
+  left, `--purge` with its question (a pty), `--yes`; a guard that the real home's installation is
+  unchanged; `shellcheck` when it is installed
 - `tests/test_base_helpers.py` — `iter_jsonl`, `open_sqlite_ro`, `parse_ts`, `clean_title`, warnings, model
 - `tests/test_mounts.py` — mountinfo parsing and filtering, env override, `find_mount`
 - `tests/test_volumes.py` — `mounts` on a fake `/dev/disk` tree and mount table: UUID and label of each
@@ -161,7 +192,8 @@
   (`claude/`, `codex/`, `grok/`, `antigravity/`, `gemini/`; SQLite fixtures are WAL-mode, open immutable)
 - `tests/fixtures/claude/not-a-store/`, `tests/fixtures/gemini/native-no-chats/` — negative cases for `is_store`
 - `scratch/` — throwaway investigation scripts (git-ignored): `walk.py`, `*_count.py`, `drives.py`, `build_fixtures.py`
-- `src/agent_sessions/errors.py` — `ApiError`, `NotFound`, `LaunchFailed`, `ImportFailed`, `UndoFailed` (an
+- `src/agent_sessions/errors.py` — `ApiError` (`reason`: plain words that name no command-line flag;
+  `remedy`: one of the `REMEDY_` words when asking in another way gets past the refusal), `NotFound`, `LaunchFailed`, `ImportFailed`, `UndoFailed` (an
   import could not be taken back; `no_record` and `differences` mark the two refusals a front end answers
   in its own way), `ExportFailed` (a transcript could not be written to a file), `Offline`
   (the drive of a session is not mounted), `MountFailed` (re-exported by `api`)
@@ -234,7 +266,9 @@
   the names each adapter takes from the
   source; the read-back of a placed copy (`Provider.read_back`, the `verify` step of `importer.execute`) and
   the roll back when it fails
-- `src/agent_sessions/tui/__init__.py` — package marker; imports no Textual; `run()`, the "run ./install.sh" hint
+- `src/agent_sessions/tui/__init__.py` — package marker; imports no Textual; `run()`; what is said when
+  Textual is missing (`install_hint`: `run ./install.sh in <checkout>` or `pip install 'agent-sessions[tui]'`)
+  and how a checkout is told from an installed package (`checkout`, `CHECKOUT_FILES`)
 - `src/agent_sessions/tui/__main__.py` — `python -m agent_sessions.tui`: run the app, exit 1 with the hint when
   Textual is missing
 - `src/agent_sessions/tui/engine.py` — `Engine`: the object the app calls the engine through (forwards to
@@ -254,7 +288,7 @@
 - `requirements-tui.txt` — the pinned Textual version `install.sh` installs into `.venv`
 - `tests/tui_support.py` — `FakeEngine` (records calls, never mounts, launches, imports or removes; refuses
   an offline session and an undo the way the engine does), fake sessions, `screen_text`, `settle`
-- `tests/test_tui_view.py` — every function of `tui/view.py`, `tui/engine.py`, the launcher and import rules;
-  runs on the system Python
+- `tests/test_tui_view.py` — every function of `tui/view.py`, `tui/engine.py`, the launcher and import rules
+  (one import of `tui` outside it, in `cli._tui`); runs on the system Python
 - `tests/test_tui_app.py` — the app under Textual's pilot with the fake engine (`make test-tui`; skips itself
   without Textual)
