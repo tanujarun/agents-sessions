@@ -12,15 +12,16 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import threading
 import urllib.parse
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar, NamedTuple
 
 from .. import importer, textsafe
-from ..fsutil import open_ro
+from ..fsutil import NotRegularFile, open_ro
 from ..model import UUID_PATTERN, Candidate, Session, Store
 
 if TYPE_CHECKING:
@@ -40,11 +41,14 @@ __all__ = [
     "open_ro",
     "open_sqlite_ro",
     "parse_ts",
+    "read_lines",
+    "read_small",
     "unreadable",
     "warn",
 ]
 
 TITLE_MAX = 80
+TITLE_SOURCE_MAX = 64 * 1024  # characters of a text that a title is made from
 
 
 class NotSupported(Exception):
@@ -203,14 +207,66 @@ def collect_warnings() -> Iterator[Warnings]:
 # --- files ------------------------------------------------------------------
 
 _BOM = b"\xef\xbb\xbf"
+# The longest line of a JSONL file that is read, in bytes with its line
+# break. The longest in any real store is 2.74 MB (docs/FORMATS.md); a file
+# on another drive can hold one of any length, and a line is parsed whole.
+JSONL_LINE_MAX = 32 * 1024 * 1024
+_PIECE = 1024 * 1024  # how much of a line is read at a time
+
+
+def read_lines(fh: BinaryIO, limit: int | None = None) -> Iterator[bytes | None]:
+    """The lines of a binary file, each with its line break. A line of more
+    than ``limit`` bytes (default ``JSONL_LINE_MAX``) comes out as None: it
+    is read and dropped a piece at a time, so no more than ``limit`` bytes
+    plus one piece are ever held, however long the line is."""
+    limit = JSONL_LINE_MAX if limit is None else limit
+    pieces: list[bytes] = []
+    size = 0
+    while True:
+        piece = fh.readline(_PIECE)
+        if piece:
+            size += len(piece)
+            if size > limit:
+                pieces.clear()
+            else:
+                pieces.append(piece)
+            if not piece.endswith(b"\n"):
+                continue  # the line goes on; at the end of the file the next read is empty
+        if size:
+            yield None if size > limit else b"".join(pieces)
+        if not piece:
+            return
+        pieces.clear()
+        size = 0
+
+
+def read_small(path: StrPath, limit: int) -> bytes | None:
+    """The bytes of a file that is expected to be small, or None when it
+    cannot be read. Something that is not a regular file, and a file of more
+    than ``limit`` bytes, are not read and get a warning."""
+    try:
+        with open_ro(path) as fh:
+            data = fh.read(limit + 1)
+    except NotRegularFile:
+        warn("not a regular file; not read", path)
+        return None
+    except OSError:
+        return None
+    if len(data) > limit:
+        warn(f"larger than {importer.human_size(limit)}; not read", path)
+        return None
+    return data
 
 
 def iter_jsonl(path: StrPath) -> Iterator[dict[str, Any]]:
     """Yield the JSON objects of a JSONL file, one line at a time.
 
     Blank lines, lines that do not parse (a half-written last line of a live
-    session) and lines that are not objects are skipped silently. A file that
-    cannot be read yields what was read so far and records a warning.
+    session, a line nested too deeply) and lines that are not objects are
+    skipped silently. A line longer than ``JSONL_LINE_MAX`` is skipped
+    without being held in memory, with a warning. A file that cannot be read
+    (one that is not a regular file included) yields what was read so far
+    and records a warning.
     """
     try:
         fh = open_ro(path)
@@ -219,12 +275,18 @@ def iter_jsonl(path: StrPath) -> Iterator[dict[str, Any]]:
         return
     with fh:
         first = True
+        lines = read_lines(fh)
         while True:
             try:
-                raw = fh.readline()
+                raw = next(lines, b"")
             except OSError as exc:
                 warn(f"read error: {exc.strerror or exc}", path)
                 return
+            if raw is None:
+                first = False
+                size = importer.human_size(JSONL_LINE_MAX)
+                warn(f"a line longer than {size} was skipped", path)
+                continue
             if not raw:
                 return
             if first:
@@ -301,8 +363,16 @@ def open_sqlite_ro(path: StrPath) -> sqlite3.Connection:
 
     Either way the connection refuses writes, and rows still in a hot
     ``-wal`` are not visible. Raises ``sqlite3.Error`` when the file cannot
-    be opened (a missing file: on the first query).
+    be opened (a missing file: on the first query), and at once for
+    something that is not a regular file: SQLite itself would open a named
+    pipe and wait, or read a device.
     """
+    try:
+        regular = stat.S_ISREG(os.stat(path).st_mode)
+    except OSError:
+        regular = True  # missing or unreachable: reported by the first query, as before
+    if not regular:
+        raise sqlite3.OperationalError("not a regular file")
     con = _sqlite_in_memory(path)
     if con is not None:
         return con
@@ -402,5 +472,7 @@ def clean_title(text: object) -> str:
     None gives an empty string."""
     if text is None:
         return ""
-    collapsed = " ".join(textsafe.clean(str(text)).split())
+    # A title is built from the start of its source only: the text of a
+    # prompt can be as long as a line of a transcript.
+    collapsed = " ".join(textsafe.clean(str(text)[:TITLE_SOURCE_MAX]).split())
     return collapsed[:TITLE_MAX].rstrip()

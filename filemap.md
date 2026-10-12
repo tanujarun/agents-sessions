@@ -17,7 +17,8 @@
 - `src/agent_sessions/model.py` — `Session` (`for_store`, `from_dict`), `Store`, `Candidate`, `make_key`,
   `UUID_PATTERN` (the default session id grammar)
 - `src/agent_sessions/fsutil.py` — our own locations (`home`, `cache_file`, `cache_dir`, `state_dir`, `config_dir`, env overrides)
-  and trace-free reads (`open_ro`, `subdirs`, `listdir_ro`: `O_NOATIME` where the platform has it)
+  and trace-free reads (`open_ro`, `subdirs`, `listdir_ro`: `O_NOATIME` where the platform has it). `open_ro`
+  never waits and reads regular files only: `NotRegularFile` for a named pipe, a device, a directory
 - `src/agent_sessions/textsafe.py` — the one sanitiser for text from a store: `clean` (control and
   bidirectional characters become spaces; `multiline` keeps line feed and tab), `json_escape` (the same
   characters as `\uXXXX` in `--json` output), the set `UNSAFE`. Used by the CLI's output helpers, `clean_title`,
@@ -33,8 +34,9 @@
   session fields, dedupe, order), scan policy; `fresh` (cache-free index for `verify`)
 - `src/agent_sessions/providers/` — one adapter per provider, plus the registry
 - `src/agent_sessions/providers/__init__.py` — registry: `register`, `all_providers`, `get`; imports the five adapters
-- `src/agent_sessions/providers/base.py` — `Provider` contract, `NotSupported`, shared helpers (`iter_jsonl`,
-  `open_sqlite_ro`, `parse_ts`, `clean_title`, `open_ro`), warnings (`warn`, `collect_warnings`)
+- `src/agent_sessions/providers/base.py` — `Provider` contract (with `id_pattern`), `NotSupported`, shared
+  helpers (`iter_jsonl`, `read_lines` and `JSONL_LINE_MAX`, `read_small`, `open_sqlite_ro`, `parse_ts`,
+  `clean_title`, `open_ro`), warnings (`warn`, `collect_warnings`)
 - `src/agent_sessions/providers/{claude,codex,grok,antigravity,gemini}.py` — the adapters; attributes and store
   signature done, `candidates`/`parse`/`resume_argv`/`import_session` not yet (tasks 4a, 4b, 5)
 - `src/agent_sessions/importer.py` — copy a foreign session into the native store
@@ -78,6 +80,9 @@
 - `tests/test_launch.py` — launch plans per provider, folder gone, foreign refused, `--here`, hooks
 - `tests/test_importer.py` — imports per provider (bytes, rewrites, idempotence, collisions, roll back, free
   space, provenance, source times), `encode_cwd`, refusals
+- `tests/test_hostile_files.py` — named pipes, devices and directories named like session files (`open_ro`,
+  whole scans in a child process under a timeout), over-long lines and the 200 MB line's memory ceiling, size
+  caps of files read whole, deeply nested JSON
 - `tests/test_import_safety.py` — what keeps an import inside the native store: `importer.contained`
   (destinations, paths below a unit, appended files, symbolic links), the names each adapter takes from the
   source

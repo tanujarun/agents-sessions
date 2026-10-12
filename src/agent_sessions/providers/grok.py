@@ -22,6 +22,7 @@ from .base import (
     iter_jsonl,
     open_ro,
     parse_ts,
+    read_small,
     unreadable,
     warn,
 )
@@ -37,6 +38,9 @@ _SUBAGENTS = "subagents"
 _META = "meta.json"
 _FIXED_PATHS = 3  # summary.json, chat_history.jsonl, <group>/.cwd
 _SMALL_FILE = 16 * 1024 * 1024
+# How deep a ``meta.json`` value is searched. The tool writes a flat object;
+# a file from elsewhere can nest values without end.
+_NEST_MAX = 32
 _QUERY = re.compile(r"<user_query>(.*?)</user_query>", re.S)
 _INJECTED = ("<user_info>", "<system-reminder>")
 # Import (FORMATS section 6): the only cwd shape whose group directory name
@@ -169,17 +173,20 @@ def _prompt_text(record: dict[str, Any]) -> str | None:
     return None if text.startswith(_INJECTED) else text
 
 
-def _names_session(value: object, session_id: str, key: str = "") -> bool:
+def _names_session(value: object, session_id: str, key: str = "", depth: int = 0) -> bool:
     """True when a ``meta.json`` value holds ``session_id`` as a string,
-    anywhere but under a key that names a parent."""
+    anywhere but under a key that names a parent, and no more than
+    ``_NEST_MAX`` levels down."""
     if "parent" in key.lower():
         return False
     if isinstance(value, str):
         return value == session_id
+    if depth >= _NEST_MAX:
+        return False
     if isinstance(value, dict):
-        return any(_names_session(v, session_id, str(k)) for k, v in value.items())
+        return any(_names_session(v, session_id, str(k), depth + 1) for k, v in value.items())
     if isinstance(value, list):
-        return any(_names_session(v, session_id, key) for v in value)
+        return any(_names_session(v, session_id, key, depth + 1) for v in value)
     return False
 
 
@@ -376,11 +383,8 @@ class Grok(Provider):
     def _group_cwd(group_dir: Path) -> tuple[str | None, str]:
         """cwd fallbacks: the group's ``.cwd`` file, then the decoded group
         directory name."""
-        try:
-            with open_ro(group_dir / _CWD) as fh:
-                recorded = fh.read(_SMALL_FILE).decode("utf-8", "replace").strip()
-        except OSError:
-            recorded = ""
+        raw = read_small(group_dir / _CWD, _SMALL_FILE)
+        recorded = raw.decode("utf-8", "replace").strip() if raw else ""
         if recorded:
             return recorded, ".cwd"
         decoded = urllib.parse.unquote(group_dir.name)

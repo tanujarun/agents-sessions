@@ -13,7 +13,17 @@ from .. import importer
 from ..fsutil import home, listdir_ro, open_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
-from .base import NotSupported, Provider, Turn, clean_title, iter_jsonl, parse_ts, unreadable, warn
+from .base import (
+    TITLE_SOURCE_MAX,
+    NotSupported,
+    Provider,
+    Turn,
+    clean_title,
+    iter_jsonl,
+    parse_ts,
+    unreadable,
+    warn,
+)
 
 if TYPE_CHECKING:
     from ..fsutil import StrPath
@@ -188,12 +198,13 @@ def _scan(path: StrPath) -> _Scan:
         if kind == "user":
             scan.continued_in = None
             real, command = _prompts(record)
+            # Kept for the title only: the start is all a title is made from.
             if command is not None and scan.command is None:
-                scan.command = command
+                scan.command = command[:TITLE_SOURCE_MAX]
             if real:
                 scan.prompts += 1
                 if scan.first_prompt is None:
-                    scan.first_prompt = real[0]
+                    scan.first_prompt = real[0][:TITLE_SOURCE_MAX]
         elif kind == "assistant":
             scan.continued_in = None
             scan.assistants += 1
@@ -206,7 +217,7 @@ def _scan(path: StrPath) -> _Scan:
         elif isinstance(kind, str) and kind in _TITLE_FIELD:
             value = record.get(_TITLE_FIELD[kind])
             if isinstance(value, str):
-                scan.titles[kind] = value
+                scan.titles[kind] = value[:TITLE_SOURCE_MAX]
         elif kind == "continued-in":
             child = record.get("continuedInSessionId")
             if isinstance(child, str) and child:

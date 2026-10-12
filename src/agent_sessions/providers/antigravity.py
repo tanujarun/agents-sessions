@@ -21,9 +21,9 @@ from .base import (
     Turn,
     clean_title,
     iter_jsonl,
-    open_ro,
     open_sqlite_ro,
     parse_ts,
+    read_small,
     unreadable,
     warn,
 )
@@ -186,17 +186,9 @@ def uri_to_path(uri: object) -> str | None:
     return path or None
 
 
-def _read_small(path: StrPath) -> bytes | None:
-    try:
-        with open_ro(path) as fh:
-            return fh.read(_SMALL_FILE)
-    except OSError:
-        return None
-
-
 def _pbtxt_title(path: StrPath) -> str:
     """The ``title:"…"`` value of an annotations text proto, or ''."""
-    raw = _read_small(path)
+    raw = read_small(path, _SMALL_FILE)
     found = _PBTXT_TITLE.search(raw) if raw else None
     if not found:
         return ""
@@ -452,7 +444,7 @@ class Antigravity(Provider):
     @staticmethod
     def _last_cwd(path: Path, cid: str) -> str | None:
         """The key of ``last_conversations.json`` whose value is the id."""
-        raw = _read_small(path)
+        raw = read_small(path, _SMALL_FILE)
         if not raw:
             return None
         try:

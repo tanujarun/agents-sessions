@@ -99,7 +99,7 @@ class Rewrite:
             with open_ro(src) as reader:
                 for _chunk in self.apply(reader):
                     pass
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RecursionError) as exc:
             raise ImportFailed(f"{src} cannot be rewritten: {exc}") from exc
         return list(self.changes)
 
@@ -318,7 +318,7 @@ def read_provenance() -> list[dict]:
             data = json.load(fh)
     except FileNotFoundError:
         return []
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         raise ImportFailed(f"the import record {path} cannot be read: {exc}") from exc
     records = data.get("imports") if isinstance(data, dict) else None
     if not isinstance(records, list):
@@ -511,7 +511,8 @@ def _copy(item: FileCopy, target: str, tick: Callable[[int], None]) -> None:
                 while True:
                     try:
                         chunk = next(chunks, None)
-                    except ValueError as exc:  # text the rewrite cannot carry over
+                    except (ValueError, RecursionError) as exc:
+                        # text the rewrite cannot carry over, or JSON nested too deeply
                         raise ImportFailed(f"{item.src} cannot be rewritten: {exc}") from exc
                     if chunk is None:
                         break

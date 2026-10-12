@@ -215,7 +215,7 @@ class PathMap:
                     overrides = json.load(fh)
             except FileNotFoundError:
                 return
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, RecursionError) as exc:
                 self.warnings.append(f"{path}: ignored: {exc}")
                 return
             if not isinstance(overrides, dict):

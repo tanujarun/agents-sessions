@@ -13,7 +13,18 @@ from .. import importer
 from ..fsutil import home, listdir_ro, open_ro, subdirs
 from ..model import Candidate, Session, Store
 from . import register
-from .base import NotSupported, Provider, Turn, clean_title, iter_jsonl, parse_ts, unreadable, warn
+from .base import (
+    JSONL_LINE_MAX,
+    NotSupported,
+    Provider,
+    Turn,
+    clean_title,
+    iter_jsonl,
+    parse_ts,
+    read_lines,
+    unreadable,
+    warn,
+)
 
 if TYPE_CHECKING:
     from ..fsutil import StrPath
@@ -27,6 +38,10 @@ _ROLLOUT = re.compile(
 )
 _DATE_DIRS = re.compile(r"[0-9]{4}/[0-9]{2}/[0-9]{2}")  # YYYY/MM/DD below sessions/
 _INDEX = "session_index.jsonl"
+# The index is read once for every thread of its store: one of more than
+# this many bytes is not read. A line of it holds an id and a name.
+_INDEX_MAX = 64 * 1024 * 1024
+_INDEX_LINE_MAX = 64 * 1024
 _ROLES = {"UserMessage": "user", "AgentMessage": "assistant"}
 # Where the Orca app keeps its own CODEX_HOME, relative to the profile that
 # holds ``.codex`` (FORMATS section 1, "Mirror stores"). Its thread-name index
@@ -95,9 +110,11 @@ class _Rollout:
         return bool(match and match.group(3))
 
 
-def _read(path: str, tools: bool = False) -> _Rollout:
+def _read(path: str, tools: bool = False, titles: bool = False) -> _Rollout:
     """Read a rollout once. ``turns`` gets the user and agent messages, and
-    with ``tools`` one turn per tool call."""
+    with ``tools`` one turn per tool call. With ``titles`` a turn holds no
+    more of its text than a title is made of (``clean_title``): listing a
+    thread needs its turns counted and one title, not every message kept."""
     rollout = _Rollout(path)
     for record in iter_jsonl(path):
         payload = record.get("payload")
@@ -125,10 +142,11 @@ def _read(path: str, tools: bool = False) -> _Rollout:
                 continue
             role = item.get("type")
             role = _ROLES.get(role) if isinstance(role, str) else None
-            if role == "user":
-                rollout.turns.append((ordinal, Turn(role, _item_text(item, " "), moment)))
-            elif role == "assistant":
-                rollout.turns.append((ordinal, Turn(role, _item_text(item, "\n"), moment)))
+            if role in ("user", "assistant"):
+                text = _item_text(item, " " if role == "user" else "\n")
+                rollout.turns.append(
+                    (ordinal, Turn(role, clean_title(text) if titles else text, moment))
+                )
         elif kind == "turn_context":
             if rollout.turn_cwd is None:
                 cwd = payload.get("cwd")
@@ -159,9 +177,19 @@ def _surviving(ordered: list[_Rollout]) -> Iterator[Turn]:
             yield turn
 
 
+def _index_too_large(path: str) -> bool:
+    try:
+        large = os.stat(path).st_size > _INDEX_MAX
+    except OSError:
+        return False  # whoever reads it reports that
+    if large:
+        warn(f"larger than {importer.human_size(_INDEX_MAX)}; thread names not read", path)
+    return large
+
+
 def _index_title(path: str, thread_id: str) -> str:
     """``thread_name`` of the last index line for the thread; renames append."""
-    if not os.path.exists(path):  # the file is optional
+    if not os.path.exists(path) or _index_too_large(path):  # the file is optional
         return ""
     name = None
     for record in iter_jsonl(path):
@@ -172,12 +200,14 @@ def _index_title(path: str, thread_id: str) -> str:
 
 def _index_line(path: str, thread_id: str) -> bytes | None:
     """The last index line that names the thread, as it is in the file."""
-    if not os.path.exists(path):
+    if not os.path.exists(path) or _index_too_large(path):
         return None
     found = None
     try:
         with open_ro(path) as fh:
-            for raw in fh:
+            for raw in read_lines(fh, _INDEX_LINE_MAX):
+                if raw is None:
+                    continue  # too long to be a thread's name line
                 line = raw.rstrip(b"\r\n")
                 try:
                     record = json.loads(line.decode("utf-8", "replace"))
@@ -274,8 +304,20 @@ class _CwdRewrite(importer.Rewrite):
     def apply(self, reader: BinaryIO) -> Iterator[bytes]:
         self._seen = {}
         self.changes = []
-        for raw in reader:
-            yield self._line(raw)
+        while True:
+            raw = reader.readline(JSONL_LINE_MAX + 1)
+            if not raw:
+                break
+            if len(raw) <= JSONL_LINE_MAX:
+                yield self._line(raw)
+                continue
+            # Longer than any line that is read as a record: copied as it
+            # is, a piece at a time.
+            while raw:
+                yield raw
+                if raw.endswith(b"\n"):
+                    break
+                raw = reader.readline(JSONL_LINE_MAX)
         self.changes = [
             f"{kind} {field}: {old} -> {new}" + (f" ({count} records)" if count > 1 else "")
             for (kind, field, old, new), count in sorted(self._seen.items())
@@ -349,7 +391,7 @@ class Codex(Provider):
             if match.group(4):
                 warn("compressed rollout (.jsonl.zst) is not supported; skipped", path)
                 continue
-            rollout = _read(path)
+            rollout = _read(path, titles=True)
             if rollout.records:
                 rollouts.append(rollout)
         if not rollouts:
