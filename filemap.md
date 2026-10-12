@@ -58,7 +58,8 @@
 - `tests/__init__.py` — puts `src` on `sys.path`
 - `tests/support.py` — `Sandbox` (fake home, cache, mounts, registry) and `FakeProvider` for the engine tests;
   `write_jsonl`, `claude_transcript` (a minimal transcript written from scratch); child processes for the
-  tests that need real ones (`python_child`, `launcher_child`, `finish`)
+  tests that need real ones (`python_child`, `launcher_child`, `finish`, `wait_for`, the slow-import driver
+  `SLOW_IMPORT`)
 - `tests/test_smoke.py` — imports, CLI skeleton, `make_key`
 - `tests/test_base_helpers.py` — `iter_jsonl`, `open_sqlite_ro`, `parse_ts`, `clean_title`, warnings, model
 - `tests/test_mounts.py` — mountinfo parsing and filtering, env override, `find_mount`
@@ -99,6 +100,10 @@
 - `tests/test_journal.py` — `fsutil.lock` (threads, real processes, the lock file that goes again),
   `make_private_dir`, the journal (append and read, torn and foreign lines, the old `imports.json`, failed
   writes), and imports of different sessions started at once in processes of their own
+- `tests/test_import_placing.py` — how a copy is put in place: `importer._place` (a file is linked, never
+  renamed over; a directory renamed; names that appear at the last moment), an interrupt between a move and
+  its note, directories flushed before the record, the lock around the whole of `execute`, and two real
+  processes importing the same session and different ones
 - `tests/test_import_safety.py` — what keeps an import inside the native store: `importer.contained`
   (destinations, paths below a unit, appended files, symbolic links), the names each adapter takes from the
   source; the read-back of a placed copy (`Provider.read_back`, the `verify` step of `importer.execute`) and

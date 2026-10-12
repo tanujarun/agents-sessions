@@ -15,8 +15,9 @@ the rules that hold for every provider, ``execute`` carries the plan out:
 - there must be room for the copy plus 10 %;
 - every file is first written into a staging directory at the root of the
   native store (same filesystem, outside the directories the tool lists),
-  then moved into place with ``os.replace``, in plan order, so the piece that
-  makes the session visible to the tool arrives last and complete;
+  then moved into place in plan order, so the piece that makes the session
+  visible to the tool arrives last and complete. The move never replaces
+  anything (``_place``), and the directories it changed are flushed to disk;
 - once the files are in place the copy is read back the way any session of
   the native store is read, and must be the session that was planned (the
   ``verify`` step of ``execute``);
@@ -38,6 +39,7 @@ module freely.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -489,8 +491,10 @@ def _make_dirs(path: str, made: list[str], mode: int = DIR_MODE) -> None:
             break
         current = parent
     for directory in reversed(missing):
-        os.mkdir(directory, mode)
+        # Remembered first: an interrupt between the two lines then costs a
+        # failed rmdir in the roll back, not a directory left behind.
         made.append(directory)
+        os.mkdir(directory, mode)
 
 
 def _copy(item: FileCopy, target: str, tick: Callable[[int], None]) -> None:
@@ -524,6 +528,86 @@ def _copy(item: FileCopy, target: str, tick: Callable[[int], None]) -> None:
             writer.flush()
             os.fsync(writer.fileno())
     os.utime(target, ns=(time.time_ns(), source.st_mtime_ns))
+
+
+# What ``os.link`` fails with where a hard link cannot be made at all, as
+# opposed to "the name is taken" (EEXIST).
+_NO_LINK = frozenset(
+    getattr(errno, name)
+    for name in ("EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EMLINK", "EXDEV")
+    if hasattr(errno, name)
+)
+
+
+def _place(target: str, dst: str, is_dir: bool) -> None:
+    """Move one staged unit to its place in the native store without
+    replacing anything. Raises ``Exists`` when the name is taken.
+
+    A file is hard-linked under its final name and the staged name removed.
+    ``link`` fails when the name exists, whatever it is, and the kernel
+    decides that in the same step that creates the name: a file that appears
+    at the last moment is never overwritten. Only where the filesystem has
+    no hard links (FAT, some network mounts) is the name looked at first and
+    the file then renamed, which leaves a moment between the two.
+
+    A directory cannot be linked; it is renamed. What ``os.rename`` of a
+    directory guarantees: on POSIX it fails when the name is a file, a link
+    or a directory with anything in it, and replaces only an *empty*
+    directory; on Windows it fails whenever the name exists. So nothing that
+    holds data is ever replaced, and ``execute`` has looked for the name
+    just before (the standard library has no rename that refuses an empty
+    directory too).
+    """
+    if os.path.lexists(dst):
+        raise Exists([dst])
+    if is_dir:
+        os.rename(target, dst)
+        return
+    try:
+        os.link(target, dst)
+    except FileExistsError:
+        raise Exists([dst]) from None
+    except (OSError, NotImplementedError, AttributeError) as exc:
+        if isinstance(exc, OSError) and os.name == "posix" and exc.errno not in _NO_LINK:
+            raise
+        if os.path.lexists(dst):
+            raise Exists([dst]) from None
+        os.replace(target, dst)
+        return
+    os.unlink(target)
+
+
+def _arrived(target: str, dst: str) -> bool:
+    """Whether a move that was interrupted had put the unit in place: the
+    name is there, and the staged one is gone or is the same file (linked,
+    not yet unlinked). A name that someone else holds leaves the staged unit
+    where it was."""
+    try:
+        there = os.lstat(dst)
+    except OSError:
+        return False
+    try:
+        return os.path.samestat(os.lstat(target), there)
+    except OSError:
+        return True
+
+
+def _flush_tree(root: str, dirs: Iterable[str]) -> None:
+    """Flush a staged directory and the directories below it, deepest first:
+    the names of the files in them are part of the copy."""
+    for rel in sorted(dirs, reverse=True):
+        fsutil.fsync_dir(os.path.join(root, rel))
+    fsutil.fsync_dir(root)
+
+
+def _flush_placed(placed: Iterable[str], made_dirs: Iterable[str]) -> None:
+    """Flush every directory in which this import created a name, so that a
+    crash right afterwards does not lose a rename or a new directory. Best
+    effort (``fsutil.fsync_dir``): not every platform can."""
+    made = list(made_dirs)
+    changed = {os.path.dirname(path) for path in [*placed, *made]} | set(made)
+    for directory in sorted(changed):
+        fsutil.fsync_dir(directory)
 
 
 def _remove(path: str) -> None:
@@ -746,7 +830,8 @@ def _carry_out(
             progress(min(done, total), total)
 
     made_dirs: list[str] = []  # created by this run, outermost first
-    placed: list[str] = []  # units already renamed into the store
+    placed: list[str] = []  # units already moved into the store
+    moving: tuple[str, str] | None = None  # (staged, destination) of the move under way
     staging = None
     record_fd = None
     record_new = False  # this run created the journal
@@ -766,6 +851,7 @@ def _carry_out(
                     os.makedirs(os.path.join(target, rel), DIR_MODE, exist_ok=True)
                 for item in unit.files:
                     _copy(item, os.path.join(target, item.rel), tick)
+                _flush_tree(target, unit.dirs)
             else:
                 _copy(unit.files[0], target, tick)
             staged.append(target)
@@ -776,10 +862,11 @@ def _carry_out(
 
         for unit, target in zip(plan.units, staged, strict=False):
             _make_dirs(os.path.dirname(unit.dst), made_dirs)
-            if os.path.lexists(unit.dst):
-                raise Exists([unit.dst])
-            os.replace(target, unit.dst)
+            moving = (target, unit.dst)
+            _place(target, unit.dst, unit.is_dir)
             placed.append(unit.dst)
+        moving = None
+        _flush_placed(placed, made_dirs)
         manifest = _manifest(placed, made_dirs)
         if verify is not None:
             try:
@@ -802,6 +889,10 @@ def _carry_out(
     finally:
         if record_fd is not None:
             os.close(record_fd)
+        # An interrupt between a move and the line that notes it: asked
+        # while the staged unit can still tell whose the name is.
+        if moving is not None and moving[1] not in placed and _arrived(*moving):
+            placed.append(moving[1])
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
         if not finished:

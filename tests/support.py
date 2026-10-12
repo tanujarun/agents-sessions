@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -244,3 +245,54 @@ def finish(case, children, timeout=CHILD_TIMEOUT) -> list[tuple[int, str, str]]:
                 child.kill()
                 child.communicate()
     return results
+
+
+# A child process that imports slowly, for the tests that have to catch an
+# import in the middle of its copy: ``python_child(SLOW_IMPORT, mark, gate,
+# "import", key)``. It runs the CLI with ``importer.CHUNK`` at 16 bytes and a
+# source reader that, once the first piece is read, creates the file ``mark``
+# and then waits for the file ``gate`` before it hands anything on. The hook
+# is this script: the package has no switch for it.
+SLOW_IMPORT = """
+import os, time
+from agent_sessions import cli, importer
+
+mark, gate = sys.argv[1], sys.argv[2]
+real_open = importer.open_ro
+importer.CHUNK = 16
+
+
+class Slow:
+    def __init__(self, reader):
+        self.reader = reader
+
+    def read(self, size=-1):
+        data = self.reader.read(size)
+        if data:
+            open(mark, "a").close()
+            while not os.path.exists(gate):
+                time.sleep(0.01)
+        return data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.reader.close()
+
+    def __getattr__(self, name):
+        return getattr(self.reader, name)
+
+
+importer.open_ro = lambda path: Slow(real_open(path))
+sys.exit(cli.main(sys.argv[3:]))
+"""
+
+
+def wait_for(case, path, timeout=CHILD_TIMEOUT) -> None:
+    """Wait until ``path`` exists; fail the test when it does not appear."""
+    deadline = time.monotonic() + timeout
+    while not os.path.exists(path):
+        if time.monotonic() > deadline:
+            case.fail(f"{path} did not appear in {timeout} s")
+        time.sleep(0.01)

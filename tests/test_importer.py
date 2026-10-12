@@ -298,16 +298,20 @@ class ClaudeImportTest(ImportCase):
         )
         self.assertTrue(all(item.rewrite is None for unit in plan.units for item in unit.files))
         placed = []
-        real = os.replace
-        with mock.patch.object(
-            importer.os, "replace", side_effect=lambda a, b: (placed.append(b), real(a, b))[1]
-        ):
+        real = importer._place
+
+        def place(target, dst, is_dir):
+            placed.append((dst, is_dir))
+            return real(target, dst, is_dir)
+
+        with mock.patch.object(importer, "_place", place):
             api.import_session(self.source(CLAUDE_WIN))
-        # ... and nothing else is moved into the store (the scan that
-        # follows saves the index, which is elsewhere).
         self.assertEqual(
-            [str(path) for path in placed if str(path).startswith(str(self.home / ".claude"))],
-            [str(self.target / CLAUDE_WIN), str(self.target / f"{CLAUDE_WIN}.jsonl")],
+            placed,
+            [
+                (str(self.target / CLAUDE_WIN), True),
+                (str(self.target / f"{CLAUDE_WIN}.jsonl"), False),
+            ],
         )
         plain = Claude().import_plan(self.source(CLAUDE_WIN_PLAIN), self.index.pathmap)
         self.assertEqual([unit.is_dir for unit in plain.units], [False])
@@ -388,15 +392,15 @@ class ClaudeImportTest(ImportCase):
         keep = self.home / ".claude" / "projects" / "-kept" / "note.txt"
         keep.parent.mkdir(parents=True)
         keep.write_text("mine", encoding="utf-8")
-        real, calls = os.replace, []
+        real, calls = importer._place, []
 
-        def failing(src, dst):
+        def failing(src, dst, is_dir):
             calls.append(dst)
             if len(calls) == 2:  # the side directory is in place, the transcript is not
                 raise OSError(errno.ENOSPC, "No space left on device", dst)
-            return real(src, dst)
+            return real(src, dst, is_dir)
 
-        with mock.patch.object(importer.os, "replace", failing):
+        with mock.patch.object(importer, "_place", failing):
             reason = self.refused(self.source(CLAUDE_WIN))
         self.assertEqual(
             calls, [str(self.target / CLAUDE_WIN), str(self.target / f"{CLAUDE_WIN}.jsonl")]
@@ -794,15 +798,15 @@ class CodexSegmentImportTest(ImportCase):
         )
 
     def test_base_goes_in_first_and_a_failure_takes_it_out_again(self):
-        real, calls = os.replace, []
+        real, calls = importer._place, []
 
-        def failing(src, dst):
+        def failing(src, dst, is_dir):
             calls.append(os.path.basename(dst))
             if len(calls) == 2:
                 raise OSError(errno.EIO, "Input/output error", dst)
-            return real(src, dst)
+            return real(src, dst, is_dir)
 
-        with mock.patch.object(importer.os, "replace", failing):
+        with mock.patch.object(importer, "_place", failing):
             self.refused(self.source(CODEX_SEGMENTED))
         self.assertEqual(calls, [SEGMENT_BASE, SEGMENT_LAST])
         self.assert_nothing_written()
