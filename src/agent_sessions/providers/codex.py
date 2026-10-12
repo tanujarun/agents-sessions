@@ -496,7 +496,11 @@ class Codex(Provider):
         yield from _surviving(_ordered(rollouts))
 
     def import_plan(
-        self, s: Session, pathmap: PathMap, target: str | None = None
+        self,
+        s: Session,
+        pathmap: PathMap,
+        target: str | None = None,
+        experimental: bool = False,
     ) -> importer.ImportPlan:
         """Every rollout of the thread to the same ``YYYY/MM/DD/<name>``
         (FORMATS section 6). A thread in one file has its working directories

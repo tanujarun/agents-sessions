@@ -431,6 +431,10 @@ class Gemini(Provider):
                         yield Turn("tool", name, parse_ts(call.get("timestamp")) or ts)
 
     def import_plan(
-        self, s: Session, pathmap: PathMap, target: str | None = None
+        self,
+        s: Session,
+        pathmap: PathMap,
+        target: str | None = None,
+        experimental: bool = False,
     ) -> importer.ImportPlan:
         raise NotSupported(IMPORT_UNSAFE)

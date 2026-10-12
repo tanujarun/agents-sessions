@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 __all__ = [
     "SQLITE_ERRORS",
     "Candidate",
+    "ExperimentalOnly",
     "NotSupported",
     "Provider",
     "Session",
@@ -59,6 +60,17 @@ class NotSupported(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class ExperimentalOnly(NotSupported):
+    """Raised by ``import_plan`` for an import that is experimental when the
+    caller did not ask for one (``experimental=True``). ``reason`` says what
+    asking for it means; ``warning`` is the text a front end shows before it
+    imports with the flag."""
+
+    def __init__(self, reason: str, warning: str):
+        super().__init__(reason)
+        self.warning = warning
 
 
 class Turn(NamedTuple):
@@ -147,7 +159,11 @@ class Provider:
         raise NotImplementedError
 
     def import_plan(
-        self, s: Session, pathmap: PathMap, target: str | None = None
+        self,
+        s: Session,
+        pathmap: PathMap,
+        target: str | None = None,
+        experimental: bool = False,
     ) -> importer.ImportPlan:
         """What importing foreign session ``s`` into the native store would
         copy, rewrite and append, as an ``importer.ImportPlan``. Reads the
@@ -158,6 +174,10 @@ class Provider:
         copy is made for that folder instead of the one the session
         recorded, in the way FORMATS "Phase 2 findings" Q8 gives for each
         provider.
+
+        ``experimental`` allows an import that has not been proven by a
+        resume yet; an adapter whose import is of that kind raises
+        ``ExperimentalOnly`` without it. It changes nothing for the others.
 
         Raises ``NotSupported(reason)`` when the format cannot be imported
         safely, ``ImportFailed`` when this session cannot be
@@ -171,18 +191,20 @@ class Provider:
         pathmap: PathMap,
         progress: importer.Progress | None = None,
         target: str | None = None,
+        experimental: bool = False,
     ) -> Session:
         """Copy foreign session ``s`` into the native store and return the
         native copy as ``parse`` reads it (the index fills the other fields).
 
         ``progress(done_bytes, total_bytes)`` is called while copying;
-        ``target`` is ``import_plan``'s. May raise ``NotSupported(reason)``
+        ``target`` and ``experimental`` are ``import_plan``'s. May raise
+        ``NotSupported(reason)``
         or ``ImportFailed`` (``importer.Exists`` when the id is already in
         the native store). The copy is read back (``read_back``) while the
         import can still be undone: when it is not the session that was
         planned, nothing of it stays in the native store.
         """
-        plan = self.import_plan(s, pathmap, target)
+        plan = self.import_plan(s, pathmap, target, experimental)
         verified: list[Session] = []
         importer.execute(plan, progress, lambda: verified.append(self.read_back(plan)))
         try:

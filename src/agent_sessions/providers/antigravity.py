@@ -7,16 +7,19 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import urllib.parse
 from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from .. import importer
 from ..fsutil import home, listdir_ro
 from ..model import Candidate, Session, Store
 from . import register
 from .base import (
     SQLITE_ERRORS,
+    ExperimentalOnly,
     NotSupported,
     Provider,
     Turn,
@@ -31,16 +34,23 @@ from .base import (
 )
 
 if TYPE_CHECKING:
-    from .. import importer
     from ..fsutil import StrPath
     from ..pathmap import PathMap
 
 IDE_NOTE = "Antigravity IDE conversation: list only"
-# The verdict of FORMATS section 6, shown to the user as it is.
-IMPORT_UNSAFE = (
-    "Antigravity keeps conversations in SQLite files with protobuf columns; "
-    "registering one needs a row in conversation_summaries.db and the "
-    "workspace path is inside protobuf blobs"
+IDE_STORE = "antigravity-ide"
+# An import is a plain copy, and experimental (FORMATS section 6 and "Phase 2
+# findings", Q5). What a front end shows before one:
+IMPORT_WARNING = (
+    "Experimental: no imported Antigravity conversation has been resumed by hand yet, "
+    "and agy starts a new conversation without an error when it cannot read a copy. "
+    "After the first resume, check that the old turns are on the screen."
+)
+# And what is answered when one was not asked for.
+EXPERIMENTAL_ONLY = (
+    "importing an Antigravity conversation is experimental and is done only when asked "
+    "for (import --experimental): no imported copy has been resumed by hand yet, and agy "
+    "starts a new conversation without an error when it cannot read one"
 )
 
 _SUMMARIES = "conversation_summaries.db"
@@ -371,7 +381,7 @@ class Antigravity(Provider):
 
         files = [str(db)]
         files += [str(p) for p in (root / "brain" / cid, annotation) if os.path.exists(p)]
-        note = IDE_NOTE if root.name == "antigravity-ide" else None
+        note = IDE_NOTE if root.name == IDE_STORE else None
         return {
             "id": cid,
             "title": title,
@@ -534,6 +544,114 @@ class Antigravity(Provider):
                         yield Turn("tool", name, ts)
 
     def import_plan(
-        self, s: Session, pathmap: PathMap, target: str | None = None
+        self,
+        s: Session,
+        pathmap: PathMap,
+        target: str | None = None,
+        experimental: bool = False,
     ) -> importer.ImportPlan:
-        raise NotSupported(IMPORT_UNSAFE)
+        """Copy only, and only as an experimental import (FORMATS "Phase 2
+        findings", Q5; the table there is what this follows).
+
+        ``brain/<id>/`` and ``annotations/<id>.pbtxt`` first, when the store
+        has them, then ``conversations/<id>.db``, byte for byte: the tool
+        finds a conversation by that file, so it arrives last. Nothing is
+        rewritten and no index is written (the tool rebuilds both of its
+        summary indexes from the conversation files). A write-ahead log is
+        never copied; a conversation that has one with anything in it is
+        refused, and so are a sub-agent conversation and one with no steps.
+
+        No folder is needed: the workspace is inside the database and stays
+        as it was recorded. A ``target`` is checked and noted in the plan,
+        and changes nothing in the copy."""
+        if not experimental:
+            raise ExperimentalOnly(EXPERIMENTAL_ONLY, IMPORT_WARNING)
+        source = next((f for f in s.files if f.endswith(".db")), None)
+        if source is None:
+            raise NotSupported("this conversation has no database file to copy")
+        # The file's name becomes a name in the native store: it must be
+        # exactly ``<this conversation's id>.db``.
+        name = os.path.basename(source)
+        if name != f"{s.id}.db" or not self.valid_id(s.id):
+            raise NotSupported(
+                f"the conversation file is not named after its conversation id: {source}"
+            )
+        db = Path(source)
+        root = db.parent.parent
+        if root.name == IDE_STORE:
+            raise NotSupported(
+                "this is an Antigravity IDE conversation; its file format is not known, "
+                "and agy reads only its own conversations"
+            )
+        self._refuse_hot_wal(source + "-wal")
+        conv = self._conversation(db)
+        if conv is None:
+            raise NotSupported(f"the conversation database cannot be read: {source}")
+        row = self._summary_row(root / _SUMMARIES, s.id)
+        if (
+            conv["parents"] > 0
+            or _text(row.get("parent_conversation_id"))
+            or _count(row.get("nesting_depth")) > 0
+        ):
+            raise NotSupported("this is a sub-agent conversation; it is not resumed on its own")
+        if conv["steps"] == 0:
+            raise NotSupported("this conversation has no steps in its database file")
+
+        plan = importer.start_plan(
+            s, self.native_store(), pathmap, self.id_pattern, target, needs_folder=False
+        )
+        native = plan.native_root
+        # Any of these means the id is, or was, in use in this store; the
+        # lock file is left behind by a conversation the tool has opened.
+        plan.existing = [
+            path
+            for path in (
+                os.path.join(native, "annotations", f"{s.id}.pbtxt"),
+                os.path.join(native, "brain", s.id),
+                os.path.join(native, "conversations", name),
+                os.path.join(native, "conversations", name + "-wal"),
+                os.path.join(native, "conversations", f"{s.id}.pb"),
+                os.path.join(native, "presence", f"{s.id}.lock"),
+            )
+            if os.path.lexists(path)
+        ]
+        brain = str(root / "brain" / s.id)
+        if os.path.isdir(brain) and not os.path.islink(brain):
+            dirs, files = importer.tree(brain)
+            plan.units.append(
+                importer.Unit(os.path.join(native, "brain", s.id), brain, files, True, dirs)
+            )
+        annotation = str(root / "annotations" / f"{s.id}.pbtxt")
+        if os.path.isfile(annotation) and not os.path.islink(annotation):
+            plan.units.append(
+                importer.Unit(
+                    os.path.join(native, "annotations", f"{s.id}.pbtxt"),
+                    annotation,
+                    [importer.file_copy(annotation)],
+                )
+            )
+        plan.units.append(
+            importer.Unit(
+                os.path.join(native, "conversations", name), source, [importer.file_copy(source)]
+            )
+        )
+        plan.info["experimental"] = True
+        return plan
+
+    @staticmethod
+    def _refuse_hot_wal(wal: str) -> None:
+        """Raise ``NotSupported`` for a conversation whose write-ahead log
+        holds anything: its last changes are not in the database file, and a
+        copy of that file alone would be an older conversation. An empty
+        log, or none, is the state at rest (FORMATS section 7)."""
+        try:
+            st = os.lstat(wal)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise importer.ImportFailed(f"cannot read {wal}: {exc.strerror or exc}") from exc
+        if not stat.S_ISREG(st.st_mode) or st.st_size:
+            raise NotSupported(
+                "this conversation has a write-ahead log that is not empty: its last "
+                f"changes are not in the database file, and a copy would not have them ({wal})"
+            )

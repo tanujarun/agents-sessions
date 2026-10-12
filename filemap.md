@@ -152,6 +152,10 @@
   accepted as one (`importer.chosen_folder`), and what it changes per provider: Claude's directory name,
   Codex's four fields (`_CwdRewrite` with a recorded and a chosen folder), Grok's group and `info.cwd` for
   the real path; the record's `chosen_folder`; the command
+- `tests/test_import_antigravity.py` — the experimental import of an Antigravity conversation against the
+  table of FORMATS Q5: refused unless asked for, the three pieces and their order, every collision, every
+  precondition (a `-wal` that is not empty, a sub-agent, no steps, an unreadable database, the IDE store),
+  no folder needed, nothing written to an index, the read-back, the command
 - `tests/test_hostile_files.py` — named pipes, devices and directories named like session files (`open_ro`,
   whole scans in a child process under a timeout), over-long lines and the 200 MB line's memory ceiling, size
   caps of files read whole, deeply nested JSON

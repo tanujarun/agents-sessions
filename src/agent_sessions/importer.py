@@ -79,7 +79,7 @@ class Exists(ImportFailed):
     store. ``paths`` are what was found. Nothing was written."""
 
     def __init__(self, paths: Iterable[str]) -> None:
-        self.paths = sorted(paths)
+        self.paths = sorted(set(paths))  # an id's own file can also be a destination
         more = f" (and {len(self.paths) - 1} more)" if len(self.paths) > 1 else ""
         super().__init__(
             f"already in the native store: {self.paths[0]}{more}; nothing was overwritten"

@@ -1270,9 +1270,11 @@ class GrokImportTest(ImportCase):
 
 class NotSupportedTest(ImportCase):
     def test_antigravity_and_gemini_state_the_documented_reason(self):
+        """Antigravity as it is asked for by default: more, and the
+        experimental import itself, in tests/test_import_antigravity.py."""
         for session_id, reason in (
-            (AGY_WIN, antigravity.IMPORT_UNSAFE),
-            (AGY_NO_CWD, antigravity.IMPORT_UNSAFE),
+            (AGY_WIN, antigravity.EXPERIMENTAL_ONLY),
+            (AGY_NO_CWD, antigravity.EXPERIMENTAL_ONLY),
             (GEMINI_WIN, gemini.IMPORT_UNSAFE),
         ):
             source = self.source(session_id)
@@ -1283,10 +1285,10 @@ class NotSupportedTest(ImportCase):
                 api.import_plan(source)
             self.assertEqual(caught.exception.reason, reason)
         self.assertEqual(
-            antigravity.IMPORT_UNSAFE,
-            "Antigravity keeps conversations in SQLite files with protobuf columns; "
-            "registering one needs a row in conversation_summaries.db and the workspace "
-            "path is inside protobuf blobs",
+            antigravity.EXPERIMENTAL_ONLY,
+            "importing an Antigravity conversation is experimental and is done only when "
+            "asked for (import --experimental): no imported copy has been resumed by hand "
+            "yet, and agy starts a new conversation without an error when it cannot read one",
         )
         self.assertEqual(
             gemini.IMPORT_UNSAFE,

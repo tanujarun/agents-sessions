@@ -387,15 +387,17 @@ class FixtureParseTest(AgyCase):
         s = self.listed(fixture_store(WINDOWS), WORKSPACE)
         self.assertEqual(self.provider.resume_argv(s), ["agy", "--conversation", WORKSPACE])
 
-    def test_import_is_refused_with_the_documented_reason(self):
-        """FORMATS section 6. More in tests/test_importer.py."""
+    def test_import_is_refused_unless_it_is_asked_for_as_experimental(self):
+        """FORMATS section 6. More in tests/test_import_antigravity.py."""
         from agent_sessions.providers import antigravity as module
-        from agent_sessions.providers.base import NotSupported
+        from agent_sessions.providers.base import ExperimentalOnly, NotSupported
 
         for call in (self.provider.import_plan, self.provider.import_session):
             with self.assertRaises(NotSupported) as caught:
                 call(None, None)
-            self.assertEqual(caught.exception.reason, module.IMPORT_UNSAFE)
+            self.assertIsInstance(caught.exception, ExperimentalOnly)
+            self.assertEqual(caught.exception.reason, module.EXPERIMENTAL_ONLY)
+            self.assertEqual(caught.exception.warning, module.IMPORT_WARNING)
 
 
 class ReadOnlyTest(AgyCase):

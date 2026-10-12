@@ -76,6 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
             "(an absolute path, or one that starts with ~; the folder must exist)"
         ),
     )
+    p.add_argument(
+        "--experimental",
+        action="store_true",
+        help=(
+            "allow an import that no resume has proven yet (Antigravity: a plain copy "
+            "of the conversation; check after the first resume that its turns are there)"
+        ),
+    )
     p.add_argument("--open", action="store_true", help="resume after import")
     p.add_argument(
         "--dry-run",
@@ -631,6 +639,8 @@ def _folder_line(plan: dict) -> str:
     and that it was chosen when it was."""
     recorded = plan["cwd"] or "not recorded"
     chosen = plan["chosen_folder"]
+    if plan["cwd_local"] is None:  # an import that uses no folder, and found none
+        return f"project folder: {recorded} ({'not found; ' if plan['cwd'] else ''}none is needed)"
     if chosen is None:
         return f"project folder: {recorded} -> {plan['cwd_local']}"
     line = f"project folder: {recorded} -> {plan['cwd_local']} (chosen with --to"
@@ -644,7 +654,7 @@ def _import(args: argparse.Namespace) -> int:
     target = os.path.expanduser(args.to) if args.to is not None else None
     index = api.load_index()
     if args.dry_run:
-        plan = api.import_plan(args.key, index=index, target=target)
+        plan = api.import_plan(args.key, index=index, target=target, experimental=args.experimental)
         if plan["already"]:
             _out(f"already imported: {plan['already']}")
             _out("dry run: nothing was written")
@@ -680,7 +690,13 @@ def _import(args: argparse.Namespace) -> int:
             _progress(f"copying… {share}% of {_size(total)}")
 
     try:
-        report = api.import_report(args.key, progress=progress, index=index, target=target)
+        report = api.import_report(
+            args.key,
+            progress=progress,
+            index=index,
+            target=target,
+            experimental=args.experimental,
+        )
     finally:
         if progress is not None:
             _progress()

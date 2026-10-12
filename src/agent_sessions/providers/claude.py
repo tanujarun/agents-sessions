@@ -390,7 +390,11 @@ class Claude(Provider):
                             yield Turn("tool", tool, moment)
 
     def import_plan(
-        self, s: Session, pathmap: PathMap, target: str | None = None
+        self,
+        s: Session,
+        pathmap: PathMap,
+        target: str | None = None,
+        experimental: bool = False,
     ) -> importer.ImportPlan:
         """Copy only (FORMATS section 6): the ``<id>/`` side directory first,
         the transcript last, into ``projects/<encoded mapped cwd>/``. Nothing

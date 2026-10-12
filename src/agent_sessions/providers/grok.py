@@ -463,7 +463,11 @@ class Grok(Provider):
                     yield Turn("tool", name, None)
 
     def import_plan(
-        self, s: Session, pathmap: PathMap, target: str | None = None
+        self,
+        s: Session,
+        pathmap: PathMap,
+        target: str | None = None,
+        experimental: bool = False,
     ) -> importer.ImportPlan:
         """The session directory without ``*.lock``, into the group directory
         of the mapped cwd, with ``summary.json`` rewritten (FORMATS section

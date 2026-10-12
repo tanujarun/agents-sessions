@@ -638,15 +638,42 @@ the SQL columns):
 
 ### 6. Import
 
-Verdict: **NotSupported as implemented; a copy-only import is specified in Phase 2, Q5, to ship
-as an experimental action until one resume has been tested by hand.**
+Verdict: **experimental: copy-only, done only when asked for** (`import --experimental`,
+`experimental=True`) `[inferred from the verified lookup; no resume of a copy has been done]`.
+Without the flag the adapter refuses and says what the flag is for.
 
-The reason given so far ("registering one needs a row in `conversation_summaries.db`") does not
-hold: the tool finds a conversation by its file `conversations/<id>.db` `[verified, code]`, and
-it rebuilds both summary indexes from the conversation files at start-up `[verified, the
+The reason given at first ("registering one needs a row in `conversation_summaries.db`") does
+not hold: the tool finds a conversation by its file `conversations/<id>.db` `[verified, code]`,
+and it rebuilds both summary indexes from the conversation files at start-up `[verified, the
 Windows store's own log: "reconcile checked 4 conversations, restored 4"]`. What stays true: the
 workspace path is inside protobuf blobs, so an imported conversation keeps its Windows
 workspace URIs, and nothing about an actual resume has been observed.
+
+The recipe is the table of Phase 2, Q5, implemented as it stands:
+
+1. Refuse (before anything else is looked at) unless the import was asked for as experimental.
+2. Refuse a conversation of an `antigravity-ide` store, one whose file is not `<id>.db`, one
+   with a `<id>.db-wal` that is not an empty regular file, one whose database cannot be read
+   (a schema with a view or a trigger included), a sub-agent conversation (§3: the summaries
+   row, or rows in `parent_references`) and one with no steps in the database file.
+3. Refuse when any of `conversations/<id>.db`, `conversations/<id>.db-wal`,
+   `conversations/<id>.pb`, `brain/<id>`, `annotations/<id>.pbtxt`, `presence/<id>.lock` exists
+   in the native store.
+4. Copy, byte for byte and in this order: `brain/<id>/` (when it is a directory; symbolic links
+   and special files in it are left out), `annotations/<id>.pbtxt` (when it is a regular file),
+   `conversations/<id>.db` last. Never `-wal`, `-shm`, either summary index, `presence/`,
+   `cache/`, `history.jsonl`, `implicit/`.
+5. Rewrite nothing, write no index. No folder is needed: a conversation without a recorded or
+   an existing folder imports all the same, and a chosen folder is only noted in the record.
+   A conversation whose folder was known from `cache/last_conversations.json` alone therefore
+   has no folder in its native copy.
+6. The copy is read back like any conversation of the native store (through the in-memory
+   read, which creates no sidecar).
+
+Undo (`unimport`): the three copied pieces; with `--force` also what the tool adds once it has
+opened the conversation (`conversations/<id>.db-wal`, `-shm`, `presence/<id>.lock`). The rows
+in the two summary indexes are left to the tool. An undo must not run while `agy` is running;
+the files cannot say whether it is (Phase 2, Q5).
 
 ### 7. Quirks
 
