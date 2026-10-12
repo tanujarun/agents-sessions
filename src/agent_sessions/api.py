@@ -1,17 +1,18 @@
 """The facade the CLI and the TUI call: load, scan, list, status, verify,
-find, open, import, transcript, and the drives: volumes, mount, forget, the
-drive letters.
+find, open, import, unimport, transcript, and the drives: volumes, mount,
+forget, the drive letters.
 
 What is worth a line in the log is written here, so both front ends log
-alike (``logs``): the summary and the warnings of a scan, an import and how
-it ended, a launch with the exact command, a mount, a drive that is
-forgotten, and any exception that is not one of the failures this module
-reports (``ApiError``), with its traceback.
+alike (``logs``): the summary and the warnings of a scan, an import or an
+undo and how it ended, a launch with the exact command, a mount, a drive
+that is forgotten, and any exception that is not one of the failures this
+module reports (``ApiError``), with its traceback.
 """
 
 from __future__ import annotations
 
 import functools
+import os
 import re
 import shlex
 import time
@@ -24,14 +25,23 @@ from . import discover, importer, launch, logs, pathmap
 from . import index as index_mod
 from . import mounts as mounts_mod
 from . import providers as registry
-from .errors import ApiError, ImportFailed, LaunchFailed, MountFailed, NotFound, Offline
-from .fsutil import cache_file, log_file
+from . import unimport as undoing
+from .errors import (
+    ApiError,
+    ImportFailed,
+    LaunchFailed,
+    MountFailed,
+    NotFound,
+    Offline,
+    UndoFailed,
+)
+from .fsutil import cache_file, home, log_file
 from .index import Index
 from .launch import LaunchPlan
 from .model import Session, make_key
 from .mounts import NATIVE_LABEL, MountsError, list_mounts
 from .providers import all_providers
-from .providers.base import NotSupported, Provider, Turn, parse_ts
+from .providers.base import ExperimentalOnly, NotSupported, Provider, Turn, parse_ts
 
 if TYPE_CHECKING:
     import threading
@@ -514,14 +524,17 @@ class ImportReport:
     bytes: int = 0
 
 
-def _plan(session: Session, index: Index) -> importer.ImportPlan:
-    """The import plan for a foreign session. Raises ``ImportFailed``, and
-    ``Offline`` when its drive is not mounted."""
+def _plan(
+    session: Session, index: Index, target: str | None = None, experimental: bool = False
+) -> importer.ImportPlan:
+    """The import plan for a foreign session, into the folder ``target``
+    when one is given. Raises ``ImportFailed``, and ``Offline`` when its
+    drive is not mounted."""
     if session.origin == "native":
         raise ImportFailed(f"this session is already on {NATIVE_LABEL}")
     _need_files(session)
     try:
-        return _provider(session).import_plan(session, index.pathmap)
+        return _provider(session).import_plan(session, index.pathmap, target, experimental)
     except NotSupported as exc:
         raise ImportFailed(exc.reason) from None
     except NotFound as exc:
@@ -529,31 +542,121 @@ def _plan(session: Session, index: Index) -> importer.ImportPlan:
 
 
 @_logged
-def can_import(session: Session | str, index: Index | None = None) -> tuple[bool, str]:
+def can_import(
+    session: Session | str,
+    index: Index | None = None,
+    target: str | None = None,
+    experimental: bool = False,
+) -> tuple[bool, str]:
     """``(True, "")`` when ``import_session`` would copy this session, else
     ``(False, reason)``: it is native, already imported, its provider cannot
-    be imported, its drive is not mounted, its project folder is not on any
-    mounted drive, its id is already in the native store, or there is too
-    little free space. Reads only; writes nothing."""
-    try:
-        index = index if index is not None else load_index()
-        session = find_session(session, index)
-        if _native_copy(session, index) is not None:
-            return False, "already imported"
-        importer.check(_plan(session, index))
-    except ApiError as exc:
-        return False, exc.reason
-    return True, ""
+    be imported, or only as an experimental import, its drive is not
+    mounted, its project folder is not on any mounted drive, its id is
+    already in the native store, or there is too little free space.
+    ``target`` and ``experimental`` ask about an import with them. Reads
+    only; writes nothing. ``import_options`` says more."""
+    options = import_options(session, index, target)
+    if options.possible or (experimental and options.experimental and not options.needs_folder):
+        return True, ""
+    return False, options.reason
+
+
+@dataclass(frozen=True)
+class ImportOptions:
+    """What an import of one session can be (``import_options``): what a
+    front end builds its prompt from."""
+
+    # ``import_session`` would copy the session as it was asked about, with
+    # no flag and no folder beyond the ``target`` that was given.
+    possible: bool
+    # Why not, in plain words; "" when ``possible``. With ``needs_folder``
+    # or ``experimental`` it is what an import without them answers.
+    reason: str = ""
+    # It would work with a folder the user chooses (``target``): the
+    # session's own folder is not on this machine, or was not recorded.
+    needs_folder: bool = False
+    # It works only as an experimental import (``experimental=True``).
+    experimental: bool = False
+    # What must be shown before an experimental import; "" otherwise.
+    warning: str = ""
+
+
+def _some_folder() -> str:
+    """A directory that exists, to ask whether an import would work with a
+    chosen folder before one is chosen: the home, else the root."""
+    here = os.path.abspath(home())
+    return here if os.path.isdir(here) else os.path.abspath(os.sep)
 
 
 @_logged
-def import_plan(ref: Session | str, index: Index | None = None) -> dict:
+def import_options(
+    ref: Session | str, index: Index | None = None, target: str | None = None
+) -> ImportOptions:
+    """What an import of this session can be: possible as it is, possible
+    with a chosen folder (``needs_folder``), possible only as an
+    experimental import (``experimental``, with the ``warning`` to show
+    first), or not at all, with the ``reason``. ``target`` asks about an
+    import into that folder. Never raises for a session that cannot be
+    imported or found: that is an answer. Reads only; writes nothing.
+
+    ``needs_folder`` and ``experimental`` are set only when the import would
+    then go through: the plan is made again with what it asked for (with a
+    stand-in for the folder that is still to be chosen) and has to pass
+    every check, free space included."""
+    try:
+        if target is not None:
+            importer.chosen_folder(target)
+        index = index if index is not None else load_index()
+        session = find_session(ref, index)
+        if _native_copy(session, index) is not None:
+            return ImportOptions(False, "already imported")
+        if session.origin == "native":
+            raise ImportFailed(f"this session is already on {NATIVE_LABEL}")
+        _need_files(session)
+        provider = _provider(session)
+    except ApiError as exc:
+        return ImportOptions(False, exc.reason)
+    reason = warning = ""  # of the import as it was asked about
+    needs_folder = experimental = False
+    folder = target
+    while True:  # as it is; then with what it turned out to need
+        try:
+            importer.check(provider.import_plan(session, index.pathmap, folder, experimental))
+        except ExperimentalOnly as exc:
+            if experimental:  # asked for and still not enough: an adapter's fault
+                return ImportOptions(False, exc.reason)
+            experimental, warning = True, exc.warning
+            reason = reason or exc.reason
+        except importer.NoFolder as exc:
+            if folder is not None:
+                return ImportOptions(False, exc.reason)
+            needs_folder, folder = True, _some_folder()
+            reason = reason or exc.reason
+        except (ApiError, NotSupported) as exc:
+            return ImportOptions(False, exc.reason)
+        else:
+            possible = not (needs_folder or experimental)
+            return ImportOptions(possible, reason, needs_folder, experimental, warning)
+
+
+@_logged
+def import_plan(
+    ref: Session | str,
+    index: Index | None = None,
+    target: str | None = None,
+    experimental: bool = False,
+) -> dict:
     """What ``import_session`` would do, as plain data, for a dry run:
     ``already`` (the native key when it is imported already, else None),
+    ``cwd`` (the folder as recorded), ``cwd_local`` (the folder the copy is
+    made for), ``chosen_folder`` (``target`` when one was given, else None),
     ``copies``, ``rewrites`` (with the changes each would make), ``appends``,
     ``bytes``, ``needed``, ``free``. Writes nothing. Raises ``ImportFailed``
-    for everything the import itself would refuse, ``Offline`` for a session
+    for everything the import itself would refuse, a ``target`` that is not
+    an absolute path of a directory included, ``Offline`` for a session
     whose drive is not mounted."""
+    if target is not None:
+        importer.chosen_folder(target)
     index = index if index is not None else load_index()
     session = find_session(ref, index)
     copy = _native_copy(session, index)
@@ -569,14 +672,18 @@ def import_plan(ref: Session | str, index: Index | None = None) -> dict:
             "appends": [],
             "bytes": 0,
         }
-    plan = _plan(session, index)
+    plan = _plan(session, index, target, experimental)
     importer.check(plan)
     return dict(importer.describe(plan), already=None)
 
 
 @_logged
 def import_report(
-    ref: Session | str, progress: importer.Progress | None = None, index: Index | None = None
+    ref: Session | str,
+    progress: importer.Progress | None = None,
+    index: Index | None = None,
+    target: str | None = None,
+    experimental: bool = False,
 ) -> ImportReport:
     """``import_session`` with the details: whether anything was copied (a
     session imported before is returned with ``created=False``) and which
@@ -584,9 +691,17 @@ def import_report(
     index = index if index is not None else load_index()
     session = find_session(ref, index)
     log = logs.logger()
-    log.info("import %s (store %s)", session.key, session.store)
+    log.info(
+        "import %s (store %s)%s%s",
+        session.key,
+        session.store,
+        f" into the chosen folder {target}" if target is not None else "",
+        ", experimental imports allowed" if experimental else "",
+    )
     try:
-        report = _import(session, progress, index)
+        if target is not None:
+            importer.chosen_folder(target)
+        report = _import(session, progress, index, target, experimental)
     except ApiError as exc:
         log.warning("import %s refused: %s", session.key, exc.reason)
         raise
@@ -604,7 +719,13 @@ def import_report(
     return report
 
 
-def _import(session: Session, progress: importer.Progress | None, index: Index) -> ImportReport:
+def _import(
+    session: Session,
+    progress: importer.Progress | None,
+    index: Index,
+    target: str | None = None,
+    experimental: bool = False,
+) -> ImportReport:
     """``import_report`` for a session that was found."""
     copy = _native_copy(session, index)
     if copy is not None:
@@ -617,9 +738,9 @@ def _import(session: Session, progress: importer.Progress | None, index: Index) 
     files: list[str] = []
     size = 0
     try:
-        plan = provider.import_plan(session, index.pathmap)
+        plan = provider.import_plan(session, index.pathmap, target, experimental)
         files, size = plan.destinations, plan.total_bytes
-        provider.import_session(session, index.pathmap, progress)
+        provider.import_session(session, index.pathmap, progress, target, experimental)
     except importer.Exists as exc:
         collision = exc  # in the store but not in this index: look again below
     except NotSupported as exc:
@@ -640,18 +761,147 @@ def _import(session: Session, progress: importer.Progress | None, index: Index) 
 
 @_logged
 def import_session(
-    ref: Session | str, progress: importer.Progress | None = None, index: Index | None = None
+    ref: Session | str,
+    progress: importer.Progress | None = None,
+    index: Index | None = None,
+    target: str | None = None,
+    experimental: bool = False,
 ) -> Session:
     """Copy a foreign session into the native store and return the native
     copy, indexed and launchable. A session that was imported before is
     returned as it is; nothing is copied twice and nothing is overwritten.
+
+    ``target`` is a folder to import into in place of the one the session
+    recorded: an absolute path of a directory that exists. It is the only
+    way to import a session whose own folder is gone or was never recorded.
+    What it changes in the copy depends on the provider (FORMATS "Phase 2
+    findings", Q8); the import record keeps both folders.
+
+    ``experimental=True`` allows an import that no resume has proven yet
+    (Antigravity: a plain copy, FORMATS Q5). Without it such a session is
+    refused, and the reason says so. ``import_options`` has the warning a
+    front end shows first.
 
     ``progress(done_bytes, total_bytes)`` is called while copying. Raises
     ``ImportFailed`` with the reason, also when the provider cannot be
     imported. A quick scan runs afterwards; an ``index`` passed in is not
     refreshed, load it again.
     """
-    return import_report(ref, progress, index).session
+    return import_report(ref, progress, index, target, experimental).session
+
+
+@dataclass
+class UnimportReport:
+    """What ``unimport`` did, or with ``dry_run`` would do."""
+
+    provider: str
+    id: str
+    native_key: str | None  # of the copy, as its import record has it
+    source_key: str | None  # of the session it was imported from
+    removed: list[str] = field(default_factory=list)  # files, then directories deepest first
+    left: list[tuple[str, str]] = field(default_factory=list)  # (path, why), by path
+    differences: list[str] = field(default_factory=list)  # from the record: a forced undo
+    forced: bool = False
+    dry_run: bool = False
+    bytes: int = 0  # of the files the undo set out to remove
+
+
+def _undo_target(ref: Session | str, index: Index) -> tuple[str, str]:
+    """The provider and session id ``ref`` names for an undo: those of a
+    listed session (``find_session``: a key, a start of one, an id), else of
+    the import record that still stands whose native key, source key or id
+    ``ref`` is. The second way finds a copy whose session is not listed any
+    more (its files were removed by hand, its drive forgotten)."""
+    if isinstance(ref, Session):
+        return ref.provider, ref.id
+    try:
+        session = find_session(ref, index)
+    except NotFound as missing:
+        text = ref.strip() if isinstance(ref, str) else ""
+        named = sorted(
+            {
+                (record["provider"], record["id"])
+                for record in undoing.not_undone(undoing.read_records())
+                if text
+                and text in (record.get("native_key"), record.get("source_key"), record.get("id"))
+            }
+        )
+        if len(named) != 1:
+            raise missing from None
+        return named[0]
+    return session.provider, session.id
+
+
+@_logged
+def unimport(
+    ref: Session | str,
+    force: bool = False,
+    dry_run: bool = False,
+    index: Index | None = None,
+) -> UnimportReport:
+    """Take an import back: remove from the native store what the last
+    import of this session created, and nothing else (``unimport``, the
+    module, has the rules). ``ref`` is the native copy, the foreign session
+    it came from, or the id.
+
+    Refused (``UndoFailed``, nothing removed) when no import of the session
+    is recorded, and when a file of the copy differs from what the record
+    says of it: the session was used since. ``force=True`` removes the copy
+    all the same, together with what the tool made beside it since
+    (``Provider.undo_extras``), and is the only way to undo an import
+    recorded without a manifest.
+
+    Directories go only when they are empty, and a line the import added to
+    a file of the tool's stays: ``left`` says what was left and why. With
+    ``dry_run=True`` nothing is touched and the report is what would be
+    done. Otherwise the undo is recorded in the journal and a quick scan
+    runs afterwards (an ``index`` passed in is not refreshed). Raises
+    ``NotFound`` for a reference that names nothing."""
+    index = index if index is not None else load_index()
+    name, session_id = _undo_target(ref, index)
+    try:
+        provider = registry.get(name)
+    except KeyError:
+        raise NotFound(f"no reader for provider {name!r}") from None
+    native = provider.native_store()
+    if native is None or not provider.valid_id(session_id):
+        raise UndoFailed(undoing.NO_RECORD)
+    log = logs.logger()
+    if not dry_run:
+        log.info("unimport %s %s from %s%s", name, session_id, native, " (forced)" if force else "")
+    try:
+        made, record = undoing.undo(
+            name, session_id, native, provider.undo_extras(session_id, native), force, dry_run
+        )
+    except UndoFailed as exc:
+        if not dry_run:
+            log.warning("unimport %s %s refused: %s", name, session_id, exc.reason)
+        raise
+    keys = [made.record.get(key) for key in ("native_key", "source_key")]
+    native_key, source_key = (key if isinstance(key, str) else None for key in keys)
+    report = UnimportReport(
+        provider=name,
+        id=session_id,
+        native_key=native_key,
+        source_key=source_key,
+        removed=made.files + made.dirs,
+        left=list(made.left),
+        differences=list(made.differences),
+        forced=made.forced,
+        dry_run=dry_run,
+        bytes=made.bytes,
+    )
+    if record is not None:
+        log.info(
+            "unimport %s %s: removed %d files and directories, left %d: %s",
+            name,
+            session_id,
+            len(report.removed),
+            len(report.left),
+            ", ".join(f"{path} ({why})" for path, why in report.left) or "nothing",
+        )
+        Index.load().scan(all_providers(), list_mounts(), deep=False)
+    return report
 
 
 # --- drives: volumes, mount, forget, drive letters ----------------------------
@@ -820,6 +1070,7 @@ __all__ = [
     "NO_READER_TOOLS",
     "ApiError",
     "ImportFailed",
+    "ImportOptions",
     "ImportReport",
     "LaunchFailed",
     "LaunchPlan",
@@ -827,11 +1078,14 @@ __all__ = [
     "NotFound",
     "Offline",
     "Turn",
+    "UndoFailed",
+    "UnimportReport",
     "cache_file",
     "can_import",
     "find_session",
     "find_volume",
     "forget_drive",
+    "import_options",
     "import_plan",
     "import_report",
     "import_session",
@@ -844,6 +1098,7 @@ __all__ = [
     "set_letter",
     "status",
     "transcript",
+    "unimport",
     "verify",
     "volumes",
 ]

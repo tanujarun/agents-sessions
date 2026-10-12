@@ -128,7 +128,10 @@ class Provider:
     def resume_argv(self, s: Session) -> list[str]            # for native sessions
     def transcript(self, s: Session) -> Iterator[Turn]       # (role, text, ts); user, assistant, tool-name turns
     def import_session(self, s: Session, pathmap) -> Session  # may raise NotSupported(reason)
+    # phase 2: both take target=None (a folder the user chose) and experimental=False
+    def import_plan(self, s: Session, pathmap) -> ImportPlan  # what import_session would do; reads only
     def read_back(self, plan) -> Session                      # the placed copy, parsed like any session
+    def undo_extras(self, session_id, native_root) -> list[str]   # phase 2: what the tool adds beside a copy
     def evidence_files(self, store: Store) -> list[str]       # phase 2: the files path_evidence reads
     def path_evidence(self, store: Store) -> list[str]        # phase 2: more recorded folders, for drive letters
 ```
@@ -548,31 +551,57 @@ Terminal: `omarchy-launch-tui` when present; else `xdg-terminal-exec`; else
   the recorded cwd becomes the folder, a value below it the same path below
   the folder, anything else goes through the path map); Grok uses the group
   name and `info.cwd` of the folder's real path. The record keeps both the
-  recorded cwd and the chosen folder.
+  recorded cwd and the chosen folder (`cwd`, `chosen_folder`, and
+  `cwd_local`: the folder the copy was made for). The folder is the user's
+  own input and is checked in one place (`importer.chosen_folder`): text
+  with a NUL, a relative path, a path that is not there and a file are
+  refused; the command expands `~`, the engine does not. `--dry-run` shows
+  the folder and that it was chosen.
 - **Grok**: the group directory is `quote(cwd, safe="")`; over 255 bytes it
   is `<slug>-<16 hex of BLAKE3(cwd)>` (FORMATS "Q1"). BLAKE3 is implemented
-  for inputs up to 1,024 bytes (one chunk) and checked against the published
-  test vectors; a longer path is refused. The old `[A-Za-z0-9/ ]` limit goes.
+  for inputs up to 1,024 bytes (one chunk, `blake3.py`) and checked against
+  the published test vectors; a longer path is refused, and so is one that
+  is not valid UTF-8. The old `[A-Za-z0-9/ ]` limit goes.
 - **Antigravity**: copy-only, exactly as FORMATS "Q5" specifies, and only
   with `--experimental` (the TUI asks a second time and says why): one
   resume by hand has not been done yet, and the tool starts a new
   conversation without an error when it cannot read a copy. No folder is
-  needed.
+  needed. Without the flag the refusal says what the flag is for; with it
+  the command prints the warning before it copies.
 - **Gemini**: still refused (no CLI, no resumable data).
 - The journal is `imports.jsonl` in the state directory: one JSON object per
   line, appended under a lock; a record lists every file and directory the
   import created with size and modification time. An old `imports.json` is
   read, never rewritten.
-- `unimport <key> [--force] [--dry-run]`: removes what the last import of
-  that session created, and nothing else. Refused when any of those files
-  differs from the record (the session was used since) unless `--force`;
+- `unimport <key> [--force] [--dry-run] [--yes]`: removes what the last
+  import of that session created, and nothing else. `<key>` is the native
+  copy, the foreign session or the id; the record is the last import of
+  that provider and id that no undo took back. Refused when any of those
+  files differs from the record (it is gone, not a regular file, of another
+  size or modification time: the session was used since) unless `--force`;
   directories are removed only when empty; a line appended to a file the
   tool owns (Codex `session_index.jsonl`) is left and reported; extra files
   a tool creates beside an imported conversation (Antigravity `-wal`,
-  `-shm`, `presence/<id>.lock`) are removed only with `--force`. The undo is
-  itself a journal record.
+  `-shm`, `presence/<id>.lock`: `Provider.undo_extras`) are removed only
+  with `--force`. The undo is itself a journal record (`"record": "undo"`:
+  what was removed, what was left and why, forced or not). It asks `y/N` on
+  a terminal and is refused without one unless `--yes`, like `forget`.
+  - Every file to be removed must be a path below the native store by the
+    rule of an import destination (`importer.below`), whatever the journal
+    says, and the record must be for this native store; otherwise nothing
+    is removed, forced or not. The directories an import made can include
+    the native store itself and the ones above it (it records what it had
+    to create): those too are removed only when empty.
+  - A record without a manifest (the old `imports.json`) is undone only
+    with `--force`, and then only the files and directories it names that
+    carry the session's id in their own name.
+  - Comparison and removal happen under the state directory's lock;
+    `--dry-run` takes no lock, writes nothing and reports what would be
+    removed and left.
 - `api.import_options(session)` tells a front end what is possible:
   `possible`, `reason`, `needs_folder`, `experimental`, `warning`.
+  `needs_folder` and `experimental` are set only when the import would then
+  pass every check (free space, collisions); `can_import` is its short form.
 
 ## Continue as a new session
 
@@ -602,7 +631,7 @@ agent-sessions --version | --debug
 agent-sessions mount <drive>            agent-sessions forget <drive> [--yes]
 agent-sessions map [LETTER: DIR | --remove LETTER:]
 agent-sessions import <key> [--to DIR] [--experimental] [--open] [--dry-run]
-agent-sessions unimport <key> [--force] [--dry-run]
+agent-sessions unimport <key> [--force] [--dry-run] [--yes]
 agent-sessions export <key> [-o FILE] [--format md|json]
 agent-sessions continue <key> [--with TOOL] [--in DIR] [--dry-run] [--here]
 ```

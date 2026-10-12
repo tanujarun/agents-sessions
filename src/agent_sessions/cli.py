@@ -68,12 +68,52 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("import", help="import; optionally resume after")
     p.add_argument("key", help=key_help)
+    p.add_argument(
+        "--to",
+        metavar="DIR",
+        help=(
+            "import into this folder instead of the one the session recorded "
+            "(an absolute path, or one that starts with ~; the folder must exist)"
+        ),
+    )
+    p.add_argument(
+        "--experimental",
+        action="store_true",
+        help=(
+            "allow an import that no resume has proven yet (Antigravity: a plain copy "
+            "of the conversation; check after the first resume that its turns are there)"
+        ),
+    )
     p.add_argument("--open", action="store_true", help="resume after import")
     p.add_argument(
         "--dry-run",
         action="store_true",
         help="print what would be copied and rewritten, write nothing",
     )
+
+    p = sub.add_parser(
+        "unimport",
+        help="remove the copy an import made",
+        description=(
+            "Take an import back: remove from the native store what the last import of the "
+            "session created, and nothing else. Refused when the copy was used since. "
+            "Directories are removed only when they are empty, and a line the import added "
+            "to a file of the tool's is left; both are reported."
+        ),
+    )
+    p.add_argument("key", help=key_help + ": the imported copy, or what it was imported from")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "remove the copy even when it was used since the import, and what the tool "
+            "made beside it; needed for an import recorded without a list of its files"
+        ),
+    )
+    p.add_argument(
+        "--dry-run", action="store_true", help="print what would be removed, remove nothing"
+    )
+    p.add_argument("--yes", action="store_true", help="do not ask")
 
     p = sub.add_parser("show", help="plain-text transcript to stdout")
     p.add_argument("key", help=key_help)
@@ -618,16 +658,39 @@ def _open(args: argparse.Namespace) -> int:
     return _resume(args.key, args.here, args.dry_run)
 
 
+def _folder_line(plan: dict) -> str:
+    """The line of a dry run that says which folder the copy is made for,
+    and that it was chosen when it was."""
+    recorded = plan["cwd"] or "not recorded"
+    chosen = plan["chosen_folder"]
+    if plan["cwd_local"] is None:  # an import that uses no folder, and found none
+        return f"project folder: {recorded} ({'not found; ' if plan['cwd'] else ''}none is needed)"
+    if chosen is None:
+        return f"project folder: {recorded} -> {plan['cwd_local']}"
+    line = f"project folder: {recorded} -> {plan['cwd_local']} (chosen with --to"
+    if plan["cwd_local"] != chosen:  # the folder's real path is what is used
+        line += f" {chosen}"
+    return line + ")"
+
+
 def _import(args: argparse.Namespace) -> int:
+    # ``~`` is expanded here: the engine takes an absolute path and nothing else.
+    target = os.path.expanduser(args.to) if args.to is not None else None
     index = api.load_index()
+    if args.experimental:
+        # Said before anything is copied, and in a dry run too. Only when
+        # the flag is what makes this import possible.
+        options = api.import_options(args.key, index=index, target=target)
+        if options.experimental:
+            _err(options.warning)
     if args.dry_run:
-        plan = api.import_plan(args.key, index=index)
+        plan = api.import_plan(args.key, index=index, target=target, experimental=args.experimental)
         if plan["already"]:
             _out(f"already imported: {plan['already']}")
             _out("dry run: nothing was written")
             return 0
         _out(f"import {plan['source_key']} -> {plan['native_key']}")
-        _out(f"project folder: {plan['cwd']} -> {plan['cwd_local']}")
+        _out(_folder_line(plan))
         for copy in plan["copies"]:
             size = _size(copy["bytes"])
             if copy["dir"]:
@@ -657,7 +720,13 @@ def _import(args: argparse.Namespace) -> int:
             _progress(f"copying… {share}% of {_size(total)}")
 
     try:
-        report = api.import_report(args.key, progress=progress, index=index)
+        report = api.import_report(
+            args.key,
+            progress=progress,
+            index=index,
+            target=target,
+            experimental=args.experimental,
+        )
     finally:
         if progress is not None:
             _progress()
@@ -671,6 +740,48 @@ def _import(args: argparse.Namespace) -> int:
     _out(report.session.key)
     if args.open:
         return _resume(report.session, False, False)
+    return 0
+
+
+def _print_undo(report: api.UnimportReport) -> None:
+    """What an undo removed and left, or with a dry run would: a line each."""
+    removed, left = ("would remove", "would leave") if report.dry_run else ("removed", "left")
+    for text in report.differences:
+        _out(f"differs from the import record: {text}")
+    for path in report.removed:
+        _out(f"{removed} {path}")
+    for path, why in report.left:
+        _out(f"{left} {path} ({why})")
+
+
+def _unimport(args: argparse.Namespace) -> int:
+    # Planned first, without touching anything: every refusal comes from
+    # here, before a question is asked.
+    planned = api.unimport(args.key, force=args.force, dry_run=True)
+    name = planned.native_key or f"{planned.provider}:{planned.id}"
+    what = (
+        f"{_count(len(planned.removed), 'file or directory', 'files and directories')} "
+        f"({_size(planned.bytes)})"
+    )
+    if args.dry_run:
+        _print_undo(planned)
+        _out("dry run: nothing was removed")
+        return 0
+    if not args.yes:
+        if not (sys.stdin.isatty() and sys.stderr.isatty()):
+            _err(f"unimport {name}: not a terminal to ask on; pass --yes")
+            return 1
+        used = " It was used since the import." if planned.differences else ""
+        if not _ask(f"Remove the imported copy {name}, {what}?{used}"):
+            _err("nothing was removed")
+            return 1
+    report = api.unimport(args.key, force=args.force)
+    _print_undo(report)
+    _err(
+        f"removed the imported copy {name}: "
+        f"{_count(len(report.removed), 'file or directory', 'files and directories')}"
+        + (f"; {len(report.left)} left in place" if report.left else "")
+    )
     return 0
 
 
@@ -730,6 +841,7 @@ _COMMANDS = {
     "verify": _verify,
     "open": _open,
     "import": _import,
+    "unimport": _unimport,
     "show": _show,
     "mount": _mount,
     "forget": _forget,

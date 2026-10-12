@@ -272,9 +272,10 @@ scanned. `mount` and `forget` take any of `label`, `fs_label`, `letter`,
 
 ## Commands without a JSON form
 
-`verify`, `open --dry-run`, `import --dry-run`, `show`, `mount`, `forget` and
-`map` print text for a person and have no `--json`. Their data is available
-to a program through the engine (`agent_sessions.api`: `verify()`,
-`open_session(…, dry_run=True)`, `import_plan()`, `transcript()`,
+`verify`, `open --dry-run`, `import --dry-run`, `unimport`, `show`, `mount`,
+`forget` and `map` print text for a person and have no `--json`. Their data
+is available to a program through the engine (`agent_sessions.api`:
+`verify()`, `open_session(…, dry_run=True)`, `import_plan()`,
+`import_options()`, `unimport(…, dry_run=True)`, `transcript()`,
 `mount_drive()`, `forget_drive()`, `volumes()`, `set_letter()`,
 `remove_letter()`); those return values are not part of this contract.

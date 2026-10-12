@@ -389,10 +389,21 @@ class Claude(Provider):
                         if isinstance(tool, str) and tool:
                             yield Turn("tool", tool, moment)
 
-    def import_plan(self, s: Session, pathmap: PathMap) -> importer.ImportPlan:
+    def import_plan(
+        self,
+        s: Session,
+        pathmap: PathMap,
+        target: str | None = None,
+        experimental: bool = False,
+    ) -> importer.ImportPlan:
         """Copy only (FORMATS section 6): the ``<id>/`` side directory first,
         the transcript last, into ``projects/<encoded mapped cwd>/``. Nothing
-        is rewritten and nothing else is copied."""
+        is rewritten and nothing else is copied.
+
+        With a chosen folder (``target``) only that directory's name
+        differs: ``projects/<encoded target>/``. The transcript stays byte
+        for byte what it was, and the tool's own marker for a session that
+        moved (a ``relocated`` record) is not written (FORMATS Q8)."""
         transcript = next((f for f in s.files if _TRANSCRIPT.fullmatch(os.path.basename(f))), None)
         if transcript is None:
             raise NotSupported("this session has no transcript file to copy")
@@ -403,8 +414,8 @@ class Claude(Provider):
         named = _TRANSCRIPT.fullmatch(name)
         if named is None or named.group(1) != s.id:
             raise NotSupported(f"the transcript is not named after its session id: {transcript}")
-        plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern)
-        folder = encode_cwd(plan.cwd_local)
+        plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern, target)
+        folder = encode_cwd(plan.cwd_local or "")
         if not _ENCODED.fullmatch(folder):
             raise NotSupported(f"the project folder {plan.cwd_local} has no directory name")
         projects = os.path.join(plan.native_root, "projects")
@@ -417,15 +428,15 @@ class Claude(Provider):
             for path in (os.path.join(projects, d, name) for d in dirs)
             if os.path.lexists(path)
         ]
-        target = os.path.join(projects, folder)
+        project = os.path.join(projects, folder)
         side = transcript[: -len(".jsonl")]
         if os.path.isdir(side) and not os.path.islink(side):
             sub, files = importer.tree(side)
             plan.units.append(
-                importer.Unit(os.path.join(target, os.path.basename(side)), side, files, True, sub)
+                importer.Unit(os.path.join(project, os.path.basename(side)), side, files, True, sub)
             )
         plan.units.append(
-            importer.Unit(os.path.join(target, name), transcript, [importer.file_copy(transcript)])
+            importer.Unit(os.path.join(project, name), transcript, [importer.file_copy(transcript)])
         )
         version = _recorded_version(transcript)
         if version:

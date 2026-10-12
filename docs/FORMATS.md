@@ -221,6 +221,13 @@ Verdict: **supported, copy-only** `[inferred from the verified lookup]`.
    already equals the stem. Re-serialising a 120 MB transcript only to change `cwd` strings is
    the larger risk.
 5. Do not copy `file-history/`, `session-env/`, `history.jsonl` rows, `sessions/<pid>.json`.
+6. Into a folder the user chose (`import --to T`; Phase 2, Q8): the same copy under
+   `projects/<enc(T)>/`, and nothing else differs. The transcript is not touched and no
+   `relocated` record is written. The native copy therefore still reads as the folder it
+   recorded, so the listing shows that folder and `open` starts in it when it maps to one, else
+   in the home directory (lookup step 3 finds the session by id from anywhere `[inferred]`).
+7. Undo (`unimport`): the transcript and the side directory, then `projects/<enc>/` and the
+   directories above it that the import made, each only when empty.
 
 Verified: directory encoding, lookup order, title/has-message logic. To confirm live: that
 2.1.296 resumes a transcript whose records carry Windows cwds, Windows tool paths and an older
@@ -370,6 +377,15 @@ Verdict: **supported: copy, rewrite `cwd` in two record types** `[inferred]`.
 5. Never write `state_5.sqlite` or `thread_history_1.sqlite`; both are derived
    (`backfill_state`, `thread_history_projection_state` hold watermarks and byte offsets), and the
    file-name fallback plus read-repair is expected to register the thread `[inferred, medium risk]`.
+6. Into a folder the user chose (`import --to T`; Phase 2, Q8): the destination is the same, and
+   the same four fields are re-pointed. With `O` the working directory the thread recorded: a
+   value that is `O` (compared without regard to case, with either slash, with or without the
+   `\\?\` prefix) becomes `T`; a value below `O` becomes the same path below `T`, in the
+   value's own spelling and whether or not it exists there; any other value, one with a `..`
+   segment included, goes through the path map as in step 3. Every other byte is as in step 3.
+7. Undo (`unimport`): the rollout files and the `sessions/YYYY/MM/DD` directories the import
+   made, when empty. The line of step 4 stays in `session_index.jsonl` and is reported: the
+   file is the tool's, and a line in it is not taken out again.
 
 To confirm live: that 0.162.0 finds a rollout that has no `threads` row; that it resumes a
 0.150.1 rollout (cross-version; `history_mode` is `paginated` in both); that a rewritten
@@ -497,16 +513,17 @@ A candidate is a directory `sessions/<group>/<name>/` that contains `summary.jso
 
 ### 6. Import
 
-Verdict: **supported for any target folder; the adapter still applies the narrow rule of step 1
-until it is changed** (the encoding it waited for is verified since Phase 2, Q1).
+Verdict: **supported for any folder: copy, rewrite two values of `summary.json`** `[verified,
+sandbox: `sessions list` and `export`; the resume itself not run]`.
 
-1. As implemented today: mapped cwd must consist of `[A-Za-z0-9/ ]` only, **or** an existing
-   native group directory must already decode to it (then reuse that directory name); otherwise
-   `NotSupported("Grok's directory encoding of '-', '.', '_', '~' is unverified")`, and a name
-   over 255 bytes is refused. What the tool does `[verified, sandbox]`: the group is
-   `quote(realpath(cwd), safe="")` for every character, and `<slug>-<16 hex of BLAKE3>` over
-   255 bytes (Phase 2, Q1), so both refusals can go; the long form needs a BLAKE3
-   implementation, which the standard library does not have.
+1. The group directory is the one the tool itself uses for the folder `[verified, sandbox]`
+   (`providers.grok.group_name`): `quote(cwd, safe="")` when that is at most 255 bytes, else
+   `<slug>-<first 16 hex of BLAKE3(cwd as UTF-8)>` (rule and slug: Phase 2, Q1). BLAKE3 is not
+   in the standard library; `agent_sessions/blake3.py` is a one-chunk implementation (inputs up
+   to 1,024 bytes), checked against the BLAKE3 team's test vectors. Refused, because never
+   seen: a folder whose path is over 1,024 bytes, and one whose name is not valid UTF-8. When
+   the native store has no directory of that name but has one that decodes
+   (`urllib.parse.unquote`) to the same folder, that one is used.
 2. Refuse when `~/.grok/sessions/*/<id>/` exists.
 3. Copy the session directory to `~/.grok/sessions/<group>/<id>/`, leaving out `*.lock`.
 4. Rewrite `summary.json` only: `info.cwd` → mapped cwd; `grok_home` → the native store path
@@ -514,9 +531,23 @@ until it is changed** (the encoding it waited for is verified since Phase 2, Q1)
    first decides `sessions list`, the second `sessions search` `[verified, sandbox]`.
 5. Leave `session_search.sqlite`, `active_sessions.json` and `prompt_history.jsonl` alone (the
    index is rebuilt by the tool `[verified, sandbox]`).
+6. Into a folder the user chose (`import --to T`; Phase 2, Q8): group directory and `info.cwd`
+   are made for `os.path.realpath(T)`, since the tool goes by the physical working directory.
+   The record keeps `T` as it was given and the real path as the folder used.
+7. Undo (`unimport`): the session directory's files as the import put them, then the directory
+   and the group directory when empty. A file the tool added to the session directory since
+   (a lock file, say) keeps it in place, and that is reported.
 
 Confirmed in the sandbox (Phase 2, Q1): the imported 1.0.34 session is found by id and exported
-in full by 1.0.46 (`chat_format_version` is 1 in both). Still to confirm live: `grok --resume
+in full by 1.0.46 (`chat_format_version` is 1 in both). Confirmed again on 2026-10-13 with the
+adapter's own naming `[verified, sandbox]`: two copies of a native session, built into a foreign
+store whose folder does not exist here, were imported with `target` into
+`…/work/my-proj_v1.2~x y/Ünï` (group `…%2Fwork%2Fmy-proj_v1.2~x%20y%2F%C3%9Cn%C3%AF`, 157 bytes)
+and into a folder whose encoded path is 336 bytes (group
+`long-project-name-long-project-name-long-65221dd8d0426ca3`). `grok sessions list` run inside
+each folder listed exactly its session, `grok export <id>` returned it (exit 0), a folder with
+no session listed none, and both imports were undone afterwards without `--force` (the two
+commands had written `docs/` and `logs/` into the store and nothing into a session directory). Still to confirm live: `grok --resume
 <id>` itself, and that Windows paths in `prompt_context.json` / `system_prompt.txt` are
 regenerated rather than trusted. The one Windows conversation is 123.7 MB on disk.
 
@@ -637,15 +668,42 @@ the SQL columns):
 
 ### 6. Import
 
-Verdict: **NotSupported as implemented; a copy-only import is specified in Phase 2, Q5, to ship
-as an experimental action until one resume has been tested by hand.**
+Verdict: **experimental: copy-only, done only when asked for** (`import --experimental`,
+`experimental=True`) `[inferred from the verified lookup; no resume of a copy has been done]`.
+Without the flag the adapter refuses and says what the flag is for.
 
-The reason given so far ("registering one needs a row in `conversation_summaries.db`") does not
-hold: the tool finds a conversation by its file `conversations/<id>.db` `[verified, code]`, and
-it rebuilds both summary indexes from the conversation files at start-up `[verified, the
+The reason given at first ("registering one needs a row in `conversation_summaries.db`") does
+not hold: the tool finds a conversation by its file `conversations/<id>.db` `[verified, code]`,
+and it rebuilds both summary indexes from the conversation files at start-up `[verified, the
 Windows store's own log: "reconcile checked 4 conversations, restored 4"]`. What stays true: the
 workspace path is inside protobuf blobs, so an imported conversation keeps its Windows
 workspace URIs, and nothing about an actual resume has been observed.
+
+The recipe is the table of Phase 2, Q5, implemented as it stands:
+
+1. Refuse (before anything else is looked at) unless the import was asked for as experimental.
+2. Refuse a conversation of an `antigravity-ide` store, one whose file is not `<id>.db`, one
+   with a `<id>.db-wal` that is not an empty regular file, one whose database cannot be read
+   (a schema with a view or a trigger included), a sub-agent conversation (§3: the summaries
+   row, or rows in `parent_references`) and one with no steps in the database file.
+3. Refuse when any of `conversations/<id>.db`, `conversations/<id>.db-wal`,
+   `conversations/<id>.pb`, `brain/<id>`, `annotations/<id>.pbtxt`, `presence/<id>.lock` exists
+   in the native store.
+4. Copy, byte for byte and in this order: `brain/<id>/` (when it is a directory; symbolic links
+   and special files in it are left out), `annotations/<id>.pbtxt` (when it is a regular file),
+   `conversations/<id>.db` last. Never `-wal`, `-shm`, either summary index, `presence/`,
+   `cache/`, `history.jsonl`, `implicit/`.
+5. Rewrite nothing, write no index. No folder is needed: a conversation without a recorded or
+   an existing folder imports all the same, and a chosen folder is only noted in the record.
+   A conversation whose folder was known from `cache/last_conversations.json` alone therefore
+   has no folder in its native copy.
+6. The copy is read back like any conversation of the native store (through the in-memory
+   read, which creates no sidecar).
+
+Undo (`unimport`): the three copied pieces; with `--force` also what the tool adds once it has
+opened the conversation (`conversations/<id>.db-wal`, `-shm`, `presence/<id>.lock`). The rows
+in the two summary indexes are left to the tool. An undo must not run while `agy` is running;
+the files cannot say whether it is (Phase 2, Q5).
 
 ### 7. Quirks
 
@@ -754,7 +812,7 @@ reproduced for the one session]`.
 ### 6. Import
 
 Verdict: **NotSupported** — "Gemini CLI is not installed on this machine, and no resumable
-Gemini session exists to import". For later: an import would copy the chat file into
+Gemini session exists to import", with or without a chosen folder or `--experimental`. For later: an import would copy the chat file into
 `~/.gemini/tmp/<slug>/chats/`, where `<slug>` must be the one the Linux CLI assigns to the mapped
 cwd in `~/.gemini/projects.json` (creating the entry and both `.project_root` markers when
 absent), and would probably need `projectHash` recomputed for the Linux path `[inferred;
@@ -995,7 +1053,8 @@ the parsed count on both stores.)
   source has it (then only the two values differ) and writes compact JSON otherwise. Keys that
   are absent are not added.
 - **Grok group directory**: besides the `[A-Za-z0-9/ ]` rule, an encoded name over 255 bytes is
-  refused (the slug-and-hash naming is documented but was never seen). Sub-agent child sessions
+  refused (the slug-and-hash naming is documented but was never seen). Both limits are gone
+  since Phase 2, Q1 gave the tool's own rule (Grok §6, step 1). Sub-agent child sessions
   of an imported session are not copied (none exists).
 - **Every import**: files are staged in `<native store>/.agent-sessions-import-<pid>-<n>/` and
   moved into place (a file is hard-linked under its name and the staged name removed, so an
@@ -1470,6 +1529,12 @@ for Grok take `os.path.realpath(T)`), compared with the recipes of each provider
 - **Every provider**: the import record should say that the folder was chosen, and keep both
   the recorded cwd and `T`. `imported_as` is found by id and is not affected.
 
+Implemented as written (each provider's §6): `Provider.import_plan(session, pathmap, target)`,
+`import --to DIR`. `T` must be an absolute path of a directory that exists
+(`importer.chosen_folder`; the command expands `~`). The record has `cwd` (as recorded),
+`chosen_folder` (`T`, or null) and `cwd_local` (the folder the copy was made for: `T`, its real
+path for Grok, else the mapped folder).
+
 ---
 
 ## Open questions / needs live test
@@ -1490,7 +1555,7 @@ Items answered since are struck through, with where the answer is.
    threads does).
 4. ~~**Grok encoding** — are `-`, `.`, `_`, `~` percent-encoded in group directory names?~~
    Answered in the sandbox (Phase 2, Q1): they are kept; the full rule, the form for names over
-   255 bytes included, is there. The adapter's narrow rule (Grok §6, step 1) can be lifted.
+   255 bytes included, is there, and the adapter now names the directory by it (Grok §6, step 1).
 5. **Grok import and cross-cwd resume** — ~~`grok export <id>` after a test import is a
    model-free probe.~~ Done (Phase 2, Q1): the imported 1.0.34 session exports in full from any
    directory. Still open: `grok --resume <id>` itself, from the mapped folder and from another

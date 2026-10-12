@@ -38,7 +38,7 @@ from fixture_world import (
 )
 from support import FIXTURES, state_names
 
-from agent_sessions import api, importer, journal
+from agent_sessions import api, blake3, importer, journal
 from agent_sessions.model import make_key
 from agent_sessions.providers import antigravity, gemini
 from agent_sessions.providers import grok as grok_mod
@@ -236,6 +236,7 @@ class ClaudeImportTest(ImportCase):
                 ],
                 "cwd": "F:\\Proj\\My Site",
                 "cwd_local": str(self.w.site),
+                "chosen_folder": None,
                 "bytes": sum(
                     os.path.getsize(self.project / rel)
                     for rel in files_below(self.project)
@@ -1003,22 +1004,12 @@ class GrokImportTest(ImportCase):
                 raw, json.dumps(after, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             )
 
-    def test_refused_when_the_folder_name_has_other_characters(self):
-        # The temp directory of this test has '-' in its path.
+    def test_import_into_the_group_the_tool_itself_would_use(self):
+        # The temp directory of this test has '-' or '_' in its path: kept as
+        # they are in the group name, the rest percent-encoded.
         self.assertRegex(str(self.w.site), r"[-._~]")
-        source = self.source(GROK_WIN)
-        reason = self.refused(source)
-        self.assertEqual(
-            reason,
-            "Grok's directory encoding of '-', '.', '_', '~' is "
-            f"unverified (project folder {self.w.site})",
-        )
-        self.assertEqual(api.can_import(source), (False, reason))
-        self.assert_nothing_written()
-
-    def test_allowed_when_a_native_group_already_decodes_to_the_folder(self):
-        (self.home / ".grok" / "sessions" / self.group).mkdir(parents=True)
-        self.w.scan()
+        self.assertRegex(self.group, r"^%2F[A-Za-z0-9%._~-]+%2FProj%2FMy%20Site$")
+        self.assertEqual(grok_mod.group_name(str(self.w.site)), self.group)
         age_access_times(self.w.c)
         before = tree_state(self.w.c)
         source = self.source(GROK_WIN)
@@ -1038,7 +1029,7 @@ class GrokImportTest(ImportCase):
                 }
             ],
         )
-        self.assertFalse(self.copy.exists())
+        self.assert_nothing_written()
 
         native = api.import_session(source)
 
@@ -1061,6 +1052,20 @@ class GrokImportTest(ImportCase):
         self.assertEqual((report.created, report.session), (False, native))
         self.assertEqual(len(self.records()), 1)
 
+    def test_a_group_directory_that_is_there_already_is_used(self):
+        group = self.home / ".grok" / "sessions" / self.group
+        group.mkdir(parents=True)
+        (group / "prompt_history.jsonl").write_bytes(b"{}\n")
+        self.w.scan()
+        native = api.import_session(self.source(GROK_WIN))
+        self.assertEqual(native.files, [str(self.copy)])
+        self.assertEqual(sorted(os.listdir(group)), [GROK_WIN, "prompt_history.jsonl"])
+        self.assertEqual(read(group / "prompt_history.jsonl"), b"{}\n")
+        # The group was not made by the import, so its record does not list it.
+        (record,) = self.records()
+        self.assertNotIn(str(group), record["manifest"]["dirs"])
+        self.assertIn(str(self.copy), record["manifest"]["dirs"])
+
     def test_plain_folder_gets_the_percent_encoded_group(self):
         source = self.source(GROK_WIN)
         plain = "/Plain Dir/My Site 2"
@@ -1070,49 +1075,120 @@ class GrokImportTest(ImportCase):
         self.assertEqual((native.id, native.cwd, native.origin), (GROK_WIN, plain, "native"))
         self.assertEqual(stat.S_IMODE(os.stat(copy).st_mode), 0o700)
 
-    def test_cwd_shapes(self):
+    def planned_group(self, folder):
+        """The group directory the adapter plans for a mapped ``folder``."""
         source = self.source(GROK_WIN)
-        for folder in (
-            "/a/b-c",
-            "/a/b.c",
-            "/a/b_c",
-            "/a/~b",
-            "/a/caf\u00e9",
-            "/a/(x)",
-            "/a/b%20c",
-            "/a/b+c",
-            "/a\\b",
-            "/a:b",
-        ):
-            with self.assertRaises(NotSupported) as caught:
-                Grok().import_plan(source, StubMap({source.cwd: folder}))
-            self.assertEqual(
-                caught.exception.reason, f"{grok_mod.ENCODING_UNVERIFIED} (project folder {folder})"
-            )
+        plan = Grok().import_plan(source, StubMap({source.cwd: folder}))
+        group = os.path.basename(os.path.dirname(plan.units[0].dst))
+        self.assertEqual(plan.units[0].dst, str(self.copy.parent.parent / group / GROK_WIN))
+        return group
+
+    def test_cwd_shapes(self):
+        """FORMATS "Phase 2 findings", Q1: the names the tool was seen to list."""
         for folder, group in (
             ("/a/B c/9", "%2Fa%2FB%20c%2F9"),
             ("/", "%2F"),
+            ("/a/b-c", "%2Fa%2Fb-c"),  # - . _ ~ are kept
+            ("/a/b.c", "%2Fa%2Fb.c"),
+            ("/a/b_c", "%2Fa%2Fb_c"),
+            ("/a/~b", "%2Fa%2F~b"),
+            ("/a/caf\u00e9", "%2Fa%2Fcaf%C3%A9"),  # UTF-8 bytes, upper-case hex
+            ("/a/u\u0308", "%2Fa%2Fu%CC%88"),  # no Unicode normalisation
+            ("/a/\u6f22\U0001f600", "%2Fa%2F%E6%BC%A2%F0%9F%98%80"),
+            ("/a/(x)", "%2Fa%2F%28x%29"),
+            ("/a/b%20c", "%2Fa%2Fb%2520c"),
+            ("/a/b+c", "%2Fa%2Fb%2Bc"),  # a space is %20, never +
+            ("/a\\b", "%2Fa%5Cb"),
+            ("/a:b", "%2Fa%3Ab"),
             (
-                "/" + "d" * 84 + "/" + "e" * 84 + "/" + "f" * 78,
-                "%2F" + "d" * 84 + "%2F" + "e" * 84 + "%2F" + "f" * 78,
+                "/a/!'*,=@&$#[]{};^`|\"<>?",
+                "%2Fa%2F%21%27%2A%2C%3D%40%26%24%23%5B%5D%7B%7D%3B%5E%60%7C%22%3C%3E%3F",
+            ),
+            (
+                "/tmp/ags/work/my-proj_v1.2~x y/\u00dcn\u00ef",  # the sandbox's own example
+                "%2Ftmp%2Fags%2Fwork%2Fmy-proj_v1.2~x%20y%2F%C3%9Cn%C3%AF",
             ),
         ):
-            plan = Grok().import_plan(source, StubMap({source.cwd: folder}))
-            self.assertEqual(os.path.basename(os.path.dirname(plan.units[0].dst)), group)
-            self.assertLessEqual(len(group), 255)
-        with self.assertRaises(NotSupported) as caught:  # one byte over the limit
-            Grok().import_plan(
-                source, StubMap({source.cwd: "/" + "d" * 84 + "/" + "e" * 84 + "/" + "f" * 79})
-            )
-        self.assertIn("255 bytes", caught.exception.reason)
+            with self.subTest(folder=folder):
+                self.assertEqual(grok_mod.group_name(folder), group)
+                self.assertEqual(self.planned_group(folder), group)
+                self.assertEqual(urllib.parse.unquote(group), folder)
         self.assert_nothing_written()
 
-    def test_an_existing_group_wins_over_the_shape_rule(self):
+    def test_a_name_over_255_bytes_is_a_slug_and_a_hash(self):
+        base = "/" + "d" * 84 + "/" + "e" * 84 + "/"
+        self.assertEqual(grok_mod.GROUP_NAME_MAX, 255)
+        at_limit = base + "f" * 78
+        self.assertEqual(len(urllib.parse.quote(at_limit, safe="")), 255)
+        self.assertEqual(
+            self.planned_group(at_limit), "%2F" + "d" * 84 + "%2F" + "e" * 84 + "%2F" + "f" * 78
+        )
+        over = base + "f" * 79  # one byte more
+        self.assertEqual(self.planned_group(over), "f" * 40 + "-562223fd3889f191")
+        # Bytes are counted, not characters: 29 times "é" is 174 bytes as %XX.
+        accented = "/" + "d" * 80 + "/" + "\u00e9" * 29
+        self.assertEqual(len(accented), 111)
+        self.assertEqual(
+            self.planned_group(accented),
+            "workspace-" + blake3.hexdigest(accented.encode("utf-8"))[:16],
+        )
+        long_name = "/" + "x" * 250 + "/My Proj.v2 (final)"
+        self.assertRegex(self.planned_group(long_name), r"^my-proj-v2-final-[0-9a-f]{16}$")
+        self.assert_nothing_written()
+
+    def test_the_slug_of_a_long_name(self):
+        """The examples of FORMATS Q1, each named by the rule before the tool
+        was asked."""
+        for name, slug in (
+            ("MyProj", "myproj"),
+            ("my proj.v1_2~x", "my-proj-v1-2-x"),
+            ("\u00dcn\u00ef K\u00f6ln", "n-k-ln"),
+            ("a  b__c", "a-b-c"),
+            (".hidden", "hidden"),
+            ("name.", "name"),
+            ("--x--", "x"),
+            ("p" * 59, "p" * 40),
+            ("x" * 39 + "\u00dctail", "x" * 39 + "-"),  # cut after trimming, not trimmed again
+            ("a" + " " * 45 + "b" * 30, "a-" + "b" * 30),  # runs collapse before the cut
+            ("\u6f22\u5b57", "workspace"),
+            ("---", "workspace"),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(grok_mod.group_slug("/some/where/" + name), slug)
+        self.assertEqual(grok_mod.group_slug("/"), "workspace")
+
+    def test_folders_whose_group_name_is_not_known_are_refused(self):
+        source = self.source(GROK_WIN)
+        too_long = "/" + "/".join(["s" * 200] * 5) + "/" + "t" * 19  # 1,025 bytes
+        self.assertEqual(len(too_long.encode()), 1025)
+        for folder, needle in (
+            (too_long, "1,025 bytes long"),
+            ("/a/not\udcff-utf8", "is not valid UTF-8"),
+        ):
+            with self.subTest(needle=needle):
+                with self.assertRaises(NotSupported) as caught:
+                    grok_mod.group_name(folder)
+                self.assertIn(needle, caught.exception.reason)
+                with self.assertRaises(NotSupported) as planned:
+                    Grok().import_plan(source, StubMap({source.cwd: folder}))
+                self.assertEqual(planned.exception.reason, caught.exception.reason)
+        with self.assertRaises(NotSupported) as caught:
+            grok_mod.group_name("")
+        self.assertIn("has no name", caught.exception.reason)
+        # One byte less, the most the hash takes, is still named.
+        self.assertRegex(grok_mod.group_name(too_long[:-1]), r"^t{18}-[0-9a-f]{16}$")
+        self.assert_nothing_written()
+
+    def test_an_existing_group_that_decodes_to_the_folder_is_reused(self):
         source = self.source(GROK_WIN)
         sessions = self.home / ".grok" / "sessions"
-        (sessions / "%2Fwith%2Dhyphen").mkdir(parents=True)  # the tool's own spelling
+        (sessions / "%2Fwith%2Dhyphen").mkdir(parents=True)  # another spelling of the folder
         plan = Grok().import_plan(source, StubMap({source.cwd: "/with-hyphen"}))
         self.assertEqual(plan.units[0].dst, str(sessions / "%2Fwith%2Dhyphen" / GROK_WIN))
+        # The tool's own name wins once it is there too.
+        (sessions / "%2Fwith-hyphen").mkdir()
+        plan = Grok().import_plan(source, StubMap({source.cwd: "/with-hyphen"}))
+        self.assertEqual(plan.units[0].dst, str(sessions / "%2Fwith-hyphen" / GROK_WIN))
 
     def test_an_id_in_any_group_is_a_collision(self):
         taken = self.home / ".grok" / "sessions" / "%2Felsewhere" / GROK_WIN
@@ -1194,9 +1270,11 @@ class GrokImportTest(ImportCase):
 
 class NotSupportedTest(ImportCase):
     def test_antigravity_and_gemini_state_the_documented_reason(self):
+        """Antigravity as it is asked for by default: more, and the
+        experimental import itself, in tests/test_import_antigravity.py."""
         for session_id, reason in (
-            (AGY_WIN, antigravity.IMPORT_UNSAFE),
-            (AGY_NO_CWD, antigravity.IMPORT_UNSAFE),
+            (AGY_WIN, antigravity.EXPERIMENTAL_ONLY),
+            (AGY_NO_CWD, antigravity.EXPERIMENTAL_ONLY),
             (GEMINI_WIN, gemini.IMPORT_UNSAFE),
         ):
             source = self.source(session_id)
@@ -1207,10 +1285,10 @@ class NotSupportedTest(ImportCase):
                 api.import_plan(source)
             self.assertEqual(caught.exception.reason, reason)
         self.assertEqual(
-            antigravity.IMPORT_UNSAFE,
-            "Antigravity keeps conversations in SQLite files with protobuf columns; "
-            "registering one needs a row in conversation_summaries.db and the workspace "
-            "path is inside protobuf blobs",
+            antigravity.EXPERIMENTAL_ONLY,
+            "importing an Antigravity conversation is experimental and is done only when "
+            "asked for (import --experimental): no imported copy has been resumed by hand "
+            "yet, and agy starts a new conversation without an error when it cannot read one",
         )
         self.assertEqual(
             gemini.IMPORT_UNSAFE,
@@ -1227,7 +1305,7 @@ class NotSupportedTest(ImportCase):
         }
         self.assertEqual(
             verdicts,
-            {"antigravity": False, "claude": True, "codex": True, "gemini": False, "grok": False},
+            {"antigravity": False, "claude": True, "codex": True, "gemini": False, "grok": True},
         )
         self.assert_nothing_written()
 

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 from .. import importer
 from ..fsutil import home, listdir_ro, open_ro, subdirs
 from ..model import Candidate, Session, Store
+from ..pathmap import normalise
 from . import register
 from .base import (
     JSONL_LINE_MAX,
@@ -240,6 +241,18 @@ def _source_name_line(store_root: str, thread_id: str) -> bytes | None:
     return None
 
 
+def _folded(path: object) -> tuple[str, tuple[str, ...], tuple[str, ...]] | None:
+    """A recorded path as ``(root, segments, segments in lower case)``, for
+    comparing two spellings of one path: either slash, any case, with or
+    without the ``\\\\?\\`` prefix (``pathmap.normalise``). None for what
+    has no root, and for a path with a ``..`` segment, which names nothing
+    until it is resolved."""
+    recorded = normalise(path)
+    if recorded is None or ".." in recorded.parts:
+        return None
+    return recorded.root, recorded.parts, tuple(part.lower() for part in recorded.parts)
+
+
 class _CwdRewrite(importer.Rewrite):
     """Maps the recorded working directories of a rollout to local paths.
 
@@ -249,19 +262,51 @@ class _CwdRewrite(importer.Rewrite):
     serialised again the way the tool writes it (compact, non-ASCII as it
     is) and parsed back to confirm that nothing else moved. Every other line
     goes through byte for byte.
+
+    With a chosen folder (``target``, and ``recorded``: the working
+    directory the thread recorded) the same values are re-pointed first
+    (FORMATS "Phase 2 findings", Q8): a value that is the recorded folder
+    becomes the chosen one, a value below it the same path below the chosen
+    one, and only a value that is neither goes through the path map.
     """
 
     label = "working directories in session_meta and turn_context records"
 
-    def __init__(self, pathmap: PathMap, mount: str) -> None:
+    def __init__(
+        self,
+        pathmap: PathMap,
+        mount: str,
+        recorded: str | None = None,
+        target: str | None = None,
+    ) -> None:
         super().__init__()
         self._pathmap = pathmap
         self._mount = mount
+        self._target = target
+        self._recorded = _folded(recorded) if target is not None else None
         self._seen: dict[tuple[str, str, str, str], int] = {}
+
+    def _moved(self, value: str) -> str | None:
+        """``value`` in the chosen folder, when it is the recorded folder or
+        a path below it; None when it is neither, or no folder was chosen."""
+        if self._target is None or self._recorded is None:
+            return None
+        path = _folded(value)
+        if path is None:
+            return None
+        root, parts, lowered = path
+        base_root, base_parts, base_lowered = self._recorded
+        depth = len(base_parts)
+        if root != base_root or lowered[:depth] != base_lowered:
+            return None
+        return os.path.join(self._target, *parts[depth:])
 
     def _local(self, value: Any) -> Any:  # a JSON value: itself, or the mapped path
         if not isinstance(value, str) or not value:
             return value
+        moved = self._moved(value)
+        if moved is not None:
+            return moved
         local, exists = self._pathmap.to_local(value, self._mount)
         return local if exists and local else value
 
@@ -450,18 +495,27 @@ class Codex(Provider):
                 rollouts.append(_read(path, tools=True))
         yield from _surviving(_ordered(rollouts))
 
-    def import_plan(self, s: Session, pathmap: PathMap) -> importer.ImportPlan:
+    def import_plan(
+        self,
+        s: Session,
+        pathmap: PathMap,
+        target: str | None = None,
+        experimental: bool = False,
+    ) -> importer.ImportPlan:
         """Every rollout of the thread to the same ``YYYY/MM/DD/<name>``
         (FORMATS section 6). A thread in one file has its working directories
         rewritten; a thread with segments keeps the base file (and any middle
         segment) byte for byte, because a segment's ``history_base`` holds a
         byte offset into the base, and only its last segment is rewritten.
         The thread's name line, when the source has one, is appended to the
-        native ``session_index.jsonl`` after the files are in place."""
+        native ``session_index.jsonl`` after the files are in place.
+
+        With a chosen folder (``target``) the destination is the same; the
+        working directories are re-pointed at it (``_CwdRewrite``)."""
         files = [f for f in s.files if _ROLLOUT.fullmatch(os.path.basename(f))]
         if not files:
             raise NotSupported("this thread has no rollout file to copy")
-        plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern)
+        plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern, target)
         native = Store(self.name, plan.native_root, "native")
         for candidate in self.candidates(native):
             if candidate.id_hint == s.id:
@@ -481,7 +535,7 @@ class Codex(Provider):
                 raise NotSupported(f"a rollout is not named after its thread id: {path}")
             rewrite = None
             if position == len(files) - 1:
-                rewrite = _CwdRewrite(pathmap, s.mount)
+                rewrite = _CwdRewrite(pathmap, s.mount, s.cwd, plan.chosen_folder)
             plan.units.append(
                 importer.Unit(
                     os.path.join(plan.native_root, "sessions", *parts),
