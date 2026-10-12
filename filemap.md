@@ -238,18 +238,22 @@
 - `src/agent_sessions/tui/__main__.py` — `python -m agent_sessions.tui`: run the app, exit 1 with the hint when
   Textual is missing
 - `src/agent_sessions/tui/engine.py` — `Engine`: the object the app calls the engine through (forwards to
-  `agent_sessions.api`, looked up at call time), `EngineError`; tests pass a fake in its place
+  `agent_sessions.api`, looked up at call time; `list_folder`: a directory's entries for the folder input,
+  through `fsutil.listdir_ro`), `EngineError`; tests pass a fake in its place
 - `src/agent_sessions/tui/view.py` — pure view logic, no Textual: rows, ages, display width and clipping,
-  column fitting, filter, tabs, selection by key, small-terminal layout, status and prompt texts, key table
-  (`KEYMAPS`), help, transcript wrapping
+  column fitting, filter, tabs, selection by key, small-terminal layout and key hints, status texts, the
+  import verdict (`Verdict`, from `import_options`), every prompt's wording at every width (foreign row,
+  mount, warning, tool, start, undo), the folder a user types (`expand_folder`, `complete_folder`), which
+  refusal of an undo it is (`undo_refusal`), one key table per mode (`KEYMAPS`), help, transcript wrapping
 - `src/agent_sessions/tui/app.py` — `SessionsApp`, `MainScreen` (workers for load, scan, import, open,
-  `can_import`), `SessionList` and `TranscriptView` (line-drawn, virtual), `TabLabel`, `HelpScreen`,
-  `TranscriptScreen` (the pager)
+  `import_options`, mount, continue, undo, and the folder input's listing and check; `Question`: what the
+  prompt on screen is about), `SessionList` and `TranscriptView` (line-drawn, virtual), `TabLabel`,
+  `HelpScreen`, `TranscriptScreen` (the pager)
 - `src/agent_sessions/tui/app.tcss` — every colour, border and spacing value; the widget tree it styles is
   listed at its top
 - `requirements-tui.txt` — the pinned Textual version `install.sh` installs into `.venv`
-- `tests/tui_support.py` — `FakeEngine` (records calls, never launches or imports; refuses an offline
-  session the way the engine does), fake sessions, `screen_text`, `settle`
+- `tests/tui_support.py` — `FakeEngine` (records calls, never mounts, launches, imports or removes; refuses
+  an offline session and an undo the way the engine does), fake sessions, `screen_text`, `settle`
 - `tests/test_tui_view.py` — every function of `tui/view.py`, `tui/engine.py`, the launcher and import rules;
   runs on the system Python
 - `tests/test_tui_app.py` — the app under Textual's pilot with the fake engine (`make test-tui`; skips itself

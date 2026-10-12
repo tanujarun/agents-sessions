@@ -305,8 +305,8 @@ exits 1. Every other subcommand runs on the system Python with no venv.
  local    /run/media/tanuj/Zephyro/AI Projects/Website Works   (exists)
  store    /run/media/tanuj/22EEA841EEA80F5B/Users/arunt/.claude
 ────────────────────────────────────────────────────────────────────────────────
- ↑↓ move  ←→ provider  Enter resume  o resume, keep open  i import  v view
- / filter  r rescan  R full rescan  ? help  q quit
+ ↑↓ move  ←→ provider  Enter resume  o keep open  i import  t into folder
+ v view  c continue  u undo  m mount  / filter  r R rescan  ? help  q quit
 ```
 
 Regions, top to bottom: status line; provider tabs with counts (`0` = all
@@ -325,18 +325,26 @@ Keys:
 |---|---|
 | `↑` `↓` `k` `j`, PgUp/PgDn, Home/End, `g`/`G` | move selection |
 | `←` `→` `h` `l`, Tab/Shift-Tab, `1`-`5`, `0` | switch provider |
-| Enter | native: resume in a new terminal window with the tool's own app-id, in the session's directory, then quit the TUI. Foreign: open the prompt below |
+| Enter | native: resume in a new terminal window with the tool's own app-id, in the session's directory, then quit the TUI. Foreign: open the prompt below; when its drive is not mounted, the mount prompt |
 | `o` | same as Enter but the TUI stays open |
-| `i` | foreign: import to Linux (asks `y/n` first); status line reports the result |
+| `i` | foreign: import to Linux (asks `y/n` first; asks for a folder when the import needs one; shows the warning and asks `Import anyway? y/n` when it is experimental); status line reports the result |
+| `t` | foreign: import into a folder that is typed (the folder input); the copy is not resumed |
+| `c` | any row whose drive is mounted: continue as a new session (tool, folder, `y/n`); the TUI stays open |
+| `u` | undo the import of the selected row, the native copy or the session it came from (asks `y/n` with what would be removed) |
+| `m` | a row whose drive is not mounted: mount the drive; one mount at a time |
 | `v` | view the transcript in a built-in scrolling pager (`q`/Esc returns) |
 | `/` | filter the current list by substring over title, project and cwd; Esc clears |
 | `r` | quick rescan (known stores); `R` full rescan of every drive |
 | `?` | key help overlay |
 | `q`, Ctrl-C | quit |
 
-Foreign-row prompt (one line over the key hints):
-`On <drive>: [i] import and resume  [I] import only  [v] view  [Esc] cancel`.
-A foreign session already imported resumes its native copy on Enter.
+Foreign-row prompt (over the key hints), for a session that can be imported
+as it is: `On <drive>: [i] import and resume  [I] import only  [t] into
+another folder  [c] continue as new  [v] view  [Esc] cancel`; "TUI
+additions" has the other three. A foreign session already imported resumes
+its native copy on Enter. The key hints are two lines with every key (in
+shorter words at 80 columns), one line with the essential ones when the
+terminal is narrower or short.
 
 Behaviour:
 
@@ -725,22 +733,61 @@ failure the user sees names the log. `--debug` also logs to stderr.
 
 - Offline rows: dimmed like foreign rows, WHERE `C: · offline`; the status
   line counts them (`135 sessions · 29 offline`).
-- Enter on an offline row that has no native copy: prompt
-  `<drive> is not mounted: [m] mount  [Esc] cancel`. `m` anywhere on such a
-  row mounts; the status line shows `waiting for the password prompt…`,
-  then the result, then a scan.
-- The foreign-row prompt is built from `import_options`:
-  `[i] import and resume  [I] import only  [t] import into another folder
-  [c] continue as new  [v] view  [Esc] cancel`, leaving out what is not
-  possible and showing the reason for it on the line above. An experimental
-  import asks again with its warning.
-- `t` and `c` open a one-line input for a folder: `~` expands, Tab completes
-  directory names, Enter accepts only an existing directory, Esc cancels.
-- `c` (any row that is not offline): choose the tool with `←` `→` among the
-  installed ones (the session's own first), then the folder; the last line
-  says `starts <Tool> and sends a first message`. Enter starts it.
-- `u` on a row with an import record: `Remove the imported copy? y/n`; a
-  refusal shows its reason.
+- Enter (or `o`) on an offline row that has no native copy: prompt
+  `<drive> is not mounted: [m] mount  [Esc] cancel`; when `volumes()` says
+  the volume is `absent` there is no prompt, the status line says `<drive>
+  is not attached`. `m` on such a row mounts without asking
+  (`api.mount_drive` with the session's mount path, in a worker): the
+  status line shows `mounting <drive>: answer the password prompt…` and the
+  rest stays usable; then the progress of the scan the engine runs (Esc
+  stops that scan); then `<drive> mounted` and the list is read again, the
+  selection staying on its session; or the reason of `MountFailed`. One
+  mount at a time (`already mounting <drive>`); `m` on any other row says
+  `this session's drive is mounted`. A scan, an import, a mount and an undo
+  each end in a scan, so one runs at a time and the others say which is
+  running.
+- The detail pane's `import` field and the foreign-row prompt are built from
+  `import_options`: `possible`, `possible into a folder you choose`,
+  `experimental only`, `not possible: <reason>`. Enter opens the prompt for
+  it, the reason on the line above the choices when there is one:
+  - possible: the line of the "TUI" section;
+  - a folder is needed: `[t] import into another folder  [c] continue as new
+    [v] view  [Esc] cancel`;
+  - experimental: `[i] import and resume (experimental)  [I] import only
+    (experimental)  [c] continue as new  [v] view  [Esc] cancel`; `i` and
+    `I` show the warning (wrapped, three lines at most) and ask `Import
+    anyway? y/n`, and `y` imports with `experimental=True`;
+  - not possible: `[c] continue as new  [v] view  [Esc] cancel`.
+  A prompt takes only the keys it shows. Narrow terminals get shorter
+  wordings, last the keys alone. Asked before the answer is there, Enter,
+  `i` and `t` wait for it; the next key press takes them back.
+- The folder input (`t`, and the second step of `c`) is one line in the
+  prompt's place, `Import into:` or `Start in:`, starting at `~/` (for a
+  continue: at the session's folder when it exists). `~` expands. Tab
+  completes the last name among the directories (hidden ones only after a
+  dot): one match gets a `/`, several go as far as they agree and the status
+  line names the first few. Enter accepts only an existing directory and
+  otherwise says so and stays; Esc returns to the list. While it is open
+  every other key is text. Listing and checking run in a worker; the listing
+  is `fsutil.listdir_ro`, which leaves access times alone. A folder accepted
+  for an import starts it at once (import only, not resumed), after the
+  warning when the import is experimental.
+- `c` (any row that is not offline, and from the foreign prompt): asks
+  `continue_options`, shows its reason when it is not possible, else three
+  steps, Esc leaving at each: `Continue with: ‹ Claude ›   ←→ change  Enter
+  next  Esc cancel` (the installed tools, starting at `default_tool`, else
+  at the first); the folder input; `Start <Tool> in <folder> and send a
+  first message to the model? y/n`. `y` calls `continue_session` and says
+  `started <Tool> in a new window`; the TUI stays open.
+- `u`: a dry run of `unimport` first. No import recorded: its reason in the
+  status line. Else `Remove the imported copy (<N> files, <size>)? y/n`, and
+  `y` removes it: `removed <N> files`, with `, <M> left in place` when the
+  report lists any; the list is read again. A copy that was used since the
+  import is asked about in its own words, `The copy was used since the
+  import (<N> files differ). Remove it and lose its new turns? y/n`, and
+  `y` runs the undo with `force=True`. The two refusals are told apart by
+  `UndoFailed.no_record` and `.differences`, never by the text; any other
+  refusal is shown as it is.
 - `?` lists all of it. Styling stays in `app.tcss`; the look is unchanged.
 
 ## Packaging
