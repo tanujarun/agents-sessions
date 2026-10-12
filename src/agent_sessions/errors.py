@@ -1,5 +1,5 @@
 """The failures the facade reports. ``api`` re-exports them; they live here so
-``launch`` and ``importer`` can raise them without importing ``api``."""
+``launch``, ``importer`` and ``mounts`` can raise them without importing ``api``."""
 
 from __future__ import annotations
 
@@ -24,4 +24,13 @@ class ImportFailed(ApiError):
     """A session could not be imported, or its provider does not allow it."""
 
 
-__all__ = ["ApiError", "ImportFailed", "LaunchFailed", "NotFound"]
+class Offline(ApiError):
+    """What was asked needs the files of a session whose drive is not
+    mounted."""
+
+
+class MountFailed(ApiError):
+    """A drive could not be mounted (``mounts.mount_volume``)."""
+
+
+__all__ = ["ApiError", "ImportFailed", "LaunchFailed", "MountFailed", "NotFound", "Offline"]
