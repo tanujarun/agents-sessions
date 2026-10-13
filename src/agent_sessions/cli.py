@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import contextlib
 import json
 import os
@@ -432,18 +433,53 @@ def build_parser() -> argparse.ArgumentParser:
 # sequences. Nothing below this block writes to a stream itself: readable text
 # goes through ``_out`` or ``_err``, JSON through ``_json``, the progress line
 # through ``_progress``, a question through ``_ask``, and each of those makes
-# its text safe on the way out (``textsafe``). tests/test_textsafe.py holds
-# this module to that.
+# its text safe on the way out (``textsafe``); the one function that writes,
+# ``_write``, encodes the text itself. tests/test_textsafe.py holds this
+# module to that.
 
 
-def _emit(stream: TextIO, text: str) -> None:
-    """Write one line that is already safe; a path with bytes that are not
-    UTF-8 is escaped, not fatal."""
+def _utf8(stream: TextIO | None) -> bool:
+    """Whether the stream writes UTF-8 (a stream that names no encoding is
+    taken to)."""
     try:
-        stream.write(text + "\n")
-    except UnicodeEncodeError:
-        encoding = getattr(stream, "encoding", None) or "utf-8"
-        stream.write(text.encode(encoding, "backslashreplace").decode(encoding) + "\n")
+        return codecs.lookup(getattr(stream, "encoding", None) or "utf-8").name == "utf-8"
+    except LookupError:
+        return False
+
+
+def _write(stream: TextIO | None, text: str, flush: bool = False) -> None:
+    """The one place that writes to a stream. ``text`` is safe already.
+
+    It is encoded here and the bytes go to the stream's buffer, so what
+    happens to a character the encoding does not have is decided here and
+    not by the stream: it is written as a backslash escape. Left to itself,
+    Python's stdout in the C and POSIX locales writes a lone surrogate back
+    as the raw byte it stands for (``surrogateescape``), and 0x9B is a CSI;
+    a path that is not UTF-8 holds such surrogates, and so can a title.
+    """
+    if stream is None:  # the stream was closed before the program started
+        return
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    try:
+        data = text.encode(encoding, "backslashreplace")
+    except LookupError:  # an encoding this Python does not know
+        encoding = "utf-8"
+        data = text.encode(encoding, "backslashreplace")
+    buffer = getattr(stream, "buffer", None)
+    if buffer is None:
+        # Text with no bytes below it (a StringIO): it gets what the bytes say.
+        stream.write(data.decode(encoding, "replace"))
+        if flush:
+            stream.flush()
+        return
+    buffer.write(data)
+    if flush or getattr(stream, "line_buffering", False):
+        buffer.flush()  # a terminal shows the line now, as when the stream wrote it
+
+
+def _emit(stream: TextIO | None, text: str) -> None:
+    """Write one line that is already safe."""
+    _write(stream, text + "\n")
 
 
 def _out(text: object, multiline: bool = False) -> None:
@@ -461,29 +497,27 @@ def _err(text: object) -> None:
 def _json(value: object) -> None:
     """Print a value as JSON: exact data, with the characters a terminal
     would act on written as ``\\uXXXX`` escapes."""
-    document = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False)
-    _emit(sys.stdout, textsafe.json_escape(document))
+    _json_line(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False))
 
 
 def _json_line(document: str) -> None:
-    """Print one line of JSON text the engine made (``export --format
-    json``): exact data, and like ``_json`` with nothing in it a terminal
-    would act on."""
-    _emit(sys.stdout, textsafe.json_escape(document))
+    """Print JSON text (the engine's own for ``export --format json``):
+    exact data, with nothing in it a terminal would act on, and always
+    valid UTF-8: where the stream's encoding is another one, everything
+    beyond ASCII is escaped too."""
+    _emit(sys.stdout, textsafe.json_escape(document, ascii_only=not _utf8(sys.stdout)))
 
 
 def _progress(text: str = "") -> None:
     """Replace the progress line on stderr; no text clears it."""
-    sys.stderr.write("\r\033[K" + textsafe.clean(text))
-    sys.stderr.flush()
+    _write(sys.stderr, "\r\033[K" + textsafe.clean(text), flush=True)
 
 
 def _ask(question: str) -> bool:
     """Ask a yes/no question and read the answer from stdin; only ``y`` or
     ``yes`` is a yes. The question goes to stderr, so stdout stays what the
     command prints."""
-    sys.stderr.write(textsafe.clean(question) + " [y/N] ")
-    sys.stderr.flush()
+    _write(sys.stderr, textsafe.clean(question) + " [y/N] ", flush=True)
     return sys.stdin.readline().strip().lower() in ("y", "yes")
 
 

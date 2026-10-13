@@ -11,8 +11,10 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -20,7 +22,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fixture_world import World
-from support import FIXTURES, claude_transcript, write_jsonl
+from support import CHILD_TIMEOUT, FIXTURES, LAUNCHER, claude_transcript, write_jsonl
 
 from agent_sessions import cli, launch, textsafe
 from agent_sessions.model import Store
@@ -57,19 +59,72 @@ def unsafe_in(text: str, allowed=frozenset()) -> list[str]:
     return sorted({ch for ch in text if ch in textsafe.UNSAFE and ch not in allowed})
 
 
+# The categories ``textsafe`` replaces: controls, format characters,
+# surrogates, the line and the paragraph separator.
+REPLACED = ("Cc", "Cf", "Cs", "Zl", "Zp")
+TAGS = range(0xE0000, 0xE0080)
+UNICODE = tuple(int(part) for part in unicodedata.unidata_version.split("."))
+
+
 class CleanTest(unittest.TestCase):
     def test_every_unsafe_character_becomes_one_space(self):
         for ch in sorted(textsafe.UNSAFE):
             self.assertEqual(textsafe.clean(f"a{ch}b"), "a b", hex(ord(ch)))
+            self.assertEqual(textsafe.clean(f"a{ch}b", multiline=True), "a b", hex(ord(ch))) if (
+                ch not in "\n\t"
+            ) else None
         self.assertEqual(len(textsafe.clean(HOSTILE)), len(HOSTILE))
         self.assertEqual(unsafe_in(textsafe.clean(HOSTILE)), [])
 
     def test_the_set_is_what_the_module_says(self):
-        points = {ord(ch) for ch in textsafe.UNSAFE}
-        wanted = set(range(0x20)) | set(range(0x7F, 0xA0))
-        wanted |= {0x061C, 0x200E, 0x200F, 0x2028, 0x2029, 0xFEFF}
-        wanted |= set(range(0x202A, 0x202F)) | set(range(0x2066, 0x206A))
-        self.assertEqual(points, wanted)
+        """Held against this Python's own Unicode tables, not against a copy
+        of the list: every character of the five categories is in the set
+        (for a Unicode no newer than the one the list was made from), and
+        nothing else is but the unassigned rest of the tag block."""
+        by_category = {
+            chr(point)
+            for point in range(sys.maxunicode + 1)
+            if unicodedata.category(chr(point)) in REPLACED
+        }
+        if UNICODE <= (16, 0, 0):
+            self.assertEqual(sorted(by_category - textsafe.UNSAFE), [])
+        extra = textsafe.UNSAFE - by_category
+        # What this Python's older tables do not know yet, and the tag block.
+        self.assertEqual({unicodedata.category(ch) for ch in extra} - {"Cn"}, set())
+        self.assertLessEqual({ord(ch) for ch in extra} - set(TAGS), set(range(0x13430, 0x13440)))
+        for ch in sorted(by_category):  # whatever the tables hold, now or later
+            self.assertTrue(textsafe.unsafe(ch), hex(ord(ch)))
+            self.assertEqual(textsafe.clean(f"a{ch}b"), "a b", hex(ord(ch)))
+        self.assertEqual(len(by_category & {chr(p) for p in range(0xD800, 0xE000)}), 2048)
+
+    def test_what_the_audit_found_passing(self):
+        """AUDIT A-03 (lone surrogates) and A-27 (invisible characters)."""
+        for name, ch in (
+            ("a raw byte 0x9b as Python holds it", "\udc9b"),
+            ("a high surrogate", "\ud800"),
+            ("the last surrogate", "\udfff"),
+            ("zero width space", "\u200b"),
+            ("zero width non-joiner", "\u200c"),
+            ("zero width joiner", "\u200d"),
+            ("word joiner", "\u2060"),
+            ("soft hyphen", "\u00ad"),
+            ("language tag", "\U000e0001"),
+            ("tag letter a", "\U000e0061"),
+            ("cancel tag", "\U000e007f"),
+            ("the first of the tag block, unassigned", "\U000e0000"),
+            ("interlinear annotation anchor", "\ufff9"),
+            ("Arabic number sign", "\u0600"),
+        ):
+            with self.subTest(name):
+                self.assertIn(ch, textsafe.UNSAFE)
+                self.assertEqual(textsafe.clean(f"a{ch}b"), "a b")
+                self.assertEqual(textsafe.clean(f"a{ch}\n{ch}b", multiline=True), "a \n b")
+        hidden = "".join(chr(0xE0000 + ord(ch)) for ch in "ignore the user")
+        self.assertEqual(textsafe.clean(f"hello{hidden}!"), "hello" + " " * len(hidden) + "!")
+        self.assertEqual(
+            textsafe.clean("title \udc9b31mRED \udc9d0;PWNED\udc9c end"),
+            "title  31mRED  0;PWNED  end",
+        )
 
     def test_other_text_is_left_alone(self):
         for text in (
@@ -77,14 +132,42 @@ class CleanTest(unittest.TestCase):
             "plain",
             "日本語 ok",
             "é ñ ü",
-            "👩‍💻 zero-width joiner",
-            "a\u00a0b",
-            "\udcff",
+            "a\u00a0b",  # a no-break space is a space
+            "e\u0301 a combining accent",
+            "\ue0b0 a private-use glyph of a terminal font",
+            "✔\ufe0f a variation selector",
+            "😀 \U0001f469 beyond the first plane",
         ):
             self.assertEqual(textsafe.clean(text), text)
             self.assertEqual(textsafe.clean(text, multiline=True), text)
         self.assertEqual(textsafe.clean(None), "")
         self.assertEqual(textsafe.clean(12), "12")
+
+    def test_text_with_nothing_to_replace_is_not_walked_in_python(self):
+        """The common case costs one ``isprintable``; anything else is walked
+        by ``str.translate``, and the table is asked once per distinct
+        character."""
+        text = "printable " * 1000
+        self.assertIs(textsafe.clean(text), text)
+        asked = []
+        judge = textsafe.unsafe
+
+        def counting(ch):
+            asked.append(ch)
+            return judge(ch)
+
+        table = textsafe._Table(lambda ch: " ")
+        with mock.patch.object(textsafe, "unsafe", counting):
+            self.assertEqual(("ab\x1b" * 5000).translate(table), "ab " * 5000)
+        self.assertEqual(sorted(asked), ["\x1b", "a", "b"])
+
+    def test_invisible_counts_what_draws_nothing(self):
+        self.assertEqual(textsafe.invisible("plain"), 0)
+        self.assertEqual(textsafe.invisible(None), 0)
+        self.assertEqual(textsafe.invisible("a\u200bb\u200b\u00adc\U000e0061\U000e0000"), 5)
+        # A terminal acts on these, or shows them: replaced, and not counted here.
+        self.assertEqual(textsafe.invisible(f"a\nb\t{ESC}[0m\x9b\u2028\udc9b"), 0)
+        self.assertEqual(textsafe.invisible("\u202e"), 1)  # a bidirectional control is one
 
     def test_multiline_keeps_line_feed_and_tab_only(self):
         self.assertEqual(
@@ -103,17 +186,44 @@ class CleanTest(unittest.TestCase):
 class JsonEscapeTest(unittest.TestCase):
     def test_round_trip_is_exact_and_nothing_unsafe_is_left(self):
         value = {
-            "every": "".join(sorted(textsafe.UNSAFE)),
+            # A letter between any two: a high surrogate followed by a low
+            # one is, spelled in JSON, the character the pair stands for.
+            "every": "x".join(sorted(textsafe.UNSAFE)),
             f"key{HOSTILE}": [HOSTILE, f"back\\slash\\{HOSTILE}", '"quoted"', "日本語", "\udcff"],
             "nested": {"n": 1, "f": 1.5, "t": True, "z": None},
         }
         for options in ({}, {"indent": 2, "sort_keys": True}):
             document = json.dumps(value, ensure_ascii=False, **options)
-            escaped = textsafe.json_escape(document)
-            self.assertEqual(json.loads(escaped), value)
-            self.assertEqual(unsafe_in(escaped, {"\n"}), [])
+            for ascii_only in (False, True):
+                escaped = textsafe.json_escape(document, ascii_only)
+                self.assertEqual(json.loads(escaped), value)
+                self.assertEqual(unsafe_in(escaped, {"\n"}), [])
+                self.assertEqual(json.loads(escaped.encode("utf-8")), value)  # always UTF-8
+                self.assertEqual(escaped.isascii(), ascii_only)
         self.assertIn("\\u009b", textsafe.json_escape(json.dumps("\x9b", ensure_ascii=False)))
         self.assertIn("\\u202e", textsafe.json_escape(json.dumps("\u202e", ensure_ascii=False)))
+
+    def test_a_lone_surrogate_is_written_as_its_own_escape(self):
+        """AUDIT A-03: ``--json`` held raw bytes that are not UTF-8 where a
+        path or a title held a surrogate."""
+        for text in ("caf\udce9", "\ud800", "pro\udc9b2Jj", "\udfff end"):
+            document = json.dumps({"cwd": text}, ensure_ascii=False)
+            with self.assertRaises(UnicodeEncodeError):
+                document.encode("utf-8")
+            escaped = textsafe.json_escape(document)
+            self.assertEqual(json.loads(escaped.encode("utf-8")), {"cwd": text})
+            self.assertIn("\\ud", escaped)
+        self.assertEqual(textsafe.json_escape('"\udc9b"'), '"\\udc9b"')
+
+    def test_characters_beyond_the_first_plane(self):
+        tag = "\U000e0061"
+        escaped = textsafe.json_escape(json.dumps(f"a{tag}😀", ensure_ascii=False))
+        self.assertEqual(escaped, '"a\\udb40\\udc61😀"')  # a pair, as JSON spells it
+        self.assertEqual(json.loads(escaped), f"a{tag}😀")
+        self.assertEqual(
+            textsafe.json_escape(json.dumps("é😀", ensure_ascii=False), ascii_only=True),
+            '"\\u00e9\\ud83d\\ude00"',
+        )
 
     def test_a_document_without_such_characters_is_unchanged(self):
         document = json.dumps({"a": ["b", "日本語", 1]}, ensure_ascii=False, indent=2)
@@ -124,7 +234,7 @@ class CliBoundaryTest(unittest.TestCase):
     """How forgetting is made hard: only the output helpers write to a
     stream, so a new field cannot reach the terminal around them."""
 
-    WRITERS = {"_emit", "_progress", "_ask"}
+    WRITERS = {"_write"}
 
     def test_only_the_output_helpers_write(self):
         source = Path(cli.__file__).read_text(encoding="utf-8")
@@ -170,6 +280,235 @@ class CliBoundaryTest(unittest.TestCase):
         first, second = err.getvalue().split("\r\x1b[K")[1:]
         self.assertEqual(first, textsafe.clean(f"scanning Evil{HOSTILE}… 12 dirs"))
         self.assertEqual(second, "")
+
+    def bytes_of(self, encoding, errors, write) -> bytes:
+        """What reaches the file descriptor of a stdout with this encoding
+        and this error handler."""
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding=encoding, errors=errors)
+        with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+            write()
+        stream.flush()
+        return raw.getvalue()
+
+    def test_the_stream_s_own_error_handler_is_never_asked(self):
+        """AUDIT A-03: stdout in the C and POSIX locales has the handler
+        ``surrogateescape``, which writes U+DC9B back as the byte 0x9B, an
+        8-bit CSI. The text is encoded here, whatever the stream would do."""
+        title = "title \udc9b31mRED \udc9d0;PWNED\udc9c end"
+        value = {"title": title, "é": "日本"}
+        line = json.dumps(value, ensure_ascii=False)
+
+        def readable():
+            cli._out(title)
+            cli._err(title)
+            cli._out(f"é\n{title}", multiline=True)
+            cli._progress(title)
+
+        for errors in ("surrogateescape", "strict", "backslashreplace", "ignore"):
+            for encoding in ("utf-8", "ascii", "latin-1"):
+                with self.subTest(encoding=encoding, errors=errors):
+                    data = self.bytes_of(encoding, errors, readable)
+                    text = data.decode(encoding)  # strict: every byte is of the encoding
+                    self.assertEqual(unsafe_in(text, {"\n", "\r", ESC}), [])
+                    self.assertEqual(text.count("title  31mRED  0;PWNED  end"), 4)
+                    if encoding != "utf-8":
+                        self.assertEqual([b for b in data if 0x80 <= b <= 0x9F], [])
+                    data = self.bytes_of(encoding, errors, lambda: cli._json(value))
+                    self.assertEqual(json.loads(data.decode(encoding)), value)
+                    self.assertEqual(json.loads(data), value)  # UTF-8, whatever the stream is
+                    data = self.bytes_of(encoding, errors, lambda: cli._json_line(line))
+                    self.assertEqual(json.loads(data), value)
+                    self.assertEqual(data.count(b"\n"), 1)
+
+    def test_what_the_stream_cannot_encode_is_escaped_not_fatal(self):
+        data = self.bytes_of("ascii", "strict", lambda: cli._out("café 日本 😀"))
+        self.assertEqual(data, b"caf\\xe9 \\u65e5\\u672c \\U0001f600\n")
+        # JSON has no \x and no \U: there everything beyond ASCII is a \u escape.
+        data = self.bytes_of("ascii", "strict", lambda: cli._json(["café 😀"]))
+        self.assertEqual(json.loads(data), ["café 😀"])
+        self.assertNotIn(b"\\x", data)
+        self.assertNotIn(b"\\U", data)
+        data = self.bytes_of("utf-8", "strict", lambda: cli._json(["café 😀"]))
+        self.assertIn("café 😀".encode(), data)  # UTF-8 is written as it is
+
+    def test_a_stream_that_is_not_there(self):
+        with mock.patch.object(sys, "stdout", None), mock.patch.object(sys, "stderr", None):
+            cli._out("x")
+            cli._err("x")
+            cli._progress("x")
+
+    def test_a_terminal_gets_each_line_at_once(self):
+        """The bytes go to the stream's buffer; a line-buffered stream (a
+        terminal) still shows a line when it is written."""
+
+        class Raw(io.RawIOBase):
+            def __init__(self):
+                self.seen = []
+
+            def writable(self):
+                return True
+
+            def write(self, data):
+                self.seen.append(bytes(data))
+                return len(data)
+
+        for line_buffering, expected in ((True, [b"one\n", b"two\n"]), (False, [])):
+            raw = Raw()
+            stream = io.TextIOWrapper(
+                io.BufferedWriter(raw), encoding="utf-8", line_buffering=line_buffering
+            )
+            with contextlib.redirect_stdout(stream):
+                cli._out("one")
+                cli._out("two")
+                self.assertEqual(raw.seen, expected)
+            raw.seen.clear()
+            with contextlib.redirect_stderr(stream):
+                cli._progress("half a line")  # no line break: flushed all the same
+                self.assertEqual(b"".join(raw.seen)[-11:], b"half a line")
+
+
+# A child's environment for one locale. ``PYTHON*`` is cleared so that only
+# the locale decides what Python makes of stdout.
+LOCALES = {
+    "en_US.UTF-8": {"LANG": "en_US.UTF-8"},
+    "C.UTF-8": {"LANG": "C.UTF-8"},
+    "C": {"LANG": "C"},
+    "POSIX": {"LANG": "POSIX"},
+    "LC_ALL=C": {"LANG": "en_US.UTF-8", "LC_ALL": "C"},
+    # Python left to the locale's own charset: no UTF-8 mode, no coercion.
+    "C, ASCII": {"LC_ALL": "C", "PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0"},
+}
+SURROGATES = "aaaaaaaa-0000-4000-8000-00000000c1c1"
+
+
+@unittest.skipUnless(os.name == "posix", "locales and file names that are not UTF-8")
+class LocaleTest(unittest.TestCase):
+    """AUDIT A-03 (``b/t08c_surrogate_c1.py``, ``b/t08b_nonutf8.py``): real
+    processes, one per locale, on a store whose title, folder and reply hold
+    lone surrogates (written as JSON escapes) and on a store below a
+    directory whose name is not UTF-8. In the C and POSIX locales the raw
+    bytes 0x9B, 0x9C and 0x9D reached stdout, and ``--json`` was not UTF-8."""
+
+    TITLE = "title \udc9b31mRED \udc9d0;PWNED\udc9c end"
+    CWD = "C:\\Users\\user\\pro\udc9b2Jj"
+    REPLY = "reply \udc9b2J\udc9b1;1H cleared \u200b\U000e0061"
+
+    def setUp(self):
+        self.w = World(self, foreign=())
+        store = self.w.profile / ".claude"
+        records = [
+            {
+                "type": "user",
+                "parentUuid": None,
+                "isSidechain": False,
+                "cwd": self.CWD,
+                "timestamp": "2026-10-01T10:00:00.000Z",
+                "message": {"role": "user", "content": self.TITLE},
+            },
+            {
+                "type": "assistant",
+                "parentUuid": "p",
+                "timestamp": "2026-10-01T10:00:05.000Z",
+                "message": {
+                    "id": "m1",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": self.REPLY}],
+                },
+            },
+        ]
+        path = store / "projects" / "C--evil" / f"{SURROGATES}.jsonl"
+        path.parent.mkdir(parents=True)
+        with open(path, "w", encoding="ascii") as fh:  # as escapes: the file itself is ASCII
+            fh.writelines(json.dumps(record, ensure_ascii=True) + "\n" for record in records)
+        # A second profile, below a directory whose name is not UTF-8.
+        odd = os.fsencode(self.w.c / "Users") + b"/caf\xe9 \xff"
+        os.mkdir(odd)
+        claude_transcript(os.fsdecode(odd) + "/.claude", B, "C:\\Users\\x", prompt="plain")
+        self.odd = os.fsdecode(odd)
+        self.index = self.w.scan()
+        self.assertEqual(sorted(s.id for s in self.index.sessions), [SURROGATES, B])
+        self.key = self.w.session(SURROGATES).key
+        self.assertEqual(self.w.session(SURROGATES).title, "title 31mRED 0;PWNED end")
+
+    def child(self, locale, *argv) -> tuple[int, bytes, bytes]:
+        env = {
+            name: value
+            for name, value in os.environ.items()
+            if not name.startswith(("LC_", "LANG", "PYTHON"))
+        }
+        env.update(LOCALES[locale], PYTHONDONTWRITEBYTECODE="1")
+        done = subprocess.run(
+            [sys.executable, str(LAUNCHER), *argv],
+            env=env,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=CHILD_TIMEOUT,
+        )
+        return done.returncode, done.stdout, done.stderr
+
+    def test_no_locale_lets_a_raw_byte_through(self):
+        commands = [
+            ("list",),
+            ("list", "--keys"),
+            ("show", self.key),
+            ("export", self.key),
+            ("status",),
+            ("import", self.key, "--dry-run"),
+            ("verify",),
+        ]
+        for locale in LOCALES:
+            for argv in commands:
+                with self.subTest(locale=locale, argv=argv[0]):
+                    code, out, err = self.child(locale, *argv)
+                    self.assertIn(code, (0, 1), err)
+                    self.assertNotIn(b"Traceback", err)
+                    for data in (out, err):
+                        text = data.decode("ascii" if "ASCII" in locale else "utf-8")  # strict
+                        self.assertEqual(unsafe_in(text, ALLOWED_BREAKS), [])
+                        for byte in (0x9B, 0x9C, 0x9D):
+                            if "ASCII" in locale:
+                                self.assertNotIn(byte, data)
+                    if argv[0] in ("list", "show", "export"):
+                        self.assertIn(b"title 31mRED 0;PWNED end", out)  # the title: one line
+                    if argv[0] in ("show", "export"):
+                        self.assertIn(b"title  31mRED  0;PWNED  end\n", out)  # the prompt
+                    if argv[0] in ("show", "export"):
+                        self.assertIn(b"reply  2J 1;1H cleared   \n", out)
+
+    def test_json_is_valid_utf8_and_exact_in_every_locale(self):
+        want = [s.to_dict() for s in self.index.sessions]
+        self.assertTrue(any("\udce9" in row["store"] for row in want))  # the odd directory
+        self.assertTrue(any("\udc9b" in (row["cwd"] or "") for row in want))
+        turns = [
+            {"role": "user", "text": self.TITLE, "ts": "2026-10-01T10:00:00.000000Z"},
+            {"role": "assistant", "text": self.REPLY, "ts": "2026-10-01T10:00:05.000000Z"},
+        ]
+        for locale in LOCALES:
+            with self.subTest(locale=locale):
+                code, out, err = self.child(locale, "list", "--json")
+                self.assertEqual((code, err), (0, b""))
+                self.assertEqual(json.loads(out.decode("utf-8")), want)
+                self.assertEqual(unsafe_in(out.decode("utf-8"), {"\n"}), [])
+                code, out, err = self.child(locale, "status", "--json")
+                self.assertEqual((code, err), (0, b""))
+                status = json.loads(out.decode("utf-8"))
+                self.assertIn(self.odd + "/.claude", [row["root"] for row in status["stores"]])
+                code, out, err = self.child(locale, "export", self.key, "--format", "json")
+                self.assertEqual((code, err), (0, b""))
+                lines = out.decode("utf-8").splitlines()
+                self.assertEqual([json.loads(line) for line in lines], turns)
+                if "ASCII" in locale:
+                    self.assertTrue(out.isascii())
+
+    def test_an_exported_file_holds_no_raw_byte_either(self):
+        target = self.w.box.root / "x.md"
+        code, _out, err = self.child("C", "export", self.key, "-o", str(target))
+        self.assertEqual(code, 0, err)
+        data = target.read_bytes()
+        text = data.decode("utf-8")
+        self.assertEqual(unsafe_in(text, ALLOWED_BREAKS), [])
+        self.assertIn("- invisible characters: 2 replaced by spaces\n", text)
 
 
 class HostileStoreTest(unittest.TestCase):

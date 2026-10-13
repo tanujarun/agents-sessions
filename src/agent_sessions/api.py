@@ -486,8 +486,11 @@ def export_transcript(
     id, the folder as recorded, the times, the message count and what
     exported it), a ``## User`` or ``## Assistant`` section per turn and a
     line ``> tool: <name>`` per tool call; all of it text made safe to show
-    (``textsafe.clean``). ``fmt="json"``: one JSON object per turn and line
-    (``role``, ``text``, ``ts``), exact data (docs/JSON.md).
+    (``textsafe.clean``). Invisible characters are replaced too, and the
+    header says how many there were: for that the transcript is read once
+    before the header is made, and again for the sections. ``fmt="json"``:
+    one JSON object per turn and line (``role``, ``text``, ``ts``), exact
+    data (docs/JSON.md).
 
     Raises at once, before anything is read: ``NotFound``, ``Offline`` for a
     session whose drive is not mounted, ``ExportFailed`` for a format that
@@ -499,10 +502,10 @@ def export_transcript(
     session = find_session(ref, index)
     _need_files(session)
     provider = _provider(session)
-    turns = provider.transcript(session)
     if fmt == exporting.JSON_LINES:
-        return exporting.json_lines(turns)
-    return exporting.markdown(session, provider.label or provider.name, turns)
+        return exporting.json_lines(provider.transcript(session))
+    label = provider.label or provider.name
+    return exporting.markdown(session, label, lambda: provider.transcript(session))
 
 
 def _in_a_store(path: str, index: Index) -> str | None:
@@ -749,7 +752,8 @@ def _hand_over(session: Session, source: Provider, plan: ContinuePlan) -> int:
             HANDOFF_MAX_AGE // 86400,
             directory,
         )
-    pieces = exporting.markdown(session, source.label or source.name, source.transcript(session))
+    label = source.label or source.name
+    pieces = exporting.markdown(session, label, lambda: source.transcript(session))
     return exporting.write(plan.handoff, pieces, overwrite=True)
 
 

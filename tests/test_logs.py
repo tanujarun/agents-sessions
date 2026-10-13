@@ -193,6 +193,63 @@ class NeverBreaksTest(LogCase):
         self.assertEqual(self.messages()[-1], "after")
 
 
+class OwnFileTest(LogCase):
+    """AUDIT A-18 (the log's part), A-03 and N-26."""
+
+    WRITE = "from agent_sessions import logs\nlogs.logger().info('hello')\nprint('done')\n"
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes")
+    def test_a_named_pipe_under_the_logs_name_holds_nothing_up(self):
+        """``scan`` hung on it: the open waited for a reader."""
+        self.state.mkdir(parents=True)
+        os.mkfifo(self.path)
+        ((code, out, err),) = finish(self, [python_child(self.WRITE)], timeout=20)
+        self.assertEqual((code, out, err), (0, "done\n", ""))
+        self.assertTrue(stat.S_ISFIFO(os.stat(self.path).st_mode))  # left as it is
+        # With a reader on the other end the open would succeed: still not written to.
+        reader = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        logs.logger().info("not into a pipe")
+        self.assertEqual(os.read(reader, 100), b"")
+        self.assertEqual(os.listdir(self.state), [LOG_NAME])
+
+    @unittest.skipUnless(POSIX, "devices")
+    def test_a_link_to_a_device_is_not_opened(self):
+        self.state.mkdir(parents=True)
+        os.symlink("/dev/zero", self.path)
+        with mock.patch.object(os, "open", side_effect=AssertionError("opened")) as opened:
+            logs.logger().info("hello")
+        opened.assert_not_called()
+
+    @unittest.skipUnless(POSIX, "file modes")
+    def test_a_log_with_a_wider_mode_is_tightened(self):
+        logs.logger().info("one")
+        logs.close()
+        os.chmod(self.path, 0o644)
+        logs.logger().info("two")
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
+        self.assertEqual(self.messages(), ["one", "two"])
+
+    def test_a_message_the_file_cannot_hold_is_escaped_not_dropped(self):
+        """``import <key> (store <path>)`` was lost whenever the path was
+        not UTF-8: the file was opened strict, and the write failed."""
+        handler = logs.PrivateRotatingFile(self.path)
+        self.addCleanup(handler.close)
+        self.assertEqual(handler.errors, "backslashreplace")
+        record = logging.LogRecord("x", logging.INFO, "f", 1, "store caf\udce9 \ud800", (), None)
+        handler.emit(record)  # the handler's own format: nothing has cleaned the text
+        handler.close()
+        self.assertEqual(self.path.read_bytes(), b"store caf\\udce9 \\ud800\n")
+
+    def test_a_path_that_is_not_utf8_is_logged(self):
+        logs.logger().info("import %s (store %s)", "claude:1:2", "/media/caf\udce9/.claude")
+        logs.logger().info("after")
+        self.assertEqual(
+            self.messages(), ["import claude:1:2 (store /media/caf /.claude)", "after"]
+        )
+        self.path.read_bytes().decode("utf-8")  # strict
+
+
 class SafeTextTest(LogCase):
     """A log is read in a terminal, and its values come from stores."""
 

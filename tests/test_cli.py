@@ -351,9 +351,10 @@ class CliTest(unittest.TestCase):
         run("scan")
         text = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
         with contextlib.redirect_stdout(text):
-            cli._out("caf\xe9 \udcff")
+            cli._out("caf\xe9 \udcff")  # the odd byte of a file name: a space, as a control is
+            cli._json("caf\xe9 \udcff")  # exact, in what JSON has for it
         text.flush()
-        self.assertEqual(text.buffer.getvalue(), b"caf\\xe9 \\udcff\n")
+        self.assertEqual(text.buffer.getvalue(), b'caf\\xe9  \n"caf\\u00e9 \\udcff"\n')
 
 
 class SessionCommandsTest(unittest.TestCase):
