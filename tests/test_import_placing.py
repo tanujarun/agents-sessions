@@ -6,6 +6,7 @@ with real processes."""
 
 import errno
 import os
+import shutil
 import sys
 import time
 import unittest
@@ -212,6 +213,64 @@ class NoReplaceTest(PlacingCase):
             importer.execute(self.plan())
         self.assertFalse(self.native.exists())
         self.nothing_left()
+
+    def test_every_step_of_the_roll_back_is_tried_whatever_the_one_before_did(self):
+        """docs/AUDIT.md A-05: on Python 3.11 ``shutil.rmtree`` passed the
+        recursion limit on a deeply nested copy, the ``RecursionError`` left
+        the roll back at that step, and everything after it stayed in the
+        native store."""
+        real = shutil.rmtree
+
+        def rmtree(path, *args, **kwargs):
+            if importer.STAGING_PREFIX in os.path.basename(path):
+                raise RecursionError("maximum recursion depth exceeded")
+            return real(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(importer.shutil, "rmtree", rmtree),
+            self.assertRaises(RecursionError),  # the first failure, once all were tried
+        ):
+            importer.execute(self.plan(), verify=mock.Mock(side_effect=ValueError("no")))
+        # The staging directory could not be removed; all the rest went.
+        (staging,) = os.listdir(self.native)
+        self.assertTrue(staging.startswith(importer.STAGING_PREFIX))
+        real(self.native)
+
+    def test_an_interrupt_in_the_middle_of_the_roll_back_does_not_end_it(self):
+        real = importer._remove
+
+        def remove(path):
+            if path == str(self.transcript):
+                raise KeyboardInterrupt  # the first unit to go: the last one placed
+            return real(path)
+
+        with (
+            mock.patch.object(importer, "_remove", remove),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            importer.execute(self.plan(), verify=mock.Mock(side_effect=ValueError("no")))
+        self.assertEqual(files_below(self.native), [os.path.relpath(self.transcript, self.native)])
+        self.assertFalse(self.side.exists())
+        self.assertEqual(os.listdir(self.native), ["projects"])  # no staging directory
+
+    def test_each_runs_every_step_and_raises_the_first_failure(self):
+        done = []
+
+        def step(name, failure=None):
+            def run():
+                done.append(name)
+                if failure is not None:
+                    raise failure
+
+            return run
+
+        importer._each(step("a"), step("b"))
+        first, second = OSError("first"), RecursionError("second")
+        with self.assertRaises(OSError) as caught:
+            importer._each(step("c", first), step("d", second), step("e", KeyboardInterrupt()))
+        self.assertIs(caught.exception, first)
+        self.assertEqual(done, ["a", "b", "c", "d", "e"])
+        importer._each()
 
     def test_a_directory_that_could_not_be_made_is_not_taken_for_ours(self):
         """``projects`` appears between the look and the mkdir (the tool

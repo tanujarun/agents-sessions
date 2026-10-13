@@ -42,6 +42,7 @@ module freely.
 from __future__ import annotations
 
 import errno
+import functools
 import json
 import os
 import re
@@ -73,6 +74,14 @@ _STAGING_NAME = re.compile(re.escape(STAGING_PREFIX) + r"([0-9]+)-[0-9a-f]+")
 STAGING_MAX_AGE = 3600  # seconds; a younger staging directory is never swept
 FILE_MODE = 0o600  # sessions are private; never wider than the tools write
 DIR_MODE = 0o700
+# How many directories deep a path below a unit may lie. The tools nest two
+# or three; a directory copied whole from another drive can nest thousands,
+# as far as a path of that drive goes.
+DEPTH_MAX = 64
+# What a path and one name in it may measure, in bytes, where the platform
+# does not say (``os.pathconf``).
+PATH_MAX = 4096
+NAME_MAX = 255
 
 
 class Exists(ImportFailed):
@@ -272,13 +281,19 @@ def tree(
     """``(sub-directories, files)`` below ``src_dir``, as relative paths in
     sorted order, parents before children. Symbolic links and special files
     are left out, and so is every file whose name ``skip(name)`` accepts.
-    Directories are listed without moving their access time."""
+    Directories are listed without moving their access time.
+
+    Raises ``ImportFailed`` as soon as a directory lies more than
+    ``DEPTH_MAX`` levels below ``src_dir``: such a tree is not walked to its
+    end (``execute`` refuses the same for a plan made any other way)."""
     src_dir = os.fspath(src_dir)
     dirs: list[str] = []
     files: list[FileCopy] = []
     pending = [""]
     while pending:
         rel_dir = pending.pop(0)
+        if _depth(rel_dir) > DEPTH_MAX:
+            raise _too_deep(src_dir)
         here = os.path.join(src_dir, rel_dir) if rel_dir else src_dir
         try:
             names = sorted(listdir_ro(here))
@@ -454,11 +469,97 @@ def contained(plan: ImportPlan) -> None:
             raise ImportFailed(f"{addition.path} is not a regular file; nothing was imported")
 
 
+def _depth(rel: str) -> int:
+    """How many names a path below a unit has; none for the unit itself."""
+    return len(_SEPARATORS.split(rel)) if rel else 0
+
+
+def _too_deep(what: str) -> ImportFailed:
+    return ImportFailed(
+        f"{what} holds directories nested more than {DEPTH_MAX} levels deep, and a session "
+        "like that is not imported; nothing was imported"
+    )
+
+
+def _limit(where: str, name: str, default: int) -> int:
+    """A limit of the filesystem that holds ``where`` (``os.pathconf``);
+    ``default`` where the platform has no such call, does not know the name,
+    or sets no limit."""
+    try:
+        value = os.pathconf(where, name)
+    except (AttributeError, OSError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _bytes(path: str) -> int:
+    """The length of a path as the filesystem counts it."""
+    try:
+        return len(os.fsencode(path))
+    except UnicodeEncodeError:  # text no file name decodes to; the copy itself will say so
+        return len(path.encode("utf-8", "surrogatepass"))
+
+
+def _staging_name() -> str:
+    """What this process names a staging directory: prefix, pid, hex time."""
+    return f"{STAGING_PREFIX}{os.getpid()}-{time.time_ns():x}"
+
+
+def fits(plan: ImportPlan) -> None:
+    """Refuse a plan whose copy nests deeper than ``DEPTH_MAX`` directories
+    below a unit, or needs a path or a name longer than the filesystem of
+    the native store takes (``os.pathconf``; ``PATH_MAX`` and ``NAME_MAX``
+    where it does not say).
+
+    The names and the nesting of a directory that is copied whole come from
+    the source. A path that is within the limit on the other drive can pass
+    it here, where it lies below another directory; found only when the
+    files are written, that fails an import half way, and a tree nested
+    thousands deep is more than a roll back can be trusted to remove
+    (``shutil.rmtree`` recurses before Python 3.12). Every path is measured
+    where it will lie and where it is staged.
+
+    Raises ``ImportFailed``; reads only. ``contained`` comes first: this
+    takes the names for text."""
+    where = _anchor(plan.native_root)
+    path_max = _limit(where, "PC_PATH_MAX", PATH_MAX)
+    name_max = _limit(where, "PC_NAME_MAX", NAME_MAX)
+    staging = os.path.join(plan.native_root, _staging_name())
+    for number, unit in enumerate(plan.units):
+        what = unit.src or unit.dst
+        inside = [(rel, _depth(rel)) for rel in unit.dirs]
+        inside += [(item.rel, _depth(item.rel) - 1) for item in unit.files if item.rel]
+        if any(depth > DEPTH_MAX for _rel, depth in inside):
+            raise _too_deep(what)
+        own = unit.dst[len(_below(plan.native_root)) :]
+        rels = ["", *(rel for rel, _levels in inside)]
+        longest = max(
+            _bytes(os.path.join(base, rel) if rel else base)
+            for base in (unit.dst, os.path.join(staging, str(number)))
+            for rel in rels
+        )
+        if longest >= path_max:  # the limit counts the byte that ends the path
+            raise ImportFailed(
+                f"the copy of {what} would need a path of {longest:,} bytes below "
+                f"{plan.native_root}, and at most {path_max - 1:,} fit there; "
+                "nothing was imported"
+            )
+        names = {name for rel in rels for name in _SEPARATORS.split(rel) if name}
+        widest = max(map(_bytes, names | set(_SEPARATORS.split(own))))
+        if widest > name_max:
+            raise ImportFailed(
+                f"the copy of {what} would need a file or directory name of {widest:,} "
+                f"bytes below {plan.native_root}, and at most {name_max:,} fit there; "
+                "nothing was imported"
+            )
+
+
 def _sound(plan: ImportPlan) -> None:
     """The refusals that do not depend on what is in the native store: a
-    session id that is not in the form its provider's ids have, and a
-    destination outside the native store. ``execute`` makes them before it
-    touches anything."""
+    session id that is not in the form its provider's ids have, a
+    destination outside the native store, and a copy that nests too deep or
+    needs a path longer than the filesystem takes. ``execute`` makes them
+    before it touches anything."""
     # The id becomes file and directory names in the native store and, once
     # the copy is listed, an argument of the tool that resumes it.
     if not isinstance(plan.session_id, str) or not plan.id_pattern.fullmatch(plan.session_id):
@@ -466,13 +567,16 @@ def _sound(plan: ImportPlan) -> None:
             "the id of this session is not in the form its tool gives ids; nothing was imported"
         )
     contained(plan)
+    fits(plan)
 
 
 def check(plan: ImportPlan) -> None:
     """Everything ``execute`` would refuse, without writing: a session id
     that is not in the form its provider's ids have, a destination outside
-    the native store (``contained``), an id or a destination that already
-    exists (``Exists``), too little free space, an unreadable import journal."""
+    the native store (``contained``), a copy nested too deep or with a path
+    too long for the native store (``fits``), an id or a destination that
+    already exists (``Exists``), too little free space, an unreadable
+    import journal."""
     _sound(plan)
     taken = list(plan.existing) + [dst for dst in plan.destinations if os.path.lexists(dst)]
     if taken:
@@ -687,6 +791,25 @@ def _remove(path: str) -> None:
         pass
 
 
+def _each(*steps: Callable[[], object]) -> None:
+    """Run every step, whatever the ones before it did, and then raise the
+    first failure, if there was one.
+
+    For a roll back: what one step could not do must not keep the others
+    from being tried. ``BaseException``: what stops a step can be an
+    interrupt, or a ``RecursionError`` out of ``shutil.rmtree``, as well as
+    an error of the filesystem."""
+    first: BaseException | None = None
+    for step in steps:
+        try:
+            step()
+        except BaseException as exc:  # raised again below, once every step was tried
+            if first is None:
+                first = exc
+    if first is not None:
+        raise first
+
+
 def _append(item: Append) -> None:
     """Add the bytes in one write; start on a fresh line when the file does
     not end with one. A file that is not there yet is created private, like
@@ -883,6 +1006,61 @@ def execute(
                     pass
 
 
+@dataclass
+class _Run:
+    """What one import has done so far: what its end has to tidy up, and a
+    roll back has to take out again (``_wind_up``)."""
+
+    made_dirs: list[str] = field(default_factory=list)  # created by this run, outermost first
+    placed: list[str] = field(default_factory=list)  # units already moved into the store
+    moving: tuple[str, str] | None = None  # (staged, destination) of the move under way
+    staging: str | None = None
+    record_fd: int | None = None
+    record_new: bool = False  # this run created the journal
+
+
+def _wind_up(run: _Run, finished: bool) -> None:
+    """The end of an import, however it ended. One that finished gives up
+    its staging directory and its descriptor of the journal. One that did
+    not is rolled back: the staging directory, the units already in place
+    and the directories made for them are removed.
+
+    The steps do not depend on each other (``_each``): one that fails does
+    not keep the rest from being tried, and the first failure is raised when
+    all of them are done."""
+
+    def arrived() -> None:
+        # An interrupt between a move and the line that notes it: asked
+        # while the staged unit can still tell whose the name is.
+        if run.moving is not None and run.moving[1] not in run.placed and _arrived(*run.moving):
+            run.placed.append(run.moving[1])
+
+    def staging() -> None:
+        if run.staging is not None:
+            shutil.rmtree(run.staging, ignore_errors=True)
+
+    def units() -> None:
+        _each(*(functools.partial(_remove, path) for path in reversed(run.placed)))
+
+    def directories() -> None:
+        for directory in reversed(run.made_dirs):
+            try:
+                os.rmdir(directory)  # only when nothing else is in it
+            except OSError:
+                pass
+
+    def journal_closed() -> None:
+        if run.record_fd is not None:
+            os.close(run.record_fd)
+        if run.record_new and not finished:
+            _drop_if_empty(journal.path())
+
+    if finished:
+        _each(staging, journal_closed)
+    else:
+        _each(arrived, staging, units, directories, journal_closed)
+
+
 def _carry_out(
     plan: ImportPlan, progress: Progress | None, verify: Callable[[], object] | None
 ) -> dict:
@@ -899,18 +1077,12 @@ def _carry_out(
         if progress is not None:
             progress(min(done, total), total)
 
-    made_dirs: list[str] = []  # created by this run, outermost first
-    placed: list[str] = []  # units already moved into the store
-    moving: tuple[str, str] | None = None  # (staged, destination) of the move under way
-    staging = None
-    record_fd = None
-    record_new = False  # this run created the journal
+    run = _Run()
+    made_dirs, placed = run.made_dirs, run.placed
     finished = False
     try:
         _make_dirs(plan.native_root, made_dirs)
-        staging = os.path.join(
-            plan.native_root, f"{STAGING_PREFIX}{os.getpid()}-{time.time_ns():x}"
-        )
+        staging = run.staging = os.path.join(plan.native_root, _staging_name())
         os.mkdir(staging, DIR_MODE)
         staged = []
         for number, unit in enumerate(plan.units):
@@ -928,11 +1100,11 @@ def _carry_out(
 
         # The journal is opened before anything becomes visible: what can
         # still fail for it after the appends is one small write.
-        record_fd, record_new = journal.open_for_append()
+        run.record_fd, run.record_new = journal.open_for_append()
 
         for unit, target in zip(plan.units, staged, strict=False):
             _make_dirs(os.path.dirname(unit.dst), made_dirs)
-            moving = (target, unit.dst)
+            run.moving = (target, unit.dst)
             try:
                 _place(target, unit.dst, unit.is_dir)
             except OSError as exc:
@@ -948,7 +1120,7 @@ def _carry_out(
                     "native store"
                 ) from exc
             placed.append(unit.dst)
-        moving = None
+        run.moving = None
         _flush_placed(placed, made_dirs)
         manifest = _manifest(placed, made_dirs)
         if verify is not None:
@@ -964,30 +1136,13 @@ def _carry_out(
         for addition in plan.appends:
             _append(addition)
         record = _record(plan, manifest)
-        journal.write(record_fd, record)
+        journal.write(run.record_fd, record)
         finished = True
-        if record_new:
+        if run.record_new:
             fsutil.fsync_dir(os.path.dirname(journal.path()))
         return record
     finally:
-        if record_fd is not None:
-            os.close(record_fd)
-        # An interrupt between a move and the line that notes it: asked
-        # while the staged unit can still tell whose the name is.
-        if moving is not None and moving[1] not in placed and _arrived(*moving):
-            placed.append(moving[1])
-        if staging is not None:
-            shutil.rmtree(staging, ignore_errors=True)
-        if not finished:
-            if record_new:
-                _drop_if_empty(journal.path())
-            for path in reversed(placed):
-                _remove(path)
-            for directory in reversed(made_dirs):
-                try:
-                    os.rmdir(directory)  # only when nothing else is in it
-                except OSError:
-                    pass
+        _wind_up(run, finished)
 
 
 __all__ = [
@@ -1006,6 +1161,7 @@ __all__ = [
     "describe",
     "execute",
     "file_copy",
+    "fits",
     "free_space",
     "human_size",
     "only_changed",

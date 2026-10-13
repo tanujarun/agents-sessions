@@ -346,6 +346,185 @@ class ContainedTest(SafetyCase):
             self.assertIn("nothing was imported", self.refused(self.with_dst(dst)))
 
 
+class DepthAndLengthTest(SafetyCase):
+    """docs/AUDIT.md A-05: a side directory is copied whole, and how deep it
+    nests and how long its paths are is the source's to decide. What the
+    native store cannot hold, or a roll back could not be trusted to remove,
+    is refused before anything is written."""
+
+    foreign = ("claude",)
+
+    def setUp(self):
+        super().setUp()
+        self.side = self.w.profile / ".claude" / "projects" / "F--Proj-My-Site" / CLAUDE_WIN
+        self.copy = self.home / ".claude" / "projects" / encode_cwd(str(self.w.site)) / CLAUDE_WIN
+
+    def nest(self, names) -> Path:
+        """Directories below the side directory, one in the other, and a
+        file in the last; returns the file."""
+        deepest = self.side
+        for name in names:
+            deepest = deepest / name
+            os.mkdir(deepest)
+        (deepest / "f").write_text("x", encoding="utf-8")
+        return deepest / "f"
+
+    def reason(self) -> str:
+        """The dry run, ``import_options`` and the import refuse alike, and
+        nothing is written."""
+        source = self.source(CLAUDE_WIN)
+        before = snapshot(self.home, self.state)
+        reasons = []
+        for action in (api.import_plan, api.import_session):
+            with self.assertRaises(api.ImportFailed) as caught:
+                action(source)
+            reasons.append(caught.exception.reason)
+        self.assertEqual(len(set(reasons)), 1, reasons)
+        self.assertEqual(api.import_options(source), api.ImportOptions(False, reasons[0]))
+        self.assertEqual(snapshot(self.home, self.state), before)
+        self.assertFalse((self.home / ".claude").exists())
+        return reasons[0]
+
+    def test_a_directory_nested_deeper_than_64_levels_is_refused(self):
+        self.assertEqual(importer.DEPTH_MAX, 64)
+        self.nest(["a"] * 65)
+        self.assertEqual(
+            self.reason(),
+            f"{self.side} holds directories nested more than 64 levels deep, and a session "
+            "like that is not imported; nothing was imported",
+        )
+
+    def test_64_levels_are_imported(self):
+        deepest = self.nest(["a"] * 64)
+        api.import_session(self.source(CLAUDE_WIN))
+        self.assertEqual((self.copy / deepest.relative_to(self.side)).read_text(), "x")
+        api.unimport(CLAUDE_WIN)
+        self.assertFalse((self.home / ".claude").exists())
+
+    def test_a_plan_made_any_other_way_is_measured_too(self):
+        """``execute`` does not rely on the adapter having walked the tree
+        with ``importer.tree``."""
+        deep = os.sep.join(["d"] * 65)
+        for change in (
+            lambda unit: unit.dirs.append(deep),
+            lambda unit: unit.files.append(importer.FileCopy("/s", os.path.join(deep, "f"))),
+        ):
+            plan = self.plan()
+            change(plan.units[0])
+            for action in (importer.fits, importer.check, importer.execute):
+                with self.assertRaises(importer.ImportFailed) as caught:
+                    action(plan)
+                self.assertIn("nested more than 64 levels deep", caught.exception.reason)
+        # A file in the sixty-fourth directory is as deep as it goes.
+        plan = self.plan()
+        plan.units[0].dirs.append(os.sep.join(["d"] * 64))
+        plan.units[0].files.append(importer.FileCopy("/s", os.sep.join(["d"] * 64 + ["f"])))
+        importer.fits(plan)
+        self.assertFalse((self.home / ".claude").exists())
+
+    @unittest.skipUnless(hasattr(os, "pathconf"), "asks the filesystem for its limits")
+    def test_a_path_that_fits_on_the_other_drive_and_not_here_is_refused(self):
+        """The auditor's case in small: the longest path of the source is
+        as long as a path may be, and its place in the native store lies
+        below a longer directory."""
+        limit = os.pathconf(self.home, "PC_PATH_MAX")
+        self.assertGreater(len(str(self.copy)), len(str(self.side)))
+        room = limit - 1 - len(str(self.side)) - len("/f")  # for the directories, "/" included
+        names = []
+        while room > 1:
+            length = min(200, room - 1)
+            if room - (length + 1) == 1:  # a rest of one byte holds no "/x"
+                length -= 1
+            names.append("n" * length)
+            room -= length + 1
+        self.assertEqual(room, 0)
+        longest = self.nest(names)
+        self.assertEqual(len(str(longest)), limit - 1)
+        self.assertEqual(longest.read_text(), "x")  # the source can be read: it fits there
+        needed = len(str(self.copy)) + len(str(longest)) - len(str(self.side))
+        self.assertEqual(
+            self.reason(),
+            f"the copy of {self.side} would need a path of {needed:,} bytes below "
+            f"{self.home / '.claude'}, and at most {limit - 1:,} fit there; nothing was imported",
+        )
+
+    def test_the_limits_are_the_filesystems_and_the_staged_path_counts(self):
+        self.nest(["a", "b" * 20])
+        longest = len(str(self.copy / "a" / ("b" * 20) / "f"))
+        measured = []
+
+        def limit(where, name, default):
+            measured.append((where, name, default))
+            return {"PC_PATH_MAX": longest + 1, "PC_NAME_MAX": 255}[name]
+
+        with mock.patch.object(importer, "_limit", limit):
+            plan = self.plan()
+            importer.fits(plan)  # to the byte
+            plan.units[0].files.append(importer.FileCopy("/s", os.path.join("a", "b" * 20, "f2")))
+            with self.assertRaises(importer.ImportFailed) as caught:
+                importer.fits(plan)
+        self.assertIn("would need a path of", caught.exception.reason)
+        # Asked of the directory that exists nearest the native store.
+        self.assertEqual(
+            measured[:2],
+            [(str(self.home), "PC_PATH_MAX", 4096), (str(self.home), "PC_NAME_MAX", 255)],
+        )
+        # A short destination does not help when the staged path is too long.
+        plan = self.plan()
+        short = os.path.join(plan.native_root, "x")
+        rel = os.path.join("a", "b" * 20, "f")
+        staged = len(os.path.join(plan.native_root, importer._staging_name(), "0", rel))
+        self.assertGreater(staged, len(os.path.join(short, rel)))
+        plan.units = [dataclasses.replace(plan.units[0], dst=short)]
+        with (
+            mock.patch.object(importer, "_limit", lambda where, name, default: staged),
+            self.assertRaises(importer.ImportFailed),
+        ):
+            importer.fits(plan)
+        with mock.patch.object(importer, "_limit", lambda where, name, default: staged + 1):
+            importer.fits(plan)
+
+    def test_a_name_longer_than_the_filesystem_takes_is_refused(self):
+        plan = self.plan()
+        plan.units = [dataclasses.replace(plan.units[0], dst=os.path.join(plan.native_root, "x"))]
+        unit = plan.units[0]
+        with mock.patch.object(
+            importer,
+            "_limit",
+            lambda where, name, default: 20 if name == "PC_NAME_MAX" else default,
+        ):
+            unit.dirs.append("n" * 20)
+            importer.fits(plan)
+            unit.dirs[-1] = "n" * 21
+            with self.assertRaises(importer.ImportFailed) as caught:
+                importer.fits(plan)
+            self.assertEqual(
+                caught.exception.reason,
+                f"the copy of {self.side} would need a file or directory name of 21 bytes below "
+                f"{self.home / '.claude'}, and at most 20 fit there; nothing was imported",
+            )
+            unit.dirs[-1] = "é" * 11  # 22 bytes: bytes are what is counted
+            with self.assertRaises(importer.ImportFailed):
+                importer.fits(plan)
+            unit.dirs[-1] = os.path.join("ok", "n" * 21)  # any name on the way
+            with self.assertRaises(importer.ImportFailed):
+                importer.fits(plan)
+            unit.dirs.pop()
+            unit.dst = os.path.join(plan.native_root, "sub", "y" * 21)  # the unit's own too
+            with self.assertRaises(importer.ImportFailed):
+                importer.fits(plan)
+
+    def test_where_the_platform_gives_no_limit_the_usual_ones_hold(self):
+        self.assertEqual((importer.PATH_MAX, importer.NAME_MAX), (4096, 255))
+        for failure in (AttributeError("no pathconf"), OSError(22, "Invalid"), ValueError("name")):
+            with mock.patch.object(importer.os, "pathconf", side_effect=failure, create=True):
+                self.assertEqual(importer._limit("/", "PC_PATH_MAX", 4096), 4096)
+        with mock.patch.object(importer.os, "pathconf", return_value=-1, create=True):
+            self.assertEqual(importer._limit("/", "PC_NAME_MAX", 255), 255)  # "no limit"
+        with mock.patch.object(importer.os, "pathconf", return_value=1024, create=True):
+            self.assertEqual(importer._limit("/", "PC_PATH_MAX", 4096), 1024)
+
+
 class AdapterNamesTest(SafetyCase):
     """Each adapter checks the names it takes from the source before it
     builds a destination from them."""
