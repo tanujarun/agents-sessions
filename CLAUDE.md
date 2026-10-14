@@ -11,7 +11,7 @@ Textual, from the project `.venv` (`./install.sh` creates it).
   formatter; `make typecheck` runs `mypy`; `make coverage`; `make check` runs lint, typecheck and
   both suites. These need the tools in `.venv`: `make dev` (installs `.[tui,dev]` editable)
 - Run: `bin/agent-sessions` (TUI) or `bin/agent-sessions <scan|list|open|import|unimport|export|continue|show|status|verify|mount|forget|map>`
-- TUI tests: `make test-tui` (needs `.venv`; about 3 minutes)
+- TUI tests: `make test-tui` (needs `.venv`; about 4 minutes). Packages: `make dist`, `make dist-check`
 - Install: `./install.sh` (`--dev` adds the tools; `./uninstall.sh` takes it back; creates `.venv` with Textual, symlinks into
   `~/.local/bin`, installs the desktop launcher)
 
@@ -33,7 +33,8 @@ Textual, from the project `.venv` (`./install.sh` creates it).
   and a directory goes only when empty.
 - Text from a store is shown only through `textsafe` (`cli._out`/`_err`/`_json`, `view.clean`); no `print` in `cli.py`.
   The log is written through `logs.logger()` only (its formatter cleans every message).
-- Foreign bytes are read bounded (`open_ro`, `iter_jsonl`, `read_small`, `open_sqlite_ro`); where JSON is
+- Foreign bytes are read bounded (`open_ro`, `iter_jsonl`, `read_small`, `load_json` with
+  `JSONL_STRUCTURE_MAX`, `open_sqlite_ro`); where JSON is
   parsed, catch `RecursionError` with `ValueError`.
 - Do not leave store-shaped directories (fake homes, copied fixtures)
   readable under `scratch/`: a real scan of `/home` would list them.
@@ -49,7 +50,8 @@ Textual, from the project `.venv` (`./install.sh` creates it).
   imported only under `tui/`, and no engine module imports `tui` (the one exception: the lazy
   import in `cli._tui`).
 - Engine messages name no command-line flag: set `ApiError.remedy`, `cli` adds the hint.
-- Every test module imports `support` (it points the state directory at a temp dir) before `agent_sessions`.
+- Every test module imports `support` (or `tui_support`/`fixture_world`, which load it first) before
+  `agent_sessions`: it points state, cache and home at temp dirs.
 - Formats come from `docs/FORMATS.md`. If the files disagree with it, fix the
   doc in the same change; never guess a field.
 - Output order is deterministic: sort everything you emit.
