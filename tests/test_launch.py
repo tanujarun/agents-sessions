@@ -3,10 +3,12 @@ notification is sent: the starter and the notifier are replaced (see
 tests/fixture_world.py), and ``exec`` is patched where ``here`` is tested.
 Rules: docs/SPEC.md "Launch", docs/FORMATS.md section 5 of each provider."""
 
+import dataclasses
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -26,7 +28,9 @@ from fixture_world import (
 from support import FIXTURES
 
 from agent_sessions import api, launch
-from agent_sessions.launch import LaunchPlan
+from agent_sessions.launch import LaunchFailed, LaunchPlan
+from agent_sessions.providers.claude import Claude
+from agent_sessions.providers.codex import Codex
 from agent_sessions.providers.gemini import Gemini
 
 TERMINAL = "omarchy-launch-tui"
@@ -185,6 +189,42 @@ class PlanTest(LaunchCase):
         with self.assertRaises(api.NotFound) as caught:
             api.open_session("claude:", dry_run=True)
         self.assertIn("matches", caught.exception.reason)
+        self.assertEqual((self.w.started, self.w.notified), ([], []))
+
+    def test_a_relative_recorded_folder_is_never_started_in(self):
+        """AUDIT M79, the "absolute path" half of SECURITY 2: a recorded
+        folder that is not an absolute path is never the directory a tool is
+        started in, also when a directory of that name exists below the
+        current one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, "proj"))
+            before = os.getcwd()
+            os.chdir(tmp)
+            self.addCleanup(os.chdir, before)
+            for relative in ("proj", "./proj", "."):
+                self.assertTrue(os.path.isdir(relative))
+                for local, recorded in ((relative, relative), (None, relative), (relative, None)):
+                    # A tool that finds a session by id from anywhere: the home
+                    # directory, with a note.
+                    for session_id, provider in ((CODEX_NATIVE, Codex), (CLAUDE_NATIVE, Claude)):
+                        session = self.w.session(session_id, "native", self.index)
+                        session = dataclasses.replace(session, cwd=recorded, cwd_local=local)
+                        plan = launch.plan(session, provider())
+                        self.assertEqual(plan.cwd, str(self.home), (local, recorded))
+                        self.assertIn("starting in the home directory", plan.note)
+                    # A tool that resumes from the project folder only: refused.
+                    session = dataclasses.replace(
+                        self.w.session(CODEX_NATIVE, "native", self.index),
+                        cwd=recorded,
+                        cwd_local=local,
+                    )
+                    with (
+                        mock.patch.object(Codex, "resume_needs_cwd", True),
+                        self.assertRaises(LaunchFailed) as caught,
+                    ):
+                        launch.plan(session, Codex())
+                    self.assertIn("can only resume from it", caught.exception.reason)
+            os.chdir(before)
         self.assertEqual((self.w.started, self.w.notified), ([], []))
 
 
