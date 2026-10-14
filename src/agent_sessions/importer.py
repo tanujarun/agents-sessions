@@ -44,6 +44,7 @@ from __future__ import annotations
 import errno
 import functools
 import json
+import logging
 import os
 import re
 import shutil
@@ -82,6 +83,8 @@ DEPTH_MAX = 64
 # does not say (``os.pathconf``).
 PATH_MAX = 4096
 NAME_MAX = 255
+
+_log = logging.getLogger(__name__)
 
 
 class Exists(ImportFailed):
@@ -162,6 +165,11 @@ class Append:
     label: str
 
 
+# What reads the copy a plan describes back from the native store and raises
+# when it is not the planned session (``Provider.read_back``).
+ReadBack = Callable[["ImportPlan"], object]
+
+
 @dataclass
 class ImportPlan:
     provider: str
@@ -187,6 +195,12 @@ class ImportPlan:
     # The folder the user chose for this import (``chosen_folder``), or None
     # when the recorded one was mapped.
     chosen_folder: str | None = None
+    # How the provider reads a copy back from the native store
+    # (``Provider.read_back``). ``execute`` needs it for an earlier import
+    # into this store that died half way (``recover``): whether what that one
+    # left is a whole session is the provider's to say. Not part of what the
+    # plan says, so it does not count when two plans are compared.
+    read_back: ReadBack | None = field(default=None, compare=False, repr=False)
 
     @property
     def total_bytes(self) -> int:
@@ -227,9 +241,11 @@ def start_plan(
     id_pattern: re.Pattern[str] = UUID_PATTERN,
     target: str | None = None,
     needs_folder: bool = True,
+    read_back: ReadBack | None = None,
 ) -> ImportPlan:
-    """A plan with everything but the copies filled in; ``id_pattern`` is
-    the provider's.
+    """A plan with everything but the copies filled in; ``id_pattern`` and
+    ``read_back`` are the provider's (``Provider.id_pattern``,
+    ``Provider.read_back``).
 
     ``target`` is a folder the user chose (``chosen_folder`` checks it); it
     takes the place of the folder the session recorded. Without one, raises
@@ -260,6 +276,7 @@ def start_plan(
         cwd_local=local,
         id_pattern=id_pattern,
         chosen_folder=chosen,
+        read_back=read_back,
     )
 
 
@@ -646,8 +663,9 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _make_dirs(path: str, made: list[str], mode: int = DIR_MODE) -> None:
-    """``mkdir -p``, remembering each directory this call created."""
+def _missing(path: str) -> list[str]:
+    """The directories at and above ``path`` that are not there, outermost
+    first."""
     missing = []
     current = os.path.abspath(path)
     while not os.path.isdir(current):
@@ -656,7 +674,12 @@ def _make_dirs(path: str, made: list[str], mode: int = DIR_MODE) -> None:
         if parent == current:
             break
         current = parent
-    for directory in reversed(missing):
+    return missing[::-1]
+
+
+def _make_dirs(path: str, made: list[str], mode: int = DIR_MODE) -> None:
+    """``mkdir -p``, remembering each directory this call created."""
+    for directory in _missing(path):
         # Remembered first: an interrupt between the two steps then costs a
         # failed rmdir in the roll back, not a directory left behind. One
         # that could not be made is not ours and is forgotten again.
@@ -896,6 +919,281 @@ def _record(plan: ImportPlan, manifest: dict) -> dict:
     return record
 
 
+def _begin(plan: ImportPlan, staging: str, made_dirs: Iterable[str]) -> dict:
+    """The journal record of an import whose files are staged and whose
+    first unit is about to be put in place. It says what is going to appear
+    in the native store, for whoever has to settle the import should this
+    process die before its last line (``recover``):
+
+    - ``destinations``: every unit, in the order they are placed;
+    - ``dirs``: the directories this import made so far, and the ones on
+      the way to a destination that are not there yet and that it is going
+      to make;
+    - ``staging``: its staging directory;
+    - ``import``: the import record as it will be, without the manifest:
+      everything of it that cannot be worked out from the native store
+      later (where the session came from, what was rewritten on the way)."""
+    to_make = [
+        directory for unit in plan.units for directory in _missing(os.path.dirname(unit.dst))
+    ]
+    planned = _record(plan, {})
+    del planned["manifest"]
+    return {
+        "record": journal.BEGIN,
+        "version": journal.VERSION,
+        "begun_at": planned["imported_at"],
+        "provider": plan.provider,
+        "id": plan.session_id,
+        "destination_store": plan.native_root,
+        "destinations": plan.destinations,
+        "dirs": sorted({*made_dirs, *to_make}),
+        "staging": staging,
+        "import": planned,
+        "agent_sessions_version": __version__,
+    }
+
+
+def _rolled_back(begin: dict, removed: Iterable[str], recovered: bool) -> dict:
+    """The journal record of an import that began and was taken out again:
+    by the import itself (its own roll back), or, ``recovered``, by a later
+    run that found its ``begin`` open."""
+    return {
+        "record": journal.ROLLBACK,
+        "version": journal.VERSION,
+        "rolled_back_at": _now(),
+        "provider": begin.get("provider"),
+        "id": begin.get("id"),
+        "destination_store": begin.get("destination_store"),
+        "begun_at": begin.get("begun_at"),
+        "removed": sorted(removed),
+        "recovered": recovered,
+        "agent_sessions_version": __version__,
+    }
+
+
+def at_or_above(root: str, path: str) -> bool:
+    """True for ``root`` itself and for a directory on the way to it: what
+    an import that had to create its native store made besides what lies
+    below it."""
+    if "\0" in path or not os.path.isabs(path):
+        return False
+    return path == root or root.startswith(path if path.endswith(os.sep) else path + os.sep)
+
+
+def _begin_paths(begin: dict, root: str) -> tuple[list[str], list[str], str | None] | None:
+    """``(destinations, directories, staging directory)`` of a ``begin``
+    record, each checked, or None for a record that cannot be acted on.
+
+    The journal is the user's own file, trusted but possibly malformed.
+    Whatever it says, a destination must be a path below the native store by
+    the rule of an import's destinations (``below``); a directory must be
+    one too, or the store itself or a directory above it (those only ever
+    go empty); and the staging directory must lie in the root of the store
+    under a name ``execute`` gives one."""
+    destinations, dirs, staging = (begin.get(key) for key in ("destinations", "dirs", "staging"))
+    if not isinstance(destinations, list) or not destinations or not isinstance(dirs, list):
+        return None
+    if not all(below(root, path) for path in destinations):
+        return None
+    if not all(isinstance(d, str) and (below(root, d) or at_or_above(root, d)) for d in dirs):
+        return None
+    if staging is not None and not (
+        isinstance(staging, str)
+        and _STAGING_NAME.fullmatch(os.path.basename(staging))
+        and staging == os.path.join(root, os.path.basename(staging))
+    ):
+        return None
+    return destinations, dirs, staging
+
+
+def _reads_back(begin: dict, root: str, destinations: list[str], read_back: ReadBack) -> bool:
+    """Whether what lies at the destinations of a ``begin`` reads as the
+    session that was to be imported, by the provider's own reading."""
+    copy = ImportPlan(
+        provider=begin["provider"],
+        session_id=begin["id"],
+        source_key="",
+        source_store="",
+        source_mount="",
+        source_files=[],
+        native_root=root,
+        cwd=None,
+        cwd_local=None,
+        units=[Unit(dst) for dst in destinations],
+    )
+    try:
+        read_back(copy)
+    except Exception:  # whatever keeps it from being read: then it is not a whole copy
+        return False
+    return True
+
+
+def _take_out(destinations: list[str], dirs: list[str], staging: str | None) -> list[str] | None:
+    """Remove what an import that died left: the destinations that are
+    there, its staging directory, then the directories it made, deepest
+    first and only when empty. Returns what was removed, or None when a
+    destination or the staging directory is still there afterwards."""
+    removed = []
+    for path in [*reversed(destinations), *([staging] if staging else [])]:
+        if not os.path.lexists(path):
+            continue
+        try:
+            _remove(path)
+        except RecursionError:  # ``shutil.rmtree`` before Python 3.12, a tree nested too deep
+            pass
+        if os.path.lexists(path):
+            return None
+        removed.append(path)
+    for directory in sorted(set(dirs), key=lambda path: (-path.count(os.sep), path)):
+        try:
+            os.rmdir(directory)  # only when nothing else is in it
+        except OSError:
+            continue
+        removed.append(directory)
+    return removed
+
+
+def _settle(begin: dict, root: str, read_back: ReadBack | None) -> dict | None:
+    """Settle one import that began and never ended (``recover``); returns
+    the record written for it, or None when it could not be settled now."""
+    whose = f"{begin.get('provider')} {begin.get('id')} into {root}"
+    paths = _begin_paths(begin, root)
+    if paths is None:
+        # Nothing it names can be trusted, so nothing is removed for it; the
+        # line that closes it keeps it from being looked at again.
+        _log.warning(
+            "the journal's line for an unfinished import of %s cannot be used (it does not "
+            "name plain paths below that store); nothing was removed for it",
+            whose,
+        )
+        record = dict(_rolled_back(begin, [], recovered=True), damaged=True)
+    else:
+        destinations, dirs, staging = paths
+        whole = all(os.path.lexists(path) for path in destinations)
+        if whole and read_back is None:
+            _log.warning(
+                "an import of %s did not finish, and whether its copy is whole cannot be "
+                "told here; it is left as it is",
+                whose,
+            )
+            return None
+        if whole and read_back is not None and _reads_back(begin, root, destinations, read_back):
+            if staging is not None and os.path.lexists(staging):
+                _remove(staging)  # what is left of it is the import's own, and empty
+            planned = begin.get("import")
+            try:
+                made = [path for path in dirs if os.path.isdir(path) and not os.path.islink(path)]
+                manifest = _manifest(destinations, made)
+            except OSError as exc:
+                _log.warning(
+                    "an import of %s did not finish; its copy is whole but could not be "
+                    "listed (%s), so it is not recorded yet",
+                    whose,
+                    exc,
+                )
+                return None
+            record = dict(planned if isinstance(planned, dict) else {})
+            record.setdefault("imported_at", begin.get("begun_at"))
+            record.update(
+                {
+                    "record": journal.IMPORT,
+                    "version": journal.VERSION,
+                    "provider": begin["provider"],
+                    "id": begin["id"],
+                    "destination_store": root,
+                    "destination_files": destinations,
+                    "manifest": manifest,
+                    "recovered": True,
+                    "recovered_at": _now(),
+                }
+            )
+        else:
+            removed = _take_out(destinations, dirs, staging)
+            if removed is None:
+                _log.warning(
+                    "an import of %s did not finish, and what it left could not be removed; "
+                    "it will be tried again",
+                    whose,
+                )
+                return None
+            record = _rolled_back(begin, removed, recovered=True)
+    try:
+        journal.append(record)
+    except OSError as exc:
+        _log.warning(
+            "an import of %s did not finish and was settled, but the journal could not "
+            "take the line that says so (%s); it will be settled again",
+            whose,
+            exc,
+        )
+        return None
+    if record["record"] == journal.IMPORT:
+        _log.info("an import of %s had not finished: its copy is whole and is recorded now", whose)
+    else:
+        _log.info(
+            "an import of %s had not finished: what it left was removed (%d files and directories)",
+            whose,
+            len(record["removed"]),
+        )
+    return record
+
+
+def _open_begins(root: str) -> list[dict]:
+    """The imports into this native store that began and never ended."""
+    try:
+        records = journal.read(quiet=True)
+    except OSError:  # an import or an undo that follows reports a journal it cannot read
+        return []
+    return [begin for begin in journal.unsettled(records) if begin.get("destination_store") == root]
+
+
+def recover(
+    native_root: StrPath, read_back: ReadBack | None = None, timeout: float | None = None
+) -> list[dict]:
+    """Settle the imports into this native store that began and never ended
+    (``journal.unsettled``); returns the records written for them.
+
+    Such an import was killed, or the machine went down, between its
+    ``begin`` line and its last one; or its own roll back could not finish.
+    What it had put in place lies in the store with no record of an import:
+    it could not be imported again (the names are taken) and not be undone
+    (nothing says it was imported). Each one is settled in one of two ways:
+
+    - forward, when every destination its ``begin`` names is there and
+      ``read_back`` reads the copy as the session that was planned: the
+      ``import`` record is written now, marked ``recovered``, with a
+      manifest of the copy as it lies in the store at this moment. A copy
+      that reads back whole is never removed: it was listed as a session of
+      the tool all along, and its user may have worked in it;
+    - back, in every other case: the destinations that are there and the
+      staging directory are removed, then the directories the import made,
+      when empty, and a ``rollback`` record is written.
+
+    Without a ``read_back`` an import whose destinations are all there is
+    left as it is: whether it is whole cannot be told.
+
+    Runs with the state directory's lock held: taken here, and a caller that
+    holds it already may call this (``execute`` and ``unimport.undo`` do, as
+    their first step). An import holds that lock from its first check to its
+    last line, so whoever has it knows that no ``begin`` of this state
+    directory is still being worked on. ``timeout`` is ``fsutil.lock``'s.
+
+    Raises ``OSError`` when the lock cannot be taken (``fsutil.LockTimeout``
+    when someone keeps it), and nothing else. What cannot be settled now (a
+    journal that cannot be written, a copy that will not go) stays open, is
+    said in the log, and is tried again by the next call."""
+    root = os.fspath(native_root)
+    if not _open_begins(root):
+        return []
+    settled = []
+    with fsutil.lock(timeout=timeout):
+        for begin in _open_begins(root):  # again: read with the lock held
+            record = _settle(begin, root, read_back)
+            if record is not None:
+                settled.append(record)
+    return settled
+
+
 def _pid_alive(pid: int) -> bool:
     """Whether a process with this id exists. Where that cannot be asked
     without side effects (signal 0 is not a probe on Windows) the answer is
@@ -962,13 +1260,20 @@ def execute(
 ) -> dict:
     """Carry out a plan and return its record in the journal.
 
-    The order is: check, stage every file, move the units into place,
-    ``verify``, append, write the record. ``verify()`` is the caller's check
-    that what now lies in the native store reads back as the session that
-    was planned (``Provider.import_session`` passes one); it raises when it
-    does not. Then, as after any other failure, everything this import put
-    in place is taken out again, the directories it made included: no line
-    is appended and no record is written.
+    The order is: settle what an earlier import into this store left
+    unfinished (``recover``), check, stage every file, write the ``begin``
+    record, move the units into place, ``verify``, append, write the
+    ``import`` record. ``verify()`` is the caller's check that what now lies
+    in the native store reads back as the session that was planned
+    (``Provider.import_session`` passes one); it raises when it does not.
+    Then, as after any other failure, everything this import put in place is
+    taken out again, the directories it made included: no line is appended,
+    and the journal gets a ``rollback`` record in place of the ``import``.
+
+    The ``begin`` record is written, and flushed to disk, before the first
+    unit appears in the store. A process that is killed after that leaves a
+    line that says what it was doing, and the next import or undo of this
+    store settles it.
 
     All of it runs with the state directory's lock held, so two imports
     never run at once: the second waits (``fsutil.LOCK_TIMEOUT``), and when
@@ -976,7 +1281,9 @@ def execute(
 
     ``progress(done_bytes, total_bytes)`` is called as the copy advances.
     Raises ``Exists`` or ``ImportFailed``; after a failure nothing of this
-    import is left in the native store or in the state directory.
+    import is left in the native store. An import that failed before it put
+    anything in place leaves nothing in the state directory either; one
+    that failed later leaves its two lines in the journal.
     """
     _sound(plan)
     state_made: list[str] = []  # the state directory, when this run created it
@@ -1017,13 +1324,15 @@ class _Run:
     staging: str | None = None
     record_fd: int | None = None
     record_new: bool = False  # this run created the journal
+    begin: dict | None = None  # its ``begin`` record, once the journal has it
 
 
 def _wind_up(run: _Run, finished: bool) -> None:
     """The end of an import, however it ended. One that finished gives up
     its staging directory and its descriptor of the journal. One that did
     not is rolled back: the staging directory, the units already in place
-    and the directories made for them are removed.
+    and the directories made for them are removed, and when the journal has
+    its ``begin``, a ``rollback`` record closes it.
 
     The steps do not depend on each other (``_each``): one that fails does
     not keep the rest from being tried, and the first failure is raised when
@@ -1049,6 +1358,20 @@ def _wind_up(run: _Run, finished: bool) -> None:
             except OSError:
                 pass
 
+    def rolled_back() -> None:
+        # Said only when it is true. While anything of this import is still
+        # there, its ``begin`` stays open, and the next import or undo of
+        # this store finishes the job (``recover``).
+        if run.begin is None or run.record_fd is None:
+            return
+        if any(os.path.lexists(path) for path in [*run.placed, run.staging] if path):
+            return
+        gone = [path for path in [*run.placed, *run.made_dirs] if not os.path.lexists(path)]
+        try:
+            journal.write(run.record_fd, _rolled_back(run.begin, gone, recovered=False))
+        except OSError:
+            pass  # the same: left open, and closed by ``recover`` once the journal takes a line
+
     def journal_closed() -> None:
         if run.record_fd is not None:
             os.close(run.record_fd)
@@ -1058,7 +1381,7 @@ def _wind_up(run: _Run, finished: bool) -> None:
     if finished:
         _each(staging, journal_closed)
     else:
-        _each(arrived, staging, units, directories, journal_closed)
+        _each(arrived, staging, units, directories, rolled_back, journal_closed)
 
 
 def _carry_out(
@@ -1066,6 +1389,9 @@ def _carry_out(
 ) -> dict:
     """``execute`` below the lock: every step, and the roll back of a failed
     one, before anyone else can look."""
+    if recover(plan.native_root, plan.read_back):
+        # What it took out may be what the plan found in the store when it was made.
+        plan.existing = [path for path in plan.existing if os.path.lexists(path)]
     sweep_staging(plan.native_root)
     check(plan)
     total = plan.total_bytes
@@ -1099,8 +1425,16 @@ def _carry_out(
             staged.append(target)
 
         # The journal is opened before anything becomes visible: what can
-        # still fail for it after the appends is one small write.
+        # still fail for it after the appends is one small write. And it is
+        # told what is about to appear in the store, on disk before the
+        # first unit is: from here on a process that dies has left a line to
+        # go by (``recover``).
         run.record_fd, run.record_new = journal.open_for_append()
+        begin = _begin(plan, staging, made_dirs)
+        journal.write(run.record_fd, begin)
+        run.begin = begin
+        if run.record_new:
+            fsutil.fsync_dir(os.path.dirname(journal.path()))
 
         for unit, target in zip(plan.units, staged, strict=False):
             _make_dirs(os.path.dirname(unit.dst), made_dirs)
@@ -1138,8 +1472,6 @@ def _carry_out(
         record = _record(plan, manifest)
         journal.write(run.record_fd, record)
         finished = True
-        if run.record_new:
-            fsutil.fsync_dir(os.path.dirname(journal.path()))
         return record
     finally:
         _wind_up(run, finished)
@@ -1152,8 +1484,10 @@ __all__ = [
     "ImportFailed",
     "ImportPlan",
     "NoFolder",
+    "ReadBack",
     "Rewrite",
     "Unit",
+    "at_or_above",
     "below",
     "check",
     "chosen_folder",
@@ -1166,6 +1500,7 @@ __all__ = [
     "human_size",
     "only_changed",
     "read_journal",
+    "recover",
     "start_plan",
     "sweep_staging",
     "tree",

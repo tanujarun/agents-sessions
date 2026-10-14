@@ -114,7 +114,9 @@ class UndoCase(unittest.TestCase):
         return self.w.session(session_id, "foreign")
 
     def records(self) -> list[dict]:
-        return journal.read()
+        """The import and undo records of the journal. The ``begin`` line
+        that every import starts with is left out."""
+        return [record for record in journal.read() if record.get("record") != "begin"]
 
     def rewrite_journal(self, change):
         """Change the last record of the journal by hand, as a damaged or a

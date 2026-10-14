@@ -499,7 +499,9 @@ class Grok(Provider):
         name = os.path.basename(os.path.normpath(source))
         if name != s.id or not self.valid_id(name):
             raise NotSupported(f"the session directory is not named after its session id: {source}")
-        plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern, target)
+        plan = importer.start_plan(
+            s, self.native_store(), pathmap, self.id_pattern, target, read_back=self.read_back
+        )
         if plan.chosen_folder is not None:
             plan.cwd_local = os.path.realpath(plan.chosen_folder)
         cwd = plan.cwd_local or ""

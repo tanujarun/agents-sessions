@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fixture_world import CLAUDE_WIN, CODEX_WIN, GROK_WIN, World
 from support import LOG_NAME, drop_state, state_names, write_jsonl
 
-from agent_sessions import api, importer
+from agent_sessions import api, importer, journal
 from agent_sessions.providers.claude import encode_cwd
 from agent_sessions.providers.codex import Codex
 
@@ -66,6 +66,22 @@ def snapshot(*roots) -> dict:
                 else:
                     found[path] = stat.S_IFMT(mode)
     return found
+
+
+def taken_out(case, before: dict, after: dict, imports: int = 1) -> None:
+    """``after`` is ``before`` but for the journal: an import that had
+    begun to put its copy in place and was rolled back leaves its two lines
+    there, ``begin`` and ``rollback``, and nothing else anywhere."""
+    where = str(journal.path())
+    case.assertEqual(
+        {path: what for path, what in after.items() if path != where},
+        {path: what for path, what in before.items() if path != where},
+    )
+    old, new = before.get(where, b""), after[where]
+    case.assertTrue(new.startswith(old))
+    kinds = [json.loads(line)["record"] for line in new[len(old) :].splitlines()]
+    case.assertEqual(kinds, ["begin", "rollback"] * imports)
+    case.assertEqual(journal.unsettled(journal.read()), [])
 
 
 class SafetyCase(unittest.TestCase):
@@ -216,7 +232,7 @@ class ContainedTest(SafetyCase):
         self.assertTrue((elsewhere / folder / CLAUDE_WIN).is_dir())
         # The link is still a link, and the record names the paths as the store has them.
         self.assertTrue(os.path.islink(os.path.join(self.root, "projects")))
-        (record,) = importer.read_journal()
+        (record,) = journal.not_undone(importer.read_journal())
         self.assertEqual(
             record["destination_files"],
             [
@@ -250,9 +266,10 @@ class ContainedTest(SafetyCase):
         self.assertEqual(os.listdir(elsewhere), [])
         after = snapshot(self.w.box.root)
         cache = str(self.w.box.cache)  # the scans of this test rewrote the index
-        self.assertEqual(
-            {k: v for k, v in after.items() if not k.startswith(cache)},
+        taken_out(
+            self,
             {k: v for k, v in before.items() if not k.startswith(cache)},
+            {k: v for k, v in after.items() if not k.startswith(cache)},
         )
 
     def test_a_failed_import_through_a_link_leaves_the_linked_directory_as_it_was(self):
@@ -263,7 +280,7 @@ class ContainedTest(SafetyCase):
         before = snapshot(self.w.box.root)
         with self.assertRaises(importer.ImportFailed):
             importer.execute(self.good, verify=mock.Mock(side_effect=ValueError("no")))
-        self.assertEqual(snapshot(self.w.box.root), before)
+        taken_out(self, before, snapshot(self.w.box.root))
 
     def test_a_link_to_another_filesystem_is_refused_in_plain_words(self):
         """The copy is staged at the root of the native store; a move from
@@ -284,7 +301,7 @@ class ContainedTest(SafetyCase):
             importer.execute(self.good)
         self.assertIn("is on another filesystem than the native store", caught.exception.reason)
         self.assertIn(os.path.dirname(self.good.units[0].dst), caught.exception.reason)
-        self.assertEqual(snapshot(self.w.box.root), before)
+        taken_out(self, before, snapshot(self.w.box.root))
 
     def test_a_link_to_a_real_other_filesystem(self):
         """The same with the kernel's own answer, where the machine has a
@@ -298,7 +315,7 @@ class ContainedTest(SafetyCase):
         with self.assertRaises(api.ImportFailed) as caught:
             importer.execute(self.good)
         self.assertIn("is on another filesystem than the native store", caught.exception.reason)
-        self.assertEqual(snapshot(self.w.box.root), before)
+        taken_out(self, before, snapshot(self.w.box.root))
         self.assertEqual(os.listdir(elsewhere), [])
 
     def test_a_link_that_stays_inside_the_native_root_is_fine(self):
@@ -691,9 +708,16 @@ class VerifyAndRollBackTest(unittest.TestCase):
         self.native = self.home / ".codex"
         self.native_index = (self.native / "session_index.jsonl").read_bytes()
 
-    def unchanged(self, before):
-        self.assertEqual(snapshot(self.home, self.state), before)
-        self.assertEqual(state_names(), ["imports.json"])
+    def unchanged(self, before, begun=0):
+        """The home and the state directory are what they were. ``begun``:
+        how many imports had put a unit in place before they failed; each
+        left its two lines in the journal, and nothing else."""
+        if begun:
+            taken_out(self, before, snapshot(self.home, self.state), begun)
+            self.assertEqual(state_names(), ["imports.json", "imports.jsonl"])
+        else:
+            self.assertEqual(snapshot(self.home, self.state), before)
+            self.assertEqual(state_names(), ["imports.json"])
         self.assertEqual((self.native / "session_index.jsonl").read_bytes(), self.native_index)
         self.assertEqual(
             [n for n in os.listdir(self.native) if n.startswith(importer.STAGING_PREFIX)], []
@@ -739,23 +763,38 @@ class VerifyAndRollBackTest(unittest.TestCase):
             f"the copy does not read as session {self.FILE_ID}; it was removed again and "
             "nothing was left in the native store",
         )
-        self.unchanged(before)
+        self.unchanged(before, begun=1)
 
-    def test_the_order_is_place_verify_append_record(self):
+    def test_the_order_is_begin_place_verify_append_record(self):
         plan = self.good_plan()
         seen = {}
+        real = importer._place
+
+        def place(target, dst, is_dir):
+            seen["before the first unit"] = [r["record"] for r in importer.read_journal()]
+            return real(target, dst, is_dir)
 
         def verify():
             seen["placed"] = [os.path.isfile(dst) for dst in plan.destinations]
             seen["index"] = (self.native / "session_index.jsonl").read_bytes()
-            seen["records"] = len(importer.read_journal())
+            seen["records"] = [r["record"] for r in importer.read_journal()]
 
         old = (self.state / "imports.json").read_bytes()
-        importer.execute(plan, verify=verify)
-        self.assertEqual(seen, {"placed": [True], "index": self.native_index, "records": 1})
+        with mock.patch.object(importer, "_place", place):
+            importer.execute(plan, verify=verify)
+        self.assertEqual(
+            seen,
+            {
+                "before the first unit": ["import", "begin"],  # the old record, then ours
+                "placed": [True],
+                "index": self.native_index,
+                "records": ["import", "begin"],
+            },
+        )
         records = importer.read_journal()
-        self.assertEqual([r["id"] for r in records], ["earlier", self.FILE_ID])
-        self.assertEqual([r["version"] for r in records], [1, 2])
+        self.assertEqual([r["id"] for r in records], ["earlier", self.FILE_ID, self.FILE_ID])
+        self.assertEqual([r["record"] for r in records], ["import", "begin", "import"])
+        self.assertEqual([r["version"] for r in records], [1, 2, 2])
         # The record from before the journal is read and never written.
         self.assertEqual((self.state / "imports.json").read_bytes(), old)
         self.assertEqual(state_names(), ["imports.json", "imports.jsonl"])
@@ -765,7 +804,7 @@ class VerifyAndRollBackTest(unittest.TestCase):
     def test_a_failed_verification_rolls_everything_back(self):
         plan = self.good_plan()
         before = snapshot(self.home, self.state)
-        for failure, reason in (
+        failures = (
             (importer.ImportFailed("not the session"), "not the session"),
             (
                 ValueError("boom"),
@@ -777,22 +816,37 @@ class VerifyAndRollBackTest(unittest.TestCase):
                 "the copy could not be read back (OSError: [Errno 5] Input/output error); "
                 "it was removed again and nothing was left in the native store",
             ),
-        ):
+        )
+        for number, (failure, reason) in enumerate(failures, 1):
             with self.assertRaises(importer.ImportFailed) as caught:
                 importer.execute(plan, verify=mock.Mock(side_effect=failure))
             self.assertEqual(caught.exception.reason, reason)
-            self.unchanged(before)
+            self.unchanged(before, begun=number)
 
     def test_directories_made_for_the_import_are_removed_too(self):
-        """Nothing native and no state directory yet: none is left."""
+        """Nothing native and no state directory yet: no native store is
+        left. The state directory stays for the journal, which says that an
+        import began and was taken out again; one that fails before it puts
+        anything in place leaves no state directory either."""
         shutil.rmtree(self.native)
         plan = self.good_plan()
         drop_state()
         self.native_index = b""
+        with (
+            mock.patch.object(importer, "_copy", side_effect=OSError(5, "Input/output error")),
+            self.assertRaises(importer.ImportFailed),
+        ):
+            importer.execute(plan)
+        self.assertFalse(self.native.exists())
+        self.assertFalse(self.state.exists())
         with self.assertRaises(importer.ImportFailed):
             importer.execute(plan, verify=mock.Mock(side_effect=importer.ImportFailed("no")))
         self.assertFalse(self.native.exists())
-        self.assertFalse(self.state.exists())
+        self.assertEqual(os.listdir(self.state), ["imports.jsonl"])
+        begin, rolled_back = journal.read()
+        self.assertEqual((begin["record"], rolled_back["record"]), ("begin", "rollback"))
+        self.assertIn(str(self.native), begin["dirs"])
+        self.assertEqual(rolled_back["removed"], sorted([*begin["dirs"], *plan.destinations]))
         # And the import that verifies makes them and leaves them.
         native = Codex().import_session(
             self.w.session(self.FILE_ID, "foreign"), api.load_index().pathmap

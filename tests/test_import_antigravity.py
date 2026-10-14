@@ -97,9 +97,15 @@ class AgyImportCase(unittest.TestCase):
             con.close()
         self.assertEqual([p for p in (f"{path}-wal", f"{path}-shm") if os.path.exists(p)], [])
 
-    def assert_nothing_written(self):
+    def assert_nothing_written(self, begun=0):
+        """Nothing in the native store. ``begun``: how many imports had put
+        a piece in place before they failed; each left its two lines in the
+        journal, and nothing else is in the state directory."""
         self.assertFalse((self.home / ".gemini").exists())
-        self.assertEqual(state_names(), [])
+        self.assertEqual(state_names(), ["imports.jsonl"] if begun else [])
+        self.assertEqual(
+            [record["record"] for record in journal.read()], ["begin", "rollback"] * begun
+        )
 
     def sidecars(self, root) -> list[str]:
         return [rel for rel in files_below(root) if rel.endswith(SIDECARS)]
@@ -142,7 +148,7 @@ class OnlyWhenAskedForTest(AgyImportCase):
     def test_the_flag_changes_nothing_for_the_other_providers(self):
         claude = api.import_session(self.w.session(CLAUDE_WIN, "foreign"), experimental=True)
         self.assertEqual((claude.origin, claude.id), ("native", CLAUDE_WIN))
-        (record,) = journal.read()
+        (record,) = journal.not_undone(journal.read())
         self.assertNotIn("experimental", record)
         # Gemini is refused all the same: no CLI and no resumable data.
         gemini = self.w.session(GEMINI_WIN, "foreign")
@@ -234,7 +240,7 @@ class CopyTest(AgyImportCase):
     def test_the_record_says_it_was_experimental(self):
         source = self.source()
         native = api.import_session(source, experimental=True)
-        (record,) = journal.read()
+        (record,) = journal.not_undone(journal.read())
         self.assertEqual(
             {key: record[key] for key in ("provider", "id", "source_key", "native_key")},
             {
@@ -271,7 +277,7 @@ class CopyTest(AgyImportCase):
             self.assertEqual((report.created, report.session), (False, first.session))
             self.assertEqual(api.can_import(self.source(), **kwargs), (False, "already imported"))
         self.assertEqual(tree_state(self.dst), before)
-        self.assertEqual(len(journal.read()), 1)
+        self.assertEqual(len(journal.not_undone(journal.read())), 1)
 
     def test_no_index_of_the_native_store_is_written(self):
         self.w = None  # a machine whose native store the tool has used
@@ -321,7 +327,7 @@ class NoFolderNeededTest(AgyImportCase):
 
     def test_a_folder_that_is_found_is_noted(self):
         api.import_session(self.source(AGY_WIN), experimental=True)
-        (record,) = journal.read()
+        (record,) = journal.not_undone(journal.read())
         self.assertEqual(
             (record["cwd"], record["cwd_local"], record["chosen_folder"]),
             ("F:/Proj/My Site", str(self.w.site), None),
@@ -331,7 +337,7 @@ class NoFolderNeededTest(AgyImportCase):
         chosen = self.home / "somewhere else"
         chosen.mkdir()
         api.import_session(self.source(AGY_NO_CWD), experimental=True, target=str(chosen))
-        (record,) = journal.read()
+        (record,) = journal.not_undone(journal.read())
         self.assertEqual(
             (record["cwd"], record["cwd_local"], record["chosen_folder"]),
             (None, str(chosen), str(chosen)),
@@ -601,9 +607,9 @@ class ReadBackTest(AgyImportCase):
         ):
             api.import_session(self.source(), experimental=True)
         self.assertIn(f"the copy does not read as session {AGY_WIN}", caught.exception.reason)
-        self.assert_nothing_written()
+        self.assert_nothing_written(begun=1)
         api.import_session(self.source(), experimental=True)  # and it works afterwards
-        self.assertEqual(len(journal.read()), 1)
+        self.assertEqual(len(journal.not_undone(journal.read())), 1)
 
     def test_a_failure_half_way_leaves_nothing_behind(self):
         real, calls = importer._place, []
@@ -617,7 +623,7 @@ class ReadBackTest(AgyImportCase):
         with mock.patch.object(importer, "_place", failing), self.assertRaises(api.ImportFailed):
             api.import_session(self.source(), experimental=True)
         self.assertEqual(len(calls), 3)
-        self.assert_nothing_written()
+        self.assert_nothing_written(begun=1)
 
 
 class WhatTheBrowserShowsTest(AgyImportCase):

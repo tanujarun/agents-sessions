@@ -7,6 +7,10 @@ it cannot account for:
 
 - the record used is the last import of that provider and session id that
   no later ``undo`` record took back (``find_record``);
+- an import into the same native store that began and never ended (its
+  process was killed) is settled first, with the lock held
+  (``importer.recover``): a copy that is whole gets its record and can then
+  be undone like any other, anything less is taken out;
 - with the state directory's lock held, every file of the manifest is
   compared with the disk: it must be there, a regular file, of the recorded
   size and modification time. Any difference means the session was used
@@ -65,6 +69,19 @@ NOT_EMPTY = "not empty: it holds something this import did not create"
 NOT_NAMED = "not named after the session; a record without a manifest cannot say more"
 
 NO_RECORD = "no import of this session is recorded; nothing was removed"
+# An import of the session began and never ended (``journal.unsettled``).
+UNFINISHED = (
+    "an import of this session did not finish and is not settled yet: the next import or "
+    "undo settles it. Nothing was removed"
+)
+TAKEN_OUT = (
+    "an import of this session had not finished: what it left in the native store was "
+    "removed, and no import of it is recorded"
+)
+NOT_SETTLED = (
+    "an import of this session did not finish, and what it left could not be settled (the "
+    "log says why); nothing was removed"
+)
 LEGACY = (
     "this import was recorded before imports listed what they created, so what was "
     "added since cannot be told; it can only be undone by force. Nothing was removed"
@@ -103,13 +120,6 @@ def read_records() -> list[dict]:
         ) from exc
 
 
-def _is_root_or_above(root: str, path: str) -> bool:
-    """True for the native root itself and for a directory on the way to it."""
-    if "\0" in path or not os.path.isabs(path):
-        return False
-    return path == root or root.startswith(path if path.endswith(os.sep) else path + os.sep)
-
-
 def _manifest(record: dict, root: str) -> tuple[list[dict], list[str]]:
     """``(files, directories)`` of a record's manifest, each checked: the
     right types, every file below the native root, every directory below it,
@@ -132,7 +142,7 @@ def _manifest(record: dict, root: str) -> tuple[list[dict], list[str]]:
     for path in dirs:
         if not isinstance(path, str):
             raise damaged
-        if not importer.below(root, path) and not _is_root_or_above(root, path):
+        if not importer.below(root, path) and not importer.at_or_above(root, path):
             raise _outside(path, root)
     return files, dirs
 
@@ -363,6 +373,15 @@ def undo_record(made: UndoPlan, removed: list[str], left: list[tuple[str, str]])
     }
 
 
+def _unfinished(records: Iterable[dict], provider: str, session_id: str, root: str) -> bool:
+    """Whether an import of this session into this native store began and
+    never ended."""
+    return any(
+        journal.ident(begin) == (provider, session_id) and begin.get("destination_store") == root
+        for begin in journal.unsettled(records)
+    )
+
+
 def undo(
     provider: str,
     session_id: str,
@@ -370,6 +389,7 @@ def undo(
     extras: Iterable[str] = (),
     force: bool = False,
     dry_run: bool = False,
+    read_back: importer.ReadBack | None = None,
 ) -> tuple[UndoPlan, dict | None]:
     """Undo the last import of ``session_id`` that still stands: returns
     the plan that was carried out and the record added to the journal.
@@ -380,23 +400,48 @@ def undo(
     meanwhile, and the plan's ``files``, ``dirs`` and ``left`` are what was
     really removed and left.
 
-    Raises ``UndoFailed``, and then nothing was removed. The one exception
-    says so in its reason: the copy went and the journal could not take the
-    record of it (the import then still stands in the journal, with its
-    files gone, and a forced undo settles it)."""
+    The first thing done with the lock held is to settle the imports into
+    this native store that began and never ended (``importer.recover``;
+    ``read_back`` is the provider's ``read_back``, which says whether such a
+    copy is whole). One of this session that is whole is recorded then and
+    undone like any other; one that is not is taken out, and the undo ends
+    with ``TAKEN_OUT``: there is no import left to undo.
+
+    Raises ``UndoFailed``, and then nothing was removed. Two exceptions say
+    so in their reason: ``TAKEN_OUT``, and the one for a copy that went
+    while the journal could not take the record of it (the import then
+    still stands in the journal, with its files gone, and a forced undo
+    settles it)."""
     extras = list(extras)
-    record = find_record(read_records(), provider, session_id)
-    if record is None:
+    root = os.fspath(native_root)
+    records = read_records()
+    record = find_record(records, provider, session_id)
+    unfinished = _unfinished(records, provider, session_id, root)
+    if record is None and not unfinished:
         raise UndoFailed(NO_RECORD, no_record=True)
     if dry_run:
-        return plan(record, native_root, extras, force), None
+        if record is None:
+            raise UndoFailed(UNFINISHED)
+        return plan(record, root, extras, force), None
     try:
         # The state directory is there: the record was read from it.
         with fsutil.lock():
-            record = find_record(read_records(), provider, session_id)
-            if record is None:  # undone by someone else while this one waited
+            settled = importer.recover(root, read_back)
+            records = read_records()
+            record = find_record(records, provider, session_id)
+            if record is None:
+                # Undone by someone else while this one waited, or never
+                # more than the beginning of an import.
+                if any(
+                    done.get("record") == journal.ROLLBACK
+                    and journal.ident(done) == (provider, session_id)
+                    for done in settled
+                ):
+                    raise UndoFailed(TAKEN_OUT, no_record=True)
+                if _unfinished(records, provider, session_id, root):
+                    raise UndoFailed(NOT_SETTLED)
                 raise UndoFailed(NO_RECORD, no_record=True)
-            made = plan(record, native_root, extras, force)
+            made = plan(record, root, extras, force)
             # Opened before anything goes: what can still fail for the
             # journal afterwards is one small write.
             fd, created = journal.open_for_append()
@@ -440,7 +485,10 @@ __all__ = [
     "LEGACY",
     "NOT_EMPTY",
     "NOT_NAMED",
+    "NOT_SETTLED",
     "NO_RECORD",
+    "TAKEN_OUT",
+    "UNFINISHED",
     "UndoFailed",
     "UndoPlan",
     "find_record",

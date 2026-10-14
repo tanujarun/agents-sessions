@@ -123,12 +123,23 @@ class ImportCase(unittest.TestCase):
     def record_file(self) -> Path:
         return Path(os.environ["AGENT_SESSIONS_STATE"]) / "imports.jsonl"
 
-    def records(self) -> list[dict]:
-        """The journal, read by hand: one JSON object per line."""
+    def journal_kinds(self) -> list[str]:
+        """What each line of the journal is, read by hand: one JSON object
+        per line. None when there is no journal."""
+        if not self.record_file.exists():
+            return []
         lines = self.record_file.read_text(encoding="utf-8").splitlines()
         records = [json.loads(line) for line in lines]
         self.assertEqual(records, journal.read())
-        return records
+        return [record["record"] for record in records]
+
+    def records(self) -> list[dict]:
+        """The import records of the journal. Every one of them follows the
+        ``begin`` line of its import, which is not returned."""
+        kinds = self.journal_kinds()
+        self.assertEqual(kinds[0::2], ["begin"] * (len(kinds) // 2), kinds)
+        self.assertEqual(len(kinds) % 2, 0, kinds)
+        return [record for record in journal.read() if record["record"] == "import"]
 
     def refused(self, ref, **kwargs) -> str:
         with self.assertRaises(api.ImportFailed) as caught:
@@ -136,9 +147,14 @@ class ImportCase(unittest.TestCase):
         return caught.exception.reason
 
     def assert_nothing_written(self, *stores):
+        """Nothing in the native stores, and no import in the journal: none
+        that stands, and none left open. One that had begun to put its
+        copy in place has its two lines there, ``begin`` and ``rollback``."""
         for name in stores or (".claude", ".codex", ".grok", ".gemini"):
             self.assertFalse((self.home / name).exists(), name)
-        self.assertFalse(self.record_file.exists())
+        kinds = self.journal_kinds()
+        self.assertEqual(kinds, ["begin", "rollback"] * (len(kinds) // 2))
+        self.assertEqual(journal.unsettled(journal.read()), [])
 
 
 # --- Claude -----------------------------------------------------------------
@@ -411,7 +427,16 @@ class ClaudeImportTest(ImportCase):
         self.assertEqual(files_below(self.home / ".claude"), ["projects/-kept/note.txt"])
         self.assertEqual(sorted(os.listdir(self.home / ".claude")), ["projects"])
         self.assertEqual(os.listdir(self.home / ".claude" / "projects"), ["-kept"])
-        self.assertEqual(state_names(), [])
+        # It had begun: the journal says so, and that it was taken out again.
+        self.assertEqual(state_names(), ["imports.jsonl"])
+        self.assertEqual(self.journal_kinds(), ["begin", "rollback"])
+        begin, rolled_back = journal.read()
+        self.assertEqual(begin["destinations"], calls)
+        self.assertEqual(
+            rolled_back["removed"], sorted([str(self.target), str(self.target / CLAUDE_WIN)])
+        )
+        self.assertEqual((rolled_back["recovered"], rolled_back["id"]), (False, CLAUDE_WIN))
+        self.assertEqual(self.records(), [])
 
     def test_an_interrupted_copy_leaves_nothing_behind(self):
         class Stop(Exception):

@@ -1035,6 +1035,31 @@ def import_report(
     return report
 
 
+def _recover(provider: Provider) -> list[dict]:
+    """Settle the imports into this provider's native store that began and
+    never ended (``importer.recover``); returns the records written for
+    them. When there are any, the index was scanned again: what is in the
+    store changed.
+
+    Before an import or an undo looks at the listing: a copy such an import
+    left whole is listed as a native session without a record of an import,
+    and one it left in part is in the way of the next import. Whoever holds
+    the lock is not waited for here: the import or the undo that follows
+    does the same as its first step, with the lock in its own hands. What
+    was done is in the log (``importer`` writes it)."""
+    native = provider.native_store()
+    if native is None:
+        return []
+    logs.logger()  # set up, for what ``importer.recover`` has to say
+    try:
+        settled = importer.recover(native, provider.read_back, timeout=0)
+    except OSError:  # the lock is held, or cannot be taken: said by what follows
+        return []
+    if settled:
+        Index.load().scan(all_providers(), list_mounts(), deep=False)
+    return settled
+
+
 def _import(
     session: Session,
     progress: importer.Progress | None,
@@ -1043,6 +1068,11 @@ def _import(
     experimental: bool = False,
 ) -> ImportReport:
     """``import_report`` for a session that was found."""
+    # First, so that the listing below is of a store with no import left
+    # half done in it. Not for a session whose drive is away: that one is
+    # answered from the listing alone, and no adapter is asked for anything.
+    if not session.offline and _recover(_provider(session)):
+        index = load_index()
     copy = _native_copy(session, index)
     if copy is not None:
         return ImportReport(copy, False)
@@ -1187,16 +1217,32 @@ def unimport(
     if native is None or not provider.valid_id(session_id):
         raise UndoFailed(undoing.NO_RECORD, no_record=True)
     log = logs.logger()
+    settled: list[dict] = []
     if not dry_run:
         log.info("unimport %s %s from %s%s", name, session_id, native, " (forced)" if force else "")
+        settled = _recover(provider)
     try:
         made, record = undoing.undo(
-            name, session_id, native, provider.undo_extras(session_id, native), force, dry_run
+            name,
+            session_id,
+            native,
+            provider.undo_extras(session_id, native),
+            force,
+            dry_run,
+            provider.read_back,
         )
     except UndoFailed as exc:
+        if exc.no_record and any(
+            record.get("record") == "rollback"
+            and (record.get("provider"), record.get("id")) == (name, session_id)
+            for record in settled
+        ):
+            # What there was to take back was the start of an import, and
+            # it went just now (``_recover``): said as the engine says it.
+            exc = UndoFailed(undoing.TAKEN_OUT, no_record=True)
         if not dry_run:
             log.warning("unimport %s %s refused: %s", name, session_id, exc.reason)
-        raise
+        raise exc from None
     keys = [made.record.get(key) for key in ("native_key", "source_key")]
     native_key, source_key = (key if isinstance(key, str) else None for key in keys)
     report = UnimportReport(

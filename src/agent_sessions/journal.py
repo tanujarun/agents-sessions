@@ -6,11 +6,23 @@ state directory's lock held (``fsutil.lock``): two processes that import at
 the same moment both leave their record, and a crash can at worst cut the
 last line short. Nothing in the file is rewritten.
 
-A record says what it is in ``record`` (``"import"``, or ``"undo"`` for an
-import that was taken back, ``unimport``) and which form it has in
-``version``. Before version 2 the records were a JSON array in
-``imports.json``, rewritten on every import; such a file is still read, its
-records first, and is never written or removed.
+A record says what it is in ``record`` and which form it has in ``version``:
+
+- ``"begin"``: an import is about to put its copy into the native store.
+  It names what is going to appear there, so that a process that dies
+  before it can say how it ended leaves something to go by;
+- ``"import"``: the import is done. The record lists what it created;
+- ``"rollback"``: an import that began was taken out again;
+- ``"undo"``: an import was taken back (``unimport``).
+
+Every import therefore leaves two lines: a ``begin``, then an ``import`` or a
+``rollback``. A ``begin`` with neither after it is an import that died half
+way (``unsettled``); the next import or undo that touches its native store
+settles it (``importer.recover``).
+
+Before version 2 the records were a JSON array in ``imports.json``,
+rewritten on every import; such a file is still read, its records first, and
+is never written or removed.
 
 Standard library only, and nothing here knows a provider.
 """
@@ -30,7 +42,9 @@ NAME = "imports.jsonl"
 LEGACY_NAME = "imports.json"
 VERSION = 2  # of a record written now
 LEGACY_VERSION = 1  # what a record of ``imports.json`` is given
-IMPORT = "import"  # ``record`` of an import
+BEGIN = "begin"  # ``record`` of an import that is about to put its copy in place
+IMPORT = "import"  # ``record`` of an import that is done
+ROLLBACK = "rollback"  # ``record`` of an import that began and was taken out again
 UNDO = "undo"  # ``record`` of an import that was taken back
 
 _log = logging.getLogger(__name__)
@@ -131,7 +145,11 @@ def not_undone(records: Iterable[dict]) -> list[dict]:
 
     An undo always takes back the last import of its provider and session id
     that is still standing, so the records are settled in order: an ``undo``
-    cancels the nearest import before it of the same provider and id."""
+    cancels the nearest import before it of the same provider and id.
+
+    Only an ``import`` record is an import that stands: a ``begin`` is one
+    that had not ended when it was written, and a ``rollback`` says that it
+    never did (``unsettled`` has the ones that are still open)."""
     standing: list[dict] = []
     for record in records:
         kind = record.get("record")
@@ -146,6 +164,37 @@ def not_undone(records: Iterable[dict]) -> list[dict]:
                     del standing[position]
                     break
     return standing
+
+
+def _whose_store(record: dict) -> tuple[str, str, object] | None:
+    """``(provider, session id, native store)`` of a record: what ties the
+    end of an import to its beginning."""
+    whose = ident(record)
+    return None if whose is None else (*whose, _text(record, "destination_store"))
+
+
+def unsettled(records: Iterable[dict]) -> list[dict]:
+    """The ``begin`` records with no ``import`` and no ``rollback`` after
+    them for the same provider, session id and native store, oldest first:
+    the imports that began and never said how they ended.
+
+    Their process died between the two lines (it was killed, the machine
+    went down), or its roll back could not finish. What they name may lie
+    in the native store, complete or in part; ``importer.recover`` settles
+    them. While an import is running, its own ``begin`` is in this list
+    too: whoever acts on it holds the state directory's lock, which that
+    import holds until it is over."""
+    pending: list[tuple[tuple[str, str, object], dict]] = []
+    for record in records:
+        kind = record.get("record")
+        whose = _whose_store(record)
+        if whose is None:
+            continue
+        if kind == BEGIN:
+            pending.append((whose, record))
+        elif kind in (IMPORT, ROLLBACK):
+            pending = [item for item in pending if item[0] != whose]
+    return [record for _whose, record in pending]
 
 
 def find_record(records: Iterable[dict], provider: str, session_id: str) -> dict | None:
@@ -236,10 +285,12 @@ def append(record: dict) -> None:
 
 
 __all__ = [
+    "BEGIN",
     "IMPORT",
     "LEGACY_NAME",
     "LEGACY_VERSION",
     "NAME",
+    "ROLLBACK",
     "UNDO",
     "VERSION",
     "append",
@@ -250,5 +301,6 @@ __all__ = [
     "open_for_append",
     "path",
     "read",
+    "unsettled",
     "write",
 ]

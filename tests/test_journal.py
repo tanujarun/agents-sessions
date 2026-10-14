@@ -564,6 +564,42 @@ class LegacyRecordTest(StateCase):
         self.assertEqual([r["id"] for r in journal.read()], ["ok", "kept"])
 
 
+class RecordKindsTest(unittest.TestCase):
+    """``begin`` and ``rollback``: what ``not_undone`` and ``unsettled``
+    make of them (docs/AUDIT.md A-04)."""
+
+    def r(self, kind, session="a", store="/s", **more):
+        return {"record": kind, "provider": "p", "id": session, "destination_store": store, **more}
+
+    def test_only_an_import_record_stands(self):
+        begin, imported = self.r("begin"), self.r("import")
+        self.assertEqual(journal.not_undone([begin]), [])
+        self.assertEqual(journal.not_undone([begin, imported]), [imported])
+        self.assertEqual(journal.not_undone([begin, self.r("rollback")]), [])
+        # A rollback is not an undo: it takes no import back.
+        self.assertEqual(journal.not_undone([imported, self.r("rollback")]), [imported])
+
+    def test_a_begin_is_open_until_an_import_or_a_rollback_of_the_same_store(self):
+        first, second = self.r("begin"), self.r("begin", "b")
+        other_store = self.r("begin", store="/t")
+        records = [first, second, other_store]
+        self.assertEqual(journal.unsettled(records), records)
+        self.assertEqual(journal.unsettled([*records, self.r("import")]), [second, other_store])
+        self.assertEqual(
+            journal.unsettled([*records, self.r("rollback", "b")]), [first, other_store]
+        )
+        self.assertEqual(
+            journal.unsettled([*records, self.r("rollback", store="/t")]), [first, second]
+        )
+        # Settled lines do not open again; a later begin does.
+        later = self.r("begin")
+        self.assertEqual(journal.unsettled([first, self.r("import"), later]), [later])
+        # An undo settles nothing, and a line without provider or id is no line.
+        self.assertEqual(journal.unsettled([first, self.r("undo")]), [first])
+        self.assertEqual(journal.unsettled([{"record": "begin"}, self.r("begin", None)]), [])
+        self.assertEqual(journal.unsettled(iter(records)), records)  # read once
+
+
 class ConcurrentImportTest(unittest.TestCase):
     """R-06: imports of different sessions, started at the same moment in
     processes of their own (our launcher), all leave their record."""
@@ -582,7 +618,14 @@ class ConcurrentImportTest(unittest.TestCase):
             self.assertIn("imported", err)
             self.assertTrue(out.startswith(f"{source.provider}:"), out)  # the native key
         with self.assertNoLogs("agent_sessions", "WARNING"):
-            records = journal.read()
+            lines = journal.read()
+        # Two lines each, its own ``begin`` right before its ``import``:
+        # one import at a time, whichever process it is.
+        self.assertEqual(
+            [(r["record"], r["id"]) for r in lines[0::2]], [("begin", r["id"]) for r in lines[1::2]]
+        )
+        records = lines[1::2]
+        self.assertEqual(journal.not_undone(lines), records)
         self.assertEqual(sorted(r["id"] for r in records), sorted(s.id for s in sources))
         self.assertEqual({r["source_key"] for r in records}, {s.key for s in sources})
         for record in records:

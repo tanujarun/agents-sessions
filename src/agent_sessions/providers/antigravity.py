@@ -603,7 +603,13 @@ class Antigravity(Provider):
             raise NotSupported("this conversation has no steps in its database file")
 
         plan = importer.start_plan(
-            s, self.native_store(), pathmap, self.id_pattern, target, needs_folder=False
+            s,
+            self.native_store(),
+            pathmap,
+            self.id_pattern,
+            target,
+            needs_folder=False,
+            read_back=self.read_back,
         )
         native = plan.native_root
         # Any of these means the id is, or was, in use in this store; the

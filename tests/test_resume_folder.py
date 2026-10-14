@@ -46,8 +46,9 @@ class ResumeFolderCase(unittest.TestCase):
         return copy.cwd_local, copy.cwd_exists, api.open_session(copy.key, dry_run=True).cwd
 
     def rewrite(self, change):
-        """Change the one record of the journal with ``change(record)``."""
-        (record,) = journal.read()
+        """Change the one import record of the journal with
+        ``change(record)``; it is then all the journal holds."""
+        (record,) = journal.not_undone(journal.read())
         change(record)
         self.journal.write_text(json.dumps(record) + "\n", encoding="utf-8")
 
@@ -77,7 +78,7 @@ class ChosenFolderTest(ResumeFolderCase):
 
     def test_without_a_chosen_folder_it_is_the_mapped_one(self):
         copy = api.import_session(CLAUDE_WIN_PLAIN)
-        self.assertEqual(journal.read()[0]["cwd_local"], str(self.w.site))
+        self.assertEqual(journal.read()[-1]["cwd_local"], str(self.w.site))
         self.assertEqual((copy.cwd_local, copy.cwd_exists), (str(self.w.site), True))
 
     def test_only_the_copy_of_that_import_is_changed(self):
@@ -159,7 +160,8 @@ class RecordTest(ResumeFolderCase):
         journal.append({"record": journal.UNDO, "provider": "claude", "id": CLAUDE_WIN_PLAIN})
         self.assertEqual(self.folder(), self.mapped)
         # An undo of another session, or of another provider's, takes nothing back.
-        self.journal.write_text(self.journal.read_text(encoding="utf-8").splitlines()[0] + "\n")
+        begin, imported, _undo = self.journal.read_text(encoding="utf-8").splitlines()
+        self.journal.write_text(f"{begin}\n{imported}\n")
         journal.append({"record": journal.UNDO, "provider": "claude", "id": CLAUDE_WIN})
         journal.append({"record": journal.UNDO, "provider": "codex", "id": CLAUDE_WIN_PLAIN})
         self.assertEqual(self.folder()[0], str(self.chosen))
@@ -167,7 +169,7 @@ class RecordTest(ResumeFolderCase):
     def test_the_last_import_that_stands_is_the_one(self):
         other = self.home / "Work" / "other"
         other.mkdir()
-        (first,) = journal.read()
+        (first,) = journal.not_undone(journal.read())
         journal.append({"record": journal.UNDO, "provider": "claude", "id": CLAUDE_WIN_PLAIN})
         journal.append(dict(first, chosen_folder=str(other), cwd_local=str(other)))
         self.assertEqual(self.folder()[0], str(other))
@@ -255,7 +257,7 @@ class RecordTest(ResumeFolderCase):
         self.journal.rmdir()
         self.journal.write_bytes(cases["torn last line"])
         with self.assertLogs("agent_sessions", "WARNING") as logged:
-            self.assertEqual(len(journal.read()), 1)
+            self.assertEqual([r["record"] for r in journal.read()], ["begin", "import"])
         self.assertIn("the last line is incomplete", logged.output[0])
 
     def test_an_old_record_file_that_cannot_be_read_is_passed_over_quietly(self):

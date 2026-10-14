@@ -418,7 +418,9 @@ class Claude(Provider):
         named = _TRANSCRIPT.fullmatch(name)
         if named is None or named.group(1) != s.id:
             raise NotSupported(f"the transcript is not named after its session id: {transcript}")
-        plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern, target)
+        plan = importer.start_plan(
+            s, self.native_store(), pathmap, self.id_pattern, target, read_back=self.read_back
+        )
         if plan.chosen_folder is not None:
             # The tool looks a session up under the name of its own working
             # directory, and that is the physical path of the folder it was
