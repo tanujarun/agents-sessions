@@ -37,7 +37,7 @@ from fixture_world import (
     files_below,
     tree_state,
 )
-from support import FIXTURES, state_names
+from support import FIXTURES, MODES_BIND, NEEDS_MODES, state_names
 
 from agent_sessions import api, blake3, importer, journal
 from agent_sessions.model import make_key
@@ -386,6 +386,45 @@ class ClaudeImportTest(ImportCase):
             files_below(self.home / ".claude"),
             [f"projects/{self.target.name}/{CLAUDE_WIN}/mine.txt"],
         )
+
+    def test_a_taken_destination_is_refused_by_the_check_before_anything_is_copied(self):
+        """A name the copy needs is taken, though nothing there holds the
+        session's id for the adapter to find (``plan.existing`` is empty).
+        ``check`` refuses it, so a dry run says so and no byte of the source
+        is read for an import that cannot end (docs/AUDIT.md A-23, M16)."""
+        source = self.source(CLAUDE_WIN)
+        plan = api._plan(source, self.index)
+        side = str(self.target / CLAUDE_WIN)
+        self.assertEqual(plan.existing, [])
+        self.assertIn(side, plan.destinations)
+        importer.check(plan)  # nothing is in the way yet
+        self.target.mkdir(parents=True)
+        for make in (
+            lambda: os.mkdir(side),
+            lambda: Path(side).write_text("theirs", encoding="utf-8"),
+            lambda: os.symlink("nowhere", side),  # a link that leads nowhere is a name taken
+        ):
+            make()
+            with self.assertRaises(importer.Exists) as caught:
+                importer.check(plan)
+            self.assertEqual(caught.exception.paths, [side])
+            verdict = api.can_import(source)
+            self.assertEqual(verdict[0], False)
+            self.assertIn(side, verdict[1])
+            with (
+                mock.patch.object(importer, "open_ro", side_effect=AssertionError("read")),
+                self.assertRaises(api.ImportFailed) as refused,
+            ):
+                api.import_plan(source)  # the dry run
+            self.assertIn(side, refused.exception.reason)
+            with mock.patch.object(importer, "open_ro", side_effect=AssertionError("read")):
+                self.assertIn(side, self.refused(source))
+            self.assertEqual(os.listdir(self.target), [CLAUDE_WIN])
+            self.assertFalse(self.record_file.exists())
+            if os.path.isdir(side) and not os.path.islink(side):
+                os.rmdir(side)
+            else:
+                os.unlink(side)
 
     def test_failure_while_copying_leaves_nothing_behind(self):
         real, calls = importer._copy, []
@@ -1568,7 +1607,7 @@ class StagingSweepTest(ImportCase):
         self.assertEqual([p for p in stale if os.path.lexists(p)], [])
         self.assertEqual([p for p in kept if not os.path.lexists(p)], [])
 
-    @unittest.skipIf(os.geteuid() == 0, "root can remove everything")
+    @unittest.skipUnless(MODES_BIND, NEEDS_MODES)
     def test_a_staging_directory_that_cannot_be_removed_is_ignored(self):
         stuck = self.make(f"{importer.STAGING_PREFIX}{dead_pid()}-1", 2 * self.HOUR)
         os.chmod(stuck / "0", 0o500)

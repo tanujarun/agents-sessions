@@ -26,7 +26,7 @@ from fixture_world import (
     files_below,
     tree_state,
 )
-from support import state_names
+from support import MODES_BIND, NEEDS_MODES, state_names
 
 from agent_sessions import api, cli, importer, journal
 from agent_sessions.model import make_key
@@ -437,7 +437,7 @@ class PreconditionTest(AgyImportCase):
         self.assertIn("write-ahead log", self.refused(source))
         self.assert_nothing_written()
 
-    @unittest.skipIf(os.geteuid() == 0, "root can look at everything")
+    @unittest.skipUnless(MODES_BIND, NEEDS_MODES)
     def test_a_store_whose_conversations_cannot_be_looked_at(self):
         source = self.source()
         conversations = self.src / "conversations"

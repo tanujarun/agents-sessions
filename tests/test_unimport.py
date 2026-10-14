@@ -35,6 +35,8 @@ from fixture_world import (
 from support import (
     FIXTURES,
     LOG_NAME,
+    MODES_BIND,
+    NEEDS_MODES,
     finish,
     launcher_child,
     python_child,
@@ -772,7 +774,7 @@ class OddFilesAndRacesTest(UndoCase):
         self.side = self.target / CLAUDE_WIN
         self.side_file = self.side / files_below(self.side)[0]
 
-    @unittest.skipIf(os.geteuid() == 0, "root can look at everything")
+    @unittest.skipUnless(MODES_BIND, NEEDS_MODES)
     def test_what_cannot_be_looked_at_is_a_difference_and_is_left_when_forced(self):
         os.chmod(self.side, 0)
         self.addCleanup(os.chmod, self.side, 0o700)
@@ -1127,7 +1129,7 @@ class LegacyRecordTest(UndoCase):
             self.assertIn(str(path), report.removed)
         self.assertEqual(os.listdir(self.target), [])
 
-    @unittest.skipIf(os.geteuid() == 0, "root can look at everything")
+    @unittest.skipUnless(MODES_BIND, NEEDS_MODES)
     def test_a_directory_below_it_that_cannot_be_listed_stays(self):
         locked = self.target / CLAUDE_WIN / "locked"
         locked.mkdir()

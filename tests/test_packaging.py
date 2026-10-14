@@ -14,10 +14,14 @@ touches a store."""
 import ast
 import contextlib
 import io
+import json
 import os
 import re
 import shlex
+import shutil
+import subprocess
 import sys
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
@@ -32,7 +36,7 @@ if str(REPO / "tests") not in sys.path:
 
 # Imported for what it does when it is loaded: AGENT_SESSIONS_STATE points at
 # a temp directory from then on, so nothing here can write the user's own log.
-import support  # noqa: E402, F401
+import support  # noqa: E402
 
 import agent_sessions  # noqa: E402
 from agent_sessions import api, cli, errors, unimport  # noqa: E402
@@ -303,6 +307,189 @@ class HelpTest(unittest.TestCase):
         self.assertIn("usage: agent-sessions", err)
 
 
+TESTS = REPO / "tests"
+PLACES = ("AGENT_SESSIONS_STATE", "AGENT_SESSIONS_CACHE", "AGENT_SESSIONS_HOME")
+
+
+def first_imports(path):
+    """``{module: line}`` for the first import of each module a test file
+    makes at its top level (the body of an ``if`` or a ``try`` there
+    included; what a function imports when it is called comes later)."""
+    found: dict[str, int] = {}
+
+    def look(statements):
+        for node in statements:
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+            elif isinstance(node, ast.If | ast.Try | ast.With):
+                look(node.body)
+                look(getattr(node, "orelse", []))
+                for handler in getattr(node, "handlers", []):
+                    look(handler.body)
+                look(getattr(node, "finalbody", []))
+                continue
+            else:
+                continue
+            for name in names:
+                found.setdefault(name.partition(".")[0], node.lineno)
+
+    look(ast.parse(path.read_text(encoding="utf-8")).body)
+    return found
+
+
+class IsolationTest(unittest.TestCase):
+    """CLAUDE.md: every test module imports ``support`` before
+    ``agent_sessions``. ``support`` points the state directory, the cache and
+    the home at temp directories when it is loaded, so no test can write the
+    user's own (docs/AUDIT.md A-23)."""
+
+    # ``fixture_world`` imports ``support`` first (checked below), so it does
+    # as well; ``tui_support`` does not.
+    FIRST = ("support", "fixture_world")
+    AFTER = ("agent_sessions", "tui_support")
+    # Modules that import ``tui_support`` and no ``support``. No write was seen
+    # from them (AUDIT A-23); to be removed with the import added.
+    KNOWN = ("test_tui_app.py", "test_tui_view.py")
+
+    def out_of_order(self, path) -> list[str]:
+        """The modules ``path`` imports before ``support``, or without it."""
+        imports = first_imports(path)
+        net = min((imports[name] for name in self.FIRST if name in imports), default=None)
+        return sorted(
+            name for name in self.AFTER if name in imports and (net is None or imports[name] < net)
+        )
+
+    def test_every_test_module_imports_support_before_the_package(self):
+        modules = sorted(TESTS.glob("test_*.py"))
+        self.assertGreater(len(modules), 40)
+        wrong = {path.name: self.out_of_order(path) for path in modules}
+        wrong = {name: early for name, early in wrong.items() if early}
+        self.assertEqual({n: e for n, e in wrong.items() if n not in self.KNOWN}, {})
+        # What stands in for ``support`` loads it before anything else of ours.
+        world = first_imports(TESTS / "fixture_world.py")
+        self.assertLess(world["support"], world["agent_sessions"])
+
+    def test_the_check_finds_what_it_is_for(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for text, early in (
+                ("import support\nimport agent_sessions\n", []),
+                ("from fixture_world import World\nfrom agent_sessions import api\n", []),
+                ("import agent_sessions\nimport support\n", ["agent_sessions"]),
+                ("from agent_sessions import api\n", ["agent_sessions"]),
+                ("import os\nfrom agent_sessions.providers import base\n", ["agent_sessions"]),
+                ("import tui_support as support\n", ["tui_support"]),
+                (
+                    "try:\n    import agent_sessions.api\nexcept ImportError:\n    pass\n",
+                    ["agent_sessions"],
+                ),
+                ("import os\n\ndef late():\n    import agent_sessions\n", []),
+                ("import os\n", []),
+            ):
+                path = Path(tmp) / "test_case.py"
+                path.write_text(text, encoding="utf-8")
+                self.assertEqual(self.out_of_order(path), early, text)
+
+    def test_support_takes_the_places_whatever_the_environment_holds(self):
+        """A fresh interpreter with all three variables exported, as a user
+        of the README might have them: ``support`` replaces each, writes
+        nothing there, and removes its own directory when the process ends."""
+        with tempfile.TemporaryDirectory() as tmp:
+            exported = {name: os.path.join(tmp, name.lower()) for name in PLACES}
+            for path in exported.values():
+                os.mkdir(path)
+            code = (
+                "import json, os, sys\n"
+                f"sys.path.insert(0, {str(TESTS)!r})\n"
+                "import support\n"
+                "from agent_sessions import fsutil, logs\n"
+                "logs.logger().error('a message of a test')\n"
+                "places = {name: os.environ[name] for name in support.OWN_PLACES}\n"
+                "places['log'] = str(fsutil.log_file())\n"
+                "places['written'] = os.path.isfile(fsutil.log_file())\n"
+                "places['cache'] = str(fsutil.cache_file())\n"
+                "places['config'] = str(fsutil.config_dir())\n"
+                "print(json.dumps(places))\n"
+            )
+            done = subprocess.run(
+                [sys.executable, "-c", code],
+                env=dict(os.environ, **exported),
+                capture_output=True,
+                text=True,
+                timeout=60,
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            self.assertEqual((done.returncode, done.stderr), (0, ""))
+            places = json.loads(done.stdout)
+            self.assertEqual(sorted(support.OWN_PLACES), sorted(PLACES))
+            self.assertTrue(places.pop("written"))
+            own = os.path.dirname(places["AGENT_SESSIONS_STATE"])
+            self.assertTrue(os.path.basename(own).startswith("agent-sessions-test-own-"), own)
+            for name, path in places.items():
+                self.assertEqual(os.path.commonpath([own, path]), own, name)
+                self.assertNotEqual(os.path.commonpath([tmp, path]), tmp, name)
+            self.assertFalse(os.path.exists(own))  # removed when the child ended
+            for path in exported.values():
+                self.assertEqual(os.listdir(path), [])
+
+    def test_this_process_has_them_too(self):
+        own = {os.path.dirname(os.environ[name]) for name in PLACES}
+        self.assertEqual(len(own), 1)
+        self.assertTrue(os.path.basename(own.pop()).startswith("agent-sessions-test-own-"))
+
+
+class PortableModulesTest(unittest.TestCase):
+    """``os.geteuid`` does not exist on Windows: a test module that calls it
+    in a decorator, unguarded, cannot even be imported there (A-23)."""
+
+    ONCE_UNGUARDED = (
+        "test_discover",
+        "test_import_antigravity",
+        "test_importer",
+        "test_unimport",
+        "test_unreadable",
+    )
+
+    def test_every_use_of_geteuid_is_behind_a_guard(self):
+        """In ``support`` behind ``hasattr``; in a test module behind the
+        module's own ``POSIX`` (``os.name == "posix"``), on the same line."""
+        seen = 0
+        for path in sorted(TESTS.glob("*.py")):
+            if path.name == Path(__file__).name:
+                continue
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if "geteuid" not in line or line.lstrip().startswith("#"):
+                    continue
+                seen += 1
+                guard = re.search(r'hasattr\(os, "geteuid"\) and |\bPOSIX (and|or) ', line)
+                self.assertIsNotNone(guard, f"{path.name}:{number}: {line.strip()}")
+                self.assertLess(guard.start(), line.index("os.geteuid()"), (path.name, number))
+        self.assertGreaterEqual(seen, 4)
+        self.assertEqual(support.MODES_BIND, os.name == "posix" and os.geteuid() != 0)
+
+    def test_the_modules_import_where_there_is_no_geteuid(self):
+        code = (
+            "import importlib, os, sys\n"
+            "del os.geteuid\n"
+            f"sys.path.insert(0, {str(TESTS)!r})\n"
+            f"for name in {self.ONCE_UNGUARDED!r}:\n"
+            "    importlib.import_module(name)\n"
+            "import support\n"
+            "print(support.MODES_BIND)\n"
+        )
+        done = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (0, "False\n", ""))
+
+
 def filemap_paths():
     """Every path ``filemap.md`` names in backticks, braces expanded."""
     found = set()
@@ -314,6 +501,35 @@ def filemap_paths():
         else:
             found.add(token)
     return found
+
+
+def tracked_files():
+    """The paths git tracks in this checkout, sorted, or None when this is
+    not a git checkout of its own (an unpacked sdist, a ``git archive`` copy,
+    such a copy inside some other repository) or there is no git."""
+    git = shutil.which("git")
+    if git is None:
+        return None
+
+    def ask(*argv):
+        try:
+            done = subprocess.run(
+                [git, "-C", str(REPO), *argv],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return done.stdout if done.returncode == 0 else None
+
+    top = ask("rev-parse", "--show-toplevel")
+    if top is None or os.path.realpath(top.rstrip("\n")) != os.path.realpath(REPO):
+        return None
+    names = ask("ls-files", "-z")
+    return None if names is None else sorted(name for name in names.split("\0") if name)
 
 
 class DocumentsTest(unittest.TestCase):
@@ -412,23 +628,35 @@ class DocumentsTest(unittest.TestCase):
             self.assertIn(f"`{name}`", readme, name)
 
     def test_the_file_map_lists_every_module_and_document(self):
+        """Every file git tracks that is a module, a test, a document or a
+        file of the checkout's root. What git does not track (a log, a note
+        someone left in the checkout) is not the file map's business."""
+        tracked = tracked_files()
+        if tracked is None:
+            self.skipTest(
+                "not a git checkout (or no git): which files are the project's is unknown"
+            )
         listed = filemap_paths()
-        wanted = [path.relative_to(REPO).as_posix() for path in sorted(PACKAGE.rglob("*.py"))]
-        wanted += [f"src/agent_sessions/tui/{name}" for name in ("app.tcss",)]
-        wanted += [
-            path.relative_to(REPO).as_posix() for path in sorted((REPO / "tests").glob("*.py"))
-        ]
-        wanted += [
-            path.relative_to(REPO).as_posix() for path in sorted((REPO / "docs").glob("*.md"))
-        ]
-        wanted += [
-            path.name
-            for path in sorted(REPO.iterdir())
-            if path.is_file() and not path.name.startswith(".") and path.name != "filemap.md"
+        wanted = [
+            path
+            for path in tracked
+            if re.fullmatch(
+                r"src/agent_sessions/.*\.(py|tcss)|tests/[^/]+\.py|docs/[^/]+\.md", path
+            )
+            or ("/" not in path and not path.startswith(".") and path != "filemap.md")
         ]
         wanted += ["bin/agent-sessions", "share/agent-sessions.desktop", ".github/workflows/ci.yml"]
         self.assertGreater(len(wanted), 90)
+        self.assertEqual([path for path in wanted if path not in tracked], [])
         self.assertEqual([path for path in wanted if path not in listed], [])
+
+    def test_a_stray_file_in_the_checkout_does_not_fail_the_file_map(self):
+        if tracked_files() is None:
+            self.skipTest("not a git checkout (or no git)")
+        with tempfile.NamedTemporaryFile(dir=REPO, prefix="stray-", suffix=".log") as stray:
+            self.assertIn(os.path.basename(stray.name), os.listdir(REPO))
+            self.assertNotIn(os.path.basename(stray.name), tracked_files())
+            self.test_the_file_map_lists_every_module_and_document()
 
     def test_the_file_map_names_no_file_that_is_gone(self):
         for path in sorted(filemap_paths()):
@@ -444,6 +672,108 @@ class DocumentsTest(unittest.TestCase):
         self.assertIsNotNone(newest)
         self.assertEqual(newest.group(1), version)
         self.assertIn(f"Version {version}.", self.section(self.read("docs/SPEC.md"), "Packaging"))
+
+
+CONSOLE = "Environment :: Console"
+
+
+class BuildTest(unittest.TestCase):
+    """What is built and what CI holds it to (docs/AUDIT.md A-23). The build
+    itself is `make dist` and `make dist-check`; CI runs both."""
+
+    def read(self, name) -> str:
+        return (REPO / name).read_text(encoding="utf-8")
+
+    def jobs(self) -> dict[str, str]:
+        """The text of each job of the workflow, by name."""
+        text = self.read(".github/workflows/ci.yml")
+        body = text[text.index("\njobs:\n") + len("\njobs:\n") :]
+        starts = list(re.finditer(r"(?m)^  ([a-z][\w-]*):\n", body))
+        ends = [found.start() for found in starts[1:]] + [len(body)]
+        return {
+            found.group(1): body[found.end() : end] for found, end in zip(starts, ends, strict=True)
+        }
+
+    def test_the_sdist_carries_no_tests(self):
+        """Without ``MANIFEST.in`` setuptools ships ``tests/test_*.py`` alone,
+        without ``support.py`` and the fixtures: tests that cannot run."""
+        lines = [
+            line
+            for line in self.read("MANIFEST.in").splitlines()
+            if line and not line.startswith("#")
+        ]
+        self.assertEqual(lines, ["include CHANGELOG.md", "prune tests"])
+        self.assertTrue((REPO / "CHANGELOG.md").is_file())
+
+    def test_make_dist_builds_and_make_dist_check_installs(self):
+        makefile = self.read("Makefile")
+        dist = re.search(r"(?m)^dist:.*\n((?:\t.*\n)+)", makefile)
+        self.assertIsNotNone(dist)
+        self.assertIn("-m build --outdir dist", dist.group(1))
+        check = re.search(r"(?m)^dist-check:.*\n((?:\t.*\n)+)", makefile)
+        self.assertIsNotNone(check)
+        for words in ("dist/*.whl dist/*.tar.gz", 'agent-sessions" --version', "tests(/|$$)"):
+            self.assertIn(words, check.group(1))
+        phony = re.search(r"(?m)^\.PHONY: (.*)$", makefile).group(1).split()
+        for target in re.findall(r"(?m)^([a-z][a-z-]*):", makefile):
+            self.assertIn(target, phony)
+        with open(REPO / "pyproject.toml", "rb") as handle:
+            dev = tomllib.load(handle)["project"]["optional-dependencies"]["dev"]
+        self.assertEqual([pin.split("==")[0] for pin in dev], ["ruff", "mypy", "coverage", "build"])
+        for pin in dev:
+            self.assertRegex(pin, r"^[a-z]+==\d+\.\d+\.\d+$")
+
+    def test_every_ci_job_has_a_time_limit(self):
+        jobs = self.jobs()
+        self.assertEqual(sorted(jobs), ["coverage", "linux", "package", "windows"])
+        for name, text in jobs.items():
+            limit = re.search(r"(?m)^    timeout-minutes: (\d+)$", text)
+            self.assertIsNotNone(limit, name)
+            self.assertLessEqual(int(limit.group(1)), 30, name)
+
+    def test_ci_runs_every_gate_on_every_python_and_builds_the_package(self):
+        jobs = self.jobs()
+
+        def runs(name):
+            return re.findall(r"(?m)^        run: (.*)$", jobs[name])
+
+        matrix = re.search(r"python-version: \[(.*)\]", jobs["linux"]).group(1)
+        self.assertEqual(matrix, '"3.11", "3.12", "3.13", "3.14"')
+        self.assertEqual(
+            runs("linux"), ["make dev", "make lint", "make typecheck", "make test", "make test-tui"]
+        )
+        self.assertEqual(runs("coverage"), ["make dev", "make coverage"])
+        self.assertEqual(runs("package"), ["make dev", "make dist", "make dist-check"])
+        self.assertEqual(runs("windows"), ["python -m unittest discover -s tests -v"])
+        self.assertIn("continue-on-error: true", jobs["windows"])
+        for name in ("linux", "coverage", "package"):
+            self.assertNotIn("continue-on-error", jobs[name])
+        makefile = self.read("Makefile")
+        for name in jobs:
+            for command in runs(name):
+                if command.startswith("make "):
+                    self.assertRegex(makefile, rf"(?m)^{command.split()[1]}:", command)
+
+    def test_coverage_has_a_floor(self):
+        with open(REPO / "pyproject.toml", "rb") as handle:
+            report = tomllib.load(handle)["tool"]["coverage"]["report"]
+        self.assertIsInstance(report["fail_under"], int)
+        self.assertGreaterEqual(report["fail_under"], 90)
+        self.assertLess(report["fail_under"], 100)
+        coverage = re.search(r"(?m)^coverage:.*\n((?:\t.*\n)+)", self.read("Makefile"))
+        self.assertTrue(coverage.group(1).rstrip().endswith("coverage report"))  # no --fail-under=0
+
+    def test_lint_knows_the_package_by_name(self):
+        """N-30: found only under ``src``, the package was third-party to
+        ruff in a checkout whose path holds ``[`` or ``]`` (``src`` is read
+        as a glob below that path), and `make lint` failed on every import."""
+        with open(REPO / "pyproject.toml", "rb") as handle:
+            isort = tomllib.load(handle)["tool"]["ruff"]["lint"]["isort"]
+        self.assertEqual(isort["known-first-party"], ["agent_sessions"])
+        self.assertLess(
+            isort["section-order"].index("test-support"),
+            isort["section-order"].index("first-party"),
+        )
 
 
 class MetadataTest(unittest.TestCase):
@@ -465,7 +795,8 @@ class MetadataTest(unittest.TestCase):
             self.assertIn(f"Programming Language :: Python :: 3.{minor}", classifiers)
         self.assertIn("Operating System :: POSIX :: Linux", classifiers)
         self.assertIn("Environment :: Console", classifiers)
-        self.assertIn("Environment :: Console :: Curses", classifiers)
+        # Textual draws the screen itself; it is not a curses program (N-15).
+        self.assertEqual([c for c in classifiers if c.startswith("Environment")], [CONSOLE])
 
     def test_no_license_is_claimed_before_the_owner_chose_one(self):
         self.assertNotIn("license", self.project)

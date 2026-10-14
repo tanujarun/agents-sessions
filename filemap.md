@@ -20,16 +20,25 @@
   drive letters, ground-truth counts, open questions
 - `bin/agent-sessions` — launcher script; no logic
 - `install.sh` — set up from this checkout: `.venv` with the pinned Textual, the link in `~/.local/bin`,
-  the desktop launcher; checks the Python version and `venv` first; `--dev` adds the development tools
-- `uninstall.sh` — take the link and the desktop launcher back, each only when it is this checkout's;
-  `--purge` also removes the cache, state and configuration directories (asks, or `--yes`)
-- `Makefile` — `test`, `test-tui`, `lint`, `format`, `typecheck`, `coverage` (every suite in one run), `dev`
-  (creates `.venv` with Textual and the development tools), `check` (lint, typecheck and both suites)
+  the desktop launcher; checks the Python version (its own floor, on the numbers) and `venv` first; `--dev`
+  adds the development tools. A link that points elsewhere stops it, and a launcher that is neither this
+  checkout's nor an earlier version's (`LAUNCHERS_BEFORE`, by SHA-256) is kept and reported, unless `--force`
+- `uninstall.sh` — take the link and the desktop launcher back, each only when it is this checkout's (or a
+  launcher an earlier version installed: the same `LAUNCHERS_BEFORE`);
+  `--purge` also removes the cache, state and configuration directories (asks, or `--yes`), and the
+  program's own files, by name, from the directories `AGENT_SESSIONS_STATE` and `AGENT_SESSIONS_CACHE` name
+- `Makefile` — `test`, `test-tui`, `lint`, `format`, `typecheck`, `coverage` (every suite in one run; fails
+  under the floor), `dev` (creates `.venv` with Textual and the development tools), `check` (lint,
+  typecheck and both suites), `dist` (the sdist and the wheel, in `dist/`), `dist-check` (each installed into
+  a venv of its own and run)
+- `MANIFEST.in` — what the sdist carries beyond setuptools' defaults (`CHANGELOG.md`) and what it leaves out
+  (`tests/`: they need the fixtures and the checkout around them)
 - `pyproject.toml` — packaging (setuptools, `src` layout, extras `tui` and `dev`, the `agent-sessions`
   entry point, readme, keywords and classifiers; no license field yet) and the ruff, mypy and coverage
-  configuration
-- `.github/workflows/ci.yml` — CI: lint, typecheck and both suites on Python 3.11 to 3.14 (Linux); engine
-  suite on Windows, allowed to fail until the port is done
+  configuration (`fail_under`: the floor `make coverage` and CI hold the total to)
+- `.github/workflows/ci.yml` — CI, every job with a time limit: lint, typecheck and both suites on Python
+  3.11 to 3.14 (Linux); every suite under coverage with the floor; the sdist and the wheel built, installed
+  and run; engine suite on Windows, allowed to fail until the port is done
 - `src/agent_sessions/__init__.py` — package marker, `__version__`
 - `src/agent_sessions/model.py` — `Session` (`for_store`, `from_dict`; `offline`: listed from the cache, its
   drive is not mounted), `Store`, `Candidate`, `make_key`, `UUID_PATTERN` (the default session id grammar)
@@ -138,7 +147,9 @@
   question), and what ends a command:
   exit codes, Ctrl-C and SIGTERM/SIGHUP (`_signals`), the `internal error` line
 - `src/agent_sessions/tui/` — Textual front end: `app.py`, `view.py` (pure view logic), `app.tcss` (all styling)
-- `share/agent-sessions.desktop` — desktop launcher for the TUI
+- `share/agent-sessions.desktop` — desktop launcher for the TUI (`TryExec`: shown only where
+  `omarchy-launch-tui` exists); when it changes, the hash of the version it replaces goes into
+  `LAUNCHERS_BEFORE` of both scripts
 - `tests/` — unittest suites
 - `tests/__init__.py` — puts `src` on `sys.path`
 - `tests/support.py` — `Sandbox` (fake home, cache, mounts with or without an identity, registry) and
@@ -148,8 +159,10 @@
   `write_jsonl`, `claude_transcript` (a minimal transcript written from scratch); child processes for the
   tests that need real ones (`python_child`, `launcher_child`, `finish`, `wait_for`, the slow-import driver
   `SLOW_IMPORT`); `FakePath` (what PATH holds for a test: programs and installing wrappers in a temp
-  directory); `state_names`/`drop_state` (the state directory without its log); a temp
-  `AGENT_SESSIONS_STATE` for anything that runs outside a `Sandbox`
+  directory); `state_names`/`drop_state` (the state directory without its log); temp directories for
+  `AGENT_SESSIONS_STATE`, `AGENT_SESSIONS_CACHE` and `AGENT_SESSIONS_HOME` (`OWN_PLACES`), set when the
+  module is loaded whatever the environment holds, for anything that runs outside a `Sandbox`;
+  `MODES_BIND` (file modes keep the test's user out: POSIX and not root)
 - `tests/test_smoke.py` — imports, CLI skeleton, `make_key`; no engine module imports Textual or `tui`
   (checked in a fresh interpreter)
 - `tests/test_entry.py` — how the program is entered: `cli.main` starts the TUI for `tui` and for no
@@ -159,13 +172,18 @@
 - `tests/test_packaging.py` — what keeps code, help and documents in step: no message outside `cli.py`
   names a command-line flag, the hint the CLI adds for every `remedy`; the help (groups, descriptions,
   examples that parse, 80 columns); every command in the README and in SPEC's CLI sections, every
-  environment variable in the README, every module in this file, one version everywhere; the package
-  metadata
+  environment variable in the README, every tracked module in this file (`git ls-files`), one version
+  everywhere; the package metadata; the rules of the suite itself (every test module imports `support`
+  before the package, `support` takes the state, cache and home whatever is exported, no unguarded
+  `os.geteuid`); the build (`MANIFEST.in`, `make dist`) and CI (a time limit on every job, the matrix,
+  the coverage floor)
 - `tests/test_install_scripts.py` — `install.sh` and `uninstall.sh` run on a copy of the checkout with a
   throwaway `HOME` and stand-ins for `python3` and the desktop tools: a first and a second run, `--dev`,
-  an old Python, no `venv`, the `PATH` warning, the desktop file's validation, what is not ours and is
-  left, `--purge` with its question (a pty), `--yes`; a guard that the real home's installation is
-  unchanged; `shellcheck` when it is installed
+  an old Python (the stand-in only says its version), no `venv`, the `PATH` warning, the desktop file's
+  validation, what is not ours and is left by both (a link elsewhere, an edited launcher, `--force`, an
+  earlier version's launcher), relative `HOME` and `XDG_DATA_HOME`, `--purge` with its question (a pty),
+  `--yes`, the directories the environment names; the two `LAUNCHERS_BEFORE` lists against the git
+  history; a guard that the real home's installation is unchanged; `shellcheck` when it is installed
 - `tests/test_fmt.py` — `fmt` (the steps of an age, units chosen after rounding, nothing it is given makes
   it raise), that the command line uses that one copy, and the cached times a listing computes with
   (a time the cache holds that `parse_ts` would not write is dropped on load and read again by the next scan)
@@ -251,8 +269,9 @@
   importable, folder gone or not recorded, Antigravity, Gemini, a bad id, no free space, a bad folder), that
   asking writes nothing, `can_import` held to the same answer, the warning `import --experimental` prints
 - `tests/test_hostile_files.py` — named pipes, devices and directories named like session files (`open_ro`,
-  whole scans in a child process under a timeout), over-long lines and the 200 MB line's memory ceiling, size
-  caps of files read whole, deeply nested JSON
+  whole scans in a child process under a timeout), over-long lines and what the 200 MB line adds to the
+  scanning process's own peak (`VmHWM`, against a scan without it), size caps of files read whole, deeply
+  nested JSON
 - `tests/test_read_bounds.py` — what one file can cost a scan: the byte budget per file (`FILE_READ_MAX`)
   on sparse files of 16 GiB and 1 PiB (real scans in child processes), a cancel that is seen inside a file
   (`base.cancellable`), lines and whole documents with too many brackets and commas

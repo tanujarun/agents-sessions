@@ -1,0 +1,10 @@
+# What a source distribution carries: the package (src/, with tui/app.tcss),
+# pyproject.toml, the README and the changelog. Enough to build the wheel and
+# to say what it is.
+#
+# No tests. setuptools would take tests/test_*.py by itself, without what they
+# import (tests/support.py, tui_support.py, fixture_world.py) and without the
+# fixtures; and several suites compare the code with the checkout around it
+# (the documents, the scripts, the Makefile, git). They run from a checkout.
+include CHANGELOG.md
+prune tests
