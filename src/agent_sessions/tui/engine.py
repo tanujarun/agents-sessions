@@ -89,15 +89,23 @@ class Engine:
     def transcript(self, ref: Session | str, index: Index | None = None) -> Iterator[Turn]:
         return self._call("transcript", ref, index=index)
 
+    def _fsutil(self) -> Any:
+        try:
+            return importlib.import_module("agent_sessions.fsutil")
+        except ImportError as exc:
+            raise EngineError(f"the engine could not be loaded: {exc}") from exc
+
+    def home(self) -> str:
+        """The home directory the engine works with (``fsutil.home``): what
+        ``~`` means in a folder the user types."""
+        return str(self._fsutil().home())
+
     def list_folder(self, directory: str) -> list[tuple[str, bool]]:
         """The entries of a directory as ``(name, is a directory)``, for the
         completion of a folder the user types. Listed the engine's way,
         which leaves the directory's access time alone (it may be on
         another drive); raises ``OSError`` when it cannot be listed."""
-        try:
-            fsutil = importlib.import_module("agent_sessions.fsutil")
-        except ImportError as exc:
-            raise EngineError(f"the engine could not be loaded: {exc}") from exc
+        fsutil = self._fsutil()
         return [
             (name, os.path.isdir(os.path.join(directory, name)))
             for name in fsutil.listdir_ro(directory)

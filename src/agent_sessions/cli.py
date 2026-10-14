@@ -1232,24 +1232,21 @@ def _continue(args: argparse.Namespace) -> int:
 
 
 def _tui(args: argparse.Namespace | None = None) -> int:
-    """Start the TUI and return its exit status (1, with one line that says
-    how to get Textual, when that is missing).
+    """Start the TUI and return its exit status. The TUI says in one line
+    what keeps it from starting: no terminal to run on (2), Textual missing
+    and how to get it (1). No command and no terminal is not a request for
+    the TUI: the help, and 2.
 
     The one place outside ``tui/`` that imports it, and only when the TUI is
-    what was asked for: every other command runs without Textual installed.
+    what was asked for: every other command runs without Textual installed
+    (``tui`` itself imports no Textual).
     """
     from . import tui
 
-    return tui.run()
-
-
-def _on_a_terminal() -> bool:
-    """Whether a person is at both ends: the TUI needs to read keys and to
-    draw."""
-    try:
-        return sys.stdin.isatty() and sys.stdout.isatty()
-    except (AttributeError, ValueError):  # a stream that was closed or replaced
-        return False
+    if args is not None and args.command is None and not tui.on_a_terminal():
+        build_parser().print_help()
+        return 2
+    return tui.run(debug=bool(getattr(args, "debug", False)))
 
 
 def _quiet_stdout() -> None:
@@ -1359,10 +1356,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.debug:
             logs.debug()
             debugging = True
-        if args.command is None and not _on_a_terminal():
-            parser.print_help()
-            return 2
-        command = args.command or "tui"  # no command on a terminal: the TUI
+        command = args.command or "tui"  # no command: the TUI
         if command == "tui":
             # Not inside ``_signals``: the app has the terminal, and what a
             # signal does to it stays what it is under the launcher script.

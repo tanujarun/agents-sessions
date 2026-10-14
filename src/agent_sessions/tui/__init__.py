@@ -6,6 +6,7 @@ plain Python, and ``app`` (the part that needs Textual) is loaded by ``run``.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -17,6 +18,10 @@ if TYPE_CHECKING:
 # or as an installed package (Textual is the extra ``tui``).
 INSTALL_HINT = "agent-sessions: the TUI needs Textual; run ./install.sh in {repo}"
 PIP_HINT = "agent-sessions: the TUI needs Textual; run: pip install 'agent-sessions[tui]'"
+
+# What is said, with exit status 2, when the TUI is asked for and there is
+# no terminal to run it on.
+NO_TERMINAL = "agent-sessions: the TUI needs a terminal (stdin, stdout and stderr)"
 
 # The files that make a directory a checkout of this project, beside the
 # package at ``src/agent_sessions``.
@@ -46,11 +51,32 @@ def install_hint(package: Path | None = None) -> str:
     return PIP_HINT if root is None else INSTALL_HINT.format(repo=root)
 
 
-def run(engine: Engine | None = None) -> int:
-    """Run the app until it exits; the process exit code."""
-    from .__main__ import main
+def on_a_terminal() -> bool:
+    """Whether a person is at every end: the TUI reads keys from stdin and
+    draws on the terminal behind stdout and stderr (Textual writes to
+    stderr). With one of them a file, a pipe or closed it would wait for
+    keys nobody can see it wait for."""
+    try:
+        return all(stream.isatty() for stream in (sys.stdin, sys.stdout, sys.stderr))
+    except (AttributeError, ValueError):  # a stream that was closed, or replaced
+        return False
 
-    return main([], engine=engine)
+
+def run(engine: Engine | None = None, debug: bool = False) -> int:
+    """Run the app until it exits; the process exit code. ``debug``: as
+    started with ``--debug``."""
+    from .__main__ import DEBUG, main
+
+    return main([DEBUG] if debug else [], engine=engine)
 
 
-__all__ = ["CHECKOUT_FILES", "INSTALL_HINT", "PIP_HINT", "checkout", "install_hint", "run"]
+__all__ = [
+    "CHECKOUT_FILES",
+    "INSTALL_HINT",
+    "NO_TERMINAL",
+    "PIP_HINT",
+    "checkout",
+    "install_hint",
+    "on_a_terminal",
+    "run",
+]

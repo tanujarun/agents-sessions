@@ -2,11 +2,14 @@
 the system Python: nothing here needs Textual."""
 
 import os
+import random
 import re
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
-from datetime import UTC, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -40,6 +43,15 @@ def ago(**delta) -> str:
 def rows_of(sessions) -> list:
     index = support.FakeIndex()
     return [view.make_row(s, index.where(s)) for s in sessions]
+
+
+class HostileCase(unittest.TestCase):
+    """Text from a store with everything in it that a terminal acts on."""
+
+    def assert_clean(self, text, tag):
+        """``text`` shows the value tagged ``tag`` and nothing unsafe."""
+        self.assertIn(tag, text)
+        self.assertEqual(support.unsafe_chars(text), [], text)
 
 
 class WidthTest(unittest.TestCase):
@@ -98,6 +110,22 @@ class WidthTest(unittest.TestCase):
         self.assertEqual(view.clean("日本 ok"), "日本 ok")
         self.assertEqual(view.clean(12), "12")
 
+    def test_clean_takes_lone_surrogates_too(self):
+        # What a byte that is not UTF-8 is read as, and what JSON can spell:
+        # a terminal cannot be sent one, and Rich draws it as six characters.
+        self.assertEqual(view.clean("a\ud800b\udc9bc\udfffd"), "a b c d")
+        self.assertEqual(view.clean("\ud7ff\ue000"), "\ud7ff\ue000")  # the neighbours stay
+        self.assertEqual(view.clean("😀"), "😀")  # a pair is one character, not two halves
+        self.assertEqual(support.unsafe_chars(view.clean(support.HOSTILE)), [])
+        self.assertEqual(len(view.clean(support.HOSTILE)), len(support.HOSTILE))
+
+    def test_showable(self):
+        for text in ("", "~/", "/home/me/日本 語", "C:\\Work\\[red]x[/]"):
+            self.assertTrue(view.showable(text), text)
+        for text in ("a\x1b[2Jb", "a\nb", "a\tb", "a\u202eb", "a\x9bb", "a\ud800b", "a\0b"):
+            self.assertFalse(view.showable(text), ascii(text))
+        self.assertFalse(view.showable(None))
+
 
 class AgeTest(unittest.TestCase):
     def test_boundaries(self):
@@ -130,8 +158,52 @@ class AgeTest(unittest.TestCase):
         self.assertEqual(view.age_text("yesterday", NOW), "-")
         self.assertEqual(view.age_text(12345, NOW), "-")
         self.assertEqual(view.age_text(ago(hours=-5), NOW), "now")  # clock skew: the future
-        self.assertEqual(view.age_text("2026-10-12T11:00:00", NOW), "1h")  # naive = UTC
         self.assertEqual(view.age_text("2026-10-12T13:00:00+02:00", NOW), "1h")
+
+    # Times the cache's loader takes (any text) and no listing can place.
+    UNPLACED = (
+        "2026-10-05T10:00:00",  # no zone: which moment it means is not known
+        "9999-12-31T23:59:59.000000Z",  # a shift into a zone east of UTC leaves the calendar
+        "0001-01-01T00:00:00Z",  # and this one into a zone west of it
+        "0001-01-01T00:00:00+14:00",
+        "9999-12-31T23:59:59-12:00",
+    )
+
+    def test_a_time_that_cannot_be_placed_is_a_dash_and_never_an_error(self):
+        zones = (
+            None,
+            UTC,
+            timezone(timedelta(hours=5, minutes=30)),
+            timezone(-timedelta(hours=12)),
+        )
+        for stamp in self.UNPLACED:
+            self.assertIsNone(view.parse_stamp(stamp), stamp)
+            self.assertEqual(view.age_text(stamp, NOW), "-", stamp)
+            for tz in zones:
+                self.assertEqual(view.local_time(stamp, tz), "-", (stamp, tz))
+                session = support.make_session("claude", 1)
+                session.updated, session.started = stamp, None
+                self.assertEqual(view.detail_fields(session, None, tz)["updated"], "-")
+                session.updated, session.started = None, stamp
+                self.assertEqual(view.detail_fields(session, None, tz)["updated"], "-")
+        # Just inside the range every zone still fits.
+        for stamp in ("0001-01-03T00:00:00Z", "9999-12-29T23:59:59Z"):
+            self.assertIsNotNone(view.parse_stamp(stamp), stamp)
+            for tz in zones:
+                self.assertRegex(view.local_time(stamp, tz), r"^\d{4}-\d\d-\d\d \d\d:\d\d$")
+        self.assertEqual(view.age_text("9999-12-29T23:59:59Z", NOW), "now")
+        self.assertRegex(view.age_text("0001-01-03T00:00:00Z", NOW), r"^20\d\dy$")
+
+    def test_a_row_with_such_a_time_is_drawn(self):
+        for stamp in self.UNPLACED:
+            session = support.make_session("claude", 1)
+            session.updated = stamp
+            line = view.format_row(view.make_row(session, "Linux"), view.fit_columns(80), NOW)
+            self.assertTrue(line.endswith("-   Linux"), (stamp, line))
+
+    def test_a_clock_without_a_zone_is_no_error_either(self):
+        naive = datetime(2026, 10, 12, 12, 0, 0)
+        self.assertEqual(view.age_text(ago(minutes=5), naive), "-")
 
     def test_ages_fit_the_column(self):
         for days in (0, 1, 13, 14, 59, 60, 300, 364, 365, 20000):
@@ -223,6 +295,74 @@ class RowTest(unittest.TestCase):
         self.assertEqual(
             [row.key for row in claude], [row.key for row in rows if row.provider == "claude"]
         )
+
+
+class HostileRowTest(HostileCase):
+    """SECURITY 6, the list: one test for each value a row shows."""
+
+    def row(self, **fields):
+        session = support.make_session("claude", 1, foreign=True)
+        for name, value in fields.items():
+            setattr(session, name, value)
+        return view.make_row(session, fields.get("where", "C:"))
+
+    def test_title(self):
+        self.assert_clean(self.row(title=support.hostile("TITLE")).title, "TITLE")
+
+    def test_project(self):
+        row = self.row(cwd="C:\\Work\\" + support.hostile_name("PROJECT"))
+        self.assert_clean(row.project, "PROJECT")
+        self.assert_clean(view.project_name("/a/b/" + support.hostile_name("NAME")), "NAME")
+
+    def test_where(self):
+        row = view.make_row(support.make_session("claude", 1), support.hostile("WHERE"))
+        self.assert_clean(row.where, "WHERE")
+        self.assert_clean(view.drive_of(row.where), "WHERE")
+
+    def test_provider_without_a_label(self):
+        row = self.row(provider=support.hostile("PROVIDER"))
+        self.assert_clean(view.provider_label(row.provider, {}), "PROVIDER")
+        line = view.format_row(row, view.fit_columns(200, show_provider=True), NOW)
+        self.assertEqual(support.unsafe_chars(line), [])
+        widths = view.column_widths([row], {})
+        self.assertEqual(widths["provider"], view.MAX_SIDE_WIDTH)
+
+    def test_provider_label(self):
+        labels = {"claude": support.hostile("LABEL")}
+        self.assert_clean(view.provider_label("claude", labels), "LABEL")
+        tabs = view.build_tabs(labels.items(), [])
+        self.assert_clean(tabs[0].label, "LABEL")
+        for text in view.fit_tab_labels(tabs, 0, 500):
+            self.assertEqual(support.unsafe_chars(text), [])
+
+    def test_the_whole_line(self):
+        row = view.make_row(
+            support.make_session(
+                "claude",
+                1,
+                title=support.hostile("T"),
+                cwd="/x/" + support.hostile_name("P"),
+            ),
+            support.hostile("W"),
+        )
+        for width in (40, 80, 120, 400):
+            columns = view.fit_columns(width, view.column_widths([row]), show_provider=True)
+            line = view.format_row(row, columns, NOW, {"claude": support.hostile("L")})
+            self.assertEqual(support.unsafe_chars(line), [], width)
+            self.assertEqual(view.text_width(line), width)
+
+    def test_the_title_of_a_prompt_and_its_fallback(self):
+        self.assert_clean(view.shown_title(support.hostile("TITLE"), "id"), "TITLE")
+        self.assert_clean(view.shown_title("", support.hostile("ID")), "ID")
+        self.assert_clean(view.shown_title(None, support.hostile("KEY")), "KEY")
+        self.assertEqual(view.shown_title("a title", "id"), "a title")
+
+    def test_the_line_of_an_empty_list(self):
+        self.assertEqual(view.empty_text(False, "x"), "")
+        self.assertEqual(view.empty_text(True, ""), "No sessions found")
+        self.assertEqual(view.empty_text(True, "  "), "No sessions found")
+        self.assertEqual(view.empty_text(True, " zz "), 'No sessions match "zz"')
+        self.assert_clean(view.empty_text(True, support.hostile("NEEDLE")), "NEEDLE")
 
 
 class SelectionTest(unittest.TestCase):
@@ -777,6 +917,138 @@ class DetailTest(unittest.TestCase):
 
     def test_nothing_selected(self):
         self.assertEqual(view.detail_fields(None), dict.fromkeys(view.DETAIL_FIELDS, "-"))
+
+    def test_a_count_that_is_not_a_number(self):
+        session = support.make_session("claude", 1)
+        for value in ("12", support.HOSTILE, 1.5, [1]):
+            session.messages = value
+            self.assertEqual(view.detail_fields(session)["messages"], "-", value)
+
+
+class HostileDetailTest(HostileCase):
+    """SECURITY 6, the detail pane: one test for each of its values. The
+    engine hands a recorded folder on as it found it; this is the only
+    thing between it and the screen."""
+
+    def field(self, name, **fields):
+        session = support.make_session("claude", 1, foreign=True)
+        for attribute, value in fields.items():
+            setattr(session, attribute, value)
+        return view.detail_fields(session, fields.get("verdict"), UTC)[name]
+
+    def test_id(self):
+        self.assert_clean(self.field("id", id=support.hostile("ID")), "ID")
+
+    def test_cwd(self):
+        self.assert_clean(self.field("cwd", cwd=support.hostile("CWD")), "CWD")
+
+    def test_local(self):
+        self.assert_clean(self.field("local", cwd_local=support.hostile("LOCAL")), "LOCAL")
+
+    def test_store(self):
+        self.assert_clean(self.field("store", store=support.hostile("STORE")), "STORE")
+
+    def test_note(self):
+        self.assert_clean(self.field("note", note=support.hostile("NOTE")), "NOTE")
+
+    def test_import_reason(self):
+        for known in (True, False):
+            verdict = Verdict(False, support.hostile("REASON"), known=known)
+            self.assert_clean(self.field("import", verdict=verdict), "REASON")
+        made = view.make_verdict(support.ImportOptions(False, support.hostile("REASON")))
+        self.assert_clean(made.reason, "REASON")
+        self.assert_clean(view.failed_verdict(support.FakeError(support.hostile("E"))).reason, "E")
+
+    def test_times_and_counts_show_nothing_of_their_own(self):
+        for name in ("updated", "started"):
+            times = {"updated": None, "started": None, name: support.HOSTILE}
+            self.assertEqual(self.field("updated", **times), "-")
+        self.assertEqual(self.field("messages", messages=support.HOSTILE), "-")
+
+
+class HostilePromptTest(HostileCase):
+    """SECURITY 6, the prompts and the status line: every text a store or
+    an engine answer can put there."""
+
+    WIDTHS = (None, 200, 120, 80, 40, 12)
+
+    def test_status_line(self):
+        self.assert_clean(view.status_parts(support.hostile("MESSAGE"), ["x"], 400)[0], "MESSAGE")
+        self.assert_clean(view.error_text(support.FakeError(support.hostile("REASON"))), "REASON")
+        self.assert_clean(view.error_text(ValueError(support.hostile("ERROR"))), "ERROR")
+
+    def test_scan_progress(self):
+        self.assert_clean(view.scan_progress_text(support.hostile("DRIVE"), 41000), "DRIVE")
+
+    def test_mount(self):
+        where = view.clean(support.hostile("DRIVE"))  # as a row holds it
+        for width in self.WIDTHS:
+            self.assertEqual(support.unsafe_chars(view.mount_prompt(where, width)), [])
+        for text in (
+            view.mount_activity_text(view.drive_of(where)),
+            view.mounted_text(view.drive_of(where)),
+            view.already_mounting_text(view.drive_of(where)),
+            view.not_attached_text(view.drive_of(where)),
+        ):
+            self.assert_clean(text, "DRIVE")
+
+    def test_foreign_prompt_reason(self):
+        verdict = Verdict(False, support.hostile("REASON"), needs_folder=True)
+        for width in self.WIDTHS:
+            for line in view.foreign_prompt("C:", verdict, width):
+                self.assertEqual(support.unsafe_chars(line), [], width)
+        self.assert_clean(view.foreign_prompt("C:", verdict)[0], "REASON")
+
+    def test_warning(self):
+        for width in self.WIDTHS:
+            lines = view.warn_prompt(support.hostile("WARNING") + " and more words " * 9, width)
+            self.assertEqual(support.unsafe_chars("".join(lines)), [], width)
+        self.assert_clean(view.warn_prompt(support.hostile("WARNING"))[0], "WARNING")
+
+    def test_tool_label(self):
+        for width in self.WIDTHS:
+            self.assertEqual(
+                support.unsafe_chars(view.tool_prompt(support.hostile("TOOL"), width)), []
+            )
+        self.assert_clean(view.tool_prompt(support.hostile("TOOL")), "TOOL")
+        self.assert_clean(view.starting_text(support.hostile("TOOL")), "TOOL")
+        self.assert_clean(view.started_text(support.hostile("TOOL")), "TOOL")
+
+    def test_start_prompt_label_and_folder(self):
+        for width in self.WIDTHS:
+            for label, folder in (
+                (support.hostile("TOOL"), "/home/me/site"),
+                ("Claude", "/mnt/" + support.hostile("FOLDER")),
+            ):
+                text = view.start_prompt(label, folder, width)
+                self.assertEqual(support.unsafe_chars(text), [], (width, label))
+        self.assert_clean(view.start_prompt(support.hostile("TOOL"), "/f"), "TOOL")
+        self.assert_clean(view.start_prompt("Claude", support.hostile("FOLDER")), "FOLDER")
+
+    def test_folder_names(self):
+        names = (support.hostile("ONE"), support.hostile("TWO"))
+        self.assert_clean(view.completions_text(names), "ONE")
+        self.assert_clean(view.folder_error("/mnt/" + support.hostile_name("PATH")), "PATH")
+
+        def failing(directory):
+            raise OSError(5, support.hostile("STRERROR"), directory)
+
+        done = view.complete_folder(f"/mnt/{support.hostile_name('DIR')}/x", failing, "/home/me")
+        self.assertIn("DIR", done.error)
+        self.assertIn("STRERROR", done.error)  # cleaned where it is shown: set_message
+        self.assert_clean(view.status_parts(done.error, [], 4000)[0], "DIR")
+
+    def test_transcript(self):
+        for role in ("user", "assistant"):
+            lines = view.transcript_lines(role, support.hostile("TEXT"), support.HOSTILE, 60, UTC)
+            self.assert_clean(" ".join(text for _kind, text in lines), "TEXT")
+        lines = view.transcript_lines("tool", support.hostile("TOOL"), None, 200, UTC)
+        self.assert_clean(lines[0][1], "TOOL")
+        for width in (1, 5, 20, 80):
+            for role in ("user", "tool", support.HOSTILE):
+                for _kind, text in view.transcript_lines(role, support.HOSTILE * 3, None, width):
+                    self.assertEqual(support.unsafe_chars(text), [], (width, role))
+        self.assert_clean(view.pager_status(3, False, False, view.clean(support.hostile("E"))), "E")
 
 
 class PromptAndKeyTest(unittest.TestCase):
@@ -1466,6 +1738,65 @@ class FolderTest(unittest.TestCase):
         # A name that would break the status line is cleaned.
         self.assertNotIn("\n", view.complete_folder("/a\nb/c", self.listing, self.home).error)
 
+    def test_a_name_that_cannot_be_shown_is_never_completed(self):
+        """A-12: a completed name goes into the input as it is."""
+        escape, bidi = "ev\x1b]0;PWNED\x07\x1b[5mil", "pic\u202etures"
+        tree = {
+            "/mnt/": [(escape, True), ("evening", True), ("every", True), (bidi, True)],
+            "/one/": [(escape, True)],
+            "/two/": [(escape, True), ("evil", True), ("notes\x1b", False)],
+        }
+
+        def listing(directory):
+            return tree[directory]
+
+        def complete(text):
+            return view.complete_folder(text, listing, self.home)
+
+        done = complete("/mnt/ev")
+        self.assertEqual(done, view.Completion("/mnt/eve", ("evening", "every"), left_out=1))
+        self.assertEqual(complete("/mnt/").left_out, 2)
+        self.assertEqual(complete("/mnt/").matches, ("evening", "every"))
+        self.assertEqual(complete("/mnt/pic"), view.Completion("/mnt/pic", left_out=1))
+        # The only match: nothing is completed, and the count says why.
+        self.assertEqual(complete("/one/e"), view.Completion("/one/e", left_out=1))
+        # One good match beside it is completed as the only one.
+        self.assertEqual(complete("/two/e"), view.Completion("/two/evil/", ("evil",), left_out=1))
+        self.assertEqual(complete("/two/n"), view.Completion("/two/n"))  # a file: not counted
+        for text in ("/mnt/", "/mnt/ev", "/mnt/pic", "/one/", "/two/e"):
+            completion = complete(text)
+            self.assertTrue(view.showable(completion.text), text)
+            self.assertTrue(all(view.showable(name) for name in completion.matches), text)
+
+    def test_what_tab_says(self):
+        say = view.completion_message
+        self.assertEqual(say(view.Completion("/a/b")), "")
+        self.assertEqual(say(view.Completion("/a/b/", ("b",))), "")
+        self.assertEqual(say(view.Completion("/a/b", ("ba", "bb"))), "ba  bb")
+        self.assertEqual(
+            say(view.Completion("/a/b", left_out=1)),
+            "1 name left out (characters that cannot be shown)",
+        )
+        self.assertEqual(
+            say(view.Completion("/a/b", ("ba", "bb"), left_out=1200)),
+            "ba  bb · 1,200 names left out (characters that cannot be shown)",
+        )
+        self.assertEqual(
+            say(view.Completion("/a/b/", ("b",), left_out=2)),
+            "2 names left out (characters that cannot be shown)",
+        )
+
+    def test_a_nul_is_refused_in_plain_words(self):
+        """N-37: not ``open: embedded null character in path``."""
+        for text in ("/home/me/a\0b", "\0", "~/\0", "/home/me/\0/x"):
+            done = self.complete(text)
+            self.assertEqual(done, view.Completion(text, error=view.FOLDER_NUL), ascii(text))
+            self.assertEqual(
+                view.folder_error(view.expand_folder(text, self.home)), view.FOLDER_NUL
+            )
+        self.assertEqual(self.listed, [])  # the disk is not asked
+        self.assertEqual(view.FOLDER_NUL, "a folder name cannot contain a NUL character")
+
     def test_a_relative_text_is_not_completed(self):
         for text in ("Projects", "Projects/s", "./x", "~other/x", "~x"):
             self.assertEqual(self.complete(text), view.Completion(text), text)
@@ -1485,6 +1816,10 @@ class FolderTest(unittest.TestCase):
     def test_labels_and_refusal(self):
         self.assertEqual(view.FOLDER_LABELS, {"import": "Import into:", "continue": "Start in:"})
         self.assertEqual(view.FOLDER_START, "~/")
+        self.assertEqual(
+            view.FOLDER_UNSHOWABLE,
+            "this session's folder name has characters that cannot be shown; type the folder",
+        )
         self.assertEqual(
             view.folder_error("/home/me/nope"), "not an existing folder: /home/me/nope"
         )
@@ -1530,6 +1865,108 @@ class TranscriptTest(unittest.TestCase):
                     self.assertLessEqual(view.text_width(line), width, (text[:10], width))
         text = "the quick brown fox " * 9
         self.assertEqual(" ".join(view.wrap_text(text, 17)).split(), text.split())
+
+    @staticmethod
+    def wrap_as_before(line, width):
+        """``wrap_line`` as it was before it measured every character once:
+        what the single pass has to give, line for line."""
+        if width <= 0 or view.text_width(line) <= width:
+            return [line]
+        out = []
+        current, used = "", 0
+        for token in re.findall(r"\s+|\S+", line):
+            size = view.text_width(token)
+            if used + size <= width:
+                current, used = current + token, used + size
+                continue
+            if token.isspace():
+                if current.strip():
+                    out.append(current.rstrip())
+                current, used = "", 0
+                continue
+            if current.strip():
+                out.append(current.rstrip())
+                current, used = "", 0
+            elif used + 1 > width:
+                current, used = "", 0
+            while used + view.text_width(token) > width:
+                head = view._take(token, width - used) or token[:1]
+                token = token[len(head) :]
+                out.append(current + head)
+                current, used = "", 0
+            current, used = current + token, used + view.text_width(token)
+        if current.strip() or not out:
+            out.append(current.rstrip())
+        return out
+
+    def test_one_pass_gives_the_lines_the_old_wrapping_gave(self):
+        rng = random.Random(20261013)  # noqa: S311  (a fixed seed for a repeatable test)
+        pieces = (
+            "a",
+            "bc",
+            "word",
+            "x" * 37,
+            "é",
+            "ñandú",
+            "漢",
+            "漢字テキスト",
+            "🚀",
+            "e\u0301",
+            " ",
+            "  ",
+            "    ",
+        )
+        differing = 0
+        for _ in range(4000):
+            line = "".join(rng.choice(pieces) for _ in range(rng.randrange(1, 40)))
+            width = rng.choice((1, 2, 3, 5, 8, 13, 20, 40, 80))
+            new, old = view.wrap_line(line, width), self.wrap_as_before(line, width)
+            if new != old:
+                # The one case that was wrong before: a wide character after
+                # an indentation that left it one cell. The old lines ran over.
+                differing += 1
+                self.assertTrue(any(view.text_width(text) > width for text in old), (line, width))
+                if width > 1:
+                    self.assertTrue(
+                        all(view.text_width(text) <= width for text in new), (line, width)
+                    )
+            # Nothing but spaces is ever dropped.
+            self.assertEqual("".join(new).replace(" ", ""), line.replace(" ", ""), (line, width))
+        self.assertLess(differing, 400)
+
+    def test_a_wide_character_after_an_indentation_starts_a_line_of_its_own(self):
+        self.assertEqual(view.wrap_line("   漢字", 4), ["漢字"])
+        self.assertEqual(view.wrap_line("   漢字かな", 4), ["漢字", "かな"])
+        self.assertEqual(view.wrap_line("    x", 4), ["x"])  # as before: the indentation goes
+
+    def test_a_long_word_costs_its_length_not_its_square(self):
+        """A-14: one turn of 20,000 characters without a space took 0.3 s as
+        accented Latin and 0.6 s as CJK, on every key the pager got."""
+
+        def best(text, width):
+            times = []
+            for _ in range(5):
+                start = time.perf_counter()
+                lines = view.wrap_line(text, width)
+                times.append(time.perf_counter() - start)
+            self.assertEqual("".join(lines), text)
+            self.assertTrue(all(view.text_width(line) <= width for line in lines))
+            return min(times)
+
+        for name, ch in (("ASCII", "x"), ("accented Latin", "é"), ("CJK", "中")):
+            for width in (80, 20):
+                self.assertLess(best(ch * 20000, width), 0.020, (name, width))
+        self.assertEqual(len(view.wrap_line("中" * 20000, 80)), 500)
+        self.assertEqual(len(view.wrap_line("é" * 20000, 80)), 250)
+        # Ten times the word, about ten times the work (the old way: a hundred).
+        short, long = best("中" * 20000, 80), best("中" * 200000, 80)
+        self.assertLess(long, short * 40)
+
+    def test_the_whole_turn_is_wrapped_in_time(self):
+        for text in ("中" * 20000, "é" * 20000, "word " * 4000, ("中" * 300 + "。\n") * 60):
+            start = time.perf_counter()
+            view.transcript_lines("assistant", text, None, 80, UTC)
+            self.assertLess(time.perf_counter() - start, 0.1, text[:8])
 
     def test_wrap_text_keeps_line_breaks(self):
         self.assertEqual(
@@ -1594,7 +2031,11 @@ class EngineTest(unittest.TestCase):
     time."""
 
     def test_forwards_to_the_api(self):
-        fake_api = mock.Mock()
+        # Held to the signatures of the real ``api``: a keyword the engine
+        # renames, or one this wrapper misspells, fails here (N-35).
+        from agent_sessions import api
+
+        fake_api = mock.create_autospec(api)
         fake_api.scan.return_value = {"mode": "quick"}
         fake_api.load_index.return_value = "INDEX"
         with mock.patch.object(engine_mod.importlib, "import_module", return_value=fake_api):
@@ -1642,6 +2083,31 @@ class EngineTest(unittest.TestCase):
         fake_api.continue_session.assert_called_once_with("k", tool="codex", folder="/f", index="I")
         fake_api.open_session.assert_called_once_with("k", here=False, dry_run=False, index="I")
 
+    def test_the_api_is_called_with_keywords_it_has(self):
+        """What the check above rests on: a call the real ``api`` could not
+        take is an error, not a recorded call."""
+        from agent_sessions import api
+
+        fake_api = mock.create_autospec(api)
+        with self.assertRaises(TypeError):
+            fake_api.scan(depth=True)
+        with self.assertRaises(TypeError):
+            fake_api.import_session("k", into="/t")
+        with self.assertRaises(TypeError):
+            fake_api.open_session()
+
+    def test_home_is_the_engines(self):
+        """N-34: ``~`` in the folder input is the home the engine works
+        with, which ``AGENT_SESSIONS_HOME`` can move."""
+        engine = engine_mod.Engine()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"AGENT_SESSIONS_HOME": tmp}):
+                self.assertEqual(engine.home(), tmp)
+            with mock.patch.dict(os.environ, {"HOME": tmp}):
+                os.environ.pop("AGENT_SESSIONS_HOME", None)
+                self.assertEqual(engine.home(), tmp)
+        self.assertIsInstance(engine.home(), str)
+
     def test_the_fake_engine_has_every_method_of_the_real_one(self):
         import inspect
 
@@ -1657,8 +2123,6 @@ class EngineTest(unittest.TestCase):
             self.assertEqual(list(fake.parameters), list(signature.parameters), name)
 
     def test_list_folder_says_what_is_a_directory(self):
-        import tempfile
-
         engine = engine_mod.Engine()
         with tempfile.TemporaryDirectory() as tmp:
             os.mkdir(os.path.join(tmp, "folder"))
@@ -1801,16 +2265,24 @@ class EntryTest(unittest.TestCase):
         self.assertNotRegex(css, r"#[0-9a-fA-F]{3,8}\s*;")
         self.assertNotRegex(css, r"rgb\(|hsl\(")
 
-    def test_no_arguments_and_no_terminal_prints_help(self):
-        result = subprocess.run(
-            [sys.executable, self.launcher],
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            timeout=60,
-        )
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("usage: agent-sessions", result.stdout)
+    def test_the_tui_without_a_terminal_is_one_line_and_exit_2(self):
+        """A-21: it used to draw into the pipe and wait for keys for ever."""
+        from agent_sessions import tui
+
+        for argv in ([], ["tui"], ["--debug"], ["--debug", "tui"]):
+            result = subprocess.run(
+                [sys.executable, self.launcher, *argv],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=60,
+            )
+            self.assertEqual(result.returncode, 2, argv)
+            if "tui" in argv:
+                self.assertEqual((result.stdout, result.stderr), ("", tui.NO_TERMINAL + "\n"))
+            else:  # no command and no terminal: the help, as ever
+                self.assertEqual(result.stderr, "", argv)
+                self.assertTrue(result.stdout.startswith("usage: agent-sessions"), argv)
 
     def test_other_subcommands_still_run(self):
         result = subprocess.run(
@@ -1823,7 +2295,8 @@ class EntryTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("agent-sessions", result.stdout)
 
-    def test_tui_is_intercepted_before_the_cli(self):
+    def test_tui_help_is_the_parsers_own(self):
+        """N-13: the launcher printed a usage line of its own."""
         result = subprocess.run(
             [sys.executable, self.launcher, "tui", "--help"],
             capture_output=True,
@@ -1831,22 +2304,32 @@ class EntryTest(unittest.TestCase):
             stdin=subprocess.DEVNULL,
             timeout=60,
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("usage: agent-sessions [tui]", result.stderr)
-        self.assertNotIn("not implemented", result.stderr)
-        result = subprocess.run(
-            [sys.executable, self.launcher, "tui", "--bogus"],
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            timeout=60,
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        entry_point = self.run_py(
+            "import sys; sys.path.insert(0, 'src')\n"
+            "from agent_sessions import cli\n"
+            "cli.main(['tui', '--help'])"
         )
-        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, entry_point.stdout)
+        self.assertTrue(result.stdout.startswith("usage: agent-sessions tui [-h]\n"))
+        self.assertIn("Open the full-screen browser", result.stdout)
+        for stray in ("--bogus", "extra"):
+            result = subprocess.run(
+                [sys.executable, self.launcher, "tui", stray],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=60,
+            )
+            self.assertEqual((result.returncode, result.stdout), (2, ""), stray)
+            self.assertIn("usage: agent-sessions", result.stderr)
 
     def test_missing_textual_is_one_line_and_exit_1(self):
         result = self.run_py(
             "import sys; sys.path.insert(0, 'src')\n"
             "sys.modules['textual'] = None\n"  # as if it were not installed
+            "from agent_sessions import tui\n"
+            "tui.on_a_terminal = lambda: True\n"  # as if a person were there
             "from agent_sessions.tui.__main__ import main\n"
             "sys.exit(main([]))"
         )

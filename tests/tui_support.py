@@ -1,21 +1,37 @@
 """Scaffolding for the TUI tests: a fake engine that records every call and
 never touches a store, mounts a drive or starts a tool, a set of fake
-sessions, and a way to read the screen as text. Imports no Textual at module
+sessions, ways to read the screen (as text, and as the segments that would
+go to the terminal), text no terminal may be sent, and a driver that runs a
+program in a pseudo-terminal of its own. Imports no Textual at module
 level."""
 
+import fcntl
 import io
 import os
+import pty
+import re
+import select
+import struct
+import subprocess
 import sys
+import termios
 import threading
 import time
+import unicodedata
 from collections import namedtuple
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-_SRC = str(Path(__file__).resolve().parent.parent / "src")
+REPO = Path(__file__).resolve().parent.parent
+_SRC = str(REPO / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+# Imported for what it does when it is loaded: AGENT_SESSIONS_STATE points at
+# a temp directory from then on, so no TUI test can write the user's own log.
+import support  # noqa: E402, F401
+
+from agent_sessions import textsafe  # noqa: E402
 from agent_sessions.api import ContinueOptions, ImportOptions, UnimportReport  # noqa: E402
 from agent_sessions.errors import UndoFailed  # noqa: E402
 from agent_sessions.model import Session  # noqa: E402
@@ -163,6 +179,13 @@ class FakeEngine:
         self.volume_state = None  # of the drive in `volumes`; default: by what is listed
         self.mount_gate = None  # an Event: mount_drive waits for it
         self.listing_threads = []  # the thread of every list_folder call
+        # method name -> what its call waits for first: an Event (30 s at
+        # most) or a number of seconds. A call that does not come back.
+        self.block = {}
+        self.threads = {}  # method name -> the thread of its last call
+        self.import_mark = None  # a file every finished import writes
+        self.where_text = None  # what ``where`` says of every session, when set
+        self.home_dir = None  # what ``home`` answers; None: this user's own
         self.turns = {}  # key -> list of Turn
         self.default_turns = [
             Turn("user", "hello there", stamp(minutes=5)),
@@ -182,6 +205,12 @@ class FakeEngine:
     def _record(self, name, arg=None):
         with self.lock:
             self.calls.append((name, arg))
+            self.threads[name] = threading.current_thread()
+        wait = self.block.get(name)
+        if isinstance(wait, threading.Event):
+            wait.wait(30)
+        elif wait:
+            time.sleep(wait)
         if name in self.fail:
             raise self.fail[name]
 
@@ -232,6 +261,8 @@ class FakeEngine:
         }
 
     def where(self, session, index):
+        if self.where_text is not None:
+            return self.where_text + (" · offline" if session.offline else "")
         return index.where(session)
 
     def find_session(self, ref, index=None):
@@ -278,6 +309,10 @@ class FakeEngine:
                 "sessions": sum(1 for session in self.sessions if session.mount == WINDOWS),
             }
         ]
+
+    def home(self):
+        self._record("home")
+        return self.home_dir or os.path.expanduser("~")
 
     def list_folder(self, directory):
         """A real listing (the tests complete in temp directories); which
@@ -340,6 +375,8 @@ class FakeEngine:
         copy.launchable, copy.imported_as = True, None
         source.imported_as = copy.key
         self.sessions.append(copy)
+        if self.import_mark:
+            Path(self.import_mark).write_text("imported", encoding="utf-8")
         return copy
 
     def unimport(self, ref, force=False, dry_run=False, index=None):
@@ -448,3 +485,210 @@ async def settle(pilot, rounds: int = 2) -> None:
     for _ in range(rounds):
         await pilot.app.workers.wait_for_complete()
         await pilot.pause()
+
+
+# --- text no terminal may be sent ---------------------------------------------------
+
+# An escape sequence that sets the window title, one that clears the screen,
+# a blink, the 8-bit CSI and OSC (C1), a bidirectional override and an
+# isolate, a line separator, a byte order mark, NUL, a lone surrogate (what a
+# byte that is not UTF-8 is read as), and text that looks like Rich markup.
+HOSTILE = (
+    "\x1b]0;PWNED\x07\x1b[2J\x1b[5mA\x9b31mB\x9d0;x\x9cC"
+    "\u202eD\u2066E\u2028F\ufeffG\x00H\ud800I\udc9bJ"
+    "[red]K[/red] [@click=app.quit]L[/] [/oops]"
+)
+# What is left of it on a screen that shows it whole: the markup, as text.
+HOSTILE_MARK = "[red]K[/red] [@click=app.quit]L[/] [/oops]"
+
+
+def hostile(tag) -> str:
+    """Hostile text that can be told from every other one by ``tag``."""
+    return f"{tag}{HOSTILE}"
+
+
+def hostile_name(tag) -> str:
+    """The same as one name of a path: no separator and no NUL, and without
+    the surrogate no file name can hold."""
+    return hostile(tag).replace("/", "|").replace("\x00", "").replace("\ud800", "")
+
+
+def unsafe_chars(text) -> list:
+    """The characters of ``text`` that must not reach a terminal: what
+    ``textsafe`` replaces, every other control character, and surrogates."""
+    return [ch for ch in text if ch in textsafe.UNSAFE or unicodedata.category(ch) in ("Cc", "Cs")]
+
+
+def screen_segments(app) -> list:
+    """Every piece of text the compositor would send to the terminal for a
+    full repaint of the current screen (Rich's control segments, which are
+    Textual's own cursor movements, left out)."""
+    from rich.console import Console
+
+    width, height = app.size
+    console = Console(
+        width=width,
+        height=height,
+        file=io.StringIO(),
+        force_terminal=True,
+        color_system="truecolor",
+        legacy_windows=False,
+    )
+    update = app.screen._compositor.render_update(
+        full=True, screen_stack=app._background_screens, simplify=False
+    )
+    return [segment.text for segment in console.render(update) if not segment.control]
+
+
+def unsafe_on_screen(app) -> list:
+    """``(characters, the text they are in)`` for every piece of the screen
+    that holds a character no terminal may be sent; empty for a clean one.
+    The line feeds that end the rows are the compositor's own."""
+    found = []
+    for text in screen_segments(app):
+        bad = unsafe_chars(text.replace("\n", ""))
+        if bad:
+            found.append((bad, text))
+    return found
+
+
+# --- a program in a pseudo-terminal of its own ---------------------------------------
+
+PtyRun = namedtuple("PtyRun", "status output seconds")
+"""What ``pty_run`` gives: the exit status (None: it had to be killed), all
+it wrote, and the seconds from the last keys sent to its exit."""
+
+_ESCAPES = re.compile(
+    rb"\x1b\[[0-?]*[ -/]*[@-~]"  # CSI
+    rb"|\x1b[\]P_^][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC, DCS, APC, PM
+    rb"|\x1b[()][0-9A-Za-z]|\x1b[=>78cDEHM]"
+)
+
+
+def plain(output) -> str:
+    """Terminal output as text: the escape sequences taken out."""
+    return _ESCAPES.sub(b"", bytes(output)).decode("utf-8", "replace")
+
+
+def pty_run(argv, steps, env, cwd, size=(100, 30), timeout=30.0) -> PtyRun:
+    """Run ``argv`` with a pseudo-terminal made here for its stdin, stdout
+    and stderr (no terminal window: nothing is shown anywhere) and play
+    ``steps`` to it. A step is ``(wait, keys)``: wait until the text
+    ``wait`` has appeared in what the program wrote since the step before
+    (a number: that many seconds), then write ``keys``. Raises
+    ``AssertionError`` with what was on the terminal when a text does not
+    come within ``timeout`` seconds."""
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", size[1], size[0], 0, 0))
+    try:
+        child = subprocess.Popen(
+            argv, stdin=slave, stdout=slave, stderr=slave, env=env, cwd=cwd, start_new_session=True
+        )
+    finally:
+        os.close(slave)
+    output = bytearray()
+
+    def read(seconds) -> bool:
+        """Take what the program writes for ``seconds``; False at its end."""
+        until = time.monotonic() + seconds
+        while True:
+            ready, _, _ = select.select([master], [], [], max(until - time.monotonic(), 0))
+            if not ready:
+                return True
+            try:
+                data = os.read(master, 65536)
+            except OSError:  # EIO: the other end is closed
+                return False
+            if not data:
+                return False
+            output.extend(data)
+
+    sent = time.monotonic()
+    try:
+        for wait, keys in steps:
+            seen = len(output)
+            deadline = time.monotonic() + (wait if isinstance(wait, (int, float)) else timeout)
+            while isinstance(wait, (int, float)) or wait not in plain(output[seen:]):
+                if time.monotonic() >= deadline or child.poll() is not None:
+                    if isinstance(wait, (int, float)):
+                        break
+                    read(0.05)
+                    raise AssertionError(
+                        f"{wait!r} did not appear (exit status {child.poll()}); "
+                        f"the terminal had: {plain(output)[-2000:]!r}"
+                    )
+                read(0.005)
+            os.write(master, keys)
+            sent = time.monotonic()
+        deadline = sent + timeout
+        while child.poll() is None and time.monotonic() < deadline:
+            read(0.005)
+        seconds = time.monotonic() - sent
+        status = child.poll()
+        while status is not None and read(0.05) and select.select([master], [], [], 0)[0]:
+            pass  # what it wrote last
+        return PtyRun(status, bytes(output), seconds)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+        os.close(master)
+
+
+def pty_env(root, **more) -> dict:
+    """The environment for a program run by ``pty_run``: a terminal type, a
+    UTF-8 locale, and our four overrides pointing into ``root``, so that the
+    real engine finds no store and walks no drive."""
+    root = Path(root)
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(root / "home"),
+        "TERM": "xterm-256color",
+        "LANG": "C.UTF-8",
+        "AGENT_SESSIONS_HOME": str(root / "home"),
+        "AGENT_SESSIONS_CACHE": str(root / "cache"),
+        "AGENT_SESSIONS_STATE": str(root / "state"),
+        "AGENT_SESSIONS_MOUNTS": "[]",
+        "AGENT_SESSIONS_NOTIFY": "0",
+        **more,
+    }
+
+
+# The app over the fake engine as a program of its own, for ``pty_run``:
+# ``python -P -c PTY_APP <setup>``. ``-P`` keeps the directory it is started
+# in off ``sys.path``; nothing here reads a store or starts anything.
+PTY_APP = f"""
+import sys
+sys.path[:0] = [{_SRC!r}, {str(REPO / "tests")!r}]
+import tui_support
+from agent_sessions.tui.app import SessionsApp
+app = SessionsApp(engine=tui_support.pty_engine(sys.argv[1]))
+app.run()
+sys.exit(app.return_code or 0)
+"""
+
+LONG_TURNS = 2000  # the pager's own limit
+BLOCKED = 30.0  # seconds a call of a ``block:`` setup does not come back for
+
+
+def pty_engine(setup) -> "FakeEngine":
+    """The fake engine for ``PTY_APP``. ``setup`` is ``plain``;
+    ``block:<method>``, a call of that method does not come back for
+    ``BLOCKED`` seconds; ``import:<seconds>``, an import takes that long; or
+    ``turns:<kind>``, the first session listed has ``LONG_TURNS`` turns of
+    20,000 characters (``words``, or ``cjk`` without a single space). It
+    lists one session more than the default ones: ``claude session 70``,
+    whose drive is not mounted. When the environment names ``PTY_MARK``, a
+    finished import writes that file."""
+    engine = FakeEngine()
+    engine.sessions.append(make_session("claude", 70, foreign=True, offline=True))
+    kind, _, value = setup.partition(":")
+    if kind == "block":
+        engine.block[value] = BLOCKED
+    elif kind == "import":
+        engine.block["import_session"] = float(value)
+    elif kind == "turns":
+        text = {"words": "word " * 4000, "cjk": "\u4e2d" * 20000}[value]
+        engine.turns[engine.listed()[0].key] = [Turn("assistant", text, None)] * LONG_TURNS
+    engine.import_mark = os.environ.get("PTY_MARK")
+    return engine

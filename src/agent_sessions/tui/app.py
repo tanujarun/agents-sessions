@@ -5,10 +5,16 @@ Rules this module keeps:
 
 - No engine logic. Every list, scan, import, undo, mount, launch and
   transcript is a call on ``self.engine`` (``tui/engine.py``), made in a
-  thread worker; the worker hands its result back with ``_ui``. An engine
+  thread; the thread hands its result back with ``_ui``. An engine
   exception becomes a status line message. What touches a disk for the
   folder input (a listing, a look whether a folder is there) runs in a
-  worker too.
+  thread too.
+- Quitting waits for nothing that only reads. Such a call runs in a daemon
+  thread (``Reader``); an import and an undo run in a thread the process
+  waits for, and the program leaves when they have finished.
+- Nothing is drawn that ``view.clean`` has not seen: every text comes from
+  a ``view`` function or goes through ``set_message``, every ``Static`` is
+  made with ``markup=False``, and the two inputs are ``SafeInput``.
 - No view logic. What a row says, which columns fit, what a key means: all of
   it is in ``tui/view.py``.
 - No styling. Colours, borders and spacing are in ``app.tcss``; this module
@@ -25,14 +31,16 @@ import re
 import signal
 import threading
 import time
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, tzinfo
 from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from rich.cells import cell_len
 from rich.segment import Segment
+from rich.text import Text
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
@@ -43,12 +51,13 @@ from textual.screen import ModalScreen, Screen
 from textual.scroll_view import ScrollView
 from textual.strip import Strip
 from textual.widgets import Input, Static
-from textual.worker import Worker, get_current_worker
+from textual.worker import Worker
 
 from . import view
 from .engine import Engine
 
 if TYPE_CHECKING:
+    from textual.dom import DOMNode
     from textual.timer import Timer
 
     from ..index import Index
@@ -68,6 +77,7 @@ VERDICT_DELAY = 0.15  # seconds a row must stay selected before import_options r
 CLOCK_INTERVAL = 30.0  # seconds between refreshes of the ages on screen
 PAGER_BATCH = 50  # turns handed to the pager at once
 PAGER_SLICE = 0.01  # seconds of wrapping before the pager yields to input
+PAGER_PAUSE = 0.001  # seconds the keyboard gets between two slices
 
 
 def _utc_now() -> datetime:
@@ -98,6 +108,89 @@ class _UiCalls:
         result = message.callback()
         if inspect.isawaitable(result):
             await result
+
+
+class Reader(Worker[None]):
+    """A worker for an engine call that only reads, run in a daemon thread.
+
+    Textual runs a thread worker in the event loop's pool, and the
+    interpreter waits for the threads of that pool when the program ends:
+    quitting took as long as the slowest read from a foreign drive. Nothing
+    waits for a daemon thread. What changes a store (an import, an undo)
+    stays a thread worker of Textual's, so that it is finished first."""
+
+    def __init__(self, node: DOMNode, read: Callable[[], object], group: str) -> None:
+        super().__init__(node, read, name=f"read-{group}", group=group, exit_on_error=False)
+        self._read = read
+
+    async def run(self) -> None:
+        loop = asyncio.get_running_loop()
+        done: asyncio.Future[None] = loop.create_future()
+
+        def settle(error: BaseException | None) -> None:
+            if done.done():  # cancelled: its screen, or the app, has gone
+                return
+            if error is None:
+                done.set_result(None)
+            else:
+                done.set_exception(error)
+
+        def read() -> None:
+            error: BaseException | None = None
+            try:
+                self._read()
+            except Exception as exc:  # the worker's to report, as for any worker
+                error = exc
+            try:
+                loop.call_soon_threadsafe(settle, error)
+            except RuntimeError:
+                pass  # the loop is closed: the program is on its way out
+
+        threading.Thread(target=read, name=self.name, daemon=True).start()
+        await done
+
+
+def read(node: DOMNode, function: Callable[[], object], group: str) -> None:
+    """Start ``function`` as a ``Reader`` of ``node``."""
+    node.workers.add_worker(Reader(node, function, group), exclusive=False)
+
+
+class _ClosesOnce(Screen):
+    """A screen that a key or a click closes. Two of them can be on their
+    way before the first is handled (a key that repeats, a second press
+    because the first seemed lost), and closing twice would take the screen
+    below away too."""
+
+    _gone = False  # closed, or closing
+
+    def close(self) -> None:
+        if self._gone or self.app.screen is not self:
+            return
+        self._gone = True
+        self.dismiss()
+
+
+class SafeInput(Input):
+    """An ``Input`` that draws its value through ``view.clean``: whatever is
+    put into it (a paste, a name read from a disk) reaches the terminal as
+    text, never as an escape sequence. The value itself is left as it is.
+
+    Textual's ``Input`` draws ``_value`` and measures with
+    ``_position_to_cell``; these two are the whole of what it shows."""
+
+    @property
+    def _value(self) -> Text:
+        return Text(view.clean(self.value), no_wrap=True, overflow="ignore", end="")
+
+    def _position_to_cell(self, position: int) -> int:
+        return cell_len(view.clean(self.value[:position]))
+
+    def show_end(self) -> None:
+        """Put the cursor after the last character and scroll to it. For a
+        value that was set while the input had no width yet: scrolling to
+        the cursor did nothing then."""
+        self.cursor_position = len(self.value)
+        self.scroll_to(x=self.max_scroll_x, animate=False, force=True)
 
 
 # --- the session list ---------------------------------------------------------
@@ -363,7 +456,7 @@ class MainScreen(_UiCalls, Screen):
         self.tab_index = 0
         self.tab_name: str | None = None
         self.needle = ""
-        self.home = os.path.expanduser("~")  # what ``~`` in the folder input means
+        self.home = self._engine_home()  # what ``~`` in the folder input means
         self.mode = "list"  # "list", or what has the keys: a table of view.KEYMAPS
         self._question: Question | None = None  # what the prompt or the folder input asks
         # Counts key presses and clicks: what a worker answers to a question
@@ -387,6 +480,16 @@ class MainScreen(_UiCalls, Screen):
         self._verdicts: dict[str, view.Verdict] = {}
         self._verdict_pending: set[str] = set()
         self._verdict_timer: Timer | None = None
+        # The exit status, once asked to quit while an import or an undo runs.
+        self._leaving: int | None = None
+
+    def _engine_home(self) -> str:
+        """The engine's home (``AGENT_SESSIONS_HOME`` can move it); this
+        user's own for an engine that does not say."""
+        try:
+            return str(self.engine.home())
+        except Exception:
+            return os.path.expanduser("~")
 
     # --- widgets ---------------------------------------------------------
 
@@ -414,10 +517,10 @@ class MainScreen(_UiCalls, Screen):
         with Horizontal(id="folderbar"):
             yield Static("", id="folder-label", markup=False)
             # The text it opens with is a start to type after, not to replace.
-            yield Input(id="folder", select_on_focus=False)
+            yield SafeInput(id="folder", select_on_focus=False)
         with Horizontal(id="filterbar"):
             yield Static("/", id="filter-label", markup=False)
-            yield Input(id="filter", placeholder="title, project or folder")
+            yield SafeInput(id="filter", placeholder="title, project or folder")
         yield Static("", id="hints", markup=False)
 
     @property
@@ -425,12 +528,12 @@ class MainScreen(_UiCalls, Screen):
         return self.query_one("#list", SessionList)
 
     @property
-    def filter_input(self) -> Input:
-        return self.query_one("#filter", Input)
+    def filter_input(self) -> SafeInput:
+        return self.query_one("#filter", SafeInput)
 
     @property
-    def folder_input(self) -> Input:
-        return self.query_one("#folder", Input)
+    def folder_input(self) -> SafeInput:
+        return self.query_one("#folder", SafeInput)
 
     def on_mount(self) -> None:
         self.query_one("#prompt").display = False
@@ -440,21 +543,53 @@ class MainScreen(_UiCalls, Screen):
         self._apply_layout()
         self.set_interval(CLOCK_INTERVAL, self._tick)
         self._set_activity(f"loading{view.ELLIPSIS}")
-        self._work(self._load_thread, group="load")
+        self._read(self._load_thread, group="load")
 
     def on_unmount(self) -> None:
-        # A scan in a thread cannot be killed; ask it to stop so quitting
-        # does not wait for a walk of every drive.
+        self._stop_reading()
+
+    def _stop_reading(self) -> None:
+        """Ask a scan, and the scan after a mount, to stop: a thread cannot
+        be killed, and the next thing it finds out should be that nobody is
+        waiting."""
         for job in (self._scan, self._mount):
             if job is not None:
                 job["cancel"].set()
 
-    def _work(
-        self, function: Callable[..., object], *args: object, group: str = "default"
-    ) -> Worker[object]:
-        return self.run_worker(
-            partial(function, *args), thread=True, group=group, exit_on_error=False
-        )
+    def _read(self, function: Callable[..., object], *args: object, group: str) -> None:
+        """Start an engine call that only reads (``Reader``)."""
+        read(self, partial(function, *args), group)
+
+    def _write(self, function: Callable[..., object], *args: object, group: str) -> None:
+        """Start an engine call that changes a store: an import, an undo.
+        The process does not end before it has."""
+        self.run_worker(partial(function, *args), thread=True, group=group, exit_on_error=False)
+
+    # --- leaving ---------------------------------------------------------
+
+    def leave(self, return_code: int = 0) -> None:
+        """Quit (``q``, Ctrl-C, SIGTERM, SIGHUP). At once when nothing is
+        being changed: every read is asked to stop and none is waited for.
+        An import or an undo under way is finished, or rolled back, first:
+        the status line says so, and until then no key does anything."""
+        if self._leaving is not None:
+            return
+        self._stop_reading()
+        writing = "import" if self._importing else "undo" if self._undoing else None
+        if writing is None:
+            self.app.exit(return_code=return_code)
+            return
+        self._leaving = return_code
+        self._close_prompt()
+        self.pop_until_active()  # the pager or the help would hide the status line
+        self.set_message(view.finishing_text(writing))
+
+    def _left(self) -> bool:
+        """After an import or an undo: go, when quitting waited for it."""
+        if self._leaving is None:
+            return False
+        self.app.exit(return_code=self._leaving)
+        return True
 
     def _tick(self) -> None:
         self.session_list.refresh()
@@ -590,12 +725,6 @@ class MainScreen(_UiCalls, Screen):
         when none of those is listed."""
         provider = self.tab_name or view.ALL
         rows = view.filter_rows(self.snapshot.rows, provider, self.needle)
-        if not self.loaded:
-            empty = ""
-        elif self.needle.strip():
-            empty = f'No sessions match "{self.needle.strip()}"'
-        else:
-            empty = "No sessions found"
         current = self.session_list.current
         key = select_key or (
             current.key
@@ -608,7 +737,7 @@ class MainScreen(_UiCalls, Screen):
             show_provider=provider == view.ALL,
             provider_labels=dict(self.snapshot.providers),
             widths=view.column_widths(rows, dict(self.snapshot.providers)),
-            empty_text=empty,
+            empty_text=view.empty_text(self.loaded, self.needle),
             from_top=from_top,
         )
 
@@ -631,6 +760,8 @@ class MainScreen(_UiCalls, Screen):
     def _row_pressed(self, message: SessionList.Pressed) -> None:
         """A click selects (the list has done that); a double-click is Enter.
         Either takes a pending prompt away first."""
+        if self._leaving is not None:
+            return
         self._close_prompt()
         self.clear_message()
         current = self.session_list.current
@@ -677,7 +808,7 @@ class MainScreen(_UiCalls, Screen):
         if session is None or key in self._verdict_pending:
             return
         self._verdict_pending.add(key)
-        self._work(self._verdict_thread, key, session, self.snapshot.index, group="verdict")
+        self._read(self._verdict_thread, key, session, self.snapshot.index, group="verdict")
 
     def _verdict_thread(self, key: str, session: Session, index: Index | None) -> None:
         try:
@@ -737,6 +868,12 @@ class MainScreen(_UiCalls, Screen):
     # --- keys ------------------------------------------------------------
 
     def on_key(self, event: events.Key) -> None:
+        if self.app.screen is not self:
+            return  # on its way when the pager or the help came up: theirs, or nobody's
+        if self._leaving is not None:
+            event.stop()
+            event.prevent_default()
+            return
         mode = "filter" if self.focused is self.filter_input else self.mode
         action = view.key_action(mode, event.key, event.character)
         if action is None:
@@ -795,10 +932,16 @@ class MainScreen(_UiCalls, Screen):
             self.select_tab(index)
 
     def do_quit(self, event: events.Key | None = None) -> None:
-        self.app.exit(return_code=0)
+        self.leave()
 
     def do_help(self, event: events.Key | None = None) -> None:
-        self.app.push_screen(HelpScreen())
+        self._show(HelpScreen())
+
+    def _show(self, screen: Screen) -> None:
+        """Put the help or the pager over this screen. Nothing when this
+        screen is not the one on top: one of them is open already."""
+        if self.app.screen is self:
+            self.app.push_screen(screen)
 
     def do_escape(self, event: events.Key | None = None) -> None:
         """Esc: stop a full rescan, else clear the filter, else stop a quick
@@ -861,7 +1004,7 @@ class MainScreen(_UiCalls, Screen):
         """A question about the selected session."""
         row = self.session_list.current
         where = row.where if row is not None and row.key == session.key else ""
-        return Question(session.key, view.clean(session.title) or session.id, where, **facts)
+        return Question(session.key, view.shown_title(session.title, session.id), where, **facts)
 
     def _open_prompt(self, mode: str, question: Question) -> None:
         """Show a prompt; ``mode`` names its keys (``view.KEYMAPS``)."""
@@ -988,13 +1131,19 @@ class MainScreen(_UiCalls, Screen):
         self.mode = "folder"
         self._question = question
         text = (question.folder if purpose == "continue" else "") or view.FOLDER_START
+        if not view.showable(text):
+            # Never into the input: it would be drawn, and typed after, as it is.
+            text = view.FOLDER_START
+            self.set_message(view.FOLDER_UNSHOWABLE)
         self._completed = text
         self.query_one("#folder-label", Static).update(view.FOLDER_LABELS[purpose])
         box = self.folder_input
         box.value = text
-        box.cursor_position = len(text)
         self.query_one("#folderbar").display = True
         box.focus()
+        # The bar has a width only once it is laid out: a long folder shows
+        # its end, where typing goes on, from then.
+        self.call_after_refresh(box.show_end)
 
     def _hide_folder(self) -> None:
         bar = self.query_one("#folderbar")
@@ -1018,7 +1167,7 @@ class MainScreen(_UiCalls, Screen):
 
     def do_folder_complete(self, event: events.Key | None = None) -> None:
         """Tab: complete the folder's last name. The listing is a worker's."""
-        self._work(self._complete_thread, self._asked, self.folder_input.value, group="folder")
+        self._read(self._complete_thread, self._asked, self.folder_input.value, group="folder")
 
     def _complete_thread(self, asked: int, text: str) -> None:
         try:
@@ -1037,20 +1186,24 @@ class MainScreen(_UiCalls, Screen):
         self._completed = completion.text
         box.value = completion.text
         box.cursor_position = len(completion.text)
-        if len(completion.matches) > 1:
-            self.set_message(view.completions_text(completion.matches))
+        said = view.completion_message(completion)
+        if said:
+            self.set_message(said)
 
     def do_folder_accept(self, event: events.Key | None = None) -> None:
         """Enter: take the folder when it is one. Looked at in a worker."""
         text = self.folder_input.value
         path = view.expand_folder(text.strip(), self.home)
-        self._work(self._folder_thread, self._asked, text, path, group="folder")
+        self._read(self._folder_thread, self._asked, text, path, group="folder")
 
     def _folder_thread(self, asked: int, text: str, path: str) -> None:
         folder = ""
         try:
-            if path and os.path.isabs(path) and os.path.isdir(path):
-                folder = os.path.normpath(path)
+            # One spelling first (``a/link/../b`` is ``a/b``): what is looked
+            # at here is the path that is used afterwards.
+            wanted = os.path.normpath(path) if path and os.path.isabs(path) else ""
+            if wanted and os.path.isdir(wanted):
+                folder = wanted
         except (OSError, ValueError):  # a NUL in the text
             folder = ""
         self._ui(self._folder_known, asked, text, path, folder)
@@ -1087,14 +1240,7 @@ class MainScreen(_UiCalls, Screen):
         elif session.imported_as:
             self._start_open(session.imported_as, session.title, stay)
         elif session.offline:
-            self._work(
-                self._volume_thread,
-                self._asked,
-                session.key,
-                session.mount,
-                self.snapshot.index,
-                group="volume",
-            )
+            self._ask_volume(session, at_once=False)
         else:
             self._ask_import(session, "prompt", stay)
 
@@ -1105,7 +1251,7 @@ class MainScreen(_UiCalls, Screen):
         """For a session whose drive is not mounted: ask the engine to
         ``view`` or ``import`` it and show what it answers in the status
         line. Nothing is started: the engine refuses both."""
-        self._work(self._refusal_thread, session, what, self.snapshot.index, group="refusal")
+        self._read(self._refusal_thread, session, what, self.snapshot.index, group="refusal")
 
     def _refusal_thread(self, session: Session, what: str, index: Index | None) -> None:
         reason = ""
@@ -1121,25 +1267,44 @@ class MainScreen(_UiCalls, Screen):
 
     # --- mount -------------------------------------------------------------
 
-    def _volume_thread(self, asked: int, key: str, mount: str, index: Index | None) -> None:
-        """Enter on a session whose drive is not mounted: is the drive there
-        to be mounted at all?"""
+    def _ask_volume(self, session: Session, at_once: bool) -> None:
+        """Enter or ``m`` on a session whose drive is not mounted: is the
+        drive there to be mounted at all? Then the prompt (Enter), or the
+        mount ``at_once`` (``m``)."""
+        self._read(
+            self._volume_thread,
+            self._asked,
+            session.key,
+            session.mount,
+            self.snapshot.index,
+            at_once,
+            group="volume",
+        )
+
+    def _volume_thread(
+        self, asked: int, key: str, mount: str, index: Index | None, at_once: bool
+    ) -> None:
         try:
             state = view.volume_state(self.engine.volumes(index=index), mount)
         except Exception as exc:
-            self._ui(self._volume_known, asked, key, None, view.error_text(exc))
+            self._ui(self._volume_known, asked, key, None, view.error_text(exc), at_once)
             return
-        self._ui(self._volume_known, asked, key, state, None)
+        self._ui(self._volume_known, asked, key, state, None, at_once)
 
-    def _volume_known(self, asked: int, key: str, state: str | None, error: str | None) -> None:
+    def _volume_known(
+        self, asked: int, key: str, state: str | None, error: str | None, at_once: bool
+    ) -> None:
         session = self._still_wanted(asked, key)
         if session is None:
             return
         question = self._about(session)
+        drive = view.drive_of(question.where)
         if error:
             self.set_message(error, error=True)
         elif state == view.VOLUME_ABSENT:
-            self.set_message(view.not_attached_text(view.drive_of(question.where)), error=True)
+            self.set_message(view.not_attached_text(drive), error=True)
+        elif at_once:
+            self._start_mount(session, drive)
         else:
             self._open_prompt("mount", question)
 
@@ -1150,8 +1315,10 @@ class MainScreen(_UiCalls, Screen):
             return
         if not session.offline:
             self.set_message(view.DRIVE_IS_MOUNTED)
-            return
-        self._start_mount(session, view.drive_of(self._about(session).where))
+        elif self._mount is not None:  # said at once, without asking about the drive again
+            self.set_message(view.already_mounting_text(self._mount["drive"]))
+        else:
+            self._ask_volume(session, at_once=True)
 
     def _job(self) -> str | None:
         """The job under way that ends in a scan, if any: one at a time."""
@@ -1174,7 +1341,7 @@ class MainScreen(_UiCalls, Screen):
         cancel = threading.Event()
         self._mount = {"drive": drive, "cancel": cancel, "scanning": False}
         self._set_activity(view.mount_activity_text(drive))
-        self._work(self._mount_thread, session.mount, drive, cancel, group="mount")
+        self._read(self._mount_thread, session.mount, drive, cancel, group="mount")
 
     def _mount_thread(self, mount: str, drive: str, cancel: threading.Event) -> None:
         last = [0.0]
@@ -1212,10 +1379,10 @@ class MainScreen(_UiCalls, Screen):
         if self._opening:
             return
         self._opening = True
-        self._work(
+        self._read(
             self._open_thread,
             key,
-            view.clean(title) or key,
+            view.shown_title(title, key),
             stay,
             self.snapshot.index,
             group="open",
@@ -1283,10 +1450,10 @@ class MainScreen(_UiCalls, Screen):
             return
         self._importing = True
         self._set_activity(view.import_progress_text(0, 0))
-        self._work(
+        self._write(
             self._import_thread,
             key,
-            view.clean(session.title) or key,
+            view.shown_title(session.title, key),
             then_open,
             stay,
             target,
@@ -1321,6 +1488,11 @@ class MainScreen(_UiCalls, Screen):
             self._ui(self._import_done, title, None, None, False, None, view.error_text(exc), stay)
             return
         new_key = getattr(copy, "key", None)
+        if self._leaving is not None:
+            # Asked to quit meanwhile: the copy is in place, and nothing more
+            # is read or started.
+            self._ui(self._import_done, title, new_key or key, None, False, None, None, stay)
+            return
         snapshot: Snapshot | None = None
         opened = False
         note: str | None = None
@@ -1353,6 +1525,8 @@ class MainScreen(_UiCalls, Screen):
         (reading the index again, or the launch)."""
         self._importing = False
         self._set_activity("")
+        if self._left():
+            return
         if snapshot is not None:
             await self._apply_snapshot(snapshot, select_key=new_key)
         if new_key is None:
@@ -1373,7 +1547,7 @@ class MainScreen(_UiCalls, Screen):
         every refusal comes from there, before a question is asked."""
         session = self.current_session()
         if session is not None:
-            self._work(
+            self._read(
                 self._undo_plan_thread,
                 self._asked,
                 session.key,
@@ -1422,7 +1596,7 @@ class MainScreen(_UiCalls, Screen):
             self.set_message(view.busy_text(running, "undo"))
             return
         self._undoing = True
-        self._work(self._undo_thread, key, force, self.snapshot.index, group="undo")
+        self._write(self._undo_thread, key, force, self.snapshot.index, group="undo")
 
     def _undo_thread(self, key: str, force: bool, index: Index | None) -> None:
         try:
@@ -1433,11 +1607,12 @@ class MainScreen(_UiCalls, Screen):
         files, _size, left = view.undo_counts(report)
         snapshot: Snapshot | None = None
         error: str | None = None
-        try:
-            # The engine has scanned; read the index again to list what is left.
-            snapshot = build_snapshot(self.engine)
-        except Exception as exc:
-            error = view.error_text(exc)
+        if self._leaving is None:  # asked to quit meanwhile: nothing more is read
+            try:
+                # The engine has scanned; read the index again to list what is left.
+                snapshot = build_snapshot(self.engine)
+            except Exception as exc:
+                error = view.error_text(exc)
         self._ui(self._undo_done, view.undo_message(files, left), snapshot, error)
 
     async def _undo_done(
@@ -1447,6 +1622,8 @@ class MainScreen(_UiCalls, Screen):
         why); otherwise the copy is gone and ``error`` is what went wrong
         when the index was read again."""
         self._undoing = False
+        if self._left():
+            return
         if snapshot is not None:
             await self._apply_snapshot(snapshot)
         if removed is None:
@@ -1465,7 +1642,7 @@ class MainScreen(_UiCalls, Screen):
             self._start_continue(session.key)
 
     def _start_continue(self, key: str) -> None:
-        self._work(
+        self._read(
             self._continue_options_thread, self._asked, key, self.snapshot.index, group="continue"
         )
 
@@ -1524,7 +1701,7 @@ class MainScreen(_UiCalls, Screen):
         # The transcript is exported before the tool starts: said meanwhile.
         self._starting = view.starting_text(label)
         self._render_status()
-        self._work(
+        self._read(
             self._continue_thread,
             question.key,
             name,
@@ -1567,11 +1744,8 @@ class MainScreen(_UiCalls, Screen):
         if session.offline:
             self._start_refusal(session, "view")
             return
-        self.app.push_screen(
-            TranscriptScreen(
-                self.engine, key, view.clean(session.title) or key, self.snapshot.index, tz=self.tz
-            )
-        )
+        title = view.shown_title(session.title, key)
+        self._show(TranscriptScreen(self.engine, key, title, self.snapshot.index, tz=self.tz))
 
     # --- load and scan -----------------------------------------------------
 
@@ -1608,7 +1782,7 @@ class MainScreen(_UiCalls, Screen):
         cancel = threading.Event()
         self._scan = {"deep": bool(deep), "cancel": cancel}
         self._set_activity(f"scanning{view.ELLIPSIS}")
-        self._work(self._scan_thread, deep, cancel, announce, group="scan")
+        self._read(self._scan_thread, deep, cancel, announce, group="scan")
 
     def _cancel_scan(self) -> None:
         if self._scan is not None:
@@ -1648,7 +1822,7 @@ class MainScreen(_UiCalls, Screen):
 # --- help overlay -------------------------------------------------------------------
 
 
-class HelpScreen(ModalScreen):
+class HelpScreen(_ClosesOnce, ModalScreen):
     """The key help; ``?``, ``q``, Esc, Enter or a click closes it."""
 
     def compose(self) -> ComposeResult:
@@ -1678,7 +1852,7 @@ class HelpScreen(ModalScreen):
         action = view.key_action("help", event.key, event.character)
         box = self.query_one("#help")
         if action == "close":
-            self.dismiss()
+            self.close()
         elif action == "up":
             box.scroll_up(animate=False)
         elif action == "down":
@@ -1689,7 +1863,7 @@ class HelpScreen(ModalScreen):
             box.scroll_page_down(animate=False)
 
     def on_click(self, event: events.Click) -> None:
-        self.dismiss()
+        self.close()
 
 
 # --- transcript pager ----------------------------------------------------------------
@@ -1697,8 +1871,13 @@ class HelpScreen(ModalScreen):
 
 class TranscriptView(ScrollView, can_focus=True):
     """A transcript drawn line by line. Turns arrive in batches and are
-    wrapped a slice at a time, so neither a long session nor a resize holds
-    the keyboard up."""
+    wrapped a slice at a time, each slice from a timer of its own: a key is
+    answered between two slices, however long the session is.
+
+    Every turn keeps the lines it was last wrapped into. After a resize the
+    turns on screen are wrapped for the new width first, then the others,
+    down and up from there; until its turn comes, a turn shows the lines it
+    had, cut to the new width."""
 
     COMPONENT_CLASSES: ClassVar[set[str]] = {
         "transcript--role-user",
@@ -1713,17 +1892,50 @@ class TranscriptView(ScrollView, can_focus=True):
         super().__init__(**kwargs)
         self.tz = tz
         self.turns: list[tuple] = []
-        self.lines: list[tuple[str, str]] = []
-        self._starts: list[int] = []  # first line of every wrapped turn
+        self.pending = 0  # turns not wrapped for the current width yet
+        self._blocks: list[list[tuple[str, str]]] = []  # the lines of every turn
+        self._wrapped_for: list[int] = []  # the width each turn's lines are for; 0: none yet
+        self._starts: list[int] = []  # first line of every turn
+        self._height = 0  # lines in all
         self._width = 0
-        self._anchor: int | None = None  # turn to scroll back to after a re-wrap
-        self._wrapping = False
+        self._down = 0  # the next turn to wrap going down from the top of the view
+        self._up = -1  # and going up
+        self._ahead = 0  # lines wrapped below the top of the view since the width changed
+        self._upward = False  # whether the next turn is one above, when both ways are open
+        self._timer: Timer | None = None
+        self._stopped = False
         self._rewrap_due = False
 
+    @property
+    def lines(self) -> list[tuple[str, str]]:
+        """Every line there is, as ``(kind, text)``."""
+        return [line for block in self._blocks for line in block]
+
+    @property
+    def settled(self) -> bool:
+        """Whether every turn is wrapped for the width the view has now."""
+        return not self.pending and self._width == self.size.width
+
     def add_turns(self, turns: Iterable[tuple]) -> None:
+        before = len(self.turns)
         self.turns.extend(turns)
-        if not self._wrapping:
+        added = len(self.turns) - before
+        self._blocks.extend([] for _ in range(added))
+        self._wrapped_for.extend([0] * added)
+        self._starts.extend([self._height] * added)
+        self.pending += added
+        if self._timer is None:
             self._wrap_some()
+
+    def stop(self) -> None:
+        """No more wrapping: the pager is closing."""
+        self._stopped = True
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+
+    def on_unmount(self) -> None:
+        self.stop()
 
     def on_resize(self, event: events.Resize) -> None:
         self._rewrap()
@@ -1735,55 +1947,97 @@ class TranscriptView(ScrollView, can_focus=True):
             self.call_later(self._rewrap)
         return super().render_lines(crop)
 
+    def _top_turn(self) -> int:
+        """The turn the first line on screen belongs to; -1 without turns.
+        Where no line is yet, the first turn that will put one there."""
+        y = int(self.scroll_offset.y)
+        if y < self._height:
+            return bisect_right(self._starts, y) - 1
+        return min(bisect_left(self._starts, y), len(self.turns) - 1)
+
     def _rewrap(self) -> None:
-        """Wrap everything again when the width has changed, and come back
-        to the turn that was at the top."""
+        """The width has changed: every turn is to be wrapped again, the
+        ones on screen first."""
         self._rewrap_due = False
         width = self.size.width
         if width == self._width:
             return
-        if self._starts and self._anchor is None:
-            top = int(self.scroll_offset.y)
-            self._anchor = max(bisect_right(self._starts, top) - 1, 0)
         self._width = width
-        self.lines, self._starts = [], []
-        self.virtual_size = Size(width, 0)
-        if not self._wrapping:
+        self.pending = sum(1 for wrapped_for in self._wrapped_for if wrapped_for != width)
+        top = max(self._top_turn(), 0)
+        self._down, self._up, self._ahead, self._upward = top, top - 1, 0, False
+        if self._timer is None:
             self._wrap_some()
 
+    def _next_turn(self) -> tuple[int, bool]:
+        """The turn to wrap next, and whether it lies above the place the
+        wrapping started from: down from there until a screenful is done,
+        then up and down in turn."""
+        width, count = self._width, len(self.turns)
+        while self._down < count and self._wrapped_for[self._down] == width:
+            self._down += 1
+        while self._up >= 0 and self._wrapped_for[self._up] == width:
+            self._up -= 1
+        below, above = self._down < count, self._up >= 0
+        upward = above and (not below or (self._ahead >= self.size.height and self._upward))
+        self._upward = not upward
+        if upward:
+            self._up -= 1
+            return self._up + 1, True
+        self._down += 1
+        return self._down - 1, False
+
     def _wrap_some(self) -> None:
-        """Wrap pending turns for ``PAGER_SLICE`` seconds, then come back."""
-        self._wrapping = False
-        if self._width <= 0:
+        """Wrap turns for ``PAGER_SLICE`` seconds; a timer comes back for
+        the rest, so that the keys waiting are handled first. The line at
+        the top of the view stays the same line of the same turn."""
+        self._timer = None
+        if self._stopped or self._width <= 0 or not self.pending:
             return
+        y = int(self.scroll_offset.y)
+        top = self._top_turn()
+        inside = y - self._starts[top] if top >= 0 else 0
+        before = len(self._blocks[top]) if top >= 0 else 0
         deadline = time.monotonic() + PAGER_SLICE
-        while len(self._starts) < len(self.turns):
-            role, text, ts = self.turns[len(self._starts)]
-            self._starts.append(len(self.lines))
-            self.lines.extend(view.transcript_lines(role, text, ts, self._width, self.tz))
+        while self.pending:
+            index, above = self._next_turn()
+            role, text, ts = self.turns[index]
+            self._blocks[index] = view.transcript_lines(role, text, ts, self._width, self.tz)
+            self._wrapped_for[index] = self._width
+            self.pending -= 1
+            if not above:
+                self._ahead += len(self._blocks[index])
             if time.monotonic() > deadline:
                 break
-        self.virtual_size = Size(self._width, len(self.lines))
-        if self._anchor is not None and self._anchor < len(self._starts):
-            self.scroll_to(y=self._starts[self._anchor], animate=False, force=True)
-            self._anchor = None
+        self._starts, self._height = [], 0
+        for block in self._blocks:
+            self._starts.append(self._height)
+            self._height += len(block)
+        self.virtual_size = Size(self._width, self._height)
+        if top >= 0:
+            after = len(self._blocks[top])
+            if after != before:  # wrapped again itself: as far into it as before
+                inside = inside * after // before if before else 0
+            target = self._starts[top] + min(inside, max(after - 1, 0))
+            if target != y:
+                self.scroll_to(y=target, animate=False, force=True)
         self.refresh()
-        if len(self._starts) < len(self.turns):
-            self._wrapping = True
-            self.call_later(self._wrap_some)
+        if self.pending:
+            self._timer = self.set_timer(PAGER_PAUSE, self._wrap_some)
 
     def render_line(self, y: int) -> Strip:
         width = self.size.width
         index = y + int(self.scroll_offset.y)
-        if not 0 <= index < len(self.lines):
+        if not 0 <= index < self._height:
             return Strip.blank(width, self.rich_style)
-        kind, text = self.lines[index]
+        turn = bisect_right(self._starts, index) - 1
+        kind, text = self._blocks[turn][index - self._starts[turn]]
         style = self.get_component_rich_style(f"transcript--{kind}")
         return Strip([Segment(text, style)]).adjust_cell_length(width, self.rich_style)
 
 
-class TranscriptScreen(_UiCalls, Screen):
-    """The built-in pager: one session's transcript, read in a worker."""
+class TranscriptScreen(_UiCalls, _ClosesOnce):
+    """The built-in pager: one session's transcript, read in a thread."""
 
     def __init__(
         self,
@@ -1803,7 +2057,6 @@ class TranscriptScreen(_UiCalls, Screen):
         self.max_turns = view.PAGER_MAX_TURNS if max_turns is None else max_turns
         self.turn_count = 0
         self.reading = True
-        self._gone = False
 
     def compose(self) -> ComposeResult:
         yield Static(self.session_title, id="pager-title", markup=False)
@@ -1819,10 +2072,10 @@ class TranscriptScreen(_UiCalls, Screen):
     def on_mount(self) -> None:
         self.body.focus()
         self._render_status()
-        self.run_worker(self._load_thread, thread=True, group="transcript", exit_on_error=False)
+        read(self, self._load_thread, "transcript")
 
     def on_unmount(self) -> None:
-        self._gone = True
+        self._gone = True  # the reader stops at its next turn
 
     def _render_status(self, capped: bool = False, error: str | None = None) -> None:
         status = self.query_one("#pager-status", Static)
@@ -1830,14 +2083,13 @@ class TranscriptScreen(_UiCalls, Screen):
         status.set_class(bool(error), "-error")
 
     def _load_thread(self) -> None:
-        worker = get_current_worker()
         batch: list[tuple] = []
         count, last = 0, time.monotonic()
         capped = False
         error: str | None = None
         try:
             for turn in self.engine.transcript(self.key, index=self.index):
-                if self._gone or worker.is_cancelled:
+                if self._gone:
                     return
                 if count >= self.max_turns:
                     capped = True
@@ -1871,8 +2123,8 @@ class TranscriptScreen(_UiCalls, Screen):
         event.prevent_default()
         body = self.body
         if action == "close":
-            self._gone = True
-            self.dismiss()
+            body.stop()
+            self.close()
         elif action == "up":
             body.scroll_up(animate=False)
         elif action == "down":
@@ -1917,6 +2169,19 @@ class SessionsApp(App):
     def get_default_screen(self) -> Screen:
         return MainScreen(self.engine, clock=self.clock, tz=self.tz)
 
+    def leave(self, return_code: int = 0) -> None:
+        """Quit, from whichever screen: what is under way decides how
+        (``MainScreen.leave``)."""
+        stack = self.screen_stack
+        if stack and isinstance(stack[0], MainScreen):
+            stack[0].leave(return_code)
+        else:
+            self.exit(return_code=return_code)
+
+    async def action_quit(self) -> None:
+        """Ctrl-C."""
+        self.leave()
+
     def on_mount(self) -> None:
         """Leave through the front door on SIGTERM and SIGHUP too, so the
         terminal is put back as it was. (Where the platform or the thread
@@ -1929,7 +2194,7 @@ class SessionsApp(App):
             if number is None:
                 continue
             try:
-                loop.add_signal_handler(number, partial(self.exit, return_code=128 + number))
+                loop.add_signal_handler(number, partial(self.leave, 128 + number))
             except (NotImplementedError, RuntimeError, ValueError):
                 continue
             self._signals.append(number)
@@ -1944,6 +2209,8 @@ class SessionsApp(App):
 __all__ = [
     "HelpScreen",
     "MainScreen",
+    "Reader",
+    "SafeInput",
     "SessionList",
     "SessionsApp",
     "Snapshot",

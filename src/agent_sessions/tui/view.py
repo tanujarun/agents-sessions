@@ -9,12 +9,13 @@ value: those are in ``app.tcss``.
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import unicodedata
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, tzinfo
+from datetime import UTC, datetime, timedelta, tzinfo
 from typing import Any, Protocol
 
 from .. import textsafe
@@ -77,6 +78,7 @@ class Verdict:
 # --- display width ----------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=4096)  # a long transcript asks about the same few characters
 def char_width(ch: str) -> int:
     """Terminal cells one character takes: 0 for combining marks, joiners and
     control characters, 2 for wide (CJK, most emoji), else 1."""
@@ -94,14 +96,28 @@ def text_width(text: str) -> int:
     """Terminal cells a string takes."""
     if text.isascii():
         return len(text)
-    return sum(char_width(ch) for ch in text)
+    return sum(map(char_width, text))
+
+
+_SURROGATES = dict.fromkeys(range(0xD800, 0xE000), textsafe.REPLACEMENT)
 
 
 def clean(text: object) -> str:
     """One printable line: control characters (newline, tab, escape) and the
     characters that reorder text become spaces, so no value can break a row
-    or move the cursor. The rule itself is ``textsafe.clean``."""
-    return textsafe.clean(text)
+    or move the cursor. The rule itself is ``textsafe.clean``.
+
+    A lone surrogate (what a byte that is not UTF-8 is read as, and what
+    JSON can spell) becomes a space as well: no terminal can be sent one,
+    and it is drawn as six characters in a place measured as one cell."""
+    text = textsafe.clean(text)
+    return text if text.isprintable() else text.translate(_SURROGATES)
+
+
+def showable(text: object) -> bool:
+    """Whether a value can be shown as it is: ``clean`` would change
+    nothing in it."""
+    return isinstance(text, str) and clean(text) == text
 
 
 def _take(text: str, width: int) -> str:
@@ -136,27 +152,40 @@ def pad(text: str, width: int, align: str = "left") -> str:
 # --- time -------------------------------------------------------------------
 
 
+# The times that can be placed: the whole range of ``datetime`` but its two
+# ends, where a shift into another zone no longer fits.
+_EDGE = timedelta(days=2)
+_FIRST = datetime.min.replace(tzinfo=UTC) + _EDGE
+_LAST = datetime.max.replace(tzinfo=UTC) - _EDGE
+
+
 def parse_stamp(stamp: object) -> datetime | None:
-    """An ISO 8601 time as an aware datetime; None when absent or malformed."""
+    """An ISO 8601 time as an aware datetime; None when it is absent,
+    malformed, or cannot be placed: one without a zone (which moment it
+    means is not known), or one at the very ends of the calendar."""
     if not stamp or not isinstance(stamp, str):
         return None
     try:
         moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-    except ValueError:
+        if moment.utcoffset() is None or not _FIRST <= moment <= _LAST:
+            return None
+    except (ValueError, OverflowError):
         return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=UTC)
     return moment
 
 
 def age_text(stamp: object, now: datetime) -> str:
     """``now``, ``5m``, ``3h``, ``2d``, ``3w``, ``2mo``, ``1y``. The steps are
     the ones `agent-sessions list` prints: seconds under a minute are ``now``,
-    days up to 13, weeks up to 59 days, months up to a year."""
+    days up to 13, weeks up to 59 days, months up to a year. ``-`` for a time
+    that is unknown or cannot be placed (``parse_stamp``)."""
     then = parse_stamp(stamp)
     if then is None:
         return EMPTY
-    seconds = max((now - then).total_seconds(), 0)
+    try:
+        seconds = max((now - then).total_seconds(), 0)
+    except (TypeError, OverflowError):  # a ``now`` without a zone, or out of range
+        return EMPTY
     days = int(seconds // 86400)
     if seconds < 60:
         return "now"
@@ -174,11 +203,17 @@ def age_text(stamp: object, now: datetime) -> str:
 
 
 def local_time(stamp: object, tz: tzinfo | None = None) -> str:
-    """``2026-10-10 17:58`` in the local zone (or ``tz``); ``-`` when unknown."""
+    """``2026-10-10 17:58`` in the local zone (or ``tz``); ``-`` when
+    unknown, and for a time the platform cannot turn into a local one."""
     moment = parse_stamp(stamp)
     if moment is None:
         return EMPTY
-    return moment.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+    try:
+        local = moment.astimezone(tz)
+    except (OverflowError, OSError, ValueError):
+        return EMPTY
+    # Not strftime: its %Y gives "1", not "0001", on some Pythons.
+    return f"{local.year:04d}-{local.month:02d}-{local.day:02d} {local.hour:02d}:{local.minute:02d}"
 
 
 # --- rows -------------------------------------------------------------------
@@ -224,10 +259,30 @@ def make_row(session: SessionLike, where: str) -> Row:
     )
 
 
+def provider_label(provider: str, labels: Mapping[str, str]) -> str:
+    """What the PROVIDER column says: the provider's label, or its name
+    when the engine gave none."""
+    return clean(labels.get(provider) or provider)
+
+
+def shown_title(title: object, fallback: object) -> str:
+    """A session's title for a prompt, a message or the pager; ``fallback``
+    (its id or its key) when it has none."""
+    return clean(title) or clean(fallback)
+
+
 def matches(row: Row, needle: str) -> bool:
     """Substring match over title, project and cwd, ignoring case."""
     needle = needle.strip().casefold()
     return not needle or needle in row.haystack
+
+
+def empty_text(loaded: bool, needle: str) -> str:
+    """The one line in the middle of a list with no rows."""
+    if not loaded:
+        return ""
+    needle = clean(needle).strip()
+    return f'No sessions match "{needle}"' if needle else "No sessions found"
 
 
 def filter_rows(rows: Iterable[Row], provider: str | None = None, needle: str = "") -> list[Row]:
@@ -298,7 +353,7 @@ def build_tabs(providers: Iterable[tuple[str, str]], rows: Sequence[Row]) -> lis
         counts[row.provider] = counts.get(row.provider, 0) + 1
     labels: dict[str, str] = {}
     for name, label in providers:
-        labels.setdefault(name, label or name)
+        labels.setdefault(name, clean(label or name))
     ordered = [name for name in PROVIDER_ORDER if name in labels]
     ordered += [name for name in labels if name not in PROVIDER_ORDER]
     tabs = [
@@ -388,7 +443,7 @@ def column_widths(
         "project": widest({row.project for row in rows}, _HEADINGS["project"]),
         "where": widest({row.where for row in rows}, _HEADINGS["where"]),
         "provider": widest(
-            {provider_labels.get(row.provider, row.provider) for row in rows}, _HEADINGS["provider"]
+            {provider_label(row.provider, provider_labels) for row in rows}, _HEADINGS["provider"]
         ),
     }
 
@@ -455,7 +510,7 @@ def format_row(
     values = {
         "title": row.title,
         "project": row.project,
-        "provider": provider_labels.get(row.provider, row.provider),
+        "provider": provider_label(row.provider, provider_labels),
         "age": age_text(row.stamp, now),
         "where": row.where,
     }
@@ -619,6 +674,13 @@ def busy_text(running: str, wanted: str) -> str:
     return f"{article} is running; {_JOBS[wanted][1]} when it has finished"
 
 
+def finishing_text(job: str) -> str:
+    """``finishing the import…``: what is said when the program was asked
+    to quit while an import or an undo (``job``) is under way; it leaves
+    when that has finished or has been rolled back."""
+    return f"finishing the {job}{ELLIPSIS}"
+
+
 def scan_message(summary: Mapping[str, Any] | None) -> str:
     """One line for a finished scan."""
     summary = summary or {}
@@ -698,7 +760,7 @@ def detail_fields(
     local = f"{clean(session.cwd_local)}   {found}" if session.cwd_local else found
     return {
         "id": clean(session.id) or EMPTY,
-        "messages": EMPTY if session.messages is None else f"{session.messages:,}",
+        "messages": f"{session.messages:,}" if isinstance(session.messages, int) else EMPTY,
         "updated": local_time(session.updated or session.started, tz),
         "cwd": clean(session.cwd) or EMPTY,
         "local": local,
@@ -925,6 +987,15 @@ FOLDER_START = "~/"
 COMPLETIONS_SHOWN = 6
 """How many names the status line shows when several folders match."""
 
+FOLDER_UNSHOWABLE = (
+    "this session's folder name has characters that cannot be shown; type the folder"
+)
+"""Said when the folder input opens at ``FOLDER_START`` because the folder
+to suggest holds a character that ``clean`` would replace."""
+
+FOLDER_NUL = "a folder name cannot contain a NUL character"
+"""Said for a typed folder with a NUL in it; nothing is asked of the disk."""
+
 _SEPARATORS = tuple(sep for sep in (os.sep, os.altsep) if sep)
 
 
@@ -935,6 +1006,7 @@ class Completion:
     text: str  # the text afterwards; as it was when there is nothing to add
     matches: tuple[str, ...] = ()  # the folders that match, in order
     error: str = ""  # why the folder could not be listed
+    left_out: int = 0  # matching folders whose names cannot be shown
 
 
 def expand_folder(text: str, home: str) -> str:
@@ -957,7 +1029,14 @@ def complete_folder(
     caller's. Only directories count, and hidden ones only when the name
     being typed starts with a dot. One match is completed and gets a
     separator; several are completed as far as they agree, and are named in
-    ``matches``. Nothing is listed for an empty text or a relative one."""
+    ``matches``. Nothing is listed for an empty text or a relative one.
+
+    A folder whose name holds a character that cannot be shown (an escape
+    sequence, a character that reorders text) is never completed: the name
+    would go into the input as it is. Such folders are counted in
+    ``left_out`` instead."""
+    if "\0" in text:
+        return Completion(text, error=FOLDER_NUL)
     if text == "~":
         return Completion(text + os.sep)
     cut = max(text.rfind(sep) for sep in _SEPARATORS) + 1
@@ -969,21 +1048,23 @@ def complete_folder(
         entries = list(list_folder(directory))
     except OSError as exc:
         return Completion(text, error=f"cannot list {clean(directory)}: {exc.strerror or exc}")
-    names = sorted(
+    found = sorted(
         name
         for name, is_dir in entries
         if is_dir and name.startswith(typed) and (typed[:1] == "." or name[:1] != ".")
     )
+    names = [name for name in found if showable(name)]
+    left_out = len(found) - len(names)
     if len(names) == 1:
-        return Completion(head + names[0] + os.sep, tuple(names))
+        return Completion(head + names[0] + os.sep, tuple(names), left_out=left_out)
     if not names:
-        return Completion(text)
+        return Completion(text, left_out=left_out)
     # As far as they agree: sorted, so the first and the last differ soonest.
     first, last = names[0], names[-1]
     agreed = next(
         (n for n, (a, b) in enumerate(zip(first, last, strict=False)) if a != b), len(first)
     )
-    return Completion(head + first[:agreed], tuple(names))
+    return Completion(head + first[:agreed], tuple(names), left_out=left_out)
 
 
 def completions_text(names: Sequence[str], shown: int = COMPLETIONS_SHOWN) -> str:
@@ -994,8 +1075,23 @@ def completions_text(names: Sequence[str], shown: int = COMPLETIONS_SHOWN) -> st
     return f"{text}  {ELLIPSIS} {more:,} more" if more > 0 else text
 
 
+def completion_message(completion: Completion) -> str:
+    """What the status line says after Tab: the names when several folders
+    match, and how many were left out because their names cannot be shown;
+    empty when there is neither."""
+    parts = []
+    if len(completion.matches) > 1:
+        parts.append(completions_text(completion.matches))
+    if completion.left_out:
+        names = plural(completion.left_out, "name")
+        parts.append(f"{names} left out (characters that cannot be shown)")
+    return " · ".join(parts)
+
+
 def folder_error(path: str) -> str:
     """What Enter answers for a text that is not a folder."""
+    if "\0" in path:
+        return FOLDER_NUL
     return f"not an existing folder: {clean(path)}" if path else "type a folder"
 
 
@@ -1327,21 +1423,39 @@ def help_lines(width: int | None = None) -> list[str]:
 ROLE_LABELS = {"user": "User", "assistant": "Assistant", "tool": "Tool"}
 
 
-def _split_wide(word: str, width: int) -> tuple[str, str]:
-    """Cut a word that is wider than a line: (what fits, the rest). Always
-    takes at least one character so wrapping ends."""
-    head = _take(word, width) or word[:1]
-    return head, word[len(head) :]
+def _cut(word: str, room: int, width: int) -> tuple[list[str], str, int]:
+    """Cut a word that is wider than a line: ``(lines, rest, cells)``. The
+    first line fits in ``room`` cells, the others in ``width``; ``rest`` is
+    the end of the word that does not fill a line, ``cells`` wide. One pass
+    with a running width, so the cost grows with the word and not with its
+    square. Every line takes at least one character, so the cutting ends."""
+    if word.isascii():
+        cuts = range(room, len(word), width)
+        lines = [word[:room], *(word[cut : cut + width] for cut in cuts)]
+        return lines[:-1], lines[-1], len(lines[-1])
+    lines = []
+    start, used, limit = 0, 0, room
+    for position, ch in enumerate(word):
+        size = char_width(ch)
+        if used + size > limit and position > start:
+            lines.append(word[start:position])
+            start, used, limit = position, 0, width
+        used += size
+    return lines, word[start:], used
+
+
+_TOKENS = re.compile(r"\s+|\S+")
 
 
 def wrap_line(line: str, width: int) -> list[str]:
     """One paragraph wrapped to ``width`` cells at spaces; a word longer than
-    a line is cut. Leading indentation stays on the first line."""
+    a line is cut. Leading indentation stays on the first line. Every
+    character is measured once, however long a word is."""
     if width <= 0 or text_width(line) <= width:
         return [line]
     out: list[str] = []
     current, used = "", 0
-    for token in re.findall(r"\s+|\S+", line):
+    for token in _TOKENS.findall(line):
         size = text_width(token)
         if used + size <= width:
             current, used = current + token, used + size
@@ -1354,13 +1468,15 @@ def wrap_line(line: str, width: int) -> list[str]:
         if current.strip():
             out.append(current.rstrip())
             current, used = "", 0
-        elif used + 1 > width:
-            current, used = "", 0  # indentation as wide as the line: drop it
-        while used + text_width(token) > width:
-            head, token = _split_wide(token, width - used)
-            out.append(current + head)
-            current, used = "", 0
-        current, used = current + token, used + text_width(token)
+        elif used and used + char_width(token[0]) > width:
+            current, used = "", 0  # indentation that leaves no room: drop it
+        if used + size > width:
+            lines, token, size = _cut(token, width - used, width)
+            if lines:
+                out.append(current + lines[0])
+                out.extend(lines[1:])
+                current, used = "", 0
+        current, used = current + token, used + size
     if current.strip() or not out:
         out.append(current.rstrip())
     return out

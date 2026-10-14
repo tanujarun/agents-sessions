@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import UTC
+from datetime import UTC, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -42,6 +42,7 @@ except ImportError:
 
 if textual is not None:
     from rich.cells import cell_len
+    from textual import events
 
     from agent_sessions.tui import app as app_mod
     from agent_sessions.tui import view
@@ -1035,7 +1036,7 @@ class PagerTest(TuiCase):
             body = None
             await until(lambda: isinstance(self.app.screen, TranscriptScreen), what="pager")
             body = self.app.screen.body
-            await until(lambda: len(body._starts) == 200, what="all turns wrapped")
+            await until(lambda: len(body.turns) == 200 and body.settled, what="all turns wrapped")
             await pilot.pause()
             self.assertIn("200 turns", self.text().splitlines()[-1])
             width = body.size.width
@@ -1080,23 +1081,19 @@ class PagerTest(TuiCase):
             await pilot.press("v")
             await until(lambda: isinstance(self.app.screen, TranscriptScreen), what="pager")
             body = self.app.screen.body
-            await until(lambda: len(body._starts) == 120, what="wrapped")
+            await until(lambda: len(body.turns) == 120 and body.settled, what="wrapped")
             before = len(body.lines)
             body.scroll_to(y=body._starts[60], animate=False, force=True, immediate=True)
             await pilot.pause()
             await pilot.resize_terminal(40, 12)
-            await until(
-                lambda: len(body._starts) == 120 and body._anchor is None, what="re-wrapped"
-            )
+            await until(lambda: body.settled, what="re-wrapped")
             await pilot.pause()
             self.assertGreater(len(body.lines), before)
             self.assertTrue(all(cell_len(text) <= body.size.width for _kind, text in body.lines))
             self.assertEqual(int(body.scroll_offset.y), body._starts[60])
             self.assertIn("turn 60", self.text())
             await pilot.resize_terminal(120, 40)
-            await until(
-                lambda: len(body._starts) == 120 and body._anchor is None, what="re-wrapped"
-            )
+            await until(lambda: body.settled, what="re-wrapped")
             await pilot.press("q")
             await settle(pilot)
             self.assertIs(self.app.screen, self.main)
@@ -1999,7 +1996,8 @@ class MountTest(OfflineCase):
             await pilot.press("m")
             await self.message("C: mounted")
             self.assertEqual(self.mounted(), [support.WINDOWS])
-            self.assertEqual(self.engine.called("volumes"), [])
+            self.assertEqual(self.engine.called("volumes"), [None])  # is the drive there at all
+            self.assertEqual(self.prompt(), "")
             self.assertEqual(self.selected(), OFFLINE)
             # Mounted now: `m` has nothing to do, and Enter asks about the import.
             await pilot.press("m")
@@ -2058,7 +2056,20 @@ class MountTest(OfflineCase):
                 self.assertEqual(self.prompt(), "")
                 await pilot.press("escape")
             self.assertEqual(self.mounted(), [])
-            # `m` itself asks the engine, whose reason is shown.
+            # `m` says the same at once (N-37): nothing is started, and
+            # nothing asks for the password of a drive that is not there.
+            activity = []
+            real = self.main._set_activity
+            self.main._set_activity = lambda text: (activity.append(text), real(text))[1]
+            await pilot.press("m")
+            await self.message("C: is not attached")
+            await settle(pilot)
+            self.assertTrue(self.main.query_one("#status-message").has_class("-error"))
+            self.assertEqual(self.mounted(), [])
+            self.assertEqual([text for text in activity if "password" in text], [])
+            self.assertEqual(self.main.mode, "list")
+            # When the drive is there, the engine's own refusal is shown.
+            self.engine.volume_state = "attached"
             self.engine.fail["mount_drive"] = MountFailed(
                 "no drive with this volume id is attached"
             )
@@ -3538,6 +3549,782 @@ class PromptSizeTest(OfflineCase):
             self.assertEqual((len(lines), lines[-1]), (4, "Import anyway? y/n"))
             self.check_frame(40, 10)
             self.assertIn("Import anyway? y/n", self.text())
+
+
+# --- quitting (AUDIT A-02) -------------------------------------------------------------
+
+
+class LeaveTest(TuiCase):
+    """``q`` and Ctrl-C leave at once: nothing that only reads is waited
+    for. An import or an undo under way is finished first, and says so."""
+
+    async def import_under_way(self, pilot, keys=("i", "y")) -> threading.Event:
+        await settle(pilot)
+        await self.select(pilot, FOREIGN)
+        gate = self.engine.block["import_session"] = threading.Event()
+        await pilot.press(*keys)
+        await until(lambda: self.imported() == [FOREIGN], what="the import")
+        await pilot.pause()
+        return gate
+
+    async def test_q_during_an_import_waits_for_it_and_says_so(self):
+        async with self.started() as pilot:
+            gate = await self.import_under_way(pilot)
+            await pilot.press("q")
+            await pilot.pause()
+            self.assertFalse(self.exited())
+            self.assertIn("finishing the import…", self.status())
+            # Meanwhile no key does anything, a second q or Ctrl-C included.
+            await pilot.press("q", "j", "enter", "v", "question_mark", "r", "ctrl+c")
+            await pilot.pause()
+            self.assertFalse(self.exited())
+            self.assertIs(self.app.screen, self.main)
+            self.assertEqual(self.selected(), FOREIGN)
+            self.assertEqual(self.engine.called("scan"), [None])
+            self.assertIn("finishing the import…", self.status())
+            gate.set()
+            await until(self.exited, what="the exit after the import")
+        self.assertEqual(self.app.return_code, 0)
+        self.assertIn(FOREIGN_COPY, [session.key for session in self.engine.sessions])
+        self.assertEqual(self.opened(), [])
+
+    async def test_an_import_and_resume_resumes_nothing_once_asked_to_quit(self):
+        async with self.started() as pilot:
+            gate = await self.import_under_way(pilot, ("enter", "i"))
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+            self.assertIn("finishing the import…", self.status())
+            gate.set()
+            await until(self.exited, what="the exit after the import")
+        self.assertEqual((self.app.return_code, self.opened()), (0, []))
+
+    async def test_ctrl_c_in_the_pager_during_an_import_shows_why_it_waits(self):
+        async with self.started() as pilot:
+            gate = await self.import_under_way(pilot)
+            await pilot.press("v")
+            await until(lambda: isinstance(self.app.screen, TranscriptScreen), what="the pager")
+            await pilot.press("ctrl+c")
+            await until(lambda: self.app.screen is self.main, what="the pager closed")
+            self.assertIn("finishing the import…", self.status())
+            gate.set()
+            await until(self.exited, what="the exit")
+        self.assertEqual(self.app.return_code, 0)
+
+    async def test_a_signal_during_an_import_waits_for_it_too(self):
+        async with self.started() as pilot:
+            gate = await self.import_under_way(pilot)
+            self.app.leave(143)  # what SIGTERM does
+            await pilot.pause()
+            self.assertFalse(self.exited())
+            gate.set()
+            await until(self.exited, what="the exit")
+        self.assertEqual(self.app.return_code, 143)
+
+    async def test_q_during_an_undo_waits_for_it(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, IMPORTED_COPY)
+            await pilot.press("u")
+            await self.mode_is(pilot, "undo")
+            gate = self.engine.block["unimport"] = threading.Event()
+            await pilot.press("y")
+            await until(lambda: len(self.undone()) == 2, what="the undo")
+            await pilot.press("q")
+            await pilot.pause()
+            self.assertFalse(self.exited())
+            self.assertIn("finishing the undo…", self.status())
+            gate.set()
+            await until(self.exited, what="the exit")
+        self.assertEqual(self.app.return_code, 0)
+        self.assertNotIn(IMPORTED_COPY, [session.key for session in self.engine.sessions])
+
+    async def test_a_read_that_does_not_come_back_does_not_hold_q(self):
+        """Every engine call that only reads runs in a daemon thread, which
+        the interpreter does not wait for at its end; an import and an undo
+        run in threads it waits for."""
+        flows = (  # (the call that does not come back, the row, the keys that make it)
+            ("scan", None, ()),
+            ("list_folder", FOREIGN, ("t", "tab")),
+            ("transcript", NATIVE, ("v",)),
+            ("import_options", FOREIGN, ("enter",)),
+            ("continue_options", NATIVE, ("c",)),
+            ("open_session", NATIVE, ("o",)),
+            ("unimport", IMPORTED_COPY, ("u",)),  # the dry run
+            ("volumes", OFFLINE, ("enter",)),
+            ("mount_drive", OFFLINE, ("m",)),
+        )
+        for name, key, keys in flows:
+            engine = FakeEngine()
+            engine.sessions.append(make_session("claude", 70, foreign=True, offline=True))
+            gate = threading.Event()
+            if key is None:
+                engine.block[name] = gate
+            async with self.started(engine=engine) as pilot:
+                if key is None:
+                    await until(lambda e=engine: e.called("scan"), what="the scan")
+                else:
+                    await settle(pilot)
+                    await self.select(pilot, key)
+                    self.main._verdicts.clear()  # so that the engine is asked again
+                    engine.block[name] = gate
+                    for press in keys:
+                        await pilot.press(press)
+                        await pilot.pause()
+                await until(lambda n=name, e=engine: n in e.threads, what=f"the call {name}")
+                await pilot.pause()
+                started = time.monotonic()
+                await pilot.press("ctrl+c")
+                await until(self.exited, what=f"the exit while {name} hangs")
+                self.assertLess(time.monotonic() - started, 0.5, name)
+            self.assertEqual(self.app.return_code, 0, name)
+            self.assertTrue(engine.threads[name].daemon, name)
+            gate.set()
+        engine = FakeEngine()
+        async with self.started(engine=engine) as pilot:
+            await settle(pilot)
+            await self.select(pilot, FOREIGN)
+            await pilot.press("i", "y")
+            await until(lambda: self.imported() == [FOREIGN], what="the import")
+            await settle(pilot)
+            await self.select(pilot, IMPORTED_COPY)
+            await pilot.press("u")
+            await self.mode_is(pilot, "undo")
+            await pilot.press("y")
+            await settle(pilot)
+        self.assertFalse(engine.threads["import_session"].daemon)
+        self.assertFalse(engine.threads["unimport"].daemon)
+
+    async def test_every_cancel_event_is_set(self):
+        self.engine.scan_gate = threading.Event()
+        async with self.started() as pilot:
+            await until(lambda: self.main._scan is not None, what="the scan")
+            cancel = self.main._scan["cancel"]
+            await pilot.press("q")
+            await until(self.exited, what="the exit")
+        self.assertTrue(cancel.is_set())
+        self.engine.scan_gate.set()
+
+
+@unittest.skipIf(textual is None, "Textual is not installed (run under .venv: make test-tui)")
+class PtyCase(unittest.TestCase):
+    """The app over the fake engine as a program of its own, in a
+    pseudo-terminal made for it alone (``tui_support.pty_run``)."""
+
+    def play(self, setup, steps, size=(100, 30), **env):
+        with tempfile.TemporaryDirectory() as tmp:
+            return support.pty_run(
+                [sys.executable, "-P", "-c", support.PTY_APP, setup],
+                steps,
+                support.pty_env(tmp, **env),
+                tmp,
+                size=size,
+            )
+
+    def assert_left_cleanly(self, run, what):
+        screen = support.plain(run.output)
+        self.assertEqual(run.status, 0, (what, screen[-1500:]))
+        self.assertNotIn("Traceback", screen, what)
+        after = support.plain(run.output[run.output.rfind(b"\x1b[?1049l") :])
+        self.assertNotIn("Error", after, what)
+
+
+def find(title) -> list:
+    """Steps that put the selection on the session with ``title``: the All
+    tab, the filter, the title, Enter. A key apart from the next, as typed:
+    in one write the title would reach the list before the filter box has
+    the focus."""
+    return [("q quit", b"0"), (0.2, b"/"), (0.3, title.encode()), (0.3, b"\r"), (0.3, b"")]
+
+
+FILTER_12 = "claude session 12"  # the foreign session that can be imported
+FILTER_70 = "claude session 70"  # the one whose drive is not mounted
+
+
+class LeaveOnATerminalTest(PtyCase):
+    """AUDIT A-02 end to end: the time from the key to the end of the
+    process. The audit measured 6 s for a call slowed to 8 s; here a call
+    does not come back for 30 s."""
+
+    def quickest(self, setup, steps):
+        """The fastest of up to three runs: a loaded machine can slow one,
+        never all three by 30 s."""
+        runs = []
+        for _ in range(3):
+            run = self.play(setup, steps)
+            self.assert_left_cleanly(run, setup)
+            runs.append(run.seconds)
+            if run.seconds < 0.5:
+                break
+        return min(runs)
+
+    def test_a_read_that_does_not_come_back_does_not_hold_the_exit(self):
+        for setup, steps in (
+            ("block:scan", [("scanning", b"q")]),
+            ("block:transcript", [("q quit", b"v"), ("loading", b"\x03")]),
+            (
+                "block:list_folder",
+                [*find(FILTER_12), (0, b"t"), ("Import into", b"\t"), (0.3, b"\x03")],
+            ),
+            ("block:mount_drive", [*find(FILTER_70), (0, b"m"), ("mounting", b"q")]),
+            ("block:continue_options", [("q quit", b"c"), (0.3, b"q")]),
+        ):
+            self.assertLess(self.quickest(setup, steps), 0.5, setup)
+
+    def test_an_import_under_way_is_finished_first(self):
+        with tempfile.TemporaryDirectory() as marks:
+            mark = os.path.join(marks, "imported")
+            run = self.play(
+                "import:1.5",
+                [*find(FILTER_12), (0, b"i"), ("[y] yes", b"y"), ("importing", b"q")],
+                PTY_MARK=mark,
+            )
+            self.assert_left_cleanly(run, "import")
+            self.assertTrue(os.path.exists(mark))  # it was finished, not cut off
+        self.assertIn("finishing the import…", support.plain(run.output))
+        self.assertGreater(run.seconds, 0.8)  # it was waited for
+
+
+# --- a key that arrives twice (AUDIT A-13) ---------------------------------------------
+
+
+class TwiceTest(TuiCase):
+    """Two presses that are both on their way before the first is handled:
+    a key that repeats, or a second press because the first seemed lost."""
+
+    async def twice(self, pilot, key, character, times=2):
+        for _ in range(times):
+            self.app.post_message(events.Key(key, character))
+        await asyncio.sleep(0.3)
+        await settle(pilot)
+
+    def alive(self, screen_type):
+        self.assertTrue(self.app.is_running)
+        self.assertIsNone(self.app.return_code)
+        self.assertIsInstance(self.app.screen, screen_type)
+
+    async def test_closing_the_pager_twice(self):
+        for key, character in (("q", "q"), ("escape", None)):
+            async with self.started() as pilot:
+                await settle(pilot)
+                await self.select(pilot, NATIVE)
+                await pilot.press("v")
+                await settle(pilot)
+                await self.twice(pilot, key, character)
+                self.alive(MainScreen)
+                self.assertEqual(len(self.app.screen_stack), 1)
+                await pilot.press("v")  # and it still opens
+                await settle(pilot)
+                self.alive(TranscriptScreen)
+
+    async def test_closing_the_help_twice(self):
+        for key, character in (("q", "q"), ("question_mark", "?"), ("enter", "\r")):
+            async with self.started() as pilot:
+                await settle(pilot)
+                await pilot.press("question_mark")
+                await settle(pilot)
+                await self.twice(pilot, key, character)
+                self.alive(MainScreen)
+                self.assertEqual(len(self.app.screen_stack), 1)
+
+    async def test_clicking_the_help_away_twice(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await pilot.press("question_mark")
+            await settle(pilot)
+            help_screen = self.app.screen
+            help_screen.on_click(None)
+            help_screen.on_click(None)
+            await settle(pilot)
+            self.alive(MainScreen)
+            self.assertEqual(len(self.app.screen_stack), 1)
+
+    async def test_opening_twice_opens_once(self):
+        for key, character, screen_type in (
+            ("v", "v", TranscriptScreen),
+            ("question_mark", "?", HelpScreen),
+        ):
+            for times in (2, 8):
+                read = len(self.engine.called("transcript"))
+                async with self.started() as pilot:
+                    await settle(pilot)
+                    await self.select(pilot, NATIVE)
+                    await self.twice(pilot, key, character, times)
+                    self.alive(screen_type)
+                    self.assertEqual(len(self.app.screen_stack), 2, (key, times))
+                    self.assertLessEqual(len(self.engine.called("transcript")) - read, 1)
+
+    async def test_view_from_the_foreign_prompt_while_one_is_open(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, FOREIGN)
+            await pilot.press("enter")
+            await self.mode_is(pilot, "foreign")
+            await self.twice(pilot, "v", "v")
+            self.alive(TranscriptScreen)
+            self.assertEqual(len(self.app.screen_stack), 2)
+
+
+class TwiceOnATerminalTest(PtyCase):
+    """The audit's reproduction: several keys in one write to a terminal."""
+
+    def test_keys_written_together(self):
+        for what, steps in (
+            ("qq", [("q quit", b"qq")]),
+            ("qqqqqqqq", [("q quit", b"qqqqqqqq")]),
+            ("??", [("q quit", b"??"), (0.5, b"\x1b"), (0.3, b"q")]),
+            ("vv", [("q quit", b"vv"), ("3 turns", b"q"), (0.3, b"q")]),
+            ("v, then qq", [("q quit", b"v"), ("3 turns", b"qq"), (0.5, b"q")]),
+            ("v, then qqqqqqqq", [("q quit", b"v"), ("3 turns", b"qqqqqqqq"), (0.5, b"q")]),
+        ):
+            self.assert_left_cleanly(self.play("plain", steps), what)
+
+
+# --- the pager stays responsive (AUDIT A-14) -------------------------------------------
+
+
+class PagerResponsiveTest(TuiCase):
+    """2,000 turns of 20,000 characters: the pager answers keys while it
+    wraps them, and stops when it is closed."""
+
+    async def open_long(self, pilot, text):
+        self.engine.turns[NATIVE] = [Turn("assistant", text, None)] * view.PAGER_MAX_TURNS
+        await settle(pilot)
+        await self.select(pilot, NATIVE)
+        await pilot.press("v")
+        await until(lambda: isinstance(self.app.screen, TranscriptScreen), what="the pager")
+        body = self.app.screen.body
+        await until(lambda: len(body.turns) >= 500, what="the turns")
+        return body
+
+    async def press_now(self, *keys):
+        """Keys as a terminal hands them over: queued, with nothing waited
+        for (the pilot's ``press`` waits until the app is idle, and a pager
+        that wraps is not)."""
+        for key in keys:
+            self.app.post_message(events.Key(key, key if len(key) == 1 else None))
+
+    async def test_q_is_answered_within_a_third_of_a_second(self):
+        for text in ("word " * 4000, "中" * 20000):
+            async with self.started() as pilot:
+                body = await self.open_long(pilot, text)
+                await self.press_now("j", "j", "pagedown")
+                started = time.monotonic()
+                await self.press_now("q")
+                await until(lambda: self.app.screen is self.main, what="the pager closed")
+                took = time.monotonic() - started
+                self.assertLess(took, 0.3, text[:3])
+                self.assertGreater(body.pending, 0)  # answered while there was work left
+                # Closed: no more wrapping.
+                left = body.pending
+                await asyncio.sleep(0.2)
+                self.assertEqual(body.pending, left)
+                self.assertFalse(self.exited())
+
+    async def test_a_resize_wraps_what_is_on_screen_first(self):
+        self.engine.turns[NATIVE] = [
+            Turn("assistant", f"turn {n} " + "word " * 600, None) for n in range(400)
+        ]
+        order = []
+        wrap = view.transcript_lines
+
+        def recorded(role, text, ts, width, tz=None, **options):
+            order.append((width, int(text.split()[1])))
+            return wrap(role, text, ts, width, tz, **options)
+
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, NATIVE)
+            await pilot.press("v")
+            await until(lambda: isinstance(self.app.screen, TranscriptScreen), what="the pager")
+            body = self.app.screen.body
+            await until(lambda: len(body.turns) == 400 and body.settled, what="wrapped", timeout=20)
+            body.scroll_to(y=body._starts[300], animate=False, force=True, immediate=True)
+            await pilot.pause()
+            with mock.patch.object(view, "transcript_lines", recorded):
+                await pilot.resize_terminal(50, 20)
+                await until(lambda: body.settled, what="re-wrapped", timeout=20)
+            width = body.size.width
+            again = [turn for wrapped_for, turn in order if wrapped_for == width]
+            self.assertEqual(sorted(again), list(range(400)))
+            # The turn on screen first, then the ones below it that fill the
+            # screen, then outwards, up and down by turns.
+            self.assertEqual(again[0], 300)
+            self.assertLess(again.index(301), again.index(310))
+            self.assertLess(again.index(299), again.index(320))
+            self.assertLess(again.index(250), again.index(0))
+            self.assertEqual(int(body.scroll_offset.y), body._starts[300])
+            self.assertIn("turn 300", self.text())
+            self.assertTrue(all(cell_len(text) <= width for _kind, text in body.lines))
+
+    async def test_turns_not_yet_wrapped_again_are_cut_to_the_width(self):
+        self.engine.turns[NATIVE] = [Turn("assistant", "word " * 600, None)] * 300
+        async with self.started(size=(120, 40)) as pilot:
+            await settle(pilot)
+            await self.select(pilot, NATIVE)
+            await pilot.press("v")
+            await until(lambda: isinstance(self.app.screen, TranscriptScreen), what="the pager")
+            body = self.app.screen.body
+            await until(lambda: len(body.turns) == 300 and body.settled, what="wrapped", timeout=20)
+            await pilot.resize_terminal(60, 20)
+            await pilot.pause()
+            self.check_frame(60, 20)
+
+
+# --- nothing unsafe reaches the terminal (AUDIT A-12, A-15) ------------------------------
+
+
+H = support.hostile
+HN = support.hostile_name
+
+
+class HostileTest(TuiCase):
+    """SECURITY 6 for the TUI: every value a session or an engine answer
+    puts on the screen carries escape sequences, C1 controls, bidirectional
+    overrides, markup and lone surrogates. After every step the segments
+    the compositor would send are searched: none may hold a character a
+    terminal acts on. A tag at the start of each value shows that it was
+    on the screen at all."""
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = os.path.realpath(tmp.name)
+        self.dir = os.path.join(self.tmp, HN("DIRQ"))  # a folder with a hostile name
+        os.mkdir(self.dir)
+        for tag in ("SUBQ1", "SUBQ2"):
+            os.mkdir(os.path.join(self.tmp, HN(tag)))
+        os.mkdir(os.path.join(self.tmp, "plain"))
+
+    def hostile_engine(self) -> FakeEngine:
+        native = make_session("claude", 1, title=H("NTITLE"), cwd="/home/user/" + HN("PJN"))
+        native.id, native.store = H("NID"), H("NSTORE")
+        native.cwd_local, native.note = H("NLOCAL"), H("NNOTE")
+        refused = make_session("claude", 2, foreign=True, title=H("RTITLE"), age=1)
+        experimental = make_session("codex", 3, foreign=True, title=H("XTITLE"), age=2)
+        possible = make_session("claude", 4, foreign=True, title=H("PTITLE"), age=3)
+        untitled = make_session("claude", 5, foreign=True, title="", age=4)
+        untitled.id = H("UID")
+        offline = make_session("claude", 6, foreign=True, offline=True, title=H("OTITLE"), age=5)
+        offline.note = H("ONOTE")
+        stranger = make_session("grok", 7, title=H("STITLE"), age=6)
+        stranger.provider = H("PROVQ")
+        engine = FakeEngine([native, refused, experimental, possible, untitled, offline, stranger])
+        engine.provider_list = [("claude", H("LABQ")), ("codex", "Codex"), ("grok", "Grok")]
+        engine.where_text = H("WHQ")
+        engine.options[refused.key] = ImportOptions(False, H("REASONQ"))
+        engine.options[experimental.key] = ImportOptions(
+            False, "experimental", False, True, H("WARNQ")
+        )
+        engine.continue_answers[possible.key] = ContinueOptions(
+            True, "", (("claude", H("TOOLQ")),), "claude", self.dir
+        )
+        engine.scan_progress = [(H("DRIVEQ"), 41000)]
+        engine.turns[native.key] = [
+            Turn("user", H("TURNQ"), H("TSQ")),
+            Turn("tool", H("TOOLNAMEQ"), None),
+            Turn(H("ROLEQ"), H("REPLYQ"), None),
+        ]
+        engine.plan_note = H("PLANQ")
+        self.keys = {
+            "native": native.key,
+            "refused": refused.key,
+            "experimental": experimental.key,
+            "possible": possible.key,
+            "untitled": untitled.key,
+            "offline": offline.key,
+            "stranger": stranger.key,
+        }
+        return engine
+
+    async def said(self, fragment):
+        """Wait for the status line to have ``fragment`` in what it was
+        given (on a narrow screen the long values cut it short)."""
+        main = self.main
+        await until(
+            lambda: fragment in main._message or fragment in main._activity,
+            what=f"the status line given {fragment!r}",
+        )
+        await asyncio.sleep(0.05)
+
+    def check(self, step, *tags):
+        found = support.unsafe_on_screen(self.app)
+        self.assertEqual(found, [], f"{step} at {self.app.size}: {found[:3]!r}")
+        text = self.text()
+        for tag in tags:
+            self.assertIn(tag, text, f"{step} at {self.app.size}")
+
+    async def test_nothing_unsafe_reaches_the_screen(self):
+        # 200 columns as well: only there does the import question have room
+        # for the title beside a drive name this long.
+        for size in ((120, 40), (80, 24), (200, 50)):
+            engine = self.hostile_engine()
+            engine.scan_gate = threading.Event()
+            async with self.started(size=size, engine=engine) as pilot:
+                await self.walk(pilot, engine)
+
+    async def walk(self, pilot, engine):
+        keys = self.keys
+        await until(lambda: self.main.loaded and "DRIVEQ" in self.status(), what="the scan")
+        self.check("scan progress", "DRIVEQ")
+        engine.scan_gate.set()
+        await settle(pilot)
+        await pilot.press("0")
+        await settle(pilot)
+        wide = self.app.size.width >= 120  # PROJECT beside PROVIDER
+        self.check("the list", "NTITLE", "WHQ", "PROVQ", *(("PJN",) if wide else ()))
+        await pilot.press("1")
+        await settle(pilot)
+        self.check("the tabs", "LABQ")
+        await self.select(pilot, keys["native"])
+        self.check("the detail pane", "NID", "NSTORE", "NLOCAL", "NNOTE")
+        await pilot.press("o")
+        await self.said("opened NTITLE")
+        self.check("a launch", "opened NTITLE")
+        await pilot.press("v")
+        await until(lambda: isinstance(self.app.screen, TranscriptScreen), what="the pager")
+        await settle(pilot)
+        self.check("the pager", "NTITLE", "TURNQ", "TOOLNAMEQ", "REPLYQ")
+        await pilot.press("q")
+        await settle(pilot)
+
+        await self.select(pilot, keys["refused"])
+        self.check("a refused import", "RTITLE", "REASONQ")
+        await pilot.press("enter")
+        await self.mode_is(pilot, "foreign_none")
+        self.check("the foreign prompt", "REASONQ")
+        await pilot.press("escape", "i")
+        await self.said("REASONQ")
+        self.check("the refusal")
+
+        await self.select(pilot, keys["experimental"])
+        await pilot.press("i")
+        await self.mode_is(pilot, "warn")
+        self.check("the warning", "WARNQ")
+        await pilot.press("n")
+
+        await self.select(pilot, keys["possible"])
+        await pilot.press("i")
+        await self.mode_is(pilot, "confirm")
+        self.check("the import question", "PTITLE", "WHQ")
+        if self.app.size.width >= 200:
+            self.assertIn("PTITLE", self.prompt())
+        await pilot.press("n", "enter")
+        await self.mode_is(pilot, "foreign")
+        self.check("the import prompt", "WHQ")
+        await pilot.press("escape")
+
+        await self.select(pilot, keys["untitled"])
+        await pilot.press("i")
+        await self.mode_is(pilot, "confirm")
+        self.check("the question about a session without a title", "UID")
+        if self.app.size.width >= 200:
+            self.assertIn("UID", self.prompt())
+        await pilot.press("n")
+
+        # Continue: the tool, then a folder the input must not take as it is.
+        await self.select(pilot, keys["possible"])
+        await pilot.press("c")
+        await self.mode_is(pilot, "tool")
+        self.check("the tool", "TOOLQ")
+        await pilot.press("enter")
+        await self.mode_is(pilot, "folder")
+        await settle(pilot)
+        self.assertEqual(self.folder.value, view.FOLDER_START)
+        self.assertIn("folder name has characters that cannot be shown", self.status())
+        self.check("the folder input")
+        self.folder.insert_text_at_cursor(support.HOSTILE)  # a paste
+        await pilot.pause()
+        self.check("a paste into the folder input")
+        await self.type_folder(pilot, self.tmp + "/")
+        await pilot.press("tab")
+        await settle(pilot)
+        self.assertEqual(self.folder.value, self.tmp + "/plain/")
+        self.assertIn("3 names left out", self.status())
+        self.check("the names Tab found")
+        await self.type_folder(pilot, self.dir)
+        await pilot.press("enter")
+        await self.mode_is(pilot, "start")
+        self.check("the start question", *(("TOOLQ",) if wide else ()))
+        await pilot.press("n")
+
+        await pilot.press("slash")
+        self.main.filter_input.insert_text_at_cursor(H("NEEDLEQ"))
+        await settle(pilot)
+        self.check("a filter that matches nothing", "NEEDLEQ")
+        await pilot.press("escape")
+        await settle(pilot)
+
+        await self.select(pilot, keys["offline"])
+        self.check("an offline row", "ONOTE")
+        engine.volume_state = "absent"
+        await pilot.press("enter")
+        await self.said("is not attached")
+        self.check("a drive that is not attached", "WHQ")
+        engine.volume_state = "attached"
+        engine.mount_gate = threading.Event()
+        await pilot.press("m")
+        await self.said("mounting WHQ")
+        self.check("the mount", "WHQ")
+        engine.mount_gate.set()
+        await self.said("mounted")
+        self.check("a mount that is done", "WHQ")
+
+        engine.fail["continue_options"] = FakeError(H("FAILQ"))
+        await self.select(pilot, keys["native"])
+        await pilot.press("c")
+        await self.said("FAILQ")
+        self.check("an engine failure", "FAILQ")
+        await pilot.press("question_mark")
+        await settle(pilot)
+        self.check("the help")
+        await pilot.press("escape")
+
+    async def test_markup_in_every_value_is_shown_as_text(self):
+        """A-15: ``markup=False`` on the detail values was held by no test."""
+        markup = "[red]K[/red] [@click=app.quit]L[/] [bold]M"
+        session = make_session("claude", 1, title="[b]T[/b]", cwd="/x/[b]P[red]")
+        session.id, session.store, session.cwd_local, session.note = (
+            f"I{markup}",
+            f"S{markup}",
+            f"L{markup}",
+            f"N{markup}",
+        )
+        async with self.started(size=(160, 40), engine=FakeEngine([session])) as pilot:
+            await settle(pilot)
+            await self.select(pilot, session.key)
+            text = self.text()
+            for value in (session.id, session.store, session.note):
+                self.assertIn(value, text)
+            self.assertIn(f"L{markup}", text)
+            self.assertIn("[b]T[/b]", text)
+            self.assertIn("/x/[b]P[red]", text)
+            self.assertFalse(self.exited())
+
+    async def test_the_inputs_draw_what_they_hold_cleaned(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await pilot.press("slash")
+            await pilot.pause()
+            self.main.filter_input.value = H("FILTERQ")
+            await settle(pilot)
+            self.check("the filter input", "FILTERQ")
+            self.assertEqual(self.main.filter_input.value, H("FILTERQ"))  # held as it is
+            await pilot.press("escape")
+            await self.select(pilot, FOREIGN)
+            await pilot.press("t")
+            await self.mode_is(pilot, "folder")
+            self.folder.value = "/mnt/" + H("FOLDERQ")
+            self.folder.cursor_position = 5
+            await settle(pilot)
+            self.check("the folder input", "FOLDERQ")
+            # The cursor stands where the cleaned text puts it.
+            self.assertEqual(self.folder._cursor_offset, 5)
+
+
+# --- times that cannot be placed (AUDIT A-26) --------------------------------------------
+
+
+class UnplacedTimeTest(TuiCase):
+    async def test_a_time_out_of_range_or_without_a_zone_is_a_dash(self):
+        india = timezone(timedelta(hours=5, minutes=30))
+        sessions = [make_session("claude", n) for n in range(3)]
+        sessions[0].updated = "9999-12-31T23:59:59.000000Z"
+        sessions[1].updated = "2026-10-05T10:00:00"
+        sessions[2].started, sessions[2].updated = "0001-01-01T00:00:00Z", None
+        engine = FakeEngine(sessions)
+        self.app = SessionsApp(engine=engine, clock=lambda: support.NOW, tz=india)
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            for session in sessions:
+                await self.select(pilot, session.key)
+                text = self.text()
+                self.assertRegex(text, r"updated +-")
+            self.assertTrue(self.app.is_running)
+            self.assertFalse(self.exited())
+
+
+# --- the folder input: what it shows and what it checks (N-32, N-33, N-34, N-37) -----------
+
+
+class FolderNitsTest(TuiCase):
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = os.path.realpath(tmp.name)
+
+    async def test_a_long_suggested_folder_shows_its_end(self):
+        """N-32: the input opened at the beginning of a 212-character
+        folder, and its end could not be seen until a key was typed."""
+        deep = os.path.join(self.tmp, *[f"segment-{n:02d}" for n in range(18)], "THE-END")
+        os.makedirs(deep)
+        self.assertGreater(len(deep), 200)
+        self.engine.continue_folder = deep
+        async with self.started(size=(80, 24)) as pilot:
+            await settle(pilot)
+            await self.select(pilot, NATIVE)
+            await pilot.press("c")
+            await self.mode_is(pilot, "tool")
+            await pilot.press("enter")
+            await self.mode_is(pilot, "folder")
+            await settle(pilot)
+            await pilot.pause()
+            line = next(line for line in self.text().splitlines() if "Start in:" in line)
+            self.assertIn("THE-END", line)
+            self.assertEqual(self.folder.cursor_position, len(deep))
+
+    async def test_a_folder_is_checked_as_it_is_used(self):
+        """N-33: ``<root>/a/link/../y`` was looked at as ``<root>/b/y`` (the
+        link followed) and imported into ``<root>/a/y``."""
+        for name in ("a", "b/c", "b/y"):
+            os.makedirs(os.path.join(self.tmp, name))
+        os.symlink(os.path.join(self.tmp, "b", "c"), os.path.join(self.tmp, "a", "link"))
+        typed = os.path.join(self.tmp, "a", "link", "..", "y")
+        self.assertTrue(os.path.isdir(typed))  # what the old check looked at
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, FOREIGN)
+            await pilot.press("t")
+            await self.mode_is(pilot, "folder")
+            await self.type_folder(pilot, typed)
+            await pilot.press("enter")
+            await self.message("not an existing folder")
+            self.assertEqual(self.imported(), [])
+            os.mkdir(os.path.join(self.tmp, "a", "y"))
+            await pilot.press("enter")
+            await self.message("imported claude session 12")
+        self.assertEqual(
+            self.engine.import_args, [(FOREIGN, os.path.join(self.tmp, "a", "y"), False)]
+        )
+
+    async def test_tilde_is_the_engines_home(self):
+        """N-34: not ``$HOME``, which ``AGENT_SESSIONS_HOME`` leaves alone."""
+        self.engine.home_dir = self.tmp
+        with mock.patch.dict(os.environ, {"HOME": "/nonexistent-home"}):
+            async with self.started() as pilot:
+                await settle(pilot)
+                await self.select(pilot, FOREIGN)
+                await pilot.press("t")
+                await self.mode_is(pilot, "folder")
+                await pilot.press("enter")  # "~/" as it opens
+                await self.message("imported claude session 12")
+        self.assertEqual(self.engine.import_args, [(FOREIGN, self.tmp, False)])
+
+    async def test_a_nul_is_refused_in_plain_words(self):
+        """N-37: Tab said ``open: embedded null character in path``."""
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.select(pilot, FOREIGN)
+            await pilot.press("t")
+            await self.mode_is(pilot, "folder")
+            await self.type_folder(pilot, self.tmp + "/a\0b")
+            for key in ("tab", "enter"):
+                await pilot.press(key)
+                await self.message(view.FOLDER_NUL)
+                self.assertEqual(self.main.mode, "folder")
+            self.assertEqual(self.engine.called("list_folder"), [])
+            self.assertEqual(self.imported(), [])
 
 
 if __name__ == "__main__":
