@@ -261,6 +261,53 @@ class RoundTripTest(UndoCase):
         self.assertEqual(unimport.not_undone(self.records()), [])
 
 
+class SharedDirectoryTest(UndoCase):
+    """docs/AUDIT.md A-24: two sessions imported into the same project
+    directory. The first import made the directories; undone first, it had
+    to leave them (the second's files were in them), and the second's undo
+    did not know them: they stayed, empty, for good."""
+
+    def test_the_order_of_the_undos_does_not_matter(self):
+        home_before = picture(self.home)
+        for first, second in ((CLAUDE_WIN_PLAIN, CLAUDE_WIN), (CLAUDE_WIN, CLAUDE_WIN_PLAIN)):
+            with self.subTest(first=first):
+                api.import_session(self.source(CLAUDE_WIN_PLAIN))  # makes .claude/projects/<dir>
+                api.import_session(self.source(CLAUDE_WIN))
+                report = api.unimport(first)
+                self.assertTrue(self.home.joinpath(".claude").exists())  # the other is there
+                planned = api.unimport(second, dry_run=True)
+                report = api.unimport(second)
+                self.assertEqual(picture(self.home), home_before, "the home is what it was")
+                self.assertEqual((report.removed, report.left), (planned.removed, planned.left))
+                self.assertIn(str(self.home / ".claude"), report.removed)
+                self.assertEqual(report.left, [])
+
+    def test_a_directory_that_holds_something_else_is_not_reported(self):
+        api.import_session(self.source(CLAUDE_WIN_PLAIN))
+        api.import_session(self.source(CLAUDE_WIN))
+        api.unimport(CLAUDE_WIN_PLAIN)
+        mine = self.home / ".claude" / "settings.json"
+        mine.write_text("{}", encoding="utf-8")
+        report = api.unimport(CLAUDE_WIN)
+        self.assertEqual(report.left, [])  # .claude is not this import's, nor empty
+        self.assertNotIn(str(self.home / ".claude"), report.removed)
+        self.assertEqual(os.listdir(self.home / ".claude"), ["settings.json"])
+
+    def test_what_an_undone_import_named_is_checked_like_any_other_path(self):
+        api.import_session(self.source(CLAUDE_WIN_PLAIN))
+        api.unimport(CLAUDE_WIN_PLAIN)
+        outside = self.w.box.root / "empty-elsewhere"
+        outside.mkdir()
+        records = journal.read()
+        records[1]["manifest"]["dirs"] += [str(outside), f"{self.home}/.claude/../.."]
+        with open(journal.path(), "w", encoding="utf-8") as fh:
+            fh.writelines(json.dumps(record) + "\n" for record in records)
+        api.import_session(self.source(CLAUDE_WIN))
+        api.unimport(CLAUDE_WIN)
+        self.assertTrue(outside.is_dir())
+        self.assertFalse((self.home / ".claude").exists())
+
+
 class CodexIndexLineTest(UndoCase):
     """A thread with a name: the import adds a line to the tool's own
     ``session_index.jsonl``. That line is the one thing an undo leaves."""

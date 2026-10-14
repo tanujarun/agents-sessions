@@ -269,12 +269,17 @@ def plan(
     extras: Iterable[str] = (),
     force: bool = False,
     gone: Iterable[str] = (),
+    earlier: Iterable[str] = (),
 ) -> UndoPlan:
     """What undoing ``record`` would remove and leave, with the native store
     as it is now. ``extras`` are the provider's (``Provider.undo_extras``).
     ``gone`` is what an earlier undo of this import that did not finish
     removed already (``journal.removed_already``): such a file being gone
-    is no difference. Reads only.
+    is no difference. ``earlier`` are the directories that imports into
+    this store which were undone since had made (``_made_earlier``): one of
+    them that is left empty goes too, so that the order in which imports
+    that share a directory are undone does not matter. One that holds
+    anything is not this undo's to report. Reads only.
 
     Raises ``UndoFailed`` for everything an undo refuses: a record for
     another native store, a damaged one, a path outside the native store, a
@@ -334,22 +339,32 @@ def plan(
     # names, so that a dry run says what the real run does.
     made.files = sorted(going)
     made.bytes = sum(going.values())
-    gone = set(going)
-    for path in _deepest_first(dirs):
+    vanishing = set(going)
+    own = set(dirs)
+    others = {
+        path
+        for path in earlier
+        if isinstance(path, str)
+        and path not in own
+        and (importer.below(root, path) or importer.at_or_above(root, path))
+    }
+    for path in _deepest_first([*own, *others]):
         if os.path.islink(path):
-            made.left.append((path, "a link now, where the import made a directory"))
+            if path in own:
+                made.left.append((path, "a link now, where the import made a directory"))
             continue
         try:
             names = os.listdir(path)
         except FileNotFoundError:
             continue
         except OSError as exc:
-            made.left.append((path, f"cannot be read: {exc.strerror or exc}"))
+            if path in own:
+                made.left.append((path, f"cannot be read: {exc.strerror or exc}"))
             continue
-        if all(os.path.join(path, name) in gone for name in names):
+        if all(os.path.join(path, name) in vanishing for name in names):
             made.dirs.append(path)
-            gone.add(path)
-        else:
+            vanishing.add(path)
+        elif path in own:
             made.left.append((path, NOT_EMPTY))
     made.left = sorted(set(made.left))
     return made
@@ -438,6 +453,28 @@ class Incomplete(UndoFailed):
         self.report: object = None
 
 
+def _made_earlier(records: list[dict], record: dict, root: str) -> list[str]:
+    """The directories that imports into this native store which were
+    undone since (not ``record``) had made, as their manifests list them.
+    Such a directory was not removed by their undo when another import put
+    something in it; once that import is undone too, it is left empty, and
+    it goes with this undo. The paths are checked by ``plan``."""
+    standing = [id(other) for other in not_undone(records)]
+    found: list[str] = []
+    for other in records:
+        if (
+            other is record
+            or other.get("record") != journal.IMPORT
+            or other.get("destination_store") != root
+            or id(other) in standing
+        ):
+            continue
+        manifest = other.get("manifest")
+        dirs = manifest.get("dirs") if isinstance(manifest, dict) else None
+        found += [path for path in dirs if isinstance(path, str)] if isinstance(dirs, list) else []
+    return found
+
+
 def _unfinished(records: Iterable[dict], provider: str, session_id: str, root: str) -> bool:
     """Whether an import of this session into this native store began and
     never ended."""
@@ -497,7 +534,10 @@ def undo(
     if dry_run and not under_lock:
         if record is None:
             raise UndoFailed(UNFINISHED)
-        return plan(record, root, extras, force, journal.removed_already(records, record)), None
+        earlier = _made_earlier(records, record, root)
+        return plan(
+            record, root, extras, force, journal.removed_already(records, record), earlier
+        ), None
     try:
         # The state directory is there: the record was read from it.
         with fsutil.lock():
@@ -516,7 +556,14 @@ def undo(
                 if _unfinished(records, provider, session_id, root):
                     raise UndoFailed(NOT_SETTLED)
                 raise UndoFailed(NO_RECORD, no_record=True)
-            made = plan(record, root, extras, force, journal.removed_already(records, record))
+            made = plan(
+                record,
+                root,
+                extras,
+                force,
+                journal.removed_already(records, record),
+                _made_earlier(records, record, root),
+            )
             if dry_run:
                 return made, None
             # Opened before anything goes: what can still fail for the
