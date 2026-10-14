@@ -60,6 +60,8 @@ NO_READER_TOOLS = ("copilot", "crush", "cursor-agent", "opencode")
 EXPORT_FORMATS = exporting.FORMATS  # what ``export_transcript`` takes as ``fmt``
 # Why an undo left a file (``UnimportReport.left``) that a forced one removes.
 LEFT_FOR_A_FORCED_UNDO = undoing.EXTRA
+# An undo that removed part of a copy and could not remove the rest.
+UndoIncomplete = undoing.Incomplete
 HANDOFF_MAX_AGE = 30 * 24 * 3600  # seconds; an older handoff file goes with the next continue
 
 _P = ParamSpec("_P")
@@ -1035,6 +1037,31 @@ def import_report(
     return report
 
 
+def _recover(provider: Provider) -> list[dict]:
+    """Settle the imports into this provider's native store that began and
+    never ended (``importer.recover``); returns the records written for
+    them. When there are any, the index was scanned again: what is in the
+    store changed.
+
+    Before an import or an undo looks at the listing: a copy such an import
+    left whole is listed as a native session without a record of an import,
+    and one it left in part is in the way of the next import. Whoever holds
+    the lock is not waited for here: the import or the undo that follows
+    does the same as its first step, with the lock in its own hands. What
+    was done is in the log (``importer`` writes it)."""
+    native = provider.native_store()
+    if native is None:
+        return []
+    logs.logger()  # set up, for what ``importer.recover`` has to say
+    try:
+        settled = importer.recover(native, provider.read_back, timeout=0)
+    except OSError:  # the lock is held, or cannot be taken: said by what follows
+        return []
+    if settled:
+        Index.load().scan(all_providers(), list_mounts(), deep=False)
+    return settled
+
+
 def _import(
     session: Session,
     progress: importer.Progress | None,
@@ -1043,6 +1070,11 @@ def _import(
     experimental: bool = False,
 ) -> ImportReport:
     """``import_report`` for a session that was found."""
+    # First, so that the listing below is of a store with no import left
+    # half done in it. Not for a session whose drive is away: that one is
+    # answered from the listing alone, and no adapter is asked for anything.
+    if not session.offline and _recover(_provider(session)):
+        index = load_index()
     copy = _native_copy(session, index)
     if copy is not None:
         return ImportReport(copy, False)
@@ -1128,78 +1160,47 @@ class UnimportReport:
 def _undo_target(ref: Session | str, index: Index) -> tuple[str, str]:
     """The provider and session id ``ref`` names for an undo: those of a
     listed session (``find_session``: a key, a start of one, an id), else of
-    the import record that still stands whose native key, source key or id
-    ``ref`` is. The second way finds a copy whose session is not listed any
-    more (its files were removed by hand, its drive forgotten)."""
+    the import record that still stands, or the import that began and never
+    ended, whose native key, source key or id ``ref`` is. The second way
+    finds a copy whose session is not listed any more (its files were
+    removed by hand, its drive forgotten, it was never listed whole).
+
+    A reference to an import that was undone, and is not listed any more
+    for that reason, is answered as one by id is: no import of the session
+    is recorded (``UndoFailed``), not "no session matches"."""
     if isinstance(ref, Session):
         return ref.provider, ref.id
     try:
         session = find_session(ref, index)
     except NotFound as missing:
         text = ref.strip() if isinstance(ref, str) else ""
-        named = sorted(
-            {
-                (record["provider"], record["id"])
-                for record in undoing.not_undone(undoing.read_records())
-                if text
-                and text in (record.get("native_key"), record.get("source_key"), record.get("id"))
-            }
-        )
-        if len(named) != 1:
-            raise missing from None
-        return named[0]
+        records = undoing.read_records()
+
+        def names(record: dict) -> bool:
+            planned = record.get("import") if record.get("record") == "begin" else record
+            keys = planned if isinstance(planned, dict) else {}
+            return bool(text) and text in (
+                keys.get("native_key"),
+                keys.get("source_key"),
+                record.get("id"),
+            )
+
+        live = undoing.not_undone(records) + undoing.journal.unsettled(records)
+        named = sorted({(r["provider"], r["id"]) for r in live if names(r)})
+        if len(named) == 1:
+            return named[0]
+        if not named and any(r.get("record") == "import" and names(r) for r in records):
+            raise UndoFailed(undoing.NO_RECORD, no_record=True) from None
+        raise missing from None
     return session.provider, session.id
 
 
-@_logged
-def unimport(
-    ref: Session | str,
-    force: bool = False,
-    dry_run: bool = False,
-    index: Index | None = None,
+def _undo_report(
+    name: str, session_id: str, made: undoing.UndoPlan, dry_run: bool
 ) -> UnimportReport:
-    """Take an import back: remove from the native store what the last
-    import of this session created, and nothing else (``unimport``, the
-    module, has the rules). ``ref`` is the native copy, the foreign session
-    it came from, or the id.
-
-    Refused (``UndoFailed``, nothing removed) when no import of the session
-    is recorded (the exception's ``no_record`` is set), and when a file of
-    the copy differs from what the record says of it: the session was used
-    since (its ``differences`` name the files). ``force=True`` removes the copy
-    all the same, together with what the tool made beside it since
-    (``Provider.undo_extras``), and is the only way to undo an import
-    recorded without a manifest.
-
-    Directories go only when they are empty, and a line the import added to
-    a file of the tool's stays: ``left`` says what was left and why. With
-    ``dry_run=True`` nothing is touched and the report is what would be
-    done. Otherwise the undo is recorded in the journal and a quick scan
-    runs afterwards (an ``index`` passed in is not refreshed). Raises
-    ``NotFound`` for a reference that names nothing."""
-    index = index if index is not None else load_index()
-    name, session_id = _undo_target(ref, index)
-    try:
-        provider = registry.get(name)
-    except KeyError:
-        raise NotFound(f"no reader for provider {name!r}") from None
-    native = provider.native_store()
-    if native is None or not provider.valid_id(session_id):
-        raise UndoFailed(undoing.NO_RECORD, no_record=True)
-    log = logs.logger()
-    if not dry_run:
-        log.info("unimport %s %s from %s%s", name, session_id, native, " (forced)" if force else "")
-    try:
-        made, record = undoing.undo(
-            name, session_id, native, provider.undo_extras(session_id, native), force, dry_run
-        )
-    except UndoFailed as exc:
-        if not dry_run:
-            log.warning("unimport %s %s refused: %s", name, session_id, exc.reason)
-        raise
     keys = [made.record.get(key) for key in ("native_key", "source_key")]
     native_key, source_key = (key if isinstance(key, str) else None for key in keys)
-    report = UnimportReport(
+    return UnimportReport(
         provider=name,
         id=session_id,
         native_key=native_key,
@@ -1212,6 +1213,90 @@ def unimport(
         dry_run=dry_run,
         bytes=made.bytes,
     )
+
+
+@_logged
+def unimport(
+    ref: Session | str,
+    force: bool = False,
+    dry_run: bool = False,
+    index: Index | None = None,
+    under_lock: bool = False,
+) -> UnimportReport:
+    """Take an import back: remove from the native store what the last
+    import of this session created, and nothing else (``unimport``, the
+    module, has the rules). ``ref`` is the native copy, the foreign session
+    it came from, or the id.
+
+    Refused (``UndoFailed``, nothing removed) when no import of the session
+    is recorded (the exception's ``no_record`` is set), when a file of the
+    copy differs from what the record says of it, and when the tool has
+    made its files beside the copy (``Provider.undo_extras``): the session
+    was used since (its ``differences`` name the files). ``force=True``
+    removes the copy all the same, together with what the tool made beside
+    it, and is the only way to undo an import recorded without a manifest.
+
+    An undo that removed part of the copy and could not remove the rest
+    raises ``UndoIncomplete``, whose ``report`` says what was removed and
+    what is left: the import still stands, and asking again goes on from
+    there.
+
+    Directories go only when they are empty, and a line the import added to
+    a file of the tool's stays: ``left`` says what was left and why. With
+    ``dry_run=True`` nothing is touched and the report is what would be
+    done; with ``under_lock`` too, the plan is made the way the real undo
+    makes it, with the state directory's lock held (a front end that asks
+    before it undoes plans so: a plan made beside another undo of the same
+    import would call the copy used, where there is no import left).
+    Otherwise the undo is recorded in the journal and a quick scan
+    runs afterwards (an ``index`` passed in is not refreshed). Raises
+    ``NotFound`` for a reference that names nothing."""
+    index = index if index is not None else load_index()
+    name, session_id = _undo_target(ref, index)
+    try:
+        provider = registry.get(name)
+    except KeyError:
+        raise NotFound(f"no reader for provider {name!r}") from None
+    native = provider.native_store()
+    if native is None or not provider.valid_id(session_id):
+        raise UndoFailed(undoing.NO_RECORD, no_record=True)
+    log = logs.logger()
+    settled: list[dict] = []
+    if not dry_run:
+        log.info("unimport %s %s from %s%s", name, session_id, native, " (forced)" if force else "")
+    if under_lock or not dry_run:
+        settled = _recover(provider)
+    try:
+        made, record = undoing.undo(
+            name,
+            session_id,
+            native,
+            provider.undo_extras(session_id, native),
+            force,
+            dry_run,
+            provider.read_back,
+            under_lock,
+        )
+    except undoing.Incomplete as exc:
+        # Part of the copy went: what did and what is left is reported as
+        # for an undo that went through, and the listing is brought up to date.
+        exc.report = _undo_report(name, session_id, exc.plan, dry_run)
+        log.warning("unimport %s %s not complete: %s", name, session_id, exc.reason)
+        Index.load().scan(all_providers(), list_mounts(), deep=False)
+        raise
+    except UndoFailed as exc:
+        if exc.no_record and any(
+            record.get("record") == "rollback"
+            and (record.get("provider"), record.get("id")) == (name, session_id)
+            for record in settled
+        ):
+            # What there was to take back was the start of an import, and
+            # it went just now (``_recover``): said as the engine says it.
+            exc = UndoFailed(undoing.TAKEN_OUT, no_record=True)
+        if not dry_run:
+            log.warning("unimport %s %s refused: %s", name, session_id, exc.reason)
+        raise exc from None
+    report = _undo_report(name, session_id, made, dry_run)
     if record is not None:
         log.info(
             "unimport %s %s: removed %d files and directories, left %d: %s",
@@ -1412,6 +1497,7 @@ __all__ = [
     "Offline",
     "Turn",
     "UndoFailed",
+    "UndoIncomplete",
     "UnimportReport",
     "cache_file",
     "can_import",

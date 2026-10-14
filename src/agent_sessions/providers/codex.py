@@ -9,7 +9,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
-from .. import importer
+from .. import importer, textsafe
 from ..fsutil import home, listdir_ro, open_ro, subdirs
 from ..model import Candidate, Session, Store
 from ..pathmap import normalise
@@ -45,6 +45,7 @@ _INDEX = "session_index.jsonl"
 # this many bytes is not read. A line of it holds an id and a name.
 _INDEX_MAX = 64 * 1024 * 1024
 _INDEX_LINE_MAX = 64 * 1024
+_NAME_MAX = 200  # characters of a thread's name that an import writes to the native index
 _VERSION_MAX = 64  # characters; a longer "cli_version" is not one
 _ROLES = {"UserMessage": "user", "AgentMessage": "assistant"}
 # Where the Orca app keeps its own CODEX_HOME, relative to the profile that
@@ -239,6 +240,52 @@ def _source_name_line(store_root: str, thread_id: str) -> bytes | None:
         if line is not None:
             return line
     return None
+
+
+def _once(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """A JSON object from its pairs; one that has a key twice is refused
+    (``ValueError``): which of the two values counts is the reader's choice."""
+    found = dict(pairs)
+    if len(found) != len(pairs):
+        raise ValueError("a key is there twice")
+    return found
+
+
+def _name_line(source: bytes, thread_id: str) -> bytes | None:
+    """The line an import adds to the native index for a thread whose name
+    line in the source is ``source``: a new line, made here of three values
+    and nothing else. No byte of the source line is copied: it is the one
+    thing an import writes that an undo does not take back.
+
+    ``id`` is the thread's own id (the import has checked its form);
+    ``thread_name`` is the source's as one line of clean text
+    (``textsafe.clean``), at most ``_NAME_MAX`` characters; ``updated_at``
+    is the source's time in our own form (``parse_ts``). None, and then no
+    line is added, when the source line is not strict UTF-8, is not a JSON
+    object with every key once, names another thread, leaves nothing of the
+    name that can be written, or has no time: every line the tool writes
+    has all three fields (FORMATS "Codex"), and one without is not written
+    into its file."""
+    try:
+        record = json.loads(source.decode("utf-8"), object_pairs_hook=_once)
+    except (ValueError, RecursionError):  # UnicodeDecodeError is a ValueError
+        return None
+    if not isinstance(record, dict) or record.get("id") != thread_id:
+        return None
+    name = record.get("thread_name")
+    name = textsafe.clean(name)[:_NAME_MAX].strip() if isinstance(name, str) else ""
+    if not name:
+        return None
+    moment = parse_ts(record.get("updated_at"))
+    if moment is None:
+        return None
+    entry = {"id": thread_id, "thread_name": name, "updated_at": moment}
+    try:
+        # The tool's own form: compact, text as it is.
+        text = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+        return text.encode("utf-8") + b"\n"
+    except UnicodeEncodeError:  # a lone surrogate in the name: no text a tool reads back
+        return None
 
 
 def _folded(path: object) -> tuple[str, tuple[str, ...], tuple[str, ...]] | None:
@@ -510,15 +557,19 @@ class Codex(Provider):
         rewritten; a thread with segments keeps the base file (and any middle
         segment) byte for byte, because a segment's ``history_base`` holds a
         byte offset into the base, and only its last segment is rewritten.
-        The thread's name line, when the source has one, is appended to the
-        native ``session_index.jsonl`` after the files are in place.
+        When the source's index names the thread, a name line is added to
+        the native ``session_index.jsonl`` after the files are in place: a
+        line written here from the source's values (``_name_line``), never
+        the source's own bytes.
 
         With a chosen folder (``target``) the destination is the same; the
         working directories are re-pointed at it (``_CwdRewrite``)."""
         files = [f for f in s.files if _ROLLOUT.fullmatch(os.path.basename(f))]
         if not files:
             raise NotSupported("this thread has no rollout file to copy")
-        plan = importer.start_plan(s, self.native_store(), pathmap, self.id_pattern, target)
+        plan = importer.start_plan(
+            s, self.native_store(), pathmap, self.id_pattern, target, read_back=self.read_back
+        )
         native = Store(self.name, plan.native_root, "native")
         for candidate in self.candidates(native):
             if candidate.id_hint == s.id:
@@ -547,9 +598,10 @@ class Codex(Provider):
                 )
             )
         index = os.path.join(plan.native_root, _INDEX)
-        line = _source_name_line(s.store, s.id)
+        source = _source_name_line(s.store, s.id)
+        line = _name_line(source, s.id) if source is not None else None
         if line is not None and _index_line(index, s.id) is None:
-            plan.appends.append(importer.Append(index, line + b"\n", "the thread's name"))
+            plan.appends.append(importer.Append(index, line, "the thread's name"))
         meta = _read_meta(files[0])
         version = meta.get("cli_version")
         if isinstance(version, str) and len(version) <= _VERSION_MAX:

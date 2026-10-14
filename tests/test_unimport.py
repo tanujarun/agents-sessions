@@ -32,7 +32,15 @@ from fixture_world import (
     World,
     files_below,
 )
-from support import FIXTURES, LOG_NAME, finish, launcher_child, python_child, state_names
+from support import (
+    FIXTURES,
+    LOG_NAME,
+    finish,
+    launcher_child,
+    python_child,
+    state_names,
+    wait_for,
+)
 
 from agent_sessions import api, cli, fsutil, importer, journal, logs, unimport
 from agent_sessions.providers.antigravity import Antigravity
@@ -47,6 +55,24 @@ from agent_sessions import fsutil
 with fsutil.lock():
     print("held", flush=True)
     sys.stdin.read()
+"""
+# The command line, with an undo that waits two seconds between removing the
+# copy and writing its record, and says when it gets there (``mark``).
+SLOW_UNDO = """
+import time
+from agent_sessions import cli, unimport
+
+real = unimport.undo_record
+
+
+def slow(*args, **kwargs):
+    open(sys.argv[1], "w").close()
+    time.sleep(2)
+    return real(*args, **kwargs)
+
+
+unimport.undo_record = slow
+sys.exit(cli.main(sys.argv[2:]))
 """
 
 
@@ -114,7 +140,9 @@ class UndoCase(unittest.TestCase):
         return self.w.session(session_id, "foreign")
 
     def records(self) -> list[dict]:
-        return journal.read()
+        """The import and undo records of the journal. The ``begin`` line
+        that every import starts with is left out."""
+        return [record for record in journal.read() if record.get("record") != "begin"]
 
     def rewrite_journal(self, change):
         """Change the last record of the journal by hand, as a damaged or a
@@ -233,6 +261,53 @@ class RoundTripTest(UndoCase):
         self.assertEqual(unimport.not_undone(self.records()), [])
 
 
+class SharedDirectoryTest(UndoCase):
+    """docs/AUDIT.md A-24: two sessions imported into the same project
+    directory. The first import made the directories; undone first, it had
+    to leave them (the second's files were in them), and the second's undo
+    did not know them: they stayed, empty, for good."""
+
+    def test_the_order_of_the_undos_does_not_matter(self):
+        home_before = picture(self.home)
+        for first, second in ((CLAUDE_WIN_PLAIN, CLAUDE_WIN), (CLAUDE_WIN, CLAUDE_WIN_PLAIN)):
+            with self.subTest(first=first):
+                api.import_session(self.source(CLAUDE_WIN_PLAIN))  # makes .claude/projects/<dir>
+                api.import_session(self.source(CLAUDE_WIN))
+                report = api.unimport(first)
+                self.assertTrue(self.home.joinpath(".claude").exists())  # the other is there
+                planned = api.unimport(second, dry_run=True)
+                report = api.unimport(second)
+                self.assertEqual(picture(self.home), home_before, "the home is what it was")
+                self.assertEqual((report.removed, report.left), (planned.removed, planned.left))
+                self.assertIn(str(self.home / ".claude"), report.removed)
+                self.assertEqual(report.left, [])
+
+    def test_a_directory_that_holds_something_else_is_not_reported(self):
+        api.import_session(self.source(CLAUDE_WIN_PLAIN))
+        api.import_session(self.source(CLAUDE_WIN))
+        api.unimport(CLAUDE_WIN_PLAIN)
+        mine = self.home / ".claude" / "settings.json"
+        mine.write_text("{}", encoding="utf-8")
+        report = api.unimport(CLAUDE_WIN)
+        self.assertEqual(report.left, [])  # .claude is not this import's, nor empty
+        self.assertNotIn(str(self.home / ".claude"), report.removed)
+        self.assertEqual(os.listdir(self.home / ".claude"), ["settings.json"])
+
+    def test_what_an_undone_import_named_is_checked_like_any_other_path(self):
+        api.import_session(self.source(CLAUDE_WIN_PLAIN))
+        api.unimport(CLAUDE_WIN_PLAIN)
+        outside = self.w.box.root / "empty-elsewhere"
+        outside.mkdir()
+        records = journal.read()
+        records[1]["manifest"]["dirs"] += [str(outside), f"{self.home}/.claude/../.."]
+        with open(journal.path(), "w", encoding="utf-8") as fh:
+            fh.writelines(json.dumps(record) + "\n" for record in records)
+        api.import_session(self.source(CLAUDE_WIN))
+        api.unimport(CLAUDE_WIN)
+        self.assertTrue(outside.is_dir())
+        self.assertFalse((self.home / ".claude").exists())
+
+
 class CodexIndexLineTest(UndoCase):
     """A thread with a name: the import adds a line to the tool's own
     ``session_index.jsonl``. That line is the one thing an undo leaves."""
@@ -249,7 +324,7 @@ class CodexIndexLineTest(UndoCase):
         self.index_file = self.home / ".codex" / "session_index.jsonl"
         self.line = (
             b'{"id":"01a0e538-c7bb-77dd-885b-0c4d54663241","thread_name":"title-168",'
-            b'"updated_at":"2026-09-27T23:35:21.831252584Z"}\n'
+            b'"updated_at":"2026-09-27T23:35:21.831252Z"}\n'
         )
 
     def test_the_store_differs_by_the_one_reported_line(self):
@@ -610,7 +685,9 @@ class UsedSinceTest(UndoCase):
         self.assertTrue((self.transcript / "inside").exists())
         self.assertFalse(self.side.exists())
 
-    def test_what_cannot_be_removed_is_left_and_the_rest_still_goes(self):
+    def failing_unlink(self):
+        """``os.unlink`` that cannot remove the transcript, as when its
+        directory is read-only for a moment."""
         real = os.unlink
 
         def unlink(path, *args, **kwargs):
@@ -618,8 +695,12 @@ class UsedSinceTest(UndoCase):
                 raise PermissionError(13, "Permission denied", str(self.transcript))
             return real(path, *args, **kwargs)
 
-        with mock.patch.object(os, "unlink", unlink):
-            report = api.unimport(CLAUDE_WIN)
+        return mock.patch.object(os, "unlink", unlink)
+
+    def test_what_cannot_be_removed_is_left_and_the_rest_still_goes(self):
+        with self.failing_unlink(), self.assertRaises(api.UndoIncomplete) as caught:
+            api.unimport(CLAUDE_WIN)
+        report = caught.exception.report
         self.assertIn(
             (str(self.transcript), "could not be removed: Permission denied"), report.left
         )
@@ -633,6 +714,49 @@ class UsedSinceTest(UndoCase):
         undone = self.records()[-1]
         self.assertEqual(undone["removed"], sorted(report.removed))
         self.assertEqual([item["path"] for item in undone["left"]], [p for p, _ in report.left])
+        self.assertIs(undone["complete"], False)
+
+    def test_an_undo_that_could_not_remove_everything_does_not_settle_the_import(self):
+        """docs/AUDIT.md A-06: it counted as the undo. The copy that was
+        left could then be neither undone (no import was recorded any more)
+        nor imported again (its names were taken)."""
+        with self.failing_unlink(), self.assertRaises(api.UndoIncomplete) as caught:
+            api.unimport(CLAUDE_WIN)
+        self.assertEqual(
+            caught.exception.reason,
+            "the undo is not complete: 1 of the files and directories of the imported copy "
+            f"could not be removed: {self.transcript} (could not be removed: Permission "
+            "denied). The import still stands; an undo asked for again removes the rest",
+        )
+        self.assertEqual(caught.exception.remedy, "")  # nothing to force: ask again
+        # The import still stands: listed as imported, found by the next undo.
+        self.assertEqual(len(unimport.not_undone(self.records())), 1)
+        self.assertEqual(self.source().imported_as, self.w.session(CLAUDE_WIN, "native").key)
+        # Asked again, plainly: the files the first one removed are not
+        # taken for a copy that was used since, and the rest goes.
+        planned = api.unimport(CLAUDE_WIN, dry_run=True)
+        self.assertEqual(planned.differences, [])
+        report = api.unimport(CLAUDE_WIN)
+        self.assertEqual(report.differences, [])
+        self.assertIn(str(self.transcript), report.removed)
+        self.assertFalse((self.home / ".claude").exists())
+        self.assertEqual([r["record"] for r in self.records()], ["import", "undo", "undo"])
+        self.assertIs(self.records()[-1]["complete"], True)
+        self.assertEqual(unimport.not_undone(self.records()), [])
+        api.import_session(self.source())  # and it can be imported again
+
+    def test_the_command_says_what_is_left_and_exits_one(self):
+        with self.failing_unlink():
+            code, out, err = run("unimport", CLAUDE_WIN, "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn(f"left {self.transcript} (could not be removed: Permission denied)\n", out)
+        self.assertTrue(out.startswith("removed "), out)
+        self.assertTrue(err.startswith("agent-sessions: the undo is not complete: 1 of"), err)
+        self.assertTrue(err.endswith("an undo asked for again removes the rest\n"), err)
+        code, out, err = run("unimport", CLAUDE_WIN, "--yes")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines()[0], f"removed {self.transcript}")
+        self.assertFalse((self.home / ".claude").exists())
 
 
 class OddFilesAndRacesTest(UndoCase):
@@ -692,8 +816,8 @@ class OddFilesAndRacesTest(UndoCase):
         self.assertIn(str(self.side_file), made.files)
         self.assertIn(str(self.side), made.dirs)
         shutil.rmtree(self.side)  # by someone else, meanwhile
-        removed, left = unimport._carry_out(made)
-        self.assertEqual(left, [])
+        removed, left, failed = unimport._carry_out(made)
+        self.assertEqual((left, failed), ([], []))
         self.assertNotIn(str(self.side_file), removed)
         self.assertNotIn(str(self.side), removed)
         gone = (str(self.side_file), str(self.side))
@@ -713,7 +837,10 @@ class OddFilesAndRacesTest(UndoCase):
             return real(path, *args, **kwargs)
 
         with mock.patch.object(os, "rmdir", rmdir):
-            removed, left = unimport._carry_out(made)
+            removed, left, failed = unimport._carry_out(made)
+        # A directory that filled up is left as the plan leaves one; one
+        # that could not be removed is what makes the undo not complete.
+        self.assertEqual(failed, [str(self.target.parent)])
         self.assertEqual(late.read_text(), "just arrived")
         self.assertEqual(
             left,
@@ -1085,17 +1212,45 @@ class ExtrasTest(UndoCase):
         for provider in (Claude(), Codex(), Grok(), Gemini()):
             self.assertEqual(provider.undo_extras(AGY_WIN, self.home / "x"), [])
 
-    def test_without_force_they_are_left_and_reported(self):
-        report = api.unimport(AGY_WIN)
-        self.assertFalse(self.db.exists())
-        for path in self.extras:
-            self.assertTrue(path.exists())
-            self.assertIn((str(path), unimport.EXTRA), report.left)
-        self.assertIn((str(self.dst / "conversations"), unimport.NOT_EMPTY), report.left)
-        self.assertEqual(
-            files_below(self.dst), sorted(os.path.relpath(p, self.dst) for p in self.extras)
+    def test_without_force_the_undo_is_refused_and_says_why(self):
+        """docs/AUDIT.md A-06: a plain undo removed the database and left
+        the tool's files beside it; the forced undo that should have taken
+        them found no import recorded, and the import found the lock file
+        in its way."""
+        reason = self.refused(AGY_WIN)
+        self.assertTrue(
+            reason.startswith("the tool has opened the imported copy since the import: "),
+            reason,
         )
-        self.assertIn("removed only by a forced undo", unimport.EXTRA)
+        self.assertTrue(
+            reason.endswith(
+                "Nothing was removed; a forced undo removes the copy and what the tool made "
+                "beside it"
+            ),
+            reason,
+        )
+        for path in self.extras:
+            self.assertIn(f"{path} was made by the tool since the import", reason)
+        with self.assertRaises(api.UndoFailed) as caught:
+            api.unimport(AGY_WIN)
+        self.assertEqual(caught.exception.remedy, "force")
+        self.assertEqual(
+            caught.exception.differences,
+            [f"{path} was made by the tool since the import" for path in self.extras],
+        )
+        self.assertTrue(self.db.exists())
+        # The command names its flag; the forced undo takes everything.
+        code, out, err = run("unimport", AGY_WIN, "--yes")
+        self.assertEqual((code, out), (1, ""))
+        self.assertTrue(err.endswith("what the tool made beside it (--force)\n"), err)
+        api.unimport(AGY_WIN, force=True)
+        self.assertEqual(files_below(self.dst), [])
+
+    def test_one_of_them_is_enough(self):
+        for path in self.extras[:2]:
+            path.unlink()
+        reason = self.refused(AGY_WIN)
+        self.assertIn(f"{self.extras[2]} was made by the tool since the import", reason)
 
     def test_with_force_they_go_too(self):
         planned = api.unimport(AGY_WIN, force=True, dry_run=True)
@@ -1120,8 +1275,8 @@ class ExtrasTest(UndoCase):
         with open(self.db, "ab") as fh:
             fh.write(b"\0" * 4096)
         reason = self.refused(AGY_WIN)
-        self.assertIn("was used since the import", reason)
-        self.assertIn(str(self.db), reason)
+        self.assertIn("the tool has opened the imported copy since the import", reason)
+        self.assertIn(f"{self.db} was ", reason)
         api.unimport(AGY_WIN, force=True)
         self.assertEqual(files_below(self.dst), [])
 
@@ -1215,6 +1370,55 @@ class LockAndRecordTest(UndoCase):
         self.assertEqual([r["record"] for r in self.records()], ["import", "undo"])
         self.assertFalse((self.home / ".claude").exists())
 
+    @unittest.skipUnless(POSIX, "a process held between its removal and its record")
+    def test_a_second_undo_while_the_first_is_half_way_is_told_there_is_none(self):
+        """docs/AUDIT.md A-08: the second undo planned without the lock,
+        found the files the first had just removed gone, and was told the
+        copy was used since and to force it. One situation, one message."""
+        mark = self.w.box.root / "removed"
+        first = python_child(SLOW_UNDO, mark, "unimport", self.imported.key, "--yes")
+        try:
+            wait_for(self, mark)  # the files are gone; the record is not written yet
+            second = run("unimport", self.imported.key, "--yes")
+        finally:
+            ((status, _out, err),) = finish(self, [first])
+        self.assertEqual(status, 0, err)
+        self.assertEqual(second, (1, "", f"agent-sessions: {unimport.NO_RECORD}\n"))
+        # And afterwards, by every name it had: the same words.
+        for ref in (self.imported.key, CLAUDE_WIN, self.source_key):
+            for extra in ((), ("--force",)):
+                with self.subTest(ref=ref, extra=extra):
+                    code, out, err = run("unimport", ref, "--yes", *extra)
+                    self.assertEqual((code, out), (1, ""))
+                    self.assertEqual(err, f"agent-sessions: {unimport.NO_RECORD}\n")
+        self.assertEqual([r["record"] for r in self.records()], ["import", "undo"])
+
+    def test_an_undone_import_asked_for_by_its_key_is_not_recorded(self):
+        """docs/AUDIT.md N-28: by id the answer was "no import of this
+        session is recorded", by the copy's key "no session matches"."""
+        api.unimport(CLAUDE_WIN)
+        for ref in (self.imported.key, CLAUDE_WIN):
+            for dry_run in (True, False):
+                with self.assertRaises(api.UndoFailed) as caught:
+                    api.unimport(ref, dry_run=dry_run)
+                self.assertEqual(caught.exception.reason, unimport.NO_RECORD)
+                self.assertTrue(caught.exception.no_record)
+        # A key that never named an import is still not a session.
+        with self.assertRaises(api.NotFound):
+            api.unimport("claude:nope")
+
+    def test_the_plan_before_the_question_is_made_with_the_lock_held(self):
+        seen = []
+        real = unimport.plan
+
+        def plan(*args, **kwargs):
+            seen.append(fsutil.lock_file().exists())
+            return real(*args, **kwargs)
+
+        with mock.patch.object(unimport, "plan", plan):
+            self.assertEqual(run("unimport", CLAUDE_WIN, "--yes")[0], 0)
+        self.assertEqual(seen, [True, True])  # the one before the question, and the undo's
+
     def test_the_undo_record(self):
         imported = self.records()[0]
         report = api.unimport(CLAUDE_WIN)
@@ -1238,6 +1442,7 @@ class LockAndRecordTest(UndoCase):
                     + imported["manifest"]["dirs"]
                 ),
                 "left": [],
+                "complete": True,
                 "agent_sessions_version": "0.2.0",
             },
         )

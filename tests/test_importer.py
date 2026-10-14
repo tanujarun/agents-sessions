@@ -27,6 +27,7 @@ from fixture_world import (
     CLAUDE_NATIVE,
     CLAUDE_WIN,
     CLAUDE_WIN_PLAIN,
+    CODEX_NATIVE,
     CODEX_SEGMENTED,
     CODEX_WIN,
     GEMINI_WIN,
@@ -122,12 +123,23 @@ class ImportCase(unittest.TestCase):
     def record_file(self) -> Path:
         return Path(os.environ["AGENT_SESSIONS_STATE"]) / "imports.jsonl"
 
-    def records(self) -> list[dict]:
-        """The journal, read by hand: one JSON object per line."""
+    def journal_kinds(self) -> list[str]:
+        """What each line of the journal is, read by hand: one JSON object
+        per line. None when there is no journal."""
+        if not self.record_file.exists():
+            return []
         lines = self.record_file.read_text(encoding="utf-8").splitlines()
         records = [json.loads(line) for line in lines]
         self.assertEqual(records, journal.read())
-        return records
+        return [record["record"] for record in records]
+
+    def records(self) -> list[dict]:
+        """The import records of the journal. Every one of them follows the
+        ``begin`` line of its import, which is not returned."""
+        kinds = self.journal_kinds()
+        self.assertEqual(kinds[0::2], ["begin"] * (len(kinds) // 2), kinds)
+        self.assertEqual(len(kinds) % 2, 0, kinds)
+        return [record for record in journal.read() if record["record"] == "import"]
 
     def refused(self, ref, **kwargs) -> str:
         with self.assertRaises(api.ImportFailed) as caught:
@@ -135,9 +147,14 @@ class ImportCase(unittest.TestCase):
         return caught.exception.reason
 
     def assert_nothing_written(self, *stores):
+        """Nothing in the native stores, and no import in the journal: none
+        that stands, and none left open. One that had begun to put its
+        copy in place has its two lines there, ``begin`` and ``rollback``."""
         for name in stores or (".claude", ".codex", ".grok", ".gemini"):
             self.assertFalse((self.home / name).exists(), name)
-        self.assertFalse(self.record_file.exists())
+        kinds = self.journal_kinds()
+        self.assertEqual(kinds, ["begin", "rollback"] * (len(kinds) // 2))
+        self.assertEqual(journal.unsettled(journal.read()), [])
 
 
 # --- Claude -----------------------------------------------------------------
@@ -410,7 +427,16 @@ class ClaudeImportTest(ImportCase):
         self.assertEqual(files_below(self.home / ".claude"), ["projects/-kept/note.txt"])
         self.assertEqual(sorted(os.listdir(self.home / ".claude")), ["projects"])
         self.assertEqual(os.listdir(self.home / ".claude" / "projects"), ["-kept"])
-        self.assertEqual(state_names(), [])
+        # It had begun: the journal says so, and that it was taken out again.
+        self.assertEqual(state_names(), ["imports.jsonl"])
+        self.assertEqual(self.journal_kinds(), ["begin", "rollback"])
+        begin, rolled_back = journal.read()
+        self.assertEqual(begin["destinations"], calls)
+        self.assertEqual(
+            rolled_back["removed"], sorted([str(self.target), str(self.target / CLAUDE_WIN)])
+        )
+        self.assertEqual((rolled_back["recovered"], rolled_back["id"]), (False, CLAUDE_WIN))
+        self.assertEqual(self.records(), [])
 
     def test_an_interrupted_copy_leaves_nothing_behind(self):
         class Stop(Exception):
@@ -663,12 +689,13 @@ class CodexImportTest(ImportCase):
         mirror.mkdir(parents=True)
         last = (
             b'{"id":"%s","thread_name":"Site r\xc3\xa9vision","updated_at":'
-            b'"2026-08-29T08:31:20.3644826Z"}' % CODEX_WIN.encode()
+            b'"2026-08-29T08:31:20.364482Z"}' % CODEX_WIN.encode()
         )
         (mirror / "session_index.jsonl").write_bytes(
             b'{"id":"%s","thread_name":"first name","updated_at":"x"}\r\n' % CODEX_WIN.encode()
             + b'{"id":"other","thread_name":"not this one","updated_at":"y"}\n'
-            + last
+            # As a Windows Codex writes it: seven fraction digits.
+            + last.replace(b"364482Z", b"3644826Z")
             + b"\n"
         )
         index = self.home / ".codex" / "session_index.jsonl"
@@ -685,11 +712,118 @@ class CodexImportTest(ImportCase):
         self.assertEqual(native.title, "Site révision")
         self.assertEqual(self.records()[0]["appended"], [str(index)])
 
+    def name_line(self, line: bytes, native: bytes | None = None) -> bytes:
+        """Import the thread with ``line`` as the last line of the source's
+        index; returns what the import added to the native one."""
+        own = self.w.profile / ".codex" / "session_index.jsonl"
+        own.write_bytes(
+            b'{"id":"%s","thread_name":"an older name","updated_at":"2026-08-01T00:00:00Z"}\n'
+            % CODEX_WIN.encode()
+            + line
+            + b"\n"
+        )
+        index = self.home / ".codex" / "session_index.jsonl"
+        if native is not None:
+            index.parent.mkdir(parents=True)
+            index.write_bytes(native)
+        self.w.scan()
+        api.import_session(CODEX_WIN)
+        self.assertTrue(self.copy.exists())
+        after = read(index) if index.exists() else b""
+        self.assertTrue(after.startswith(native or b""))
+        return after[len(native or b"") :]
+
+    MINE = b'{"id":"%s","thread_name":"mine","updated_at":"2026-10-01T00:00:00Z"}\n' % (
+        CODEX_NATIVE.encode()
+    )
+
+    def test_the_name_line_is_written_anew_and_never_copied(self):
+        """docs/AUDIT.md A-11: the line is the one write an undo never takes
+        back, and it was the source's bytes as they were. Now it is a line
+        of our own, made of three checked values and nothing else."""
+        added = self.name_line(
+            b'  {"updated_at" : "2026-08-29T09:31:15.3316788+02:00", "anything": {"else": [1, 2]},'
+            b' "thread_name": "RENAMED\\u001b[2J BY \xe2\x80\xaeTHE DRIVE", "id": "%s"}\r'
+            % CODEX_WIN.encode(),
+            self.MINE,
+        )
+        self.assertEqual(
+            added,
+            b'{"id":"%s","thread_name":"RENAMED [2J BY  THE DRIVE",'
+            b'"updated_at":"2026-08-29T07:31:15.331678Z"}\n' % CODEX_WIN.encode(),
+        )
+
+    def test_a_line_with_a_key_twice_is_not_a_name_line(self):
+        """The auditor's line: the first ``id`` is one of the user's own
+        threads, the last the thread's. Which of the two a parser takes is
+        the parser's choice; nothing of such a line is written."""
+        added = self.name_line(
+            b'{"id":"%s","thread_name":"RENAMED BY THE DRIVE","updated_at":"2099-01-01T00:00:00Z",'
+            b'"id":"%s"}' % (CODEX_NATIVE.encode(), CODEX_WIN.encode()),
+            self.MINE,
+        )
+        self.assertEqual(added, b"")
+        self.assertEqual(self.records()[-1]["appended"], [])
+
+    def test_a_name_that_is_not_utf8_is_not_written(self):
+        added = self.name_line(
+            b'{"id":"%s","thread_name":"caf\xe9 \xff\xfe name","updated_at":"2026-08-29T08:31:16Z"}'
+            % CODEX_WIN.encode(),
+            self.MINE,
+        )
+        self.assertEqual(added, b"")
+        read(self.home / ".codex" / "session_index.jsonl").decode("utf-8")  # still text
+
+    def test_a_name_that_cannot_be_written_as_text_is_not_written(self):
+        # A lone surrogate, escaped: valid JSON, and no text a tool can read back.
+        added = self.name_line(
+            b'{"id":"%s","thread_name":"a \\ud800 name","updated_at":"2026-08-29T08:31:16Z"}'
+            % CODEX_WIN.encode(),
+            self.MINE,
+        )
+        self.assertEqual(added, b"")
+
+    def test_the_name_is_bounded_and_a_line_without_a_time_is_not_written(self):
+        """Every line the tool writes has all three fields (FORMATS
+        "Codex"): a line without a time that is one is not written."""
+        for line, expected in (
+            (
+                b'{"id":"%s","thread_name":"'
+                + b"n" * 5000
+                + b'","updated_at":"2026-08-29T08:31:16Z"}',
+                b'{"id":"%s","thread_name":"'
+                + b"n" * 200
+                + b'","updated_at":"2026-08-29T08:31:16.000000Z"}\n',
+            ),
+            (b'{"id":"%s","thread_name":"a name","updated_at":"tomorrow"}', b""),
+            (b'{"id":"%s","thread_name":"a name","updated_at":"9999-01-01T00:00:00Z"}', b""),
+            (b'{"id":"%s","thread_name":"a name","updated_at":{"deep":[1]}}', b""),
+            (b'{"id":"%s","thread_name":"a name"}', b""),
+            (  # nothing left of the name
+                b'{"id":"%s","thread_name":"\\u0007 \\t ","updated_at":"2026-08-29T08:31:16Z"}',
+                b"",
+            ),
+            (  # not a name line at all: the one before it is the thread's last
+                b'{"id":"%s","thread_name":["a name"]}',
+                b'{"id":"%s","thread_name":"an older name",'
+                b'"updated_at":"2026-08-01T00:00:00.000000Z"}\n',
+            ),
+        ):
+            with self.subTest(line=line[:60]):
+                thread = CODEX_WIN.encode()
+                added = self.name_line(line.replace(b"%s", thread))
+                self.assertEqual(added, expected.replace(b"%s", thread))
+                api.unimport(CODEX_WIN)
+                index = self.home / ".codex" / "session_index.jsonl"
+                if index.exists():
+                    index.unlink()
+
     def test_an_index_the_import_creates_is_private(self):
         """docs/REVIEW.md R-10: thread names are session data like the rest."""
         own = self.w.profile / ".codex" / "session_index.jsonl"
         own.write_bytes(
-            b'{"id":"%s","thread_name":"from the store","updated_at":"t"}\n' % CODEX_WIN.encode()
+            b'{"id":"%s","thread_name":"from the store","updated_at":"2026-08-29T08:31:16Z"}\n'
+            % CODEX_WIN.encode()
         )
         self.w.scan()
         index = self.home / ".codex" / "session_index.jsonl"
@@ -702,7 +836,8 @@ class CodexImportTest(ImportCase):
     def test_an_index_that_exists_keeps_its_mode(self):
         own = self.w.profile / ".codex" / "session_index.jsonl"
         own.write_bytes(
-            b'{"id":"%s","thread_name":"from the store","updated_at":"t"}\n' % CODEX_WIN.encode()
+            b'{"id":"%s","thread_name":"from the store","updated_at":"2026-08-29T08:31:16Z"}\n'
+            % CODEX_WIN.encode()
         )
         index = self.home / ".codex" / "session_index.jsonl"
         index.parent.mkdir(parents=True)
@@ -716,7 +851,8 @@ class CodexImportTest(ImportCase):
     def test_a_name_the_native_index_already_has_is_not_appended_again(self):
         own = self.w.profile / ".codex" / "session_index.jsonl"
         own.write_bytes(
-            b'{"id":"%s","thread_name":"from the store","updated_at":"t"}\n' % CODEX_WIN.encode()
+            b'{"id":"%s","thread_name":"from the store","updated_at":"2026-08-29T08:31:16Z"}\n'
+            % CODEX_WIN.encode()
         )
         index = self.home / ".codex" / "session_index.jsonl"
         index.parent.mkdir(parents=True)
@@ -730,7 +866,10 @@ class CodexImportTest(ImportCase):
 
     def test_failed_append_rolls_the_rollout_back(self):
         own = self.w.profile / ".codex" / "session_index.jsonl"
-        own.write_bytes(b'{"id":"%s","thread_name":"n","updated_at":"t"}\n' % CODEX_WIN.encode())
+        own.write_bytes(
+            b'{"id":"%s","thread_name":"n","updated_at":"2026-08-29T08:31:16Z"}\n'
+            % CODEX_WIN.encode()
+        )
         self.w.scan()
         with mock.patch.object(
             importer, "_append", side_effect=OSError(errno.EACCES, "Permission denied", "idx")
@@ -813,11 +952,12 @@ class CodexSegmentImportTest(ImportCase):
         self.assertEqual(
             (native.messages, native.title, native.launchable), (source.messages, "title-168", True)
         )
-        # The name line: the last one of the source index, as it is in the file.
+        # The name line: the values of the last one of the source index,
+        # written anew (the time in our own form, six fraction digits).
         self.assertEqual(
             read(self.home / ".codex" / "session_index.jsonl"),
             b'{"id":"01a0e538-c7bb-77dd-885b-0c4d54663241","thread_name":"title-168",'
-            b'"updated_at":"2026-09-27T23:35:21.831252584Z"}\n',
+            b'"updated_at":"2026-09-27T23:35:21.831252Z"}\n',
         )
         self.assertEqual(
             files_below(self.home / ".codex"),
@@ -1179,16 +1319,55 @@ class GrokImportTest(ImportCase):
         self.assertRegex(grok_mod.group_name(too_long[:-1]), r"^t{18}-[0-9a-f]{16}$")
         self.assert_nothing_written()
 
-    def test_an_existing_group_that_decodes_to_the_folder_is_reused(self):
+    def test_a_group_that_only_decodes_to_the_folder_is_not_used(self):
+        """docs/AUDIT.md A-24: the tool lists a folder's sessions from one
+        name only (FORMATS Q1). A directory that merely decodes to the
+        folder (lower-case hex, an escaped ``-``) is not that name, and a
+        session filed there would not be listed."""
         source = self.source(GROK_WIN)
         sessions = self.home / ".grok" / "sessions"
-        (sessions / "%2Fwith%2Dhyphen").mkdir(parents=True)  # another spelling of the folder
+        for other in ("%2Fwith%2Dhyphen", "%2fwith-hyphen"):
+            (sessions / other).mkdir(parents=True)  # another spelling of the folder
+            self.assertEqual(urllib.parse.unquote(other), "/with-hyphen")
         plan = Grok().import_plan(source, StubMap({source.cwd: "/with-hyphen"}))
-        self.assertEqual(plan.units[0].dst, str(sessions / "%2Fwith%2Dhyphen" / GROK_WIN))
-        # The tool's own name wins once it is there too.
+        self.assertEqual(plan.units[0].dst, str(sessions / "%2Fwith-hyphen" / GROK_WIN))
+        # The same once the tool's own name is there too.
         (sessions / "%2Fwith-hyphen").mkdir()
         plan = Grok().import_plan(source, StubMap({source.cwd: "/with-hyphen"}))
         self.assertEqual(plan.units[0].dst, str(sessions / "%2Fwith-hyphen" / GROK_WIN))
+
+    def test_a_summary_that_starts_with_a_byte_order_mark_is_imported(self):
+        """docs/AUDIT.md A-24: such a session was listed and could not be
+        imported. The copy's summary is the same JSON without the mark."""
+        summary = self.original / "summary.json"
+        plain = read(summary)
+        summary.write_bytes(b"\xef\xbb\xbf" + plain)
+        self.w.scan()
+        source = self.source(GROK_WIN)
+        self.assertEqual(source.id, GROK_WIN)  # listed, as before
+        planned = api.import_plan(source)
+        self.assertIn(
+            "the byte order mark at the start is left out", planned["rewrites"][0]["changes"]
+        )
+        native = api.import_session(source)
+        self.assertEqual(native.id, GROK_WIN)
+        copied = read(self.copy / "summary.json")
+        self.assertFalse(copied.startswith(b"\xef\xbb\xbf"))
+        after, before = json.loads(copied), json.loads(plain)
+        self.assertEqual(after["info"]["cwd"], str(self.w.site))
+        for key in before:
+            if key not in ("info", "grok_home"):
+                self.assertEqual(after[key], before[key], key)
+        # A summary in the tool's own layout keeps it, mark or no mark.
+        pretty = json.dumps(before, ensure_ascii=False, indent=2).encode("utf-8")
+        rewrite = _SummaryRewrite("/c", "/g")
+        for mark in (b"", b"\xef\xbb\xbf"):
+            with open(self.w.box.root / "summary.json", "w+b") as fh:
+                fh.write(mark + pretty)
+                fh.seek(0)
+                out = b"".join(rewrite.apply(fh))
+            self.assertTrue(out.startswith(b'{\n  "'), out[:20])
+            self.assertEqual(json.loads(out)["info"]["cwd"], "/c")
 
     def test_an_id_in_any_group_is_a_collision(self):
         taken = self.home / ".grok" / "sessions" / "%2Felsewhere" / GROK_WIN

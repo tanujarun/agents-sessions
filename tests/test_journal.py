@@ -68,6 +68,34 @@ except fsutil.LockTimeout as exc:
 """
 
 
+def in_time(case, call, seconds=10):
+    """What ``call()`` returns, or the exception it raises, from a thread of
+    its own: a call that has not come back after ``seconds`` fails the test
+    (it waits in the open of a named pipe; ``release`` lets it go)."""
+    result = []
+
+    def body():
+        try:
+            result.append(call())
+        except Exception as exc:
+            result.append(exc)
+
+    thread = threading.Thread(target=body, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    if thread.is_alive():
+        case.fail("the call waits: it opened a named pipe and nobody writes to it")
+    return result[0]
+
+
+def release(pipe):
+    """Let a reader go that waits in the open of the named pipe ``pipe``."""
+    try:
+        os.close(os.open(pipe, os.O_WRONLY | os.O_NONBLOCK))
+    except OSError:
+        pass
+
+
 class StateCase(unittest.TestCase):
     def setUp(self):
         self.box = Sandbox(self)
@@ -162,6 +190,62 @@ class LockTest(StateCase):
         self.lock_path.write_text("999999999\n")
         with fsutil.lock(timeout=0):
             self.assertEqual(self.lock_path.read_text(), f"{os.getpid()}\n")
+        if POSIX:
+            self.assertEqual(os.listdir(self.state), [])  # and the next holder took it away
+
+    @unittest.skipUnless(POSIX, "a process killed with the lock in hand")
+    def test_a_holder_that_was_killed_leaves_a_file_the_next_holder_removes(self):
+        """docs/AUDIT.md N-27."""
+        holder = python_child(HOLDER, stdin=-1)
+        try:
+            self.assertEqual(holder.stdout.readline(), "held\n")
+            holder.kill()
+        finally:
+            finish(self, [holder])
+        self.assertEqual(self.lock_path.read_text(), f"{holder.pid}\n")  # left behind
+        with fsutil.lock(timeout=0):
+            self.assertEqual(self.lock_path.read_text(), f"{os.getpid()}\n")
+        self.assertEqual(os.listdir(self.state), [])
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "needs symbolic links")
+    def test_a_link_under_the_locks_name_is_refused_and_never_written_through(self):
+        """docs/AUDIT.md A-18: the holder's number went into the file the
+        link pointed at, in place of what that file held."""
+        victim = self.box.root / "notes.txt"
+        victim.write_text("my notes, 28 bytes of them.\n")
+        os.symlink(victim, self.lock_path)
+        for _attempt in range(2):
+            with self.assertRaises(fsutil.NotRegularFile) as caught, fsutil.lock(timeout=0):
+                self.fail("the lock was taken through a link")
+            self.assertEqual(caught.exception.filename, str(self.lock_path))
+            self.assertEqual(victim.read_text(), "my notes, 28 bytes of them.\n")
+            self.assertTrue(self.lock_path.is_symlink())  # not ours to remove either
+        dangling = self.box.root / "nowhere"
+        os.unlink(self.lock_path)
+        os.symlink(dangling, self.lock_path)
+        with self.assertRaises(fsutil.NotRegularFile), fsutil.lock(timeout=0):
+            self.fail("the lock was taken through a link")
+        self.assertFalse(dangling.exists())  # nothing was created where it points
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs named pipes")
+    def test_a_named_pipe_under_the_locks_name_is_refused(self):
+        os.mkfifo(self.lock_path)
+        with self.assertRaises(fsutil.NotRegularFile), fsutil.lock(timeout=0):
+            self.fail("a named pipe was taken for the lock file")
+        self.assertTrue(stat.S_ISFIFO(os.lstat(self.lock_path).st_mode))
+
+    def test_a_directory_under_the_locks_name_is_refused(self):
+        self.lock_path.mkdir()
+        with self.assertRaises(OSError) as caught, fsutil.lock(timeout=0):
+            self.fail("a directory was taken for the lock file")
+        self.assertNotIsInstance(caught.exception, fsutil.LockTimeout)
+        self.assertTrue(self.lock_path.is_dir())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs named pipes")
+    def test_who_holds_the_lock_is_read_without_waiting(self):
+        os.mkfifo(self.lock_path)
+        self.addCleanup(release, self.lock_path)
+        self.assertIsNone(in_time(self, lambda: fsutil._holder(str(self.lock_path))))
 
     def test_a_disk_too_full_for_the_holders_number_does_not_cost_the_lock(self):
         real = os.write
@@ -362,6 +446,41 @@ class JournalTest(StateCase):
         with self.assertRaises(OSError):
             journal.append({"id": "a"})
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs named pipes")
+    def test_a_named_pipe_under_the_journals_name_is_an_error_not_a_wait(self):
+        """docs/AUDIT.md A-18: every listing reads the journal, and a plain
+        open of a named pipe waits for a writer that never comes."""
+        self.state.mkdir()
+        os.mkfifo(journal.path())
+        self.addCleanup(release, journal.path())
+        for quiet in (False, True):
+            failure = in_time(self, lambda quiet=quiet: journal.read(quiet))
+            self.assertIsInstance(failure, fsutil.NotRegularFile)
+        # And nothing is written into it: a record would be lost there.
+        failure = in_time(self, lambda: journal.append({"id": "lost"}))
+        self.assertIsInstance(failure, fsutil.NotRegularFile)
+        self.assertTrue(stat.S_ISFIFO(os.lstat(journal.path()).st_mode))
+        # The same for the old record beside it, which is only ever read.
+        os.unlink(journal.path())
+        os.mkfifo(journal.legacy_path())
+        self.addCleanup(release, journal.legacy_path())
+        with self.assertLogs("agent_sessions", "WARNING") as logged:
+            self.assertEqual(in_time(self, journal.read), [])
+        self.assertIn("left as it is", logged.output[0])
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "needs symbolic links")
+    def test_a_journal_kept_elsewhere_through_a_link_is_the_users_own(self):
+        """The state directory is the user's: a journal that is a link to a
+        file of theirs is read and added to like any other."""
+        self.state.mkdir()
+        elsewhere = self.box.root / "kept" / "imports.jsonl"
+        elsewhere.parent.mkdir()
+        elsewhere.write_bytes(b'{"id":"a"}\n')
+        os.symlink(elsewhere, journal.path())
+        journal.append({"id": "b"})
+        self.assertEqual(journal.read(), [{"id": "a"}, {"id": "b"}])
+        self.assertEqual(elsewhere.read_bytes(), b'{"id":"a"}\n{"id":"b"}\n')
+
     def test_a_write_that_fails_leaves_the_journal_as_it_was(self):
         journal.append({"id": "kept"})
         before = journal.path().read_bytes()
@@ -445,6 +564,42 @@ class LegacyRecordTest(StateCase):
         self.assertEqual([r["id"] for r in journal.read()], ["ok", "kept"])
 
 
+class RecordKindsTest(unittest.TestCase):
+    """``begin`` and ``rollback``: what ``not_undone`` and ``unsettled``
+    make of them (docs/AUDIT.md A-04)."""
+
+    def r(self, kind, session="a", store="/s", **more):
+        return {"record": kind, "provider": "p", "id": session, "destination_store": store, **more}
+
+    def test_only_an_import_record_stands(self):
+        begin, imported = self.r("begin"), self.r("import")
+        self.assertEqual(journal.not_undone([begin]), [])
+        self.assertEqual(journal.not_undone([begin, imported]), [imported])
+        self.assertEqual(journal.not_undone([begin, self.r("rollback")]), [])
+        # A rollback is not an undo: it takes no import back.
+        self.assertEqual(journal.not_undone([imported, self.r("rollback")]), [imported])
+
+    def test_a_begin_is_open_until_an_import_or_a_rollback_of_the_same_store(self):
+        first, second = self.r("begin"), self.r("begin", "b")
+        other_store = self.r("begin", store="/t")
+        records = [first, second, other_store]
+        self.assertEqual(journal.unsettled(records), records)
+        self.assertEqual(journal.unsettled([*records, self.r("import")]), [second, other_store])
+        self.assertEqual(
+            journal.unsettled([*records, self.r("rollback", "b")]), [first, other_store]
+        )
+        self.assertEqual(
+            journal.unsettled([*records, self.r("rollback", store="/t")]), [first, second]
+        )
+        # Settled lines do not open again; a later begin does.
+        later = self.r("begin")
+        self.assertEqual(journal.unsettled([first, self.r("import"), later]), [later])
+        # An undo settles nothing, and a line without provider or id is no line.
+        self.assertEqual(journal.unsettled([first, self.r("undo")]), [first])
+        self.assertEqual(journal.unsettled([{"record": "begin"}, self.r("begin", None)]), [])
+        self.assertEqual(journal.unsettled(iter(records)), records)  # read once
+
+
 class ConcurrentImportTest(unittest.TestCase):
     """R-06: imports of different sessions, started at the same moment in
     processes of their own (our launcher), all leave their record."""
@@ -463,7 +618,14 @@ class ConcurrentImportTest(unittest.TestCase):
             self.assertIn("imported", err)
             self.assertTrue(out.startswith(f"{source.provider}:"), out)  # the native key
         with self.assertNoLogs("agent_sessions", "WARNING"):
-            records = journal.read()
+            lines = journal.read()
+        # Two lines each, its own ``begin`` right before its ``import``:
+        # one import at a time, whichever process it is.
+        self.assertEqual(
+            [(r["record"], r["id"]) for r in lines[0::2]], [("begin", r["id"]) for r in lines[1::2]]
+        )
+        records = lines[1::2]
+        self.assertEqual(journal.not_undone(lines), records)
         self.assertEqual(sorted(r["id"] for r in records), sorted(s.id for s in sources))
         self.assertEqual({r["source_key"] for r in records}, {s.key for s in sources})
         for record in records:

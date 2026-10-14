@@ -190,7 +190,7 @@ class ChosenFolderTest(FolderCase):
         self.assertEqual(
             api.import_plan(CLAUDE_WIN, target=str(self.chosen))["already"], report.session.key
         )
-        self.assertEqual(len(journal.read()), 1)
+        self.assertEqual(len(journal.not_undone(journal.read())), 1)
 
     def test_a_native_session_is_not_imported_into_a_folder_either(self):
         shutil.copytree(FIXTURES / "claude" / "native" / ".claude", self.home / ".claude")
@@ -281,6 +281,24 @@ class ClaudeFolderTest(FolderCase):
         self.assertEqual(native.cwd, RECORDED)
         self.assertEqual(self.source(CLAUDE_WIN).imported_as, native.key)
 
+    def test_the_real_path_of_the_chosen_folder_names_the_directory(self):
+        """docs/AUDIT.md N-23: the tool looks a session up under the name of
+        its own working directory, which is the folder's physical path. A
+        copy filed under the name of a link to it would not be found."""
+        link = self.home / "link to it"
+        os.symlink(self.chosen, link)
+        source = self.source(CLAUDE_WIN)
+        plan = api.import_plan(source, target=str(link))
+        self.assertEqual((plan["cwd_local"], plan["chosen_folder"]), (str(self.chosen), str(link)))
+        api.import_session(source, target=str(link))
+        self.assert_copied_into(self.target)  # projects/<the folder itself>, not the link
+        (record,) = journal.not_undone(journal.read())
+        self.assertEqual(
+            (record["cwd_local"], record["chosen_folder"]), (str(self.chosen), str(link))
+        )
+        # And the copy is resumed in the folder that was chosen.
+        self.assertEqual(self.w.session(CLAUDE_WIN, "native").cwd_local, str(link))
+
     def test_the_tools_own_marker_for_a_moved_session_is_not_written(self):
         self.lose_the_folder()
         api.import_session(self.source(CLAUDE_WIN), target=str(self.chosen))
@@ -308,7 +326,7 @@ class ClaudeFolderTest(FolderCase):
         self.assertEqual(plan["rewrites"], [])
         self.assert_nothing_written()
         api.import_session(source, target=f"{self.chosen}/")
-        (record,) = journal.read()
+        (record,) = journal.not_undone(journal.read())
         self.assertEqual(
             (record["cwd"], record["cwd_local"], record["chosen_folder"]),
             (RECORDED, str(self.chosen), str(self.chosen)),
@@ -326,7 +344,7 @@ class ClaudeFolderTest(FolderCase):
         self.assert_copied_into(self.target, CLAUDE_WIN_PLAIN)
         mapped = self.home / ".claude" / "projects" / encode_cwd(str(self.w.site))
         self.assertFalse(mapped.exists())
-        (record,) = journal.read()
+        (record,) = journal.not_undone(journal.read())
         self.assertEqual(record["chosen_folder"], str(self.chosen))
 
     def test_a_session_without_a_recorded_folder(self):
@@ -337,7 +355,7 @@ class ClaudeFolderTest(FolderCase):
             importer.start_plan(source, "/native", self.index.pathmap)
         api.import_session(source, target=str(self.chosen))
         self.assert_copied_into(self.target, CLAUDE_WIN_PLAIN)
-        (record,) = journal.read()
+        (record,) = journal.not_undone(journal.read())
         self.assertEqual(
             (record["cwd"], record["cwd_local"], record["chosen_folder"]),
             (None, str(self.chosen), str(self.chosen)),
@@ -436,7 +454,7 @@ class CodexFolderTest(FolderCase):
             ],
         )
         self.assertEqual((native.cwd, native.cwd_local, native.launchable), (chosen, chosen, True))
-        (record,) = journal.read()
+        (record,) = journal.not_undone(journal.read())
         self.assertEqual(
             (record["cwd"], record["cwd_local"], record["chosen_folder"]),
             (RECORDED, chosen, chosen),
@@ -688,7 +706,7 @@ class GrokFolderTest(FolderCase):
         self.assertTrue(group.endswith("%2FWork%2Fnew%20place"), group)
         self.assert_imported_for(chosen, group)
         self.assertEqual((native.cwd, native.cwd_local, native.launchable), (chosen, chosen, True))
-        (record,) = journal.read()
+        (record,) = journal.not_undone(journal.read())
         self.assertEqual(
             (record["cwd"], record["cwd_local"], record["chosen_folder"]),
             (RECORDED, chosen, chosen),
@@ -721,7 +739,7 @@ class GrokFolderTest(FolderCase):
         api.import_session(self.source(GROK_WIN), target=str(link))
         # Filed under the folder itself: the tool goes by the physical path.
         self.assert_imported_for(str(self.chosen), urllib.parse.quote(str(self.chosen), safe=""))
-        (record,) = journal.read()
+        (record,) = journal.not_undone(journal.read())
         self.assertEqual(
             (record["cwd_local"], record["chosen_folder"]), (str(self.chosen), str(link))
         )
@@ -781,7 +799,7 @@ class ImportToCommandTest(FolderCase):
         self.assertEqual(
             os.listdir(self.home / ".claude" / "projects"), [encode_cwd(str(self.chosen))]
         )
-        self.assertEqual(journal.read()[0]["chosen_folder"], str(self.chosen))
+        self.assertEqual(journal.read()[-1]["chosen_folder"], str(self.chosen))
 
     def test_a_refusal_for_want_of_a_folder_names_the_flag(self):
         claude_transcript(self.w.profile / ".claude", NO_FOLDER, None, project="none")

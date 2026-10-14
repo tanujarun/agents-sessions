@@ -158,6 +158,27 @@ def open_private(path: StrPath) -> io.TextIOWrapper:
         raise
 
 
+def open_regular(path: StrPath, flags: int, mode: int = PRIVATE_FILE) -> int:
+    """``os.open`` for one of our own files that is written to (the lock
+    file, the journal): the descriptor of a regular file, or an error. The
+    state directory is the user's own, trusted but possibly malformed: a
+    named pipe under one of our names must not make a command wait for a
+    reader (the open does not wait where the platform has O_NONBLOCK), and
+    what is written into anything but a regular file is lost. Raises
+    ``NotRegularFile`` for a pipe, a device or a socket; a directory fails
+    in the open itself. ``flags`` are ``os.open``'s."""
+    fd = os.open(path, flags | _NO_WAIT, mode)
+    try:
+        regular = stat.S_ISREG(os.fstat(fd).st_mode)
+    except BaseException:
+        os.close(fd)
+        raise
+    if not regular:
+        os.close(fd)
+        raise NotRegularFile(path)
+    return fd
+
+
 def fsync_dir(path: StrPath) -> bool:
     """Flush a directory to disk, so that a name just created, renamed or
     removed in it survives a crash. Best effort: False where a directory
@@ -227,9 +248,10 @@ def _try_lock(fd: int) -> bool:
 
 
 def _holder(path: str) -> int | None:
-    """The process id the holder wrote into the lock file, when it is one."""
+    """The process id the holder wrote into the lock file, when it is one.
+    Read without waiting, and from a regular file only (``open_ro``)."""
     try:
-        with open(path, "rb") as fh:
+        with open_ro(path) as fh:
             text = fh.read(_PID_TEXT_MAX).strip()
     except OSError:
         return None
@@ -237,11 +259,12 @@ def _holder(path: str) -> int | None:
 
 
 def _still_named(fd: int, path: str) -> bool:
-    """Whether the lock file that is open is still the one at ``path``."""
+    """Whether the lock file that is open is still the one at ``path``; a
+    link under that name is not it, wherever it leads."""
     if sys.platform == "win32":
         return True  # the file is never removed there, see _release
     try:
-        return os.path.samestat(os.fstat(fd), os.stat(path))
+        return os.path.samestat(os.fstat(fd), os.lstat(path))
     except OSError:
         return False
 
@@ -258,12 +281,28 @@ def _note_holder(fd: int) -> None:
         pass
 
 
+def _open_lock(path: str) -> int:
+    """The lock file, opened or created: a regular file under that very
+    name. The holder's process id is written into it in place of what it
+    held (``_note_holder``), so it is never opened through a symbolic link:
+    a link under the lock's name is refused (``NotRegularFile``) whatever
+    it points at, and so is a named pipe (``open_regular``)."""
+    if os.path.islink(path):
+        raise NotRegularFile(path)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return open_regular(path, flags)
+    except OSError:
+        if os.path.islink(path):  # put there after the look; O_NOFOLLOW refused it
+            raise NotRegularFile(path) from None
+        raise
+
+
 def _acquire(path: str, deadline: float, timeout: float) -> int:
     """Open the lock file and lock it, by ``deadline`` (``timeout`` is what
     the caller asked for, for the error); the descriptor is the lock."""
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
     while True:
-        fd = os.open(path, flags, PRIVATE_FILE)
+        fd = _open_lock(path)
         mine = False
         try:
             while not _try_lock(fd):

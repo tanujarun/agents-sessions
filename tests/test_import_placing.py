@@ -6,6 +6,7 @@ with real processes."""
 
 import errno
 import os
+import shutil
 import sys
 import time
 import unittest
@@ -54,12 +55,19 @@ class PlacingCase(unittest.TestCase):
     def plan(self, session_id=CLAUDE_WIN) -> importer.ImportPlan:
         return api._plan(self.source(session_id), api.load_index())
 
-    def nothing_left(self):
-        """No staging directory, no journal, no lock file."""
+    def nothing_left(self, begun=None):
+        """No staging directory, no lock file, and no import in the journal
+        that stands or is still open: every import that had begun to put
+        its copy in place (``begun`` of them, when given) left its two
+        lines there, ``begin`` and ``rollback``."""
         if self.native.exists():
             names = os.listdir(self.native)
             self.assertEqual([n for n in names if n.startswith(importer.STAGING_PREFIX)], [])
-        self.assertFalse(journal.path().exists())
+        kinds = [record["record"] for record in journal.read()]
+        self.assertEqual(kinds, ["begin", "rollback"] * (len(kinds) // 2))
+        if begun is not None:
+            self.assertEqual(len(kinds), 2 * begun)
+            self.assertEqual(journal.path().exists(), bool(begun))
         self.assertFalse(fsutil.lock_file().exists())
 
 
@@ -84,7 +92,9 @@ class NoReplaceTest(PlacingCase):
         self.assertEqual(self.transcript.read_text(encoding="utf-8"), "theirs")
         # Everything of ours is gone again, the side directory included.
         self.assertEqual(files_below(self.native), [os.path.relpath(self.transcript, self.native)])
-        self.nothing_left()
+        # The journal says what was taken out: ours, and not the file that was in the way.
+        self.nothing_left(begun=1)
+        self.assertEqual(journal.read()[1]["removed"], [str(self.side)])
 
     def test_a_file_is_linked_into_place_not_renamed_over(self):
         plan = self.plan()
@@ -213,6 +223,64 @@ class NoReplaceTest(PlacingCase):
         self.assertFalse(self.native.exists())
         self.nothing_left()
 
+    def test_every_step_of_the_roll_back_is_tried_whatever_the_one_before_did(self):
+        """docs/AUDIT.md A-05: on Python 3.11 ``shutil.rmtree`` passed the
+        recursion limit on a deeply nested copy, the ``RecursionError`` left
+        the roll back at that step, and everything after it stayed in the
+        native store."""
+        real = shutil.rmtree
+
+        def rmtree(path, *args, **kwargs):
+            if importer.STAGING_PREFIX in os.path.basename(path):
+                raise RecursionError("maximum recursion depth exceeded")
+            return real(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(importer.shutil, "rmtree", rmtree),
+            self.assertRaises(RecursionError),  # the first failure, once all were tried
+        ):
+            importer.execute(self.plan(), verify=mock.Mock(side_effect=ValueError("no")))
+        # The staging directory could not be removed; all the rest went.
+        (staging,) = os.listdir(self.native)
+        self.assertTrue(staging.startswith(importer.STAGING_PREFIX))
+        real(self.native)
+
+    def test_an_interrupt_in_the_middle_of_the_roll_back_does_not_end_it(self):
+        real = importer._remove
+
+        def remove(path):
+            if path == str(self.transcript):
+                raise KeyboardInterrupt  # the first unit to go: the last one placed
+            return real(path)
+
+        with (
+            mock.patch.object(importer, "_remove", remove),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            importer.execute(self.plan(), verify=mock.Mock(side_effect=ValueError("no")))
+        self.assertEqual(files_below(self.native), [os.path.relpath(self.transcript, self.native)])
+        self.assertFalse(self.side.exists())
+        self.assertEqual(os.listdir(self.native), ["projects"])  # no staging directory
+
+    def test_each_runs_every_step_and_raises_the_first_failure(self):
+        done = []
+
+        def step(name, failure=None):
+            def run():
+                done.append(name)
+                if failure is not None:
+                    raise failure
+
+            return run
+
+        importer._each(step("a"), step("b"))
+        first, second = OSError("first"), RecursionError("second")
+        with self.assertRaises(OSError) as caught:
+            importer._each(step("c", first), step("d", second), step("e", KeyboardInterrupt()))
+        self.assertIs(caught.exception, first)
+        self.assertEqual(done, ["a", "b", "c", "d", "e"])
+        importer._each()
+
     def test_a_directory_that_could_not_be_made_is_not_taken_for_ours(self):
         """``projects`` appears between the look and the mkdir (the tool
         made it): the import fails, and the roll back leaves that directory
@@ -267,7 +335,7 @@ class FlushTest(PlacingCase):
             return real_sync(path)
 
         def write(fd, record):
-            events.append(("record", record["id"]))
+            events.append(("record", record["record"]))
             return real_write(fd, record)
 
         with (
@@ -277,8 +345,14 @@ class FlushTest(PlacingCase):
             record = importer.execute(self.plan())
         staging = [path for kind, path in events if importer.STAGING_PREFIX in path]
         flushed = [path for kind, path in events if kind == "dir" and path not in staging]
-        position = events.index(("record", CLAUDE_WIN))
+        begun, position = (at for at, event in enumerate(events) if event[0] == "record")
+        self.assertEqual(position, len(events) - 1)  # the import record is the last step
         before_record = {path for kind, path in events[:position] if kind == "dir"}
+        # The copy is staged and flushed, then the journal is told, and the
+        # state directory flushed for the journal it now holds; only then
+        # does a name appear in the native store.
+        self.assertEqual([path for _kind, path in events[:begun]], staging)
+        self.assertEqual(events[begun : begun + 2], [("record", "begin"), ("dir", str(self.state))])
         # The staged side directory, every directory in it, deepest first.
         inside = [d for d in record["manifest"]["dirs"] if d.startswith(str(self.side))]
         self.assertEqual(len(staging), len(inside))
@@ -289,8 +363,7 @@ class FlushTest(PlacingCase):
         expected = {str(self.home), *made}
         self.assertLessEqual(expected, before_record)
         self.assertEqual(sorted(set(flushed) - {str(self.state)}), sorted(expected))
-        # The state directory, once the journal it now holds is written.
-        self.assertEqual(events[-1], ("dir", str(self.state)))
+        self.assertEqual(events[-1], ("record", "import"))
         if POSIX:
             self.assertTrue(real_sync(self.target))
 
@@ -342,8 +415,9 @@ class OneAtATimeTest(PlacingCase):
             importer.execute(plan, verify=mock.Mock(side_effect=ValueError("no")))
         self.assertEqual(seen, {"locked": True})
         self.assertFalse(self.native.exists())
-        self.nothing_left()
-        self.assertFalse(self.state.exists())  # made for the lock, removed with it
+        self.nothing_left(begun=1)
+        # The state directory was made for the lock; it stays for the journal.
+        self.assertEqual(os.listdir(self.state), ["imports.jsonl"])
 
     def test_an_import_that_cannot_get_the_lock_is_refused(self):
         self.state.mkdir(exist_ok=True)
@@ -392,7 +466,8 @@ class OneAtATimeTest(PlacingCase):
         self.assertIn("imported 2 items", err_1)
         self.assertEqual(err_2, "agent-sessions: already imported; nothing was copied\n")
         self.assertEqual(out_1, out_2)  # the same native key
-        self.assertEqual([r["id"] for r in journal.read()], [CLAUDE_WIN])
+        self.assertEqual([r["record"] for r in journal.read()], ["begin", "import"])
+        self.assertEqual({r["id"] for r in journal.read()}, {CLAUDE_WIN})
         self.assertEqual(
             files_below(self.target),
             sorted(
@@ -419,7 +494,15 @@ class OneAtATimeTest(PlacingCase):
             gate.touch()
             results = finish(self, [first] + ([second] if second is not None else []))
         self.assertEqual([status for status, _out, _err in results], [0, 0], results)
-        self.assertEqual([r["id"] for r in journal.read()], [CLAUDE_WIN, CLAUDE_WIN_PLAIN])
+        self.assertEqual(
+            [(r["record"], r["id"]) for r in journal.read()],
+            [
+                ("begin", CLAUDE_WIN),
+                ("import", CLAUDE_WIN),
+                ("begin", CLAUDE_WIN_PLAIN),
+                ("import", CLAUDE_WIN_PLAIN),
+            ],
+        )
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fixture_world import CLAUDE_WIN, CODEX_WIN, GROK_WIN, World
 from support import LOG_NAME, drop_state, state_names, write_jsonl
 
-from agent_sessions import api, importer
+from agent_sessions import api, importer, journal
 from agent_sessions.providers.claude import encode_cwd
 from agent_sessions.providers.codex import Codex
 
@@ -66,6 +66,22 @@ def snapshot(*roots) -> dict:
                 else:
                     found[path] = stat.S_IFMT(mode)
     return found
+
+
+def taken_out(case, before: dict, after: dict, imports: int = 1) -> None:
+    """``after`` is ``before`` but for the journal: an import that had
+    begun to put its copy in place and was rolled back leaves its two lines
+    there, ``begin`` and ``rollback``, and nothing else anywhere."""
+    where = str(journal.path())
+    case.assertEqual(
+        {path: what for path, what in after.items() if path != where},
+        {path: what for path, what in before.items() if path != where},
+    )
+    old, new = before.get(where, b""), after[where]
+    case.assertTrue(new.startswith(old))
+    kinds = [json.loads(line)["record"] for line in new[len(old) :].splitlines()]
+    case.assertEqual(kinds, ["begin", "rollback"] * imports)
+    case.assertEqual(journal.unsettled(journal.read()), [])
 
 
 class SafetyCase(unittest.TestCase):
@@ -216,7 +232,7 @@ class ContainedTest(SafetyCase):
         self.assertTrue((elsewhere / folder / CLAUDE_WIN).is_dir())
         # The link is still a link, and the record names the paths as the store has them.
         self.assertTrue(os.path.islink(os.path.join(self.root, "projects")))
-        (record,) = importer.read_journal()
+        (record,) = journal.not_undone(importer.read_journal())
         self.assertEqual(
             record["destination_files"],
             [
@@ -250,9 +266,10 @@ class ContainedTest(SafetyCase):
         self.assertEqual(os.listdir(elsewhere), [])
         after = snapshot(self.w.box.root)
         cache = str(self.w.box.cache)  # the scans of this test rewrote the index
-        self.assertEqual(
-            {k: v for k, v in after.items() if not k.startswith(cache)},
+        taken_out(
+            self,
             {k: v for k, v in before.items() if not k.startswith(cache)},
+            {k: v for k, v in after.items() if not k.startswith(cache)},
         )
 
     def test_a_failed_import_through_a_link_leaves_the_linked_directory_as_it_was(self):
@@ -263,7 +280,7 @@ class ContainedTest(SafetyCase):
         before = snapshot(self.w.box.root)
         with self.assertRaises(importer.ImportFailed):
             importer.execute(self.good, verify=mock.Mock(side_effect=ValueError("no")))
-        self.assertEqual(snapshot(self.w.box.root), before)
+        taken_out(self, before, snapshot(self.w.box.root))
 
     def test_a_link_to_another_filesystem_is_refused_in_plain_words(self):
         """The copy is staged at the root of the native store; a move from
@@ -284,7 +301,7 @@ class ContainedTest(SafetyCase):
             importer.execute(self.good)
         self.assertIn("is on another filesystem than the native store", caught.exception.reason)
         self.assertIn(os.path.dirname(self.good.units[0].dst), caught.exception.reason)
-        self.assertEqual(snapshot(self.w.box.root), before)
+        taken_out(self, before, snapshot(self.w.box.root))
 
     def test_a_link_to_a_real_other_filesystem(self):
         """The same with the kernel's own answer, where the machine has a
@@ -298,7 +315,7 @@ class ContainedTest(SafetyCase):
         with self.assertRaises(api.ImportFailed) as caught:
             importer.execute(self.good)
         self.assertIn("is on another filesystem than the native store", caught.exception.reason)
-        self.assertEqual(snapshot(self.w.box.root), before)
+        taken_out(self, before, snapshot(self.w.box.root))
         self.assertEqual(os.listdir(elsewhere), [])
 
     def test_a_link_that_stays_inside_the_native_root_is_fine(self):
@@ -344,6 +361,185 @@ class ContainedTest(SafetyCase):
         os.symlink(self.w.box.root, os.path.join(self.root, "up"))
         for dst in (f"{self.root}/up/../x.jsonl", f"{self.root}/projects/../../x.jsonl"):
             self.assertIn("nothing was imported", self.refused(self.with_dst(dst)))
+
+
+class DepthAndLengthTest(SafetyCase):
+    """docs/AUDIT.md A-05: a side directory is copied whole, and how deep it
+    nests and how long its paths are is the source's to decide. What the
+    native store cannot hold, or a roll back could not be trusted to remove,
+    is refused before anything is written."""
+
+    foreign = ("claude",)
+
+    def setUp(self):
+        super().setUp()
+        self.side = self.w.profile / ".claude" / "projects" / "F--Proj-My-Site" / CLAUDE_WIN
+        self.copy = self.home / ".claude" / "projects" / encode_cwd(str(self.w.site)) / CLAUDE_WIN
+
+    def nest(self, names) -> Path:
+        """Directories below the side directory, one in the other, and a
+        file in the last; returns the file."""
+        deepest = self.side
+        for name in names:
+            deepest = deepest / name
+            os.mkdir(deepest)
+        (deepest / "f").write_text("x", encoding="utf-8")
+        return deepest / "f"
+
+    def reason(self) -> str:
+        """The dry run, ``import_options`` and the import refuse alike, and
+        nothing is written."""
+        source = self.source(CLAUDE_WIN)
+        before = snapshot(self.home, self.state)
+        reasons = []
+        for action in (api.import_plan, api.import_session):
+            with self.assertRaises(api.ImportFailed) as caught:
+                action(source)
+            reasons.append(caught.exception.reason)
+        self.assertEqual(len(set(reasons)), 1, reasons)
+        self.assertEqual(api.import_options(source), api.ImportOptions(False, reasons[0]))
+        self.assertEqual(snapshot(self.home, self.state), before)
+        self.assertFalse((self.home / ".claude").exists())
+        return reasons[0]
+
+    def test_a_directory_nested_deeper_than_64_levels_is_refused(self):
+        self.assertEqual(importer.DEPTH_MAX, 64)
+        self.nest(["a"] * 65)
+        self.assertEqual(
+            self.reason(),
+            f"{self.side} holds directories nested more than 64 levels deep, and a session "
+            "like that is not imported; nothing was imported",
+        )
+
+    def test_64_levels_are_imported(self):
+        deepest = self.nest(["a"] * 64)
+        api.import_session(self.source(CLAUDE_WIN))
+        self.assertEqual((self.copy / deepest.relative_to(self.side)).read_text(), "x")
+        api.unimport(CLAUDE_WIN)
+        self.assertFalse((self.home / ".claude").exists())
+
+    def test_a_plan_made_any_other_way_is_measured_too(self):
+        """``execute`` does not rely on the adapter having walked the tree
+        with ``importer.tree``."""
+        deep = os.sep.join(["d"] * 65)
+        for change in (
+            lambda unit: unit.dirs.append(deep),
+            lambda unit: unit.files.append(importer.FileCopy("/s", os.path.join(deep, "f"))),
+        ):
+            plan = self.plan()
+            change(plan.units[0])
+            for action in (importer.fits, importer.check, importer.execute):
+                with self.assertRaises(importer.ImportFailed) as caught:
+                    action(plan)
+                self.assertIn("nested more than 64 levels deep", caught.exception.reason)
+        # A file in the sixty-fourth directory is as deep as it goes.
+        plan = self.plan()
+        plan.units[0].dirs.append(os.sep.join(["d"] * 64))
+        plan.units[0].files.append(importer.FileCopy("/s", os.sep.join(["d"] * 64 + ["f"])))
+        importer.fits(plan)
+        self.assertFalse((self.home / ".claude").exists())
+
+    @unittest.skipUnless(hasattr(os, "pathconf"), "asks the filesystem for its limits")
+    def test_a_path_that_fits_on_the_other_drive_and_not_here_is_refused(self):
+        """The auditor's case in small: the longest path of the source is
+        as long as a path may be, and its place in the native store lies
+        below a longer directory."""
+        limit = os.pathconf(self.home, "PC_PATH_MAX")
+        self.assertGreater(len(str(self.copy)), len(str(self.side)))
+        room = limit - 1 - len(str(self.side)) - len("/f")  # for the directories, "/" included
+        names = []
+        while room > 1:
+            length = min(200, room - 1)
+            if room - (length + 1) == 1:  # a rest of one byte holds no "/x"
+                length -= 1
+            names.append("n" * length)
+            room -= length + 1
+        self.assertEqual(room, 0)
+        longest = self.nest(names)
+        self.assertEqual(len(str(longest)), limit - 1)
+        self.assertEqual(longest.read_text(), "x")  # the source can be read: it fits there
+        needed = len(str(self.copy)) + len(str(longest)) - len(str(self.side))
+        self.assertEqual(
+            self.reason(),
+            f"the copy of {self.side} would need a path of {needed:,} bytes below "
+            f"{self.home / '.claude'}, and at most {limit - 1:,} fit there; nothing was imported",
+        )
+
+    def test_the_limits_are_the_filesystems_and_the_staged_path_counts(self):
+        self.nest(["a", "b" * 20])
+        longest = len(str(self.copy / "a" / ("b" * 20) / "f"))
+        measured = []
+
+        def limit(where, name, default):
+            measured.append((where, name, default))
+            return {"PC_PATH_MAX": longest + 1, "PC_NAME_MAX": 255}[name]
+
+        with mock.patch.object(importer, "_limit", limit):
+            plan = self.plan()
+            importer.fits(plan)  # to the byte
+            plan.units[0].files.append(importer.FileCopy("/s", os.path.join("a", "b" * 20, "f2")))
+            with self.assertRaises(importer.ImportFailed) as caught:
+                importer.fits(plan)
+        self.assertIn("would need a path of", caught.exception.reason)
+        # Asked of the directory that exists nearest the native store.
+        self.assertEqual(
+            measured[:2],
+            [(str(self.home), "PC_PATH_MAX", 4096), (str(self.home), "PC_NAME_MAX", 255)],
+        )
+        # A short destination does not help when the staged path is too long.
+        plan = self.plan()
+        short = os.path.join(plan.native_root, "x")
+        rel = os.path.join("a", "b" * 20, "f")
+        staged = len(os.path.join(plan.native_root, importer._staging_name(), "0", rel))
+        self.assertGreater(staged, len(os.path.join(short, rel)))
+        plan.units = [dataclasses.replace(plan.units[0], dst=short)]
+        with (
+            mock.patch.object(importer, "_limit", lambda where, name, default: staged),
+            self.assertRaises(importer.ImportFailed),
+        ):
+            importer.fits(plan)
+        with mock.patch.object(importer, "_limit", lambda where, name, default: staged + 1):
+            importer.fits(plan)
+
+    def test_a_name_longer_than_the_filesystem_takes_is_refused(self):
+        plan = self.plan()
+        plan.units = [dataclasses.replace(plan.units[0], dst=os.path.join(plan.native_root, "x"))]
+        unit = plan.units[0]
+        with mock.patch.object(
+            importer,
+            "_limit",
+            lambda where, name, default: 20 if name == "PC_NAME_MAX" else default,
+        ):
+            unit.dirs.append("n" * 20)
+            importer.fits(plan)
+            unit.dirs[-1] = "n" * 21
+            with self.assertRaises(importer.ImportFailed) as caught:
+                importer.fits(plan)
+            self.assertEqual(
+                caught.exception.reason,
+                f"the copy of {self.side} would need a file or directory name of 21 bytes below "
+                f"{self.home / '.claude'}, and at most 20 fit there; nothing was imported",
+            )
+            unit.dirs[-1] = "é" * 11  # 22 bytes: bytes are what is counted
+            with self.assertRaises(importer.ImportFailed):
+                importer.fits(plan)
+            unit.dirs[-1] = os.path.join("ok", "n" * 21)  # any name on the way
+            with self.assertRaises(importer.ImportFailed):
+                importer.fits(plan)
+            unit.dirs.pop()
+            unit.dst = os.path.join(plan.native_root, "sub", "y" * 21)  # the unit's own too
+            with self.assertRaises(importer.ImportFailed):
+                importer.fits(plan)
+
+    def test_where_the_platform_gives_no_limit_the_usual_ones_hold(self):
+        self.assertEqual((importer.PATH_MAX, importer.NAME_MAX), (4096, 255))
+        for failure in (AttributeError("no pathconf"), OSError(22, "Invalid"), ValueError("name")):
+            with mock.patch.object(importer.os, "pathconf", side_effect=failure, create=True):
+                self.assertEqual(importer._limit("/", "PC_PATH_MAX", 4096), 4096)
+        with mock.patch.object(importer.os, "pathconf", return_value=-1, create=True):
+            self.assertEqual(importer._limit("/", "PC_NAME_MAX", 255), 255)  # "no limit"
+        with mock.patch.object(importer.os, "pathconf", return_value=1024, create=True):
+            self.assertEqual(importer._limit("/", "PC_PATH_MAX", 4096), 1024)
 
 
 class AdapterNamesTest(SafetyCase):
@@ -512,9 +708,16 @@ class VerifyAndRollBackTest(unittest.TestCase):
         self.native = self.home / ".codex"
         self.native_index = (self.native / "session_index.jsonl").read_bytes()
 
-    def unchanged(self, before):
-        self.assertEqual(snapshot(self.home, self.state), before)
-        self.assertEqual(state_names(), ["imports.json"])
+    def unchanged(self, before, begun=0):
+        """The home and the state directory are what they were. ``begun``:
+        how many imports had put a unit in place before they failed; each
+        left its two lines in the journal, and nothing else."""
+        if begun:
+            taken_out(self, before, snapshot(self.home, self.state), begun)
+            self.assertEqual(state_names(), ["imports.json", "imports.jsonl"])
+        else:
+            self.assertEqual(snapshot(self.home, self.state), before)
+            self.assertEqual(state_names(), ["imports.json"])
         self.assertEqual((self.native / "session_index.jsonl").read_bytes(), self.native_index)
         self.assertEqual(
             [n for n in os.listdir(self.native) if n.startswith(importer.STAGING_PREFIX)], []
@@ -560,23 +763,38 @@ class VerifyAndRollBackTest(unittest.TestCase):
             f"the copy does not read as session {self.FILE_ID}; it was removed again and "
             "nothing was left in the native store",
         )
-        self.unchanged(before)
+        self.unchanged(before, begun=1)
 
-    def test_the_order_is_place_verify_append_record(self):
+    def test_the_order_is_begin_place_verify_append_record(self):
         plan = self.good_plan()
         seen = {}
+        real = importer._place
+
+        def place(target, dst, is_dir):
+            seen["before the first unit"] = [r["record"] for r in importer.read_journal()]
+            return real(target, dst, is_dir)
 
         def verify():
             seen["placed"] = [os.path.isfile(dst) for dst in plan.destinations]
             seen["index"] = (self.native / "session_index.jsonl").read_bytes()
-            seen["records"] = len(importer.read_journal())
+            seen["records"] = [r["record"] for r in importer.read_journal()]
 
         old = (self.state / "imports.json").read_bytes()
-        importer.execute(plan, verify=verify)
-        self.assertEqual(seen, {"placed": [True], "index": self.native_index, "records": 1})
+        with mock.patch.object(importer, "_place", place):
+            importer.execute(plan, verify=verify)
+        self.assertEqual(
+            seen,
+            {
+                "before the first unit": ["import", "begin"],  # the old record, then ours
+                "placed": [True],
+                "index": self.native_index,
+                "records": ["import", "begin"],
+            },
+        )
         records = importer.read_journal()
-        self.assertEqual([r["id"] for r in records], ["earlier", self.FILE_ID])
-        self.assertEqual([r["version"] for r in records], [1, 2])
+        self.assertEqual([r["id"] for r in records], ["earlier", self.FILE_ID, self.FILE_ID])
+        self.assertEqual([r["record"] for r in records], ["import", "begin", "import"])
+        self.assertEqual([r["version"] for r in records], [1, 2, 2])
         # The record from before the journal is read and never written.
         self.assertEqual((self.state / "imports.json").read_bytes(), old)
         self.assertEqual(state_names(), ["imports.json", "imports.jsonl"])
@@ -586,7 +804,7 @@ class VerifyAndRollBackTest(unittest.TestCase):
     def test_a_failed_verification_rolls_everything_back(self):
         plan = self.good_plan()
         before = snapshot(self.home, self.state)
-        for failure, reason in (
+        failures = (
             (importer.ImportFailed("not the session"), "not the session"),
             (
                 ValueError("boom"),
@@ -598,22 +816,37 @@ class VerifyAndRollBackTest(unittest.TestCase):
                 "the copy could not be read back (OSError: [Errno 5] Input/output error); "
                 "it was removed again and nothing was left in the native store",
             ),
-        ):
+        )
+        for number, (failure, reason) in enumerate(failures, 1):
             with self.assertRaises(importer.ImportFailed) as caught:
                 importer.execute(plan, verify=mock.Mock(side_effect=failure))
             self.assertEqual(caught.exception.reason, reason)
-            self.unchanged(before)
+            self.unchanged(before, begun=number)
 
     def test_directories_made_for_the_import_are_removed_too(self):
-        """Nothing native and no state directory yet: none is left."""
+        """Nothing native and no state directory yet: no native store is
+        left. The state directory stays for the journal, which says that an
+        import began and was taken out again; one that fails before it puts
+        anything in place leaves no state directory either."""
         shutil.rmtree(self.native)
         plan = self.good_plan()
         drop_state()
         self.native_index = b""
+        with (
+            mock.patch.object(importer, "_copy", side_effect=OSError(5, "Input/output error")),
+            self.assertRaises(importer.ImportFailed),
+        ):
+            importer.execute(plan)
+        self.assertFalse(self.native.exists())
+        self.assertFalse(self.state.exists())
         with self.assertRaises(importer.ImportFailed):
             importer.execute(plan, verify=mock.Mock(side_effect=importer.ImportFailed("no")))
         self.assertFalse(self.native.exists())
-        self.assertFalse(self.state.exists())
+        self.assertEqual(os.listdir(self.state), ["imports.jsonl"])
+        begin, rolled_back = journal.read()
+        self.assertEqual((begin["record"], rolled_back["record"]), ("begin", "rollback"))
+        self.assertIn(str(self.native), begin["dirs"])
+        self.assertEqual(rolled_back["removed"], sorted([*begin["dirs"], *plan.destinations]))
         # And the import that verifies makes them and leaves them.
         native = Codex().import_session(
             self.w.session(self.FILE_ID, "foreign"), api.load_index().pathmap

@@ -1064,9 +1064,11 @@ def _print_undo(report: api.UnimportReport) -> None:
 
 
 def _unimport(args: argparse.Namespace) -> int:
-    # Planned first, without touching anything: every refusal comes from
-    # here, before a question is asked.
-    planned = api.unimport(args.key, force=args.force, dry_run=True)
+    # Planned first, removing nothing: every refusal comes from here, before
+    # a question is asked. The plan of a real undo is made the way the undo
+    # makes its own, with the lock held: one made beside another undo of the
+    # same import would call the copy used. A dry run takes no lock.
+    planned = api.unimport(args.key, force=args.force, dry_run=True, under_lock=not args.dry_run)
     name = planned.native_key or f"{planned.provider}:{planned.id}"
     what = (
         f"{_count(len(planned.removed), 'file or directory', 'files and directories')} "
@@ -1084,7 +1086,15 @@ def _unimport(args: argparse.Namespace) -> int:
         if not _ask(f"Remove the imported copy {name}, {what}?{used}"):
             _err("nothing was removed")
             return 1
-    report = api.unimport(args.key, force=args.force)
+    try:
+        report = api.unimport(args.key, force=args.force)
+    except api.UndoIncomplete as exc:
+        # What went is printed as for an undo that went through; the line
+        # after it says what is left and that the import still stands.
+        if isinstance(exc.report, api.UnimportReport):
+            _print_undo(exc.report)
+        _err(_reason(exc))
+        return 1
     _print_undo(report)
     _err(
         f"removed the imported copy {name}: "
@@ -1251,28 +1261,42 @@ class _Signalled(BaseException):
 @contextlib.contextmanager
 def _signals() -> Iterator[None]:
     """For the length of a command, turn SIGTERM and SIGHUP into an
-    exception raised in the main thread, the way Ctrl-C is one already.
+    exception raised in the main thread, the way Ctrl-C is one already, and
+    let only the first of the three through.
 
-    Left alone, either ends the process on the spot and no ``finally`` runs:
-    an import would leave its staging directory and whatever it had already
-    put in place. Only the first signal is raised; one that arrives while
-    the command is unwinding is ignored, so a roll back is not cut short.
-    The handlers that were there come back when the command is over.
+    Left alone, SIGTERM or SIGHUP ends the process on the spot and no
+    ``finally`` runs: an import would leave its staging directory and
+    whatever it had already put in place. The first signal is raised; every
+    one that follows, of any of the three, is held off until the command is
+    over, so the roll back it started is not cut short by a second Ctrl-C or
+    by the hangup that follows when the terminal is closed. The command then
+    ends with the first signal's status (``main``). A signal that is ignored
+    when the command starts (``nohup``, a shell's background job) stays
+    ignored, and Ctrl-C is taken over only from Python's own handler. The
+    handlers that were there come back when the command is over.
     """
 
-    def raise_it(signum: int, frame: object) -> None:
-        if not seen:
-            seen.append(signum)
-            raise _Signalled(signum)
+    def first_only(signum: int, frame: object) -> None:
+        if seen:
+            return  # held off: the command is unwinding from the first one
+        seen.append(signum)
+        if signum == signal.SIGINT:
+            raise KeyboardInterrupt
+        raise _Signalled(signum)
 
     seen: list[int] = []
     before = {}
-    for name in _TERMINATING:
+    for name in ("SIGINT", *_TERMINATING):
         signum = getattr(signal, name, None)  # SIGHUP is not on every platform
         if signum is None:
             continue
+        current = signal.getsignal(signum)
+        if current is signal.SIG_IGN:
+            continue
+        if signum == signal.SIGINT and current is not signal.default_int_handler:
+            continue  # someone else's handler: theirs to keep
         try:
-            before[signum] = signal.signal(signum, raise_it)
+            before[signum] = signal.signal(signum, first_only)
         except (ValueError, OSError):
             pass  # not the main thread, or a signal this platform does not let us handle
     try:
