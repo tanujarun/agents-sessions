@@ -919,7 +919,27 @@ def _record(plan: ImportPlan, manifest: dict) -> dict:
     return record
 
 
-def _begin(plan: ImportPlan, staging: str, made_dirs: Iterable[str]) -> dict:
+def _staged_manifest(plan: ImportPlan, staged: list[str]) -> dict:
+    """The manifest of a staged copy, as it will lie in the native store:
+    each unit's directories, and each file with the size and modification
+    time it has staged. A unit is moved into place whole (linked or
+    renamed), so these are what the placed files will have."""
+    dirs: list[str] = []
+    files: list[dict] = []
+    for unit, target in zip(plan.units, staged, strict=True):
+        pieces = [(target, unit.dst)]
+        if unit.is_dir:
+            dirs += [unit.dst, *(os.path.join(unit.dst, rel) for rel in unit.dirs)]
+            pieces = [
+                (os.path.join(target, f.rel), os.path.join(unit.dst, f.rel)) for f in unit.files
+            ]
+        for here, there in pieces:
+            st = os.lstat(here)
+            files.append({"path": there, "size": st.st_size, "mtime_ns": st.st_mtime_ns})
+    return {"dirs": sorted(dirs), "files": sorted(files, key=lambda item: item["path"])}
+
+
+def _begin(plan: ImportPlan, staging: str, made_dirs: Iterable[str], staged: list[str]) -> dict:
     """The journal record of an import whose files are staged and whose
     first unit is about to be put in place. It says what is going to appear
     in the native store, for whoever has to settle the import should this
@@ -930,6 +950,10 @@ def _begin(plan: ImportPlan, staging: str, made_dirs: Iterable[str]) -> dict:
       the way to a destination that are not there yet and that it is going
       to make;
     - ``staging``: its staging directory;
+    - ``manifest``: the units' own directories and files, each file with
+      the size and modification time it has staged, which the placed one
+      will have (``_staged_manifest``): what an undo compares the copy with
+      should the import have to be recorded later;
     - ``import``: the import record as it will be, without the manifest:
       everything of it that cannot be worked out from the native store
       later (where the session came from, what was rewritten on the way)."""
@@ -948,6 +972,7 @@ def _begin(plan: ImportPlan, staging: str, made_dirs: Iterable[str]) -> dict:
         "destinations": plan.destinations,
         "dirs": sorted({*made_dirs, *to_make}),
         "staging": staging,
+        "manifest": _staged_manifest(plan, staged),
         "import": planned,
         "agent_sessions_version": __version__,
     }
@@ -980,17 +1005,42 @@ def at_or_above(root: str, path: str) -> bool:
     return path == root or root.startswith(path if path.endswith(os.sep) else path + os.sep)
 
 
-def _begin_paths(begin: dict, root: str) -> tuple[list[str], list[str], str | None] | None:
-    """``(destinations, directories, staging directory)`` of a ``begin``
-    record, each checked, or None for a record that cannot be acted on.
+def _staged(manifest: object, root: str) -> dict | None:
+    """A ``begin``'s manifest, checked: every directory and every file below
+    the native store, each file with an integer size and modification time;
+    None otherwise."""
+    if not isinstance(manifest, dict):
+        return None
+    dirs, files = manifest.get("dirs"), manifest.get("files")
+    if not isinstance(dirs, list) or not isinstance(files, list):
+        return None
+    if not all(below(root, path) for path in dirs):
+        return None
+    for item in files:
+        if not isinstance(item, dict) or not below(root, item.get("path")):
+            return None
+        for key in ("size", "mtime_ns"):
+            if not isinstance(item.get(key), int) or isinstance(item.get(key), bool):
+                return None
+    return {"dirs": list(dirs), "files": [dict(item) for item in files]}
+
+
+def _begin_paths(begin: dict, root: str) -> tuple[list[str], list[str], str | None, dict] | None:
+    """``(destinations, directories, staging directory, manifest)`` of a
+    ``begin`` record, each checked, or None for a record that cannot be
+    acted on.
 
     The journal is the user's own file, trusted but possibly malformed.
     Whatever it says, a destination must be a path below the native store by
     the rule of an import's destinations (``below``); a directory must be
     one too, or the store itself or a directory above it (those only ever
-    go empty); and the staging directory must lie in the root of the store
-    under a name ``execute`` gives one."""
+    go empty); the staging directory must lie in the root of the store
+    under a name ``execute`` gives one; and the manifest must be one
+    (``_staged``)."""
     destinations, dirs, staging = (begin.get(key) for key in ("destinations", "dirs", "staging"))
+    manifest = _staged(begin.get("manifest"), root)
+    if manifest is None:
+        return None
     if not isinstance(destinations, list) or not destinations or not isinstance(dirs, list):
         return None
     if not all(below(root, path) for path in destinations):
@@ -1003,7 +1053,7 @@ def _begin_paths(begin: dict, root: str) -> tuple[list[str], list[str], str | No
         and staging == os.path.join(root, os.path.basename(staging))
     ):
         return None
-    return destinations, dirs, staging
+    return destinations, dirs, staging, manifest
 
 
 def _reads_back(begin: dict, root: str, destinations: list[str], read_back: ReadBack) -> bool:
@@ -1063,12 +1113,13 @@ def _settle(begin: dict, root: str, read_back: ReadBack | None) -> dict | None:
         # line that closes it keeps it from being looked at again.
         _log.warning(
             "the journal's line for an unfinished import of %s cannot be used (it does not "
-            "name plain paths below that store); nothing was removed for it",
+            "name plain paths below that store, or has no manifest); nothing was removed "
+            "for it",
             whose,
         )
         record = dict(_rolled_back(begin, [], recovered=True), damaged=True)
     else:
-        destinations, dirs, staging = paths
+        destinations, dirs, staging, staged = paths
         whole = all(os.path.lexists(path) for path in destinations)
         if whole and read_back is None:
             _log.warning(
@@ -1081,17 +1132,14 @@ def _settle(begin: dict, root: str, read_back: ReadBack | None) -> dict | None:
             if staging is not None and os.path.lexists(staging):
                 _remove(staging)  # what is left of it is the import's own, and empty
             planned = begin.get("import")
-            try:
-                made = [path for path in dirs if os.path.isdir(path) and not os.path.islink(path)]
-                manifest = _manifest(destinations, made)
-            except OSError as exc:
-                _log.warning(
-                    "an import of %s did not finish; its copy is whole but could not be "
-                    "listed (%s), so it is not recorded yet",
-                    whose,
-                    exc,
-                )
-                return None
+            # What the import would have recorded: the copy as it was placed,
+            # not as it is now. A copy the tool has worked in since is then
+            # "used since the import" to an undo, as any other would be.
+            made = [path for path in dirs if os.path.isdir(path) and not os.path.islink(path)]
+            manifest = {
+                "dirs": sorted({*made, *staged["dirs"]}),
+                "files": sorted(staged["files"], key=lambda item: item["path"]),
+            }
             record = dict(planned if isinstance(planned, dict) else {})
             record.setdefault("imported_at", begin.get("begun_at"))
             record.update(
@@ -1161,10 +1209,11 @@ def recover(
 
     - forward, when every destination its ``begin`` names is there and
       ``read_back`` reads the copy as the session that was planned: the
-      ``import`` record is written now, marked ``recovered``, with a
-      manifest of the copy as it lies in the store at this moment. A copy
+      ``import`` record is written now, marked ``recovered``, with the
+      manifest of the copy as it was placed (the ``begin`` has it). A copy
       that reads back whole is never removed: it was listed as a session of
-      the tool all along, and its user may have worked in it;
+      the tool all along, and its user may have worked in it; an undo then
+      finds it used since the import, as for any other;
     - back, in every other case: the destinations that are there and the
       staging directory are removed, then the directories the import made,
       when empty, and a ``rollback`` record is written.
@@ -1430,7 +1479,7 @@ def _carry_out(
         # first unit is: from here on a process that dies has left a line to
         # go by (``recover``).
         run.record_fd, run.record_new = journal.open_for_append()
-        begin = _begin(plan, staging, made_dirs)
+        begin = _begin(plan, staging, made_dirs, staged)
         journal.write(run.record_fd, begin)
         run.begin = begin
         if run.record_new:

@@ -590,17 +590,37 @@ class KilledImportTest(StoppedImportCase):
         self.assertEqual(self.kinds(), ["begin", "import", "undo"])
         self.assertEqual(state_names(), ["imports.jsonl"])
 
-    def test_a_whole_copy_that_was_used_since_is_kept_and_recorded_as_it_is_now(self):
+    def test_a_whole_copy_that_was_used_since_is_kept_and_an_undo_says_so(self):
+        """The copy is listed as a session all along, and the tool may resume
+        it before anything settles the import. It is kept, and recorded as
+        it was placed: an undo finds it used since the import, as any other,
+        and only a forced one removes it."""
         begin = self.killed("placed")
         transcript = begin["destinations"][1]
+        placed = os.stat(transcript)
+        self.assertIn(
+            {"path": transcript, "size": placed.st_size, "mtime_ns": placed.st_mtime_ns},
+            begin["manifest"]["files"],
+        )
         with open(transcript, "ab") as fh:  # the tool resumed it meanwhile
             fh.write(b'{"type":"user","message":{"role":"user","content":"more"}}\n')
         size = os.path.getsize(transcript)
-        self.assertEqual(run("import", self.source.key)[0], 0)
+        self.assertEqual(run("import", self.source.key)[0], 0)  # settled: recorded
         self.assertEqual(os.path.getsize(transcript), size)
         self.assertEqual(self.kinds(), ["begin", "import"])
-        listed = {item["path"]: item["size"] for item in journal.read()[1]["manifest"]["files"]}
-        self.assertEqual(listed[transcript], size)
+        record = journal.read()[1]
+        self.assertEqual(record["manifest"]["files"], begin["manifest"]["files"])
+        code, out, err = run("unimport", CLAUDE_WIN, "--yes")
+        self.assertEqual((code, out), (1, ""))
+        self.assertTrue(
+            err.startswith("agent-sessions: the imported copy was used since the import: "), err
+        )
+        self.assertIn(f"{transcript} was {placed.st_size:,} bytes and is {size:,}", err)
+        self.assertEqual(os.path.getsize(transcript), size)
+        code, _out, err = run("unimport", CLAUDE_WIN, "--yes", "--force")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(self.native.exists())
+        self.assertEqual(self.kinds(), ["begin", "import", "undo"])
 
     def test_a_copy_that_does_not_read_back_is_taken_out(self):
         begin = self.killed("placed")
@@ -632,6 +652,10 @@ class RecoverTest(ImportCase):
             "destinations": [self.side, self.transcript],
             "dirs": [self.root, os.path.join(self.root, "projects"), os.path.dirname(self.side)],
             "staging": None,
+            "manifest": {
+                "dirs": [self.side],
+                "files": [{"path": self.transcript, "size": 3, "mtime_ns": 1}],
+            },
             "import": {"source_key": "claude:x:y"},
         }
         record.update(fields)
@@ -659,6 +683,9 @@ class RecoverTest(ImportCase):
             {"dirs": [str(self.w.box.root / "elsewhere")]},
             {"staging": str(inside)},  # not a name a staging directory has
             {"staging": f"{self.root}/projects/.agent-sessions-import-1-1"},  # not at the root
+            {"manifest": None},  # nothing to compare a copy with
+            {"manifest": {"dirs": [], "files": [{"path": str(victim), "size": 1, "mtime_ns": 1}]}},
+            {"manifest": {"dirs": [], "files": [{"path": self.transcript, "size": "3"}]}},
         ):
             with self.subTest(fields=fields):
                 self.begin(**fields)
