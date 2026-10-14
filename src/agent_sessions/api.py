@@ -1521,8 +1521,9 @@ def mount_drive(
 
     The mount is ``mounts.mount_volume``: it may wait for the password the
     desktop asks for. One that is mounted already is only scanned. Raises
-    ``NotFound``, or ``MountFailed`` with the reason. ``progress`` and
-    ``cancel`` are the scan's."""
+    ``NotFound``, or ``MountFailed`` with the reason. ``progress`` is the
+    scan's; ``cancel`` ends the wait for the mount (its child is terminated,
+    ``MountFailed``) and then the scan."""
     index = load_index()
     volume = find_volume(ref, index)
     log = logs.logger()
@@ -1539,7 +1540,7 @@ def mount_drive(
             "mount %s (volume id %s, last at %s)", volume["label"], volume["uuid"], volume["path"]
         )
         try:
-            where = mounts_mod.mount_volume(volume["uuid"])
+            where = mounts_mod.mount_volume(volume["uuid"], cancel=cancel)
         except MountFailed as exc:
             log.warning("mount %s failed: %s", volume["label"], exc.reason)
             raise

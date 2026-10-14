@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1237,6 +1238,16 @@ class MountDriveTest(DrivesCase):
         self.assertEqual(
             caught.exception.reason, "no answer after 120 s (was the password prompt answered?)"
         )
+
+    def test_the_cancel_reaches_the_wait_for_the_mount(self):
+        cancel = threading.Event()
+        cancel.set()  # the TUI quit before the mount began
+        scans = len(self.log().split(" INFO scan "))
+        with self.assertRaises(MountFailed) as caught:
+            api.mount_drive("C:", cancel=cancel)
+        self.assertEqual(caught.exception.reason, "cancelled")
+        self.assertEqual(self.disks.started, [])
+        self.assertEqual(len(self.log().split(" INFO scan ")), scans)
 
     def test_a_drive_that_is_not_attached(self):
         self.disks.detach("nvme2n1p3")

@@ -11,6 +11,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -439,6 +441,84 @@ class MountVolumeTest(DisksCase):
             mounts.mount_volume(WIN)
         process.terminate.assert_called_once_with()
 
+    def test_a_cancel_ends_the_wait_and_the_child(self):
+        """The TUI sets the event when it quits during a mount: the wait
+        looks at it between short waits, and the child is terminated."""
+        cancel = threading.Event()
+        process = FakeProcess(hangs=True)
+        answer = process.communicate
+
+        def communicate(timeout=None):
+            if len(process.calls) == 2:  # two waits have run out
+                cancel.set()
+            return answer(timeout)
+
+        process.communicate = communicate
+        self.disks.on_start = lambda argv: process
+        self.assertEqual(self.failure(WIN, cancel=cancel), mounts.CANCELLED)
+        self.assertEqual(
+            process.calls,
+            [
+                ("communicate", mounts._POLL),
+                ("communicate", mounts._POLL),
+                ("communicate", mounts._POLL),
+                "terminate",
+                ("communicate", 5.0),
+            ],
+        )
+        self.assertEqual(mounts._waiting, set())
+
+    def test_a_cancel_set_before_the_start_starts_nothing(self):
+        cancel = threading.Event()
+        cancel.set()
+        self.assertEqual(self.failure(WIN, cancel=cancel), mounts.CANCELLED)
+        self.assertEqual(self.disks.started, [])
+
+    def test_with_a_cancel_the_short_waits_add_up_to_the_timeout(self):
+        process = FakeProcess(hangs=True)
+        self.disks.on_start = lambda argv: process
+        reason = self.failure(WIN, timeout=0.625, cancel=threading.Event())
+        self.assertEqual(reason, "no answer after 0.625 s (was the password prompt answered?)")
+        self.assertEqual(mounts._POLL, 0.25)
+        self.assertEqual(
+            process.calls,
+            [("communicate", 0.25), ("communicate", 0.25), ("communicate", 0.125)]
+            + ["terminate", ("communicate", 5.0)],
+        )
+
+    def test_with_a_cancel_a_child_that_answers_is_read_as_before(self):
+        self.disks.mounting = (self.win, self.win_at)
+        process = FakeProcess()
+        self.disks.on_start = lambda argv: (self.disks.mount(*self.disks.mounting), process)[1]
+        self.assertEqual(mounts.mount_volume(WIN, cancel=threading.Event()), self.win_at)
+        self.assertEqual(process.calls, [("communicate", mounts._POLL)])
+        self.assertEqual(mounts._waiting, set())
+
+    def test_the_child_is_known_while_it_is_waited_for(self):
+        seen = []
+        process = FakeProcess()
+        answer = process.communicate
+
+        def communicate(timeout=None):
+            seen.append(process in mounts._waiting)
+            return answer(timeout)
+
+        process.communicate = communicate
+        self.disks.on_start = lambda argv: process
+        self.failure(WIN)  # success the mount table does not show; the wait is what counts
+        self.assertEqual(seen, [True])
+        self.assertEqual(mounts._waiting, set())
+
+    def test_at_exit_every_child_still_waited_for_is_terminated(self):
+        gone = FakeProcess()
+        gone.terminate = mock.Mock(side_effect=ProcessLookupError(3, "No such process"))
+        running = FakeProcess()
+        with mock.patch.object(mounts, "_waiting", {gone, running}):
+            mounts._stop_waiting()
+            self.assertEqual(mounts._waiting, set())
+        self.assertEqual(running.calls, ["terminate"])
+        gone.terminate.assert_called_once_with()
+
     def test_success_that_the_mount_table_does_not_show(self):
         self.assertEqual(
             self.failure(WIN),
@@ -490,6 +570,50 @@ class StarterTest(unittest.TestCase):
         ((status, out, err),) = finish(self, [child])
         self.assertEqual((status, out, err), (0, b"True True\n", b"to stderr\n"))
         self.assertNotEqual(os.getsid(0), child.pid)
+
+    @unittest.skipUnless(os.path.isdir("/proc/self"), "needs /proc to look at a process")
+    def test_a_program_that_ends_during_a_mount_leaves_no_child(self):
+        """The TUI's quit: the mount waits in a daemon thread, the cancel is
+        set and the program ends at once, before the thread looks again.
+        The child (a sleeping Python here, never udisksctl) is terminated
+        on the way out all the same."""
+        code = (
+            "import os, subprocess, sys, threading, time, types\n"
+            "from agent_sessions import mounts\n"
+            "def start(argv):\n"
+            "    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+            "        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,\n"
+            "        start_new_session=True)\n"
+            "    print(child.pid, flush=True)\n"
+            "    return child\n"
+            "mounts.starter = start\n"
+            "mounts._device_of = lambda uuid: '/dev/x'\n"
+            "mounts._mounted_at = lambda uuid, device: None\n"
+            "mounts.shutil = types.SimpleNamespace(which=lambda name: '/usr/bin/' + name)\n"
+            "cancel = threading.Event()\n"
+            "threading.Thread(target=mounts.mount_volume, args=('ABCD', 120.0, cancel),\n"
+            "    daemon=True).start()\n"
+            "while not mounts._waiting:\n"
+            "    time.sleep(0.01)\n"
+            "cancel.set()\n"
+        )
+        ((status, out, err),) = finish(self, [python_child(code)])
+        self.assertEqual((status, err), (0, ""))
+        pid = int(out)
+
+        def running() -> bool:
+            try:
+                with open(f"/proc/{pid}/stat", encoding="ascii") as stat_file:
+                    return stat_file.read().rsplit(")", 1)[1].split()[0] != "Z"
+            except OSError:  # gone, or going
+                return False
+
+        deadline = time.monotonic() + 10
+        while running() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if running():
+            os.kill(pid, 9)
+            self.fail("the mount's child outlived the program")
 
     def test_outside_the_suite_the_starter_is_the_real_one(self):
         """In a fresh interpreter, where ``support`` has replaced nothing.
