@@ -260,10 +260,12 @@ def _name_line(source: bytes, thread_id: str) -> bytes | None:
     ``id`` is the thread's own id (the import has checked its form);
     ``thread_name`` is the source's as one line of clean text
     (``textsafe.clean``), at most ``_NAME_MAX`` characters; ``updated_at``
-    is the source's time in our own form (``parse_ts``) and is left out when
-    it is not a time. None, and then no line is added, when the source line
-    is not strict UTF-8, is not a JSON object with every key once, names
-    another thread or leaves nothing of the name that can be written."""
+    is the source's time in our own form (``parse_ts``). None, and then no
+    line is added, when the source line is not strict UTF-8, is not a JSON
+    object with every key once, names another thread, leaves nothing of the
+    name that can be written, or has no time: every line the tool writes
+    has all three fields (FORMATS "Codex"), and one without is not written
+    into its file."""
     try:
         record = json.loads(source.decode("utf-8"), object_pairs_hook=_once)
     except (ValueError, RecursionError):  # UnicodeDecodeError is a ValueError
@@ -274,10 +276,10 @@ def _name_line(source: bytes, thread_id: str) -> bytes | None:
     name = textsafe.clean(name)[:_NAME_MAX].strip() if isinstance(name, str) else ""
     if not name:
         return None
-    entry = {"id": thread_id, "thread_name": name}
     moment = parse_ts(record.get("updated_at"))
-    if moment is not None:
-        entry["updated_at"] = moment
+    if moment is None:
+        return None
+    entry = {"id": thread_id, "thread_name": name, "updated_at": moment}
     try:
         # The tool's own form: compact, text as it is.
         text = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))

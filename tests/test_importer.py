@@ -767,7 +767,9 @@ class CodexImportTest(ImportCase):
 
     def test_a_name_that_is_not_utf8_is_not_written(self):
         added = self.name_line(
-            b'{"id":"%s","thread_name":"caf\xe9 \xff\xfe name"}' % CODEX_WIN.encode(), self.MINE
+            b'{"id":"%s","thread_name":"caf\xe9 \xff\xfe name","updated_at":"2026-08-29T08:31:16Z"}'
+            % CODEX_WIN.encode(),
+            self.MINE,
         )
         self.assertEqual(added, b"")
         read(self.home / ".codex" / "session_index.jsonl").decode("utf-8")  # still text
@@ -775,25 +777,32 @@ class CodexImportTest(ImportCase):
     def test_a_name_that_cannot_be_written_as_text_is_not_written(self):
         # A lone surrogate, escaped: valid JSON, and no text a tool can read back.
         added = self.name_line(
-            b'{"id":"%s","thread_name":"a \\ud800 name"}' % CODEX_WIN.encode(), self.MINE
+            b'{"id":"%s","thread_name":"a \\ud800 name","updated_at":"2026-08-29T08:31:16Z"}'
+            % CODEX_WIN.encode(),
+            self.MINE,
         )
         self.assertEqual(added, b"")
 
-    def test_the_name_is_bounded_and_a_time_that_is_none_is_left_out(self):
+    def test_the_name_is_bounded_and_a_line_without_a_time_is_not_written(self):
+        """Every line the tool writes has all three fields (FORMATS
+        "Codex"): a line without a time that is one is not written."""
         for line, expected in (
             (
-                b'{"id":"%s","thread_name":"' + b"n" * 5000 + b'","updated_at":"tomorrow"}',
-                b'{"id":"%s","thread_name":"' + b"n" * 200 + b'"}\n',
+                b'{"id":"%s","thread_name":"'
+                + b"n" * 5000
+                + b'","updated_at":"2026-08-29T08:31:16Z"}',
+                b'{"id":"%s","thread_name":"'
+                + b"n" * 200
+                + b'","updated_at":"2026-08-29T08:31:16.000000Z"}\n',
             ),
-            (
-                b'{"id":"%s","thread_name":"a name","updated_at":"9999-01-01T00:00:00Z"}',
-                b'{"id":"%s","thread_name":"a name"}\n',
+            (b'{"id":"%s","thread_name":"a name","updated_at":"tomorrow"}', b""),
+            (b'{"id":"%s","thread_name":"a name","updated_at":"9999-01-01T00:00:00Z"}', b""),
+            (b'{"id":"%s","thread_name":"a name","updated_at":{"deep":[1]}}', b""),
+            (b'{"id":"%s","thread_name":"a name"}', b""),
+            (  # nothing left of the name
+                b'{"id":"%s","thread_name":"\\u0007 \\t ","updated_at":"2026-08-29T08:31:16Z"}',
+                b"",
             ),
-            (
-                b'{"id":"%s","thread_name":"a name","updated_at":{"deep":[1]}}',
-                b'{"id":"%s","thread_name":"a name"}\n',
-            ),
-            (b'{"id":"%s","thread_name":"\\u0007 \\t "}', b""),  # nothing left of the name
             (  # not a name line at all: the one before it is the thread's last
                 b'{"id":"%s","thread_name":["a name"]}',
                 b'{"id":"%s","thread_name":"an older name",'
@@ -813,7 +822,8 @@ class CodexImportTest(ImportCase):
         """docs/REVIEW.md R-10: thread names are session data like the rest."""
         own = self.w.profile / ".codex" / "session_index.jsonl"
         own.write_bytes(
-            b'{"id":"%s","thread_name":"from the store","updated_at":"t"}\n' % CODEX_WIN.encode()
+            b'{"id":"%s","thread_name":"from the store","updated_at":"2026-08-29T08:31:16Z"}\n'
+            % CODEX_WIN.encode()
         )
         self.w.scan()
         index = self.home / ".codex" / "session_index.jsonl"
@@ -826,7 +836,8 @@ class CodexImportTest(ImportCase):
     def test_an_index_that_exists_keeps_its_mode(self):
         own = self.w.profile / ".codex" / "session_index.jsonl"
         own.write_bytes(
-            b'{"id":"%s","thread_name":"from the store","updated_at":"t"}\n' % CODEX_WIN.encode()
+            b'{"id":"%s","thread_name":"from the store","updated_at":"2026-08-29T08:31:16Z"}\n'
+            % CODEX_WIN.encode()
         )
         index = self.home / ".codex" / "session_index.jsonl"
         index.parent.mkdir(parents=True)
@@ -840,7 +851,8 @@ class CodexImportTest(ImportCase):
     def test_a_name_the_native_index_already_has_is_not_appended_again(self):
         own = self.w.profile / ".codex" / "session_index.jsonl"
         own.write_bytes(
-            b'{"id":"%s","thread_name":"from the store","updated_at":"t"}\n' % CODEX_WIN.encode()
+            b'{"id":"%s","thread_name":"from the store","updated_at":"2026-08-29T08:31:16Z"}\n'
+            % CODEX_WIN.encode()
         )
         index = self.home / ".codex" / "session_index.jsonl"
         index.parent.mkdir(parents=True)
@@ -854,7 +866,10 @@ class CodexImportTest(ImportCase):
 
     def test_failed_append_rolls_the_rollout_back(self):
         own = self.w.profile / ".codex" / "session_index.jsonl"
-        own.write_bytes(b'{"id":"%s","thread_name":"n","updated_at":"t"}\n' % CODEX_WIN.encode())
+        own.write_bytes(
+            b'{"id":"%s","thread_name":"n","updated_at":"2026-08-29T08:31:16Z"}\n'
+            % CODEX_WIN.encode()
+        )
         self.w.scan()
         with mock.patch.object(
             importer, "_append", side_effect=OSError(errno.EACCES, "Permission denied", "idx")
