@@ -1046,7 +1046,8 @@ class ScriptTextTest(unittest.TestCase):
     def launchers_before(self, name) -> list[str]:
         text = (REPO / name).read_text(encoding="utf-8")
         block = re.search(r"(?m)^LAUNCHERS_BEFORE=\(\n((?:  .*\n)+)\)$", text)
-        self.assertIsNotNone(block, name)
+        if block is None:
+            self.fail(f"{name}: no LAUNCHERS_BEFORE list")
         hashes = re.findall(r"(?m)^  (\S+)", block.group(1))
         for value in hashes:
             self.assertRegex(value, r"^[0-9a-f]{64}$")
