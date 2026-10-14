@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from collections.abc import Iterable, Iterator
@@ -19,6 +18,7 @@ from .base import (
     Turn,
     clean_title,
     iter_jsonl,
+    load_json,
     mtime,
     open_ro,
     parse_ts,
@@ -219,7 +219,7 @@ def _load(path: Path) -> tuple[dict, list[dict]] | None:
         warn("no session metadata record; too large to try as one JSON object", path)
         return None
     try:
-        legacy = json.loads(raw.decode("utf-8-sig", "replace"))
+        legacy = load_json(raw)
     except (ValueError, RecursionError):
         legacy = None
     if not isinstance(legacy, dict) or "sessionId" not in legacy:
@@ -385,7 +385,7 @@ class Gemini(Provider):
         if not text:
             return None
         try:
-            data = json.loads(text)
+            data = load_json(text)
         except (ValueError, RecursionError):
             warn("not valid JSON", projects_json)
             return None

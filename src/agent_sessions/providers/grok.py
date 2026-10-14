@@ -21,6 +21,7 @@ from .base import (
     between,
     clean_title,
     iter_jsonl,
+    load_json,
     mtime,
     open_ro,
     parse_ts,
@@ -67,7 +68,7 @@ def _load_json(path: StrPath) -> tuple[Any, str | None]:
     if len(raw) > _SMALL_FILE:
         return None, "file too large"
     try:
-        return json.loads(raw.decode("utf-8-sig", "replace")), None
+        return load_json(raw), None
     except (ValueError, RecursionError):
         return None, "not valid JSON"
 

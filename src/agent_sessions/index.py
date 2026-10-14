@@ -792,7 +792,18 @@ class Index:
                     continue
                 with base.collect_warnings() as collected:
                     try:
-                        session = provider.parse(store, candidate)
+                        # The cancel event reaches the reads of this parse:
+                        # a file of any size does not hold a cancel up.
+                        with base.cancellable(cancel):
+                            session = provider.parse(store, candidate)
+                    except base.Cancelled:
+                        cancelled = True
+                        for later in candidates[position:]:
+                            if later.id_hint in reusable:
+                                entry["candidates"].setdefault(
+                                    later.id_hint, reusable[later.id_hint]
+                                )
+                        break
                     except NotImplementedError:
                         entry["implemented"] = False
                         entry["candidates"] = {}

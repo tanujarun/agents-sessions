@@ -82,8 +82,11 @@
   `resumable` property, `new_session_argv`: the command for a new session with a first prompt, `evidence_files` and `path_evidence`: recorded folders beyond the sessions' own, for
   the path map; `import_plan` and `import_session` with a chosen folder (`target`) and `experimental`;
   `undo_extras`: what the tool adds beside an imported session), `NotSupported`, `ExperimentalOnly` (an
-  import that is done only when asked for; carries the warning to show first), shared helpers (`iter_jsonl`, `read_lines` and `JSONL_LINE_MAX`,
-  `read_small`, `open_sqlite_ro`, `parse_ts` (nothing outside 1990 to 2100; `unit` for epoch numbers),
+  import that is done only when asked for; carries the warning to show first), shared helpers (`iter_jsonl`, `read_lines` and
+  the bounds of a read: `JSONL_LINE_MAX`, `JSONL_STRUCTURE_MAX` with `too_dense` and `load_json`,
+  `FILE_READ_MAX`; `cancellable`, which lets a scan's cancel event end a read (`Cancelled`);
+  `read_small`, `open_sqlite_ro` (always a copy in memory: `SQLITE_MEMORY_MAX`, `SQLITE_VALUE_MAX`), `mtime`,
+  `parse_ts` (nothing outside 1990 to 2100; `unit` for epoch numbers),
   `clean_title`, `open_ro`), warnings (`warn`, `collect_warnings`)
 - `src/agent_sessions/providers/{claude,codex,grok,antigravity,gemini}.py` — the adapters: store signature,
   `candidates`, `parse`, `transcript`, `resume_argv`, `new_session_argv`, and `import_plan` (Claude, Codex and Grok; Antigravity
@@ -250,6 +253,11 @@
 - `tests/test_hostile_files.py` — named pipes, devices and directories named like session files (`open_ro`,
   whole scans in a child process under a timeout), over-long lines and the 200 MB line's memory ceiling, size
   caps of files read whole, deeply nested JSON
+- `tests/test_read_bounds.py` — what one file can cost a scan: the byte budget per file (`FILE_READ_MAX`)
+  on sparse files of 16 GiB and 1 PiB (real scans in child processes), a cancel that is seen inside a file
+  (`base.cancellable`), lines and whole documents with too many brackets and commas
+  (`JSONL_STRUCTURE_MAX`, `load_json`), the peak memory of a scan for the dearest lines (`VmHWM` of a
+  child), and databases with a value over `SQLITE_VALUE_MAX` or larger than `SQLITE_MEMORY_MAX`
 - `tests/test_sqlite_hardening.py` — `open_sqlite_ro` on files that are not trusted: the settings made before
   anything is read, schemas with a view, a trigger or a virtual table refused, truncated and scrambled
   databases as one skipped candidate each

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import re
 import sqlite3
@@ -26,6 +25,7 @@ from .base import (
     between,
     clean_title,
     iter_jsonl,
+    load_json,
     mtime,
     open_sqlite_ro,
     parse_ts,
@@ -444,7 +444,7 @@ class Antigravity(Provider):
         if not isinstance(value, str) or not value.strip():
             return None
         try:
-            uris = json.loads(value)
+            uris = load_json(value)
         except (ValueError, RecursionError):
             return None
         return uri_to_path(uris[0]) if isinstance(uris, list) and uris else None
@@ -456,7 +456,7 @@ class Antigravity(Provider):
         if not raw:
             return None
         try:
-            data = json.loads(raw.decode("utf-8-sig", "replace"))
+            data = load_json(raw)
         except (ValueError, RecursionError):
             warn("not valid JSON", path)
             return None

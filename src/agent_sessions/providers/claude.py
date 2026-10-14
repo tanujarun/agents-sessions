@@ -22,6 +22,7 @@ from .base import (
     between,
     clean_title,
     iter_jsonl,
+    load_json,
     mtime,
     parse_ts,
     read_small,
@@ -346,7 +347,7 @@ class Claude(Provider):
         if raw is None:
             return []
         try:
-            config = json.loads(raw.decode("utf-8-sig", "replace"))
+            config = load_json(raw)
         except (ValueError, RecursionError):
             return []
         projects = config.get("projects") if isinstance(config, dict) else None
