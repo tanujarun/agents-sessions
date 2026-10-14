@@ -2,18 +2,20 @@
 
 import json
 import os
+import re
 import stat
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from support import FakePath, FakeProvider, OtherProvider, Sandbox
+from support import FakePath, FakeProvider, OtherProvider, Sandbox, finish, python_child
 
-from agent_sessions import api, discover, providers
+from agent_sessions import api, discover, fsutil, providers
 from agent_sessions import index as index_mod
 from agent_sessions.fsutil import cache_file
 from agent_sessions.index import Index
@@ -250,18 +252,18 @@ class CacheFileTest(IndexCase):
         self.assertEqual((mode(self.box.cache), mode(cache_file())), (0o700, 0o600))
         self.assertIn("a private title", cache_file().read_text())
         # A cache written before this, readable by everyone, in a directory
-        # that was made the ordinary way: the file is tightened when it is
-        # rewritten, the directory that exists is left as it is.
+        # that was made the ordinary way (0.1.0 made it 0755): both are
+        # tightened when the cache is rewritten (AUDIT A-25).
         text = cache_file().read_text()
         cache_file().unlink()
         self.box.cache.rmdir()
         self.box.cache.mkdir()
-        ordinary = mode(self.box.cache)
+        os.chmod(self.box.cache, 0o755)  # noqa: S103  (the mode 0.1.0 left: what is tightened)
         cache_file().write_text(text)
         os.chmod(cache_file(), 0o644)
         api.scan()
         self.assertEqual(mode(cache_file()), 0o600)
-        self.assertEqual(mode(self.box.cache), ordinary)
+        self.assertEqual(mode(self.box.cache), 0o700)
         # A temp file of that name left behind, with a wide mode: not inherited.
         stale = self.box.cache / f"index.json.{os.getpid()}.tmp"
         stale.write_text("left over")
@@ -272,9 +274,18 @@ class CacheFileTest(IndexCase):
         self.assertEqual(sorted(p.name for p in self.box.cache.iterdir()), ["index.json"])
         # Reading changes nothing.
         os.chmod(cache_file(), 0o640)
+        os.chmod(self.box.cache, 0o750)  # noqa: S103  (wide on purpose: reading must not change it)
         api.load_index()
         api.status()
-        self.assertEqual(mode(cache_file()), 0o640)
+        self.assertEqual((mode(cache_file()), mode(self.box.cache)), (0o640, 0o750))
+        os.chmod(self.box.cache, 0o700)
+        # A directory the user named for the index file itself is not ours to tighten.
+        theirs = self.box.root / "theirs"
+        theirs.mkdir(mode=0o755)
+        os.chmod(theirs, 0o755)  # noqa: S103  (the user's own mode, which stays)
+        with mock.patch.dict(os.environ, {"AGENT_SESSIONS_CACHE": str(theirs / "i.json")}):
+            api.scan()
+        self.assertEqual((mode(theirs), mode(theirs / "i.json")), (0o755, 0o600))
 
     @unittest.skipUnless(os.name == "posix", "file modes")
     def test_a_cache_directory_that_is_made_is_private_and_its_parents_are_not_ours(self):
@@ -293,10 +304,13 @@ class CacheFileTest(IndexCase):
             api.scan()
             self.assertTrue(target.is_file())
 
-    def test_corrupt_cache_starts_empty(self):
+    def test_a_file_that_is_no_cache_starts_empty_and_is_kept_aside(self):
+        """AUDIT A-19: an unusable cache was treated as absent and replaced by
+        the next save, with the only record of the drives that are away."""
         self.box.session(self.native, "a")
         api.scan()
         good = cache_file().read_text()
+        unusable = cache_file().with_name("index.json.unusable")
         broken = [
             "",
             "{",
@@ -304,38 +318,117 @@ class CacheFileTest(IndexCase):
             "null",
             '"text"',
             good[: len(good) // 2],
-            json.dumps({"version": index_mod.CACHE_VERSION}),
             json.dumps(dict(json.loads(good), version=index_mod.CACHE_VERSION + 1)),
-            json.dumps(dict(json.loads(good), stores=[{"provider": 1}])),
-            json.dumps(dict(json.loads(good), stores="x")),
-            json.dumps(dict(json.loads(good), parsed={"k": {"candidates": []}})),
-            json.dumps(
-                dict(
-                    json.loads(good),
-                    parsed={
-                        "fake:x": {
-                            "reader": "r",
-                            "implemented": True,
-                            "warnings": [],
-                            "candidates": {"a": {"sig": [], "warnings": [], "session": {"id": 5}}},
-                        }
-                    },
-                )
-            ),
-            json.dumps(dict(json.loads(good), last_deep="soon")),
-            json.dumps(dict(json.loads(good), walk={"/": {"dirs": "many"}})),
+            json.dumps(dict(json.loads(good), version=True)),
+            json.dumps({"no": "version"}),
         ]
         for text in broken:
             with self.subTest(text=text[:40]):
                 cache_file().write_text(text)
+                index = Index.load()
+                self.assertRegex(index.load_error, r"^unreadable: .+")
                 self.assertEqual(api.list_sessions(), [])
                 self.assertEqual(api.status()["stores"], [])
+                self.assertEqual(cache_file().read_text(), text)  # reading moves nothing
                 FakeProvider.parsed.clear()
                 summary = api.scan()
                 self.assertEqual((summary["mode"], summary["sessions"]), ("deep", 1))
                 self.assertEqual(FakeProvider.parsed, ["a"])
+                self.assertEqual(unusable.read_text(), text)  # kept, the older one replaced
+                kept = [w for w in summary["warnings"] if "could not be used" in w]
+                self.assertEqual(
+                    kept,
+                    [
+                        f"{cache_file()}: the cache could not be used ({index.load_error}); "
+                        f"it was kept as {unusable} and a new one was written"
+                    ],
+                )
+                self.assertIsNone(Index.load().load_error)
         cache_file().write_bytes(b"\xff\xfe\x00garbage")
         self.assertEqual(api.list_sessions(), [])
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE(unusable.stat().st_mode), 0o600)  # moved, as it was
+
+    def test_a_file_that_cannot_be_kept_aside_is_not_overwritten(self):
+        cache_file().parent.mkdir(parents=True, exist_ok=True)
+        cache_file().write_text("{")
+        (self.box.cache / "index.json.unusable").mkdir()  # in the way
+        self.box.session(self.native, "a")
+        summary = api.scan()
+        self.assertEqual(cache_file().read_text(), "{")
+        self.assertTrue(any("cache not saved" in w for w in summary["warnings"]))
+
+    def test_a_damaged_entry_is_left_out_and_only_it(self):
+        """AUDIT A-19: one wrong value anywhere cost the whole cache (3,628 of
+        6,000 single-value mutations in the audit's fuzz)."""
+        self.box.session(self.native, "a")
+        self.box.session(self.foreign, "b")
+        api.scan()
+        good = json.loads(cache_file().read_text())
+        key = f"fake:{self.foreign}"
+        native_key = f"fake:{self.native}"
+
+        def with_candidate(**changes):
+            entry = json.loads(json.dumps(good["parsed"][key]))
+            entry["candidates"]["b"].update(changes)
+            return dict(good, parsed=dict(good["parsed"], **{key: entry}))
+
+        cases = {
+            "a store that is no store": dict(good, stores=[*good["stores"], {"provider": 1}]),
+            "a list that is no list": dict(good, skipped="x"),
+            "a parse entry that is no entry": dict(good, parsed=dict(good["parsed"], k={"x": 1})),
+            "a session of the wrong form": with_candidate(session={"id": 5}),
+            "a signature of the wrong form": with_candidate(sig=[[1, 2]]),
+            "a signature with a number that is text": with_candidate(sig=[["/p", "1", 2]]),
+            "warnings that are no text": with_candidate(warnings=[1]),
+            "a time that is no time": dict(good, last_deep="soon"),
+            "a walk that is no walk": dict(good, walk={"/": {"dirs": "many"}}),
+            "a volume that is no volume": dict(good, volumes={"/x": {"uuid": 5}}),
+            "deep_mounts with numbers": dict(good, deep_mounts=[1]),
+        }
+        for name, data in cases.items():
+            with self.subTest(name=name):
+                cache_file().write_text(json.dumps(data))
+                index = Index.load()
+                self.assertIsNone(index.load_error)
+                self.assertGreaterEqual(index.damaged, 1)
+                self.assertIn(native_key, index.parsed)  # what is sound is kept
+                ids = sorted(s.id for s in api.list_sessions())
+                self.assertIn("a", ids)
+                warning = index.damage_warning()
+                self.assertRegex(
+                    warning,
+                    rf"^{re.escape(str(cache_file()))}: [0-9,]+ damaged entr(y|ies) of the cache "
+                    "were left out; a scan reads what is on the mounted drives again$",
+                )
+                self.assertIn(warning, api.status()["warnings"])
+                summary = api.scan()
+                self.assertEqual(summary["sessions"], 2)
+                self.assertEqual(Index.load().damaged, 0)  # the next save is whole again
+                self.assertFalse(cache_file().with_name("index.json.unusable").exists())
+
+    def test_temp_files_of_a_save_that_was_killed_are_removed(self):
+        """AUDIT A-19 (``feat/t4_kill.py``, "cache-write"): ``index.json.<pid>.tmp``
+        stayed for good, with every title and folder in it."""
+        self.box.session(self.native, "a")
+        api.scan()
+        gone = 4_000_000  # no process has this id
+        with mock.patch.object(index_mod.fsutil, "process_alive", lambda pid: pid != gone):
+            for name in (
+                f"index.json.{gone}.tmp",
+                "index.json.1.tmp",
+                "index.json.x.tmp",
+                "other.tmp",
+            ):
+                (self.box.cache / name).write_text("{}")
+            api.scan()
+        self.assertEqual(
+            sorted(p.name for p in self.box.cache.iterdir()),
+            ["index.json", "index.json.1.tmp", "index.json.x.tmp", "other.tmp"],
+        )
+        self.assertTrue(fsutil.process_alive(os.getpid()))
+        if os.name == "posix":
+            self.assertFalse(fsutil.process_alive(gone))
 
     def test_an_unusable_cache_is_emptied_without_building_the_index_twice(self):
         """``load`` used to call ``__init__`` a second time on the object to
@@ -355,7 +448,7 @@ class CacheFileTest(IndexCase):
         loaded = Counting.load()
         self.assertEqual((Counting.made, loaded.load_error, len(loaded.stores)), (1, None, 2))
         # Stores are read before the part that is wrong: taken over, then dropped again.
-        cache_file().write_text(json.dumps(dict(good, parsed={"k": {"candidates": []}})))
+        cache_file().write_text(json.dumps(dict(good, version=99)))
         Counting.made = 0
         broken = Counting.load()
         self.assertEqual(Counting.made, 1)
@@ -386,6 +479,146 @@ class CacheFileTest(IndexCase):
         self.assertEqual(summary["sessions"], 1)
         self.assertEqual(len(summary["warnings"]), 1)
         self.assertIn("cache not saved", summary["warnings"][0])
+
+
+class CopiesTest(IndexCase):
+    """AUDIT A-17: of copies of one session with the same time, the one on a
+    volume that is there is listed, not the one whose drive is away."""
+
+    def test_a_mounted_copy_wins_over_an_offline_one(self):
+        first = self.box.mount("aaa Backup")
+        second = self.box.mount("bbb Data")
+        for disk in (first, second):
+            store = self.box.store(disk / "Users" / "u")
+            self.box.session(store, "same", updated="2026-10-01T10:00:00Z", title="same")
+        api.scan(deep=True)
+        (listed,) = [s for s in api.list_sessions() if s.id == "same"]
+        self.assertEqual(listed.mount, str(first))  # both there: the smaller store key
+        self.box.unmount(first)
+        (listed,) = [s for s in api.list_sessions() if s.id == "same"]
+        self.assertEqual((listed.mount, listed.offline), (str(second), False))
+        index = api.load_index()
+        self.assertEqual(api.find_session("same", index).mount, str(second))
+        # A newer copy still wins, mounted or not.
+        self.box.set_mounts(*self.box.mounts[1:], {"path": first, "label": "aaa Backup"})
+        self.box.session(
+            self.box.root / "media" / "aaa Backup" / "Users" / "u" / ".fake",
+            "same",
+            updated="2026-10-02T10:00:00Z",
+        )
+        api.scan(deep=True)
+        self.box.unmount(first)
+        (listed,) = [s for s in api.list_sessions() if s.id == "same"]
+        self.assertEqual((listed.mount, listed.offline), (str(first), True))
+
+
+class ScanLockTest(IndexCase):
+    """AUDIT A-19: a scan that read the cache before an import's scan saved
+    it wrote its older view back (``feat/t5_concurrent.py``, 4 of 20)."""
+
+    def test_a_scan_reads_again_what_was_saved_since_it_loaded(self):
+        self.box.session(self.native, "a")
+        api.scan(deep=True)
+        mine = Index.load()
+        theirs = Index.load()
+        self.box.session(self.native, "new")
+        FakeProvider.parsed.clear()
+        theirs.scan(providers.all_providers(), api.list_mounts())  # saves "new"
+        self.assertEqual(FakeProvider.parsed, ["new"])
+        summary = mine.scan(providers.all_providers(), api.list_mounts())
+        self.assertEqual(FakeProvider.parsed, ["new"])  # not parsed a second time
+        self.assertEqual((summary["parsed"], summary["sessions"]), (0, 2))
+        self.assertIn("new", {s.id for s in api.list_sessions()})
+
+    def test_only_index_lock_is_taken_and_it_is_gone_afterwards(self):
+        self.box.session(self.native, "a")
+        taken = []
+        real = fsutil.lock
+
+        def recording(path=None, timeout=None):
+            taken.append(os.fspath(path) if path is not None else "state")
+            return real(path, timeout)
+
+        with mock.patch.object(index_mod.fsutil, "lock", recording):
+            api.scan()
+            api.load_index()
+            api.status()
+            api.list_sessions()
+        self.assertEqual(taken, [str(self.box.cache / "index.lock")])  # the scan's alone
+        self.assertEqual(fsutil.index_lock_file(), self.box.cache / "index.lock")
+        self.assertEqual(sorted(p.name for p in self.box.cache.iterdir()), ["index.json"])
+
+    def test_a_scan_waits_for_another_and_then_saves(self):
+        """Real processes: the other holds the lock for a second."""
+        self.box.session(self.native, "a")
+        api.scan()
+        lock = fsutil.index_lock_file()
+        holder = python_child(
+            "import time\nfrom agent_sessions import fsutil\n"
+            "with fsutil.lock(sys.argv[1]):\n    print('held', flush=True)\n    time.sleep(1.5)\n",
+            lock,
+        )
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline(), "held\n")
+        self.box.session(self.native, "b")
+        started = time.monotonic()
+        summary = api.scan()
+        self.assertGreater(time.monotonic() - started, 0.5)
+        self.assertEqual(summary["sessions"], 2)
+        self.assertFalse(any("not saved" in w for w in summary["warnings"]))
+        self.assertEqual(len(Index.load().sessions or api.list_sessions()), 2)
+        finish(self, [holder])
+
+    def test_a_lock_held_too_long_means_a_scan_that_is_not_saved(self):
+        self.box.session(self.native, "a")
+        api.scan()
+        before = cache_file().read_bytes()
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with fsutil.lock(fsutil.index_lock_file()):
+                held.set()
+                release.wait(10)
+
+        other = threading.Thread(target=hold)
+        other.start()
+        self.addCleanup(other.join)
+        self.addCleanup(release.set)
+        held.wait(5)
+        self.box.session(self.native, "b")
+        with mock.patch.object(index_mod, "SCAN_LOCK_WAIT", 0.3):
+            summary = api.scan()
+        self.assertEqual(summary["sessions"], 2)  # the listing of this scan is right
+        self.assertIn(
+            f"{cache_file()}: cache not saved: another scan is still running "
+            f"(process {os.getpid()})",
+            summary["warnings"],
+        )
+        self.assertEqual(cache_file().read_bytes(), before)
+        # A cancel ends the wait at once.
+        cancel = threading.Event()
+        cancel.set()
+        started = time.monotonic()
+        summary = api.scan(cancel=cancel)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertTrue(any("not saved" in w for w in summary["warnings"]))
+        # Listing and status never wait for it.
+        started = time.monotonic()
+        api.load_index()
+        api.status()
+        self.assertLess(time.monotonic() - started, 1)
+        release.set()
+        other.join()
+        api.scan()
+        self.assertEqual(len(api.list_sessions()), 2)
+
+    def test_a_cache_directory_that_cannot_be_written_scans_without_a_lock(self):
+        self.box.session(self.native, "a")
+        self.box.cache.write_text("a file where the directory should be")
+        summary = api.scan()
+        self.assertEqual(summary["sessions"], 1)
+        self.assertTrue(any("cache not saved" in w for w in summary["warnings"]))
 
 
 class ScanPolicyTest(IndexCase):

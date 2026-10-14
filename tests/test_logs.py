@@ -312,10 +312,18 @@ class DebugTest(LogCase):
         code, out, err = run("--debug", "scan")
         self.assertEqual(code, 0)
         self.assertIn("scan: quick", out)
-        logged = [LINE.match(line).group(4) for line in err.splitlines()]
+        lines = [LINE.match(line) for line in err.splitlines()]
+        logged = [line.group(4) for line in lines if line.group(3) == "INFO"]
         self.assertEqual(len(logged), 1)
         self.assertTrue(logged[0].startswith("scan quick: "))
-        self.assertEqual(len(self.messages()), 2)  # both scans are in the file
+        # AUDIT A-25: --debug logs more than it did (nothing at DEBUG level).
+        debug = [line.group(4) for line in lines if line.group(3) == "DEBUG"]
+        store = self.box.home / ".fake"
+        self.assertIn(f"scan: fake store {store}: 1 candidates", debug)
+        self.assertIn(f"scan: {store}: a from the cache", debug)
+        self.assertTrue(any(line.startswith("tool fake-agent: ") for line in debug), debug)
+        self.assertEqual(len(self.messages("INFO")), 2)  # both scans are in the file
+        self.assertEqual(self.messages("DEBUG"), debug)  # and the second one's details
         # The flag held for that command only: the next one is quiet again.
         self.assertEqual(run("scan")[2], "")
         self.assertEqual(len(logging.getLogger(logs.NAME).handlers), 2)  # the null one, the file

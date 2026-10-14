@@ -353,6 +353,7 @@ def tool_state(binary: str) -> ToolState:
     """
     path = shutil.which(binary) if binary else None
     if path is None:
+        _log.debug("tool %s: %s", binary, NOT_FOUND)
         return ToolState(None, False, False, NOT_FOUND)
     key = (path, _mise_installs())
     state = _inspected.get(key)
@@ -450,6 +451,13 @@ def terminal_command(app_id: str, argv: list[str]) -> list[str]:
     ``LaunchFailed`` when there is none, naming the variable that settles it.
     Files only (``shutil.which``); nothing is started.
     """
+    found = _terminal_command(app_id, argv)
+    _log.debug("launch: the window is opened with %s", found[: len(found) - len(argv)])
+    return found
+
+
+def _terminal_command(app_id: str, argv: list[str]) -> list[str]:
+    """``terminal_command`` without its log line."""
     chosen = os.environ.get(TERMINAL_ENV, "").strip()
     if chosen:
         try:
@@ -732,6 +740,12 @@ def _start(planned: Callable[[], _Plan], binary: str, here: bool, dry_run: bool)
     share. ``binary`` names the tool when the system cannot say what failed."""
     try:
         made = planned()
+        _log.debug(
+            "launch: %s, in %s%s",
+            "this process" if here else "a new window",
+            made.cwd,
+            " (a dry run: nothing is started)" if dry_run else "",
+        )
         if dry_run:
             return made
         if here:

@@ -635,15 +635,25 @@ class VolumesTableTest(OfflineCase):
             "version zero": dict(good, version=0),
             "version text": dict(good, version="2"),
         }
+        versions = {"a later version", "version zero", "version text"}
         for name, data in broken.items():
             with self.subTest(name=name):
                 write_cache(data)
                 index = Index.load()
-                self.assertRegex(index.load_error or "", r"^unreadable: .+")
-                self.assertEqual((index.stores, index.volumes, index.parsed), ([], {}, {}))
-                self.assertEqual(api.list_sessions(), [])
+                if name in versions:  # not a cache this program reads: nothing of it
+                    self.assertRegex(index.load_error or "", r"^unreadable: .+")
+                    self.assertEqual((index.stores, index.volumes, index.parsed), ([], {}, {}))
+                    self.assertEqual(api.list_sessions(), [])
+                    continue
+                # AUDIT A-19: what is damaged is left out, and only it.
+                self.assertIsNone(index.load_error)
+                self.assertGreaterEqual(index.damaged, 1)
+                self.assertEqual(len(index.stores), len(good["stores"]))
+                self.assertIn("left out", api.status()["warnings"][0])
+                self.assertEqual(len(api.list_sessions()), 3)  # the store's row is made again
         write_cache(good)
         self.assertEqual(len(api.list_sessions()), 3)
+        self.assertEqual(Index.load().damaged, 0)
 
     def test_a_store_without_a_row_gets_one(self):
         """A version 2 cache that lost a row: the store is still listed."""
@@ -849,9 +859,15 @@ class Version1Test(OfflineCase):
             with self.subTest(name=name):
                 write_cache(data)
                 index = Index.load()
-                self.assertRegex(index.load_error or "", r"^unreadable: .+")
-                self.assertEqual((index.stores, index.volumes, index.mounts), ([], {}, []))
+                # AUDIT A-19: what is damaged is left out, and only it.
+                self.assertIsNone(index.load_error)
+                self.assertGreaterEqual(index.damaged, 1)
                 self.assertEqual(run("status", "--json")[0], 0)
+                self.assertEqual(run("list", "--json")[0], 0)
+                kept = len(good["stores"]) - (1 if name.startswith("store") else 0)
+                if name in ("stores null", "store mount a number", "store without mount_label"):
+                    kept = 0  # every row of the list is damaged
+                self.assertEqual(len(index.stores), kept)
         write_cache(good)
         self.assertEqual(len(api.list_sessions()), 3)
 
@@ -986,6 +1002,44 @@ class MovedVolumeTest(OfflineCase):
         self.assertIn(str(self.disk), index.volumes)
         self.assertNotIn(str(nothing), index.volumes)
         self.assertEqual(sorted(s.id for s in index.sessions if s.offline), ["e", "f"])
+
+    def test_a_volume_with_no_uuid_that_holds_the_same_stores_at_another_path(self):
+        """AUDIT A-17 (``feat/t6_offline.py``, b): a volume whose id is not
+        known came back at ``…1``; its 8 sessions were shown offline, and
+        the copies on the mounted volume were hidden behind them."""
+        self.box.unmount(self.disk)
+        self.box.mount("Win Disk")  # no identity
+        api.scan(deep=True)
+        self.assertEqual(api.load_index().volumes[str(self.disk)]["uuid"], "")
+        new = self.move()  # no identity at the new path either
+        summary = api.scan()
+        self.assertEqual((summary["stores_not_mounted"], summary["offline"]), (0, 0))
+        index = api.load_index()
+        self.assertNotIn(str(self.disk), index.volumes)
+        foreign = [s for s in index.sessions if s.origin == "foreign"]
+        self.assertEqual(sorted(s.id for s in foreign), ["e", "f"])
+        self.assertEqual({(s.mount, s.offline) for s in foreign}, {(str(new), False)})
+
+    def test_one_that_holds_other_stores_or_fits_two_volumes_is_kept(self):
+        self.box.unmount(self.disk)
+        self.box.mount("Win Disk")
+        api.scan(deep=True)
+        new = self.move()
+        self.box.store(new / "Users" / "other")  # one store more than was remembered
+        api.scan(deep=True)
+        self.assertIn(str(self.disk), api.load_index().volumes)
+        # Two volumes that both hold exactly what was remembered: not told apart.
+        twin = self.box.root / "elsewhere" / "twin"
+        twin.parent.mkdir()
+        os.rename(new, twin)
+        (twin / "Users" / "other" / ".fake" / "sessions").rmdir()
+        (twin / "Users" / "other" / ".fake").rmdir()
+        shutil.copytree(twin, self.box.root / "elsewhere" / "twin2")
+        self.box.unmount(new)
+        self.box.mount("twin", at=twin)
+        self.box.mount("twin2", at=self.box.root / "elsewhere" / "twin2")
+        api.scan(deep=True)
+        self.assertIn(str(self.disk), api.load_index().volumes)
 
     def test_another_volume_at_another_path_changes_nothing(self):
         api.scan(deep=True)

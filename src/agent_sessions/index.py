@@ -11,8 +11,12 @@ from the cached parse alone.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import os
+import re
+import stat
 import sys
 import time
 from collections.abc import Collection, Iterable
@@ -20,10 +24,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import discover, journal, launch, textsafe
+from . import discover, fsutil, journal, launch, textsafe
 from .discover import Skipped
 from .fmt import utc_now
-from .fsutil import cache_file, make_private_dir, open_private
+from .fsutil import cache_file, make_private_dir, open_private, open_ro
 from .model import Candidate, Session, Store
 from .mounts import NATIVE_LABEL, UUID_PATTERN, Mount, identity_from_mount_point
 from .pathmap import HOST_ROOT, PathMap, normalise
@@ -34,6 +38,8 @@ if TYPE_CHECKING:
 
     from .fsutil import StrPath
 
+_log = logging.getLogger(__name__)
+
 CACHE_VERSION = 2
 # Version 1 had no ``volumes`` table, no identity in ``mounts`` and no path
 # evidence per store. It is taken over (``_adopt``), not thrown away: its
@@ -43,6 +49,13 @@ _OLD_VERSION = 1
 DEEP_MAX_AGE = 24 * 3600  # seconds; an older deep pass is repeated by `scan`
 OFFLINE_NOTE = "drive not mounted"  # the note of a session listed from the cache alone
 _MOUNT_FIELDS = ("path", "label", "fstype", "device", "uuid", "fs_label")
+UNUSABLE_SUFFIX = ".unusable"  # a cache that could not be used is kept under its name + this
+# What a scan waits for another one to save before it scans without saving.
+SCAN_LOCK_WAIT = 30.0
+_LOCK_SLICE = 0.2  # seconds of one wait, between two looks at the cancel event
+# What a row of the cache that is not what it should be raises on the way in.
+_DAMAGE = (KeyError, TypeError, ValueError, AttributeError, IndexError)
+_UNREAD = object()  # ``Index._mark`` of an index that was not read from its file
 _OLD_MOUNT_FIELDS = 4  # how many of them a version 1 cache has
 _CONVERSATION = {  # field -> accepted types, as stored per candidate
     "id": (str,),
@@ -259,6 +272,28 @@ def _strings(items: object) -> list[str]:
     return items
 
 
+def _signature_rows(sig: object) -> bool:
+    """Whether a cached signature has the form ``signature`` gives it:
+    ``[path, mtime_ns, size]`` rows, the numbers None for a missing file."""
+    return isinstance(sig, list) and all(
+        isinstance(row, list)
+        and len(row) == 3
+        and isinstance(row[0], str)
+        and all(v is None or (type(v) is int) for v in row[1:])
+        for row in sig
+    )
+
+
+def _file_mark(path: Path) -> tuple[int, int, int] | None:
+    """What tells one version of the cache file from another: inode,
+    modification time and size; None when it is not there."""
+    try:
+        found = os.stat(path)
+    except OSError:
+        return None
+    return (found.st_ino, found.st_mtime_ns, found.st_size)
+
+
 def _no_evidence() -> dict[str, list]:
     """The path evidence of a store that offers none, as cached per store."""
     return {"sig": [], "paths": [], "warnings": []}
@@ -322,6 +357,10 @@ class Index:
         # set by load(), not persisted: why the cache gave nothing
         # ("missing", "unreadable: <reason>"), None when it was read
         self.load_error: str | None = None
+        self.damaged = 0  # entries of the file that were left out (``_adopt``)
+        self._set_aside = False  # the file is unusable: keep it aside before a save
+        self.set_aside: str | None = None  # where the last save kept it
+        self._mark: object = getattr(self, "_mark", _UNREAD)
         # derived by finalise()
         self.sessions: list[Session] = []
         self.store_rows: list[dict] = []
@@ -333,103 +372,202 @@ class Index:
 
     @classmethod
     def load(cls, path: StrPath | None = None) -> Index:
-        """Read the cache; a missing, corrupt or old-version file gives an
-        empty index, and ``load_error`` says which it was."""
+        """Read the cache. A missing file, or one that is not a cache this
+        program can read (not JSON, another version), gives an empty index,
+        and ``load_error`` says which it was; such a file is moved aside
+        before anything is saved over it (``save``). Of a cache that reads,
+        what is damaged is left out row by row (``_adopt``)."""
         where = Path(path) if path is not None else cache_file()
         index = cls(where)
-        try:
-            with open(where, encoding="utf-8") as fh:
-                index._adopt(json.load(fh))
-        except FileNotFoundError:
-            index._reset()
-            index.load_error = "missing"
-        except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
-            index._reset()  # whatever _adopt had taken over before it failed
-            reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
-            index.load_error = f"unreadable: {reason or type(exc).__name__}"
+        index._read()
         return index
 
+    def _read(self) -> None:
+        """Fill the index from its file (``load``)."""
+        if self.path is None:
+            return
+        self._reset()
+        self._mark = _file_mark(self.path)
+        try:
+            with open_ro(self.path) as fh:
+                data = json.loads(fh.read().decode("utf-8"))
+        except FileNotFoundError:
+            self.load_error = "missing"
+            return
+        except OSError as exc:  # unreadable, or not a file: nothing to keep aside
+            self.load_error = f"unreadable: {exc.strerror or exc}"
+            return
+        except (ValueError, RecursionError) as exc:
+            self._unusable(exc)
+            return
+        try:
+            self._adopt(data)
+        except _DAMAGE as exc:
+            self._reset()
+            self._unusable(exc)
+
+    def _unusable(self, exc: BaseException) -> None:
+        """The file is there and is no cache this program can use: it is kept
+        under another name before the next save (``save``), never just
+        overwritten. It may be the only record of the sessions of a drive
+        that is not mounted, or a newer program's cache."""
+        self.load_error = f"unreadable: {exc or type(exc).__name__}"
+        self._set_aside = True
+
     def _adopt(self, data: Any) -> None:  # the parsed cache file: any JSON value
-        if data["version"] not in (_OLD_VERSION, CACHE_VERSION):
-            raise ValueError("other cache version")
-        old = data["version"] == _OLD_VERSION
-        self.stores = [
-            Store(*_strings([d["provider"], d["root"], d["origin"], d["mount"], d["mount_label"]]))
-            for d in data["stores"]
-        ]
-        self.skipped = [
-            Skipped(*_strings([d["provider"], d["root"], d["reason"], d["mount"]]))
-            for d in data["skipped"]
-        ]
-        self.mounts = []
-        for d in data["mounts"]:
-            row = dict.fromkeys(_MOUNT_FIELDS, "")
-            for name in _MOUNT_FIELDS[: _OLD_MOUNT_FIELDS if old else None]:
-                row[name] = d[name]
-            _strings(list(row.values()))
-            self.mounts.append(row)
+        """Take over a cache file's content, entry by entry. A file that is
+        not an object, or has a version this program does not know, raises
+        ``ValueError``. In one that has a known version, a store, a skipped
+        store, a mount, a volume, a walk or a cached entry that is not what
+        it should be is left out, and only it: the rest is kept (a scan
+        reads again what is on the mounted drives). ``damaged`` counts what
+        was left out; ``finalise`` gives one warning for it."""
+        version = data.get("version") if isinstance(data, dict) else None
+        if type(version) is not int or version not in (_OLD_VERSION, CACHE_VERSION):
+            raise ValueError("not a cache of a version this program reads")
+        old = version == _OLD_VERSION
+        self.damaged = 0
+
+        def part(name: str, kind: type) -> Any:
+            value = data.get(name)
+            if isinstance(value, kind):
+                return value
+            self.damaged += 1
+            return kind()
+
+        for d in part("stores", list):
+            try:
+                self.stores.append(
+                    Store(
+                        *_strings(
+                            [d["provider"], d["root"], d["origin"], d["mount"], d["mount_label"]]
+                        )
+                    )
+                )
+            except _DAMAGE:
+                self.damaged += 1
+        for d in part("skipped", list):
+            try:
+                self.skipped.append(
+                    Skipped(*_strings([d["provider"], d["root"], d["reason"], d["mount"]]))
+                )
+            except _DAMAGE:
+                self.damaged += 1
+        for d in part("mounts", list):
+            try:
+                row = dict.fromkeys(_MOUNT_FIELDS, "")
+                for name in _MOUNT_FIELDS[: _OLD_MOUNT_FIELDS if old else None]:
+                    row[name] = d[name]
+                _strings(list(row.values()))
+                self.mounts.append(row)
+            except _DAMAGE:
+                self.damaged += 1
         for name in ("last_quick", "last_deep"):
-            value = data[name]
+            value = data.get(name)
             if value is not None and base.parse_ts(value) is None:
-                raise ValueError("bad timestamp")
+                self.damaged += 1
+                value = None  # no time: the scan it stood for is due again
             setattr(self, name, value)
-        self.deep_mounts = _strings(data["deep_mounts"])
-        self.walk = {}
-        for mount, stats in data["walk"].items():
-            row = discover.WalkStats(**stats).to_dict()
-            _strings(row["error_paths"])
-            if not all(isinstance(row[k], (int, float)) for k in row if k != "error_paths"):
-                raise ValueError("bad walk stats")
-            self.walk[mount] = row
-        self.parsed = {}
-        for key, entry in data["parsed"].items():
-            candidates = {}
-            for hint, cached in entry["candidates"].items():
+        try:
+            self.deep_mounts = _strings(data.get("deep_mounts"))
+        except _DAMAGE:
+            self.damaged += 1
+        for mount, stats in part("walk", dict).items():
+            try:
+                row = discover.WalkStats(**stats).to_dict()
+                _strings(row["error_paths"])
+                if not all(isinstance(row[k], (int, float)) for k in row if k != "error_paths"):
+                    raise ValueError("bad walk stats")
+                self.walk[mount] = row
+            except _DAMAGE:
+                self.damaged += 1
+        for key, entry in part("parsed", dict).items():
+            try:
+                self.parsed[key] = self._cached_store(entry, old)
+            except _DAMAGE:
+                self.damaged += 1
+        if old:
+            self._volumes_of_old_cache()
+        else:
+            for path, row in part("volumes", dict).items():
+                try:
+                    self.volumes[path] = _volume(row)
+                except _DAMAGE:
+                    self.damaged += 1
+        # A store on a drive that is not mounted is listed by its volume's
+        # row: none may be without one.
+        for path in sorted(self._foreign_mounts() - set(self.volumes)):
+            self.volumes[path] = self._blank_volume(path)
+
+    def _cached_store(self, entry: Any, old: bool) -> dict:  # one entry of ``parsed``
+        """One store's entry of the parse cache, its damaged candidates left
+        out (``damaged`` counts them); ``_DAMAGE`` when the entry itself is
+        not one. A cached time that ``parse_ts`` would not have written is
+        dropped (``_sound_times``), and the candidate is parsed again by the
+        next scan."""
+        if not isinstance(entry["reader"], str):
+            raise ValueError("bad reader id")
+        evidence = _no_evidence()
+        if not old:
+            try:
+                given = entry["evidence"]
+                if not _signature_rows(given["sig"]):
+                    raise ValueError("bad signature")
+                evidence = {
+                    "sig": given["sig"],
+                    "paths": _strings(given["paths"]),
+                    "warnings": _strings(given["warnings"]),
+                }
+            except _DAMAGE:
+                self.damaged += 1  # gathered again: an empty signature matches no file
+        candidates = {}
+        for hint, cached in entry["candidates"].items():
+            try:
                 session = cached["session"]
                 if session is not None and not _is_conversation(session):
                     raise ValueError("bad cached session")
                 sig = cached["sig"]
-                if not isinstance(sig, list):
+                if not _signature_rows(sig):
                     raise ValueError("bad signature")
-                if session is not None:
-                    session, sound = _sound_times(session)
-                    if not sound:
-                        sig = []  # no file has this signature: the next scan parses it again
-                candidates[hint] = {
-                    "sig": sig,
-                    "session": session,
-                    "warnings": _strings(cached["warnings"]),
-                }
-            if not isinstance(entry["reader"], str):
-                raise ValueError("bad reader id")
-            evidence = _no_evidence() if old else entry["evidence"]
-            if not isinstance(evidence["sig"], list):
-                raise ValueError("bad signature")
-            self.parsed[key] = {
-                "reader": entry["reader"],
-                "implemented": bool(entry["implemented"]),
-                "warnings": _strings(entry["warnings"]),
-                "candidates": candidates,
-                "evidence": {
-                    "sig": evidence["sig"],
-                    "paths": _strings(evidence["paths"]),
-                    "warnings": _strings(evidence["warnings"]),
-                },
-            }
-        if old:
-            self._volumes_of_old_cache()
-        else:
-            self.volumes = {path: _volume(row) for path, row in data["volumes"].items()}
-            # A store on a drive that is not mounted is listed by its
-            # volume's row: none may be without one.
-            for path in sorted(self._foreign_mounts() - set(self.volumes)):
-                self.volumes[path] = self._blank_volume(path)
+                warnings = _strings(cached["warnings"])
+            except _DAMAGE:
+                self.damaged += 1
+                continue
+            if session is not None:
+                session, sound = _sound_times(session)
+                if not sound:
+                    self.damaged += 1
+                    sig = []  # no file has this signature: the next scan parses it again
+            candidates[hint] = {"sig": sig, "session": session, "warnings": warnings}
+        return {
+            "reader": entry["reader"],
+            "implemented": bool(entry["implemented"]),
+            "warnings": _strings(entry["warnings"]),
+            "candidates": candidates,
+            "evidence": evidence,
+        }
+
+    def damage_warning(self) -> str | None:
+        """The one warning for what ``_adopt`` left out, or None."""
+        if not self.damaged:
+            return None
+        what = "entry" if self.damaged == 1 else "entries"
+        return (
+            f"{self.path}: {self.damaged:,} damaged {what} of the cache were left out; "
+            "a scan reads what is on the mounted drives again"
+        )
 
     def save(self) -> None:
         """Write the cache atomically: a temp file in the same directory, then
         ``os.replace``. The file is private (0600), whatever mode the one it
-        replaces had, and so is a cache directory this makes (0700): the
-        cache holds the title and the folder of every session."""
+        replaces had, and so is a cache directory this makes (0700), or one
+        of ours that is there with a wider mode: the cache holds the title
+        and the folder of every session.
+
+        A file this index could not use is moved aside first (to its name +
+        ``.unusable``, replacing an older one there); when that cannot be
+        done, nothing is saved (``OSError``). The temp files of saves that
+        were cut short, whose process is gone, are removed."""
         if self.path is None:
             return
         data = {
@@ -444,7 +582,21 @@ class Index:
             "walk": self.walk,
             "parsed": self.parsed,
         }
-        make_private_dir(self.path.parent)
+        directory = self.path.parent
+        make_private_dir(directory)
+        own = fsutil.own_cache_dir()
+        if own is not None and os.path.abspath(own) == os.path.abspath(directory):
+            fsutil.keep_private(directory)
+        if self._set_aside:
+            try:
+                regular = stat.S_ISREG(os.lstat(self.path).st_mode)
+            except FileNotFoundError:
+                regular = False  # gone meanwhile: nothing to keep
+            if regular:
+                os.replace(self.path, self.unusable_path())
+                self.set_aside = str(self.unusable_path())
+            self._set_aside = False
+        self._sweep_temp_files()
         tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
         try:
             with open_private(tmp) as fh:
@@ -455,6 +607,76 @@ class Index:
                 os.unlink(tmp)
             except OSError:
                 pass
+        self._mark = _file_mark(self.path)
+
+    def unusable_path(self) -> Path:
+        """Where a cache that could not be used is kept."""
+        path = self.path if self.path is not None else cache_file()
+        return path.with_name(path.name + UNUSABLE_SUFFIX)
+
+    def _sweep_temp_files(self) -> None:
+        """Remove ``<name>.<pid>.tmp`` beside the cache when that process is
+        gone: what a save that was killed left. Each holds every title and
+        folder. Best effort."""
+        if self.path is None:
+            return
+        pattern = re.compile(re.escape(self.path.name) + r"\.([0-9]{1,10})\.tmp")
+        try:
+            names = os.listdir(self.path.parent)
+        except OSError:
+            return
+        for name in sorted(names):
+            found = pattern.fullmatch(name)
+            if found is None or int(found.group(1)) == os.getpid():
+                continue
+            if fsutil.process_alive(int(found.group(1))):
+                continue
+            try:
+                os.unlink(self.path.parent / name)
+            except OSError:
+                pass
+
+    def _lock(self, held: contextlib.ExitStack, cancel: threading.Event | None) -> str | None:
+        """Take the cache's lock (``fsutil.index_lock_file``: ``index.lock``
+        beside the file) for the rest of a scan, into ``held``; returns None,
+        or why the cache must not be saved by this scan.
+
+        From loading to saving a scan holds it, so that one that read the
+        cache before another saved it (an import's) cannot write its older
+        view back: when the file changed since this index read it, it is
+        read again now, under the lock. Taken after the state directory's
+        lock, never before it. A cache that is held longer than
+        ``SCAN_LOCK_WAIT`` (another scan of a slow drive), or the cancel
+        event, ends the wait: this scan then runs and is not saved. Where no
+        lock can be made (a read-only directory) the scan runs without one,
+        and its save fails and says so."""
+        if self.path is None:
+            return None
+        try:
+            make_private_dir(self.path.parent)
+        except OSError:
+            return None
+        path = self.path.with_suffix(".lock")
+        deadline = time.monotonic() + SCAN_LOCK_WAIT
+        said = False
+        while True:
+            try:
+                held.enter_context(fsutil.lock(path, timeout=_LOCK_SLICE))
+                break
+            except fsutil.LockTimeout as exc:
+                who = f"process {exc.pid}" if exc.pid is not None else "another process"
+                if not said:
+                    _log.debug("scan: waiting for %s, held by %s", path, who)
+                    said = True
+                if (cancel is not None and cancel.is_set()) or time.monotonic() >= deadline:
+                    _log.debug("scan: %s still held by %s; this scan is not saved", path, who)
+                    return f"another scan is still running ({who})"
+            except OSError:
+                return None
+        if self._mark is not _UNREAD and _file_mark(self.path) != self._mark:
+            _log.debug("scan: %s was saved since it was read; read again", self.path)
+            self._read()
+        return None
 
     # --- volumes ------------------------------------------------------------
 
@@ -541,6 +763,44 @@ class Index:
         }
         for path in sorted(moved):
             self.forget(path)
+
+    def _drop_moved_without_id(
+        self, present: Collection[str], stores: Iterable[Store], skipped: Iterable[Skipped]
+    ) -> None:
+        """Forget a volume whose UUID is not known, remembered at a path that
+        is not mounted now, when one mounted volume holds exactly the same
+        stores below its mount point (each store at the same place below
+        it, the same provider, nothing more and nothing less): it is that
+        volume, mounted somewhere else. Its sessions are listed from there;
+        the copies remembered at the old path would only hide them (or be
+        listed twice) as offline. Two mounted volumes that both fit are not
+        told apart, and nothing is forgotten."""
+
+        def below(root: str, mount: str) -> str | None:
+            base_path = mount.rstrip(os.sep)
+            return root[len(base_path) + 1 :] if root.startswith(base_path + os.sep) else None
+
+        found: dict[str, set[tuple[str, str]]] = {}
+        seen: list[Store | Skipped] = [*stores, *skipped]
+        for item in seen:
+            if item.mount in present:
+                rel = below(item.root, item.mount)
+                if rel is not None:
+                    found.setdefault(item.mount, set()).add((item.provider, rel))
+        for path, row in sorted(self.volumes.items()):
+            if path in present or row["uuid"]:
+                continue
+            kept: set[tuple[str, str]] = set()
+            remembered: list[Store | Skipped] = [*self.stores, *self.skipped]
+            for item in remembered:
+                if item.mount == path and getattr(item, "origin", "foreign") != "native":
+                    rel = below(item.root, path)
+                    if rel is not None:
+                        kept.add((item.provider, rel))
+            matches = [mount for mount, here in found.items() if kept and here == kept]
+            if len(matches) == 1:
+                _log.debug("scan: the volume once at %s is at %s now", path, matches[0])
+                self.forget(path)
 
     def forget(self, path: str) -> int:
         """Take a volume out of the index: its row, the stores remembered on
@@ -633,8 +893,25 @@ class Index:
     ) -> dict:
         """Refresh stores and the parse cache, save, finalise; return a
         summary. ``deep=None`` follows ``needs_deep``. A set ``cancel`` event
-        stops the walk or the parsing; what was done until then is kept."""
+        stops the walk or the parsing; what was done until then is kept.
+        The cache's lock is held for the whole of it (``_lock``)."""
         started = time.monotonic()
+        with contextlib.ExitStack() as held:
+            refused = self._lock(held, cancel)
+            return self._scan(providers, mounts, deep, progress, cancel, refused, started)
+
+    def _scan(
+        self,
+        providers: Iterable[base.Provider],
+        mounts: Iterable[Mount],
+        deep: bool | None,
+        progress: discover.Progress | None,
+        cancel: threading.Event | None,
+        refused: str | None,
+        started: float,
+    ) -> dict:
+        """``scan`` with the lock taken, or ``refused`` saying why the cache
+        is not to be saved."""
         launch.forget_tools()  # a tool installed since the last scan is seen by this one
         providers = list(providers)
         mounts = sorted(mounts, key=lambda m: m.path)
@@ -661,6 +938,7 @@ class Index:
         # remembered, with its cached parses. One on a present mount that is
         # no longer a store is forgotten.
         present = {m.path for m in mounts}
+        self._drop_moved_without_id(present, stores.values(), skipped.values())
         active = set(stores)
         for old in self.stores:
             key = (old.provider, old.root)
@@ -699,11 +977,21 @@ class Index:
         self._note_volumes(mounts)
         self.finalise(providers, mounts)
         self._note_letters()
+        notes = set()
+        unusable = self.load_error if self._set_aside else None
         try:
-            self.save()
+            if refused is not None:
+                notes.add(f"{self.path}: cache not saved: {refused}")
+            else:
+                self.save()
         except OSError as exc:
-            save_error = f"{self.path}: cache not saved: {exc.strerror or exc}"
-            self.warnings = sorted(set(self.warnings) | {save_error})
+            notes.add(f"{self.path}: cache not saved: {exc.strerror or exc}")
+        if self.set_aside is not None and unusable is not None:
+            notes.add(
+                f"{self.path}: the cache could not be used ({unusable}); it was kept as "
+                f"{self.set_aside} and a new one was written"
+            )
+        self.warnings = sorted(set(self.warnings) | notes)
         by_provider = {p.name: {"stores": 0, "sessions": 0, "offline": 0} for p in providers}
         for row in self.store_rows:
             if row["present"] and row["provider"] in by_provider:
@@ -775,6 +1063,9 @@ class Index:
             # Directories the adapter could not list: kept with the store,
             # and gone again on the scan after they become readable.
             entry["warnings"] += sorted(set(listing.items))
+            _log.debug(
+                "scan: %s store %s: %d candidates", store.provider, store.root, len(candidates)
+            )
             for position, candidate in enumerate(candidates):
                 hint = candidate.id_hint
                 if hint in entry["candidates"]:
@@ -797,7 +1088,9 @@ class Index:
                 if cached is not None and cached["sig"] == sig:
                     entry["candidates"][hint] = cached
                     counts["cached"] += 1
+                    _log.debug("scan: %s: %s from the cache", store.root, hint)
                     continue
+                _log.debug("scan: %s: %s parsed", store.root, hint)
                 with base.collect_warnings() as collected:
                     try:
                         # The cancel event reaches the reads of this parse:
@@ -869,9 +1162,14 @@ class Index:
         sessions: list[Session] = []
         rows = []
         warnings: set[str] = set()
+        damage = self.damage_warning()
+        if damage is not None:
+            warnings.add(damage)
         # (row, store, conversation), in order
         found: list[tuple[dict[str, Any], Store, dict[str, Any]]] = []
-        best: dict[tuple[str, str, str], tuple[str, int]] = {}  # (origin, provider, id)
+        best: dict[
+            tuple[str, str, str], tuple[tuple[str, bool], int]
+        ] = {}  # by (origin, provider, id)
         evidence: list[tuple[object, Mount | str | None]] = []  # (recorded path, source mount)
         for store in sorted(self.stores, key=_store_key):
             entry = self.parsed.get(_store_key(store)) or {}
@@ -918,12 +1216,14 @@ class Index:
                     row["skipped"] += 1
                     continue
                 # Of several copies of one session (a hard-linked mirror, a
-                # copied profile) the newest is listed; on a tie the one
-                # met first, which is the smaller store key.
+                # copied profile) the newest is listed; on a tie the one on
+                # a volume that is there, then the one met first, which is
+                # the smaller store key: an offline copy never hides one
+                # that can be read.
                 ident = (store.origin, store.provider, conversation["id"])
-                updated = conversation["updated"] or ""
-                if ident not in best or updated > best[ident][0]:
-                    best[ident] = (updated, len(found))
+                rank = (conversation["updated"] or "", bool(row["present"]))
+                if ident not in best or rank > best[ident][0]:
+                    best[ident] = (rank, len(found))
                 found.append((row, store, conversation))
         for position, (row, store, conversation) in enumerate(found):
             ident = (store.origin, store.provider, conversation["id"])
