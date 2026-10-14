@@ -39,7 +39,7 @@ from fixture_world import (
 )
 from support import FIXTURES, MODES_BIND, NEEDS_MODES, state_names
 
-from agent_sessions import api, blake3, importer, journal
+from agent_sessions import api, blake3, fsutil, importer, journal
 from agent_sessions.model import make_key
 from agent_sessions.providers import antigravity, gemini
 from agent_sessions.providers import grok as grok_mod
@@ -1565,8 +1565,8 @@ class StagingSweepTest(ImportCase):
     def leftovers(self):
         prefix = importer.STAGING_PREFIX
         dead, live = dead_pid(), os.getpid()
-        self.assertFalse(importer._pid_alive(dead))
-        self.assertTrue(importer._pid_alive(live))
+        self.assertFalse(fsutil.process_alive(dead))  # what the sweep asks
+        self.assertTrue(fsutil.process_alive(live))
         stale = [
             self.make(f"{prefix}{dead}-18a3f0", 2 * self.HOUR),
             self.make(f"{prefix}{dead}-0", 30 * 24 * self.HOUR),
@@ -1621,12 +1621,6 @@ class StagingSweepTest(ImportCase):
 
 
 class HelpersTest(unittest.TestCase):
-    def test_human_size(self):
-        self.assertEqual(
-            [importer.human_size(n) for n in (0, 999, 1000, 116701, 123697588, 5 * 10**12)],
-            ["0 B", "999 B", "1.0 kB", "116.7 kB", "123.7 MB", "5000.0 GB"],
-        )
-
     def test_tree_lists_without_locks_and_in_order(self):
         import tempfile
 

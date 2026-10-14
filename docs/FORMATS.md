@@ -45,7 +45,11 @@ Throwaway scripts that produced the numbers are in `scratch/` (git-ignored): `wa
   every DB, native ones too, with `file:<quoted path>?mode=ro&immutable=1`**; quote the path
   with `urllib.parse.quote` (spaces, `%`, `#`, `?`). Immutable mode ignores a hot `-wal`, so
   rows not yet checkpointed are invisible; where that matters copy `db` + `db-wal` into
-  `~/.cache/agent-sessions/` and open the copy.
+  `~/.cache/agent-sessions/` and open the copy. *As built (phase 2, audit A-16): no database
+  is opened in place any more, `immutable=1` included (it still moves the file's access
+  time). `providers.base.open_sqlite_ro` reads the file through `open_ro` and loads it into
+  an in-memory connection (`Connection.deserialize`), up to `SQLITE_MEMORY_MAX`; a larger
+  file is not opened at all. Rows in a hot `-wal` stay invisible.*
 - Mounts are `relatime`: reading a file can update its atime on the NTFS drive. Open with
   `os.O_NOATIME` where the platform has it (ignore `PermissionError`).
 - **Size caps.** A file on another drive can hold anything, so every read is bounded; what is
@@ -53,15 +57,30 @@ Throwaway scripts that produced the numbers are in `scratch/` (git-ignored): `wa
 
   | what | cap | constant |
   |---|---|---|
-  | one line of a JSONL file (with its line break) | 32 MiB | `providers.base.JSONL_LINE_MAX` |
+  | one line of a JSONL file (with its line break) | 16 MiB | `providers.base.JSONL_LINE_MAX` |
+  | brackets, braces and commas in one line, or in a JSON file read whole, before it is parsed | 1,000,000 | `providers.base.JSONL_STRUCTURE_MAX` |
+  | what is read of any one file through `read_lines` (the rest is not read; the session is listed from what was) | 2 GiB | `providers.base.FILE_READ_MAX` |
+  | a SQLite database, loaded whole into memory (a larger one is not opened) | 256 MiB | `providers.base.SQLITE_MEMORY_MAX` |
+  | one value or row a SQLite query gives (`SQLITE_LIMIT_LENGTH`) | 16 MiB | `providers.base.SQLITE_VALUE_MAX` |
+  | a small file read whole: Grok `summary.json` and `.cwd`, Antigravity `annotations/<id>.pbtxt` and `last_conversations.json`, Gemini's text files | 16 MiB | `_SMALL_FILE` in `providers.grok`, `providers.antigravity`, `providers.gemini` |
+  | Claude's `.claude.json` (path evidence) | 16 MiB | `providers.claude._CONFIG_MAX` |
   | a Gemini chat file (`.jsonl`, and the older `.json`) | 64 MiB | `providers.gemini._CHAT_MAX`, `_LEGACY_MAX` |
   | the Codex `session_index.jsonl` | 64 MiB | `providers.codex._INDEX_MAX` |
+  | one line of the Codex `session_index.jsonl` | 64 KiB | `providers.codex._INDEX_LINE_MAX` |
+  | what `tool_state` reads of a command on `PATH` | 64 KiB | `launch.WRAPPER_MAX` |
   | the text a title is made from | 64 Ki characters | `providers.base.TITLE_SOURCE_MAX` |
   | a recorded working directory | 32,767 characters | `index.CWD_MAX` |
   | a session's note | 200 characters | `index.NOTE_MAX` |
+  | recorded paths of one store kept as path-map evidence | 10,000 | `index.EVIDENCE_MAX` |
+  | the name of a Codex thread an import writes to the native index | 200 characters | `providers.codex._NAME_MAX` |
+  | the nesting of a directory an import copies | 64 levels | `importer.DEPTH_MAX` |
 
-  The longest real line is 2.74 MB; the caps are far above anything seen and exist for what
-  was not.
+  The longest real line is 2.74 MB and the densest has 29,405 brackets, braces and commas; the
+  caps are far above anything seen and exist for what was not. A line's cost to parse goes by
+  its brackets, braces and commas, not by its bytes (about 100 bytes of memory each at the
+  worst, measured on Python 3.11 and 3.14): one line of 31 MiB of `[],` took 918 MB before
+  `JSONL_STRUCTURE_MAX` (audit A-16). The scan's cancel event is looked at every 4 MiB of a
+  file and while a database is loaded, so a cancel ends within a few megabytes.
 - A time before 1990 or after 2100 is not a time (`parse_ts` gives none): a damaged or made-up
   value, or a file written while the clock was unset. An epoch number is read in the unit its
   source fixes (a file's modification time: seconds); only a number in a field documented as
@@ -226,7 +245,9 @@ Verdict: **supported, copy-only** `[inferred from the verified lookup]`.
    the larger risk.
 5. Do not copy `file-history/`, `session-env/`, `history.jsonl` rows, `sessions/<pid>.json`.
 6. Into a folder the user chose (`import --to T`; Phase 2, Q8): the same copy under
-   `projects/<enc(T)>/`, and nothing else differs. The transcript is not touched and no
+   `projects/<enc(realpath(T))>/` (the tool looks a session up under its physical working
+   directory, as Grok's step 6 assumes; audit N-23), and nothing else differs. The record keeps
+   `T` as given (`chosen_folder`) and the real path (`cwd_local`). The transcript is not touched and no
    `relocated` record is written. The native copy therefore still reads as the folder it
    recorded, so the listing shows that folder and `open` starts in it when it maps to one, else
    in the home directory (lookup step 3 finds the session by id from anywhere `[inferred]`).
@@ -382,7 +403,12 @@ Verdict: **supported: copy, rewrite `cwd` in two record types** `[inferred]`.
    and tool call payloads are history; leave them.
 4. If the source has a name (`session_index.jsonl`, or the Orca mirror's), append
    `{"id","thread_name","updated_at"}` to `~/.codex/session_index.jsonl`. The file may be absent
-   and the tool tolerates that (the Windows store has none) `[verified]`.
+   and the tool tolerates that (the Windows store has none) `[verified]`. The line is written
+   anew from the source's values, never copied (audit A-11; `providers.codex._name_line`): `id`
+   is the thread's id, `thread_name` the name as one line of clean text of at most 200
+   characters, `updated_at` the source's time in `parse_ts` form. A source line that is not
+   strict UTF-8 JSON with each key once, that leaves no name, or that has no valid time adds
+   no line.
 5. Never write `state_5.sqlite` or `thread_history_1.sqlite`; both are derived
    (`backfill_state`, `thread_history_projection_state` hold watermarks and byte offsets), and the
    file-name fallback plus read-repair is expected to register the thread `[inferred, medium risk]`.
@@ -536,12 +562,14 @@ sandbox: `sessions list` and `export`; the resume itself not run]`.
    in the standard library; `agent_sessions/blake3.py` is a one-chunk implementation (inputs up
    to 1,024 bytes), checked against the BLAKE3 team's test vectors. Refused, because never
    seen: a folder whose path is over 1,024 bytes, and one whose name is not valid UTF-8. When
-   the native store has no directory of that name but has one that decodes
-   (`urllib.parse.unquote`) to the same folder, that one is used.
+   the native store has a directory that only decodes (`urllib.parse.unquote`) to the same
+   folder (lower-case hex, an escaped hyphen), it is not used: the tool lists a folder's
+   sessions from `group_name(cwd)` alone (audit A-24; before, such a directory was taken).
 2. Refuse when `~/.grok/sessions/*/<id>/` exists.
 3. Copy the session directory to `~/.grok/sessions/<group>/<id>/`, leaving out `*.lock`.
 4. Rewrite `summary.json` only: `info.cwd` → mapped cwd; `grok_home` → the native store path
-   (layout: see "Import and launch notes"). Both the group name and `info.cwd` matter: the
+   (layout: see "Import and launch notes"). A `summary.json` that starts with a UTF-8 byte order
+   mark is read, and the mark is dropped from the copy (it is not part of the JSON; audit A-24). Both the group name and `info.cwd` matter: the
    first decides `sessions list`, the second `sessions search` `[verified, sandbox]`.
 5. Leave `session_search.sqlite`, `active_sessions.json` and `prompt_history.jsonl` alone (the
    index is rebuilt by the tool `[verified, sandbox]`).
@@ -564,6 +592,13 @@ no session listed none, and both imports were undone afterwards without `--force
 commands had written `docs/` and `logs/` into the store and nothing into a session directory). Still to confirm live: `grok --resume
 <id>` itself, and that Windows paths in `prompt_context.json` / `system_prompt.txt` are
 regenerated rather than trusted. The one Windows conversation is 123.7 MB on disk.
+
+Confirmed on 2026-10-14 with the one real Windows session and the code as it is after the audit
+fixes `[verified, sandbox]`: imported into a throwaway home (the drive read only), then a
+byte-identical copy of grok 1.0.46 run as `unshare -r -n -- env -i HOME=<sandbox> … grok export
+<id>` with no network and stdin from `/dev/null`: exit 0, 854 lines, the first turn the session's
+first prompt; `~/.grok` was identical before and after (2,393 entries). The import was undone
+afterwards, and the throwaway home's `.grok` was byte-identical to its state before.
 
 ### 7. Quirks
 
@@ -1089,6 +1124,9 @@ the parsed count on both stores.)
   `PRAGMA query_only`), so SQLite never opens the file and its access time cannot move. Larger
   files, and any file that does not load that way, are opened with `mode=ro&immutable=1` as
   before. Both ways give the same rows on every fixture database and on the real ones.
+  *Superseded (audit A-16): every database is loaded into memory, up to 256 MiB
+  (`SQLITE_MEMORY_MAX`); a larger one, and one that does not load, is not opened; a value is
+  limited to 16 MiB (`SQLITE_VALUE_MAX`).*
 - **Launch**: `resume_needs_cwd` is true for Gemini only (§5 of each provider). The other four
   start in the home directory with a note when the recorded folder is gone or unknown.
 

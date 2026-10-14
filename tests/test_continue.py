@@ -259,7 +259,14 @@ class PlanTest(ContinueCase):
             "nothing": lambda self, p: [],
             "something that differs each time": lambda self, p: ["claude", str(next(clock)), p],
             "another length for another prompt": lambda self, p: ["claude", *p.split()[:2], p],
+            # AUDIT M27: the element that differs must be the prompt, whole. An
+            # adapter that hands the probe on unchanged (36 characters of digits
+            # and dashes) and changes the real prompt was caught by nothing else.
+            "the prompt cut short": lambda self, p: ["claude", p[:36]],
+            "the prompt in other letters": lambda self, p: ["claude", p.upper()],
         }
+        self.assertEqual(len(launch._PROBE), 36)
+        self.assertEqual(launch._PROBE.upper(), launch._PROBE)
         for name, command in commands.items():
             with self.subTest(name), mock.patch.object(Claude, "new_session_argv", command):
                 self.assertEqual(self.failure(), refusal)

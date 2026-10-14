@@ -27,6 +27,8 @@
   launcher an earlier version installed: the same `LAUNCHERS_BEFORE`);
   `--purge` also removes the cache, state and configuration directories (asks, or `--yes`), and the
   program's own files, by name, from the directories `AGENT_SESSIONS_STATE` and `AGENT_SESSIONS_CACHE` name
+  (the log and its rotations, the lock, the journal, the handoff files; the index, its `.unusable` copy,
+  its `.lock`, the temp files of a save that was cut short)
 - `Makefile` — `test`, `test-tui`, `lint`, `format`, `typecheck`, `coverage` (every suite in one run; fails
   under the floor), `dev` (creates `.venv` with Textual and the development tools), `check` (lint,
   typecheck and both suites), `dist` (the sdist and the wheel, in `dist/`), `dist-check` (each installed into
@@ -72,7 +74,8 @@
   real-filesystem list `REAL_FSTYPES`; `AGENT_SESSIONS_MOUNTS` override; a volume by its UUID: `UUID_PATTERN`,
   `volume_state` (`mounted`, `attached`, `absent`; files only), `identity_from_mount_point` (a udisks mount
   point's name back to UUID and label), `mount_volume` (`udisksctl mount`, through the hook `starter`; the one
-  `subprocess` use outside `launch.py`)
+  `subprocess` use outside `launch.py`; a `cancel` event ends the wait and the child, `MountFailed(CANCELLED)`),
+  `_stop_waiting` (at exit, terminates a child a mount still waits for)
 - `src/agent_sessions/discover.py` — `fast_pass`, `deep_pass`, `brute_pass` (the walk `verify` uses), the prune
   list `PRUNE`, `ALWAYS_DESCEND`, `SKIP_RULES` (stores found but not listed), `PROJECT_ROOT` (stores inside this
   checkout are skipped too)
@@ -108,8 +111,10 @@
   (`providers.grok.group_name`)
 - `src/agent_sessions/importer.py` — copy a foreign session into the native store: plans (`start_plan`; a
   folder the user chose, `chosen_folder`; `NoFolder` when the session's own is not found), the checks
-  (`check`, `contained`, and `below` for one path), `execute` (stage, place, verify, append, journal record
-  with a manifest; all under the state directory's lock, rolled back on any failure), `sweep_staging`
+  (`check`, `contained`, and `below` for one path; `fits`: depth and path limits), `execute` (a `begin`
+  record, stage, place, verify, append, journal record with a manifest; all under the state directory's
+  lock, rolled back on any failure, each step of the roll back on its own), `recover` (settles a `begin`
+  that has no `import` or `rollback` after it), `sweep_staging`
 - `src/agent_sessions/unimport.py` — take an import back: the record is `journal.find_record`'s (the last import of a
   session that no undo took back), `plan` (what would be removed and left, read from the record's manifest
   and the disk; refuses a copy that was used since, a damaged record, a path outside the native store),
@@ -171,10 +176,11 @@
   Textual (a fresh interpreter, a temp home)
 - `tests/test_packaging.py` — what keeps code, help and documents in step: no message outside `cli.py`
   names a command-line flag, the hint the CLI adds for every `remedy`; the help (groups, descriptions,
-  examples that parse, 80 columns); every command in the README and in SPEC's CLI sections, every
+  examples that parse, `HELP_WIDTH` columns); every command in the README and in SPEC's CLI sections, every
   environment variable in the README, every tracked module in this file (`git ls-files`), one version
-  everywhere; the package metadata; the rules of the suite itself (every test module imports `support`
-  before the package, `support` takes the state, cache and home whatever is exported, no unguarded
+  everywhere; the package metadata; the rules of the suite itself (every test module imports `support`,
+  or a helper that imports it first, before the package; `support` takes the state, cache and home
+  whatever is exported, no unguarded
   `os.geteuid`); the build (`MANIFEST.in`, `make dist`) and CI (a time limit on every job, the matrix,
   the coverage floor)
 - `tests/test_install_scripts.py` — `install.sh` and `uninstall.sh` run on a copy of the checkout with a
@@ -191,8 +197,8 @@
 - `tests/test_mounts.py` — mountinfo parsing and filtering, env override, `find_mount`
 - `tests/test_volumes.py` — `mounts` on a fake `/dev/disk` tree and mount table: UUID and label of each
   mount, udev escapes, `identity_from_mount_point`, `volume_state`, `mount_volume` (the exact command,
-  refusals before anything is run, the tool's failures, the timeout and the child's end), how the program
-  is started (tried on a Python child)
+  refusals before anything is run, the tool's failures, the timeout and the child's end, the cancel and the
+  child terminated at exit), how the program is started (tried on a Python child)
 - `tests/test_offline.py` — drives that are not mounted: offline sessions in the listing, WHERE, what is
   refused (`Offline`), `verify`, the `volumes` table and cache version 2, the migration of a version 1
   cache (wrong types included), a volume at another mount path, `api.volumes`, `find_volume`,
@@ -227,7 +233,7 @@
   (the drive of a session is not mounted), `MountFailed` (re-exported by `api`)
 - `tests/fixture_world.py` — `World`: fake home plus two fake drives built from the fixtures, launches and
   notifications recorded; `tree_state`, `age_access_times`, `files_below`
-- `tests/test_launch.py` — launch plans per provider, folder gone, foreign refused, `--here`, hooks; which
+- `tests/test_launch.py` — launch plans per provider, folder gone or relative, foreign refused, `--here`, hooks; which
   terminal is used, table-driven on a fake PATH (every known terminal, the order, `$TERMINAL`,
   `AGENT_SESSIONS_TERMINAL`, none at all)
 - `tests/test_json_contract.py` — every `--json` output and the lines of `export --format json` against the
@@ -247,7 +253,7 @@
   (Claude, Antigravity), the mapped one while the source drive is away, an import that was undone, records
   and journals that are malformed or unreadable (no failure, no warning), the journal read once per listing
 - `tests/test_continue.py` — `continue`: every adapter's new-session command against FORMATS Q3, the plan
-  (`launch.plan_new`: the prompt and nothing else from outside the adapter, the handoff file's name, the
+  (`launch.plan_new`: the prompt, whole, and nothing else from outside the adapter, the handoff file's name, the
   folder, a tool that is not installed), `continue_options`, `continue_session` (the transcript written
   private and replaced in one step, another tool, a foreign session, a hostile session, `--here`), every
   refusal, the sweep of old handoff files, the log, the command
@@ -284,7 +290,9 @@
   "time"), `between`, long message ids, the index's bounds on a session's folder, note and title
 - `tests/test_interrupts.py` — Ctrl-C (exit 130, one line), SIGTERM and SIGHUP raised as an exception for
   the length of a command, the `internal error` line and `--debug`; a real child process signalled in the
-  middle of an import's copy; the source disappearing and the disk filling up mid-copy (complete roll back)
+  middle of an import's copy; the source disappearing and the disk filling up mid-copy (complete roll back);
+  a second signal held off during the roll back (`SecondSignalTest`); a child killed outright at each step
+  and what the next import or undo makes of it (`KilledImportTest`, `RecoverTest`)
 - `tests/test_logs.py` — `logs` (nothing created until a message is written, modes, rotation, a log that
   cannot be written, cleaned messages and tracebacks, `--debug`) and what the facade logs (scan, warnings
   once per scan, import, launch, unexpected exceptions)
@@ -308,20 +316,26 @@
 - `src/agent_sessions/tui/engine.py` — `Engine`: the object the app calls the engine through (forwards to
   `agent_sessions.api`, looked up at call time; `list_folder`: a directory's entries for the folder input,
   through `fsutil.listdir_ro`), `EngineError`; tests pass a fake in its place
-- `src/agent_sessions/tui/view.py` — pure view logic, no Textual: rows, ages, display width and clipping,
+- `src/agent_sessions/tui/view.py` — pure view logic, no Textual: rows, ages (`age_text`, `local_time`,
+  `bytes_text`, `parse_stamp`: names of `fmt`'s functions), `clean` (`textsafe.clean`), display width and clipping,
   column fitting, filter, tabs, selection by key, small-terminal layout and key hints, status texts, the
   import verdict (`Verdict`, from `import_options`), every prompt's wording at every width (foreign row,
   mount, warning, tool, start, undo), the folder a user types (`expand_folder`, `complete_folder`), which
   refusal of an undo it is (`undo_refusal`), one key table per mode (`KEYMAPS`), help, transcript wrapping
 - `src/agent_sessions/tui/app.py` — `SessionsApp`, `MainScreen` (workers for load, scan, import, open,
   `import_options`, mount, continue, undo, and the folder input's listing and check; `Question`: what the
-  prompt on screen is about), `SessionList` and `TranscriptView` (line-drawn, virtual), `TabLabel`,
-  `HelpScreen`, `TranscriptScreen` (the pager)
+  prompt on screen is about; `leave`: quitting at once, or after an import or an undo), `Reader` (an
+  engine call that only reads, in a daemon thread), `SafeInput` (an input that draws its value cleaned),
+  `_ClosesOnce` (a screen a key closes once), `SessionList` and `TranscriptView` (line-drawn, virtual,
+  wrapped in timed slices), `TabLabel`, `HelpScreen`, `TranscriptScreen` (the pager)
 - `src/agent_sessions/tui/app.tcss` — every colour, border and spacing value; the widget tree it styles is
   listed at its top
 - `requirements-tui.txt` — the pinned Textual version `install.sh` installs into `.venv`
-- `tests/tui_support.py` — `FakeEngine` (records calls, never mounts, launches, imports or removes; refuses
-  an offline session and an undo the way the engine does), fake sessions, `screen_text`, `settle`
+- `tests/tui_support.py` — imports `support` first; `FakeEngine` (records calls, never mounts, launches,
+  imports or removes; refuses an offline session and an undo the way the engine does; gates that hold a
+  scan or a mount), fake sessions, `screen_text`, `settle`; hostile text and what is drawn of
+  it (`HOSTILE`, `hostile`, `hostile_name`, `screen_segments`, `unsafe_on_screen`); the app as a program
+  of its own in a private pseudo-terminal (`pty_run`, `pty_env`, `PTY_APP`, `pty_engine`, `plain`)
 - `tests/test_tui_view.py` — every function of `tui/view.py`, `tui/engine.py`, the launcher and import rules
   (one import of `tui` outside it, in `cli._tui`); runs on the system Python
 - `tests/test_tui_app.py` — the app under Textual's pilot with the fake engine (`make test-tui`; skips itself

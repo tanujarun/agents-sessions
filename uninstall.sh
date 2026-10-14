@@ -18,8 +18,11 @@
 #
 # With AGENT_SESSIONS_STATE or AGENT_SESSIONS_CACHE set, --purge also takes the
 # program's files out of the directory each names: the files it writes, by
-# name, and nothing else. Such a directory is removed only when nothing else
-# is left in it.
+# name, and nothing else (state: agent-sessions.log and its rotations .1 to .3,
+# agent-sessions.lock, imports.jsonl, imports.json, handoff/<tool>-<id>.md;
+# cache: index.json or the .json file named, its .unusable copy, its .lock
+# and the <pid>.tmp files of a save that was cut short). Such a directory is
+# removed only when nothing else is left in it.
 #
 # Never touched: the session stores (~/.claude, ~/.codex, ~/.grok, ~/.gemini),
 # imported sessions in them included, and this checkout with its .venv. Not
@@ -216,7 +219,9 @@ if [ "$purge" -eq 1 ]; then
   fi
 
   # The cache: the index, in the directory named or, when the name ends in
-  # .json, that file itself; and what a write that was cut short left beside it.
+  # .json, that file itself; beside it, what a write that was cut short left
+  # (<index>.<pid>.tmp), an index that could not be used, kept aside
+  # (<index>.unusable), and the lock a scan holds (index.json: index.lock).
   cache="${AGENT_SESSIONS_CACHE:-}"
   if [ -n "$cache" ]; then
     case "$cache" in
@@ -228,7 +233,7 @@ if [ "$purge" -eq 1 ]; then
     esac
     dir="$(dirname -- "$index")"
     if named AGENT_SESSIONS_CACHE "$dir"; then
-      if ours "$index" "$index".[0-9]*.tmp; then
+      if ours "$index" "$index".[0-9]*.tmp "$index.unusable" "${index%.json}.lock"; then
         holders+=("$dir")
       fi
     fi

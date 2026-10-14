@@ -80,6 +80,16 @@ class AgeTest(unittest.TestCase):
         self.assertEqual(fmt.age("2026-10-12T09:00:00", NOW), "3h")
         self.assertEqual(fmt.age("2026-10-12T09:00:00Z", NOW.replace(tzinfo=None)), "3h")
 
+    def test_the_two_ends_of_the_calendar_are_not_placed(self):
+        """A shift into a zone leaves ``datetime``'s range there: the TUI had
+        this rule, and one copy holds it for both front ends now."""
+        for value in ("9999-12-31T23:59:59.000000Z", "0001-01-01T00:00:00Z"):
+            with self.subTest(value=value):
+                self.assertIsNone(fmt.parse_stamp(value))
+                self.assertEqual(fmt.age(value, NOW), fmt.EMPTY)
+        for value in ("9999-12-29T23:59:59Z", "0001-01-03T00:00:00Z"):
+            self.assertIsNotNone(fmt.parse_stamp(value))
+
     def test_no_clock_given_is_now(self):
         recent = datetime.now(UTC) - timedelta(hours=5, minutes=1)
         self.assertEqual(fmt.age(recent.isoformat()), "5h")

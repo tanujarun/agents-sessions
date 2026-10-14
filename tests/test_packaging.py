@@ -121,8 +121,6 @@ class NeutralMessagesTest(unittest.TestCase):
 
     def test_the_reasons_that_had_a_flag_say_it_in_plain_words(self):
         self.assertIn("can only be undone by force", unimport.LEGACY)
-        self.assertIn("removed only by a forced undo", unimport.EXTRA)
-        self.assertEqual(api.LEFT_FOR_A_FORCED_UNDO, unimport.EXTRA)
 
 
 class RemediesTest(unittest.TestCase):
@@ -181,13 +179,16 @@ class RemediesTest(unittest.TestCase):
             ):
                 self.assertEqual(run(*command), (1, "", f"agent-sessions: {printed}\n"), word)
 
-    def test_what_an_undo_left_for_a_forced_one_names_the_flag(self):
+    def test_what_an_undo_left_is_printed_with_its_reason_and_no_flag(self):
+        """What the tool made beside a copy is never left by an undo: a plain
+        undo is refused while it is there, and a forced one removes it. So no
+        reason an undo leaves a file for names a flag."""
         report = api.UnimportReport(
             "antigravity",
             "id",
             None,
             None,
-            left=[("/n/a.db-wal", unimport.EXTRA), ("/n/dir", unimport.NOT_EMPTY)],
+            left=[("/n/index.jsonl", unimport.APPENDED), ("/n/dir", unimport.NOT_EMPTY)],
             dry_run=True,
         )
         out = io.StringIO()
@@ -196,10 +197,12 @@ class RemediesTest(unittest.TestCase):
         self.assertEqual(
             out.getvalue().splitlines(),
             [
-                f"would leave /n/a.db-wal ({unimport.EXTRA}: --force)",
+                f"would leave /n/index.jsonl ({unimport.APPENDED})",
                 f"would leave /n/dir ({unimport.NOT_EMPTY})",
             ],
         )
+        for why in (unimport.APPENDED, unimport.APPENDED_MAYBE, unimport.NOT_EMPTY):
+            self.assertIsNone(FLAG.search(why), why)
 
 
 class HelpTest(unittest.TestCase):
@@ -291,11 +294,14 @@ class HelpTest(unittest.TestCase):
             del args
         self.assertGreater(seen, 20)
 
-    def test_every_help_fits_80_columns_whatever_the_terminal(self):
+    def test_every_help_fits_its_width_whatever_the_terminal(self):
+        """``HELP_WIDTH`` (78) columns, as SPEC says: the text written by hand
+        (the notes under the groups) included (AUDIT N-04)."""
+        self.assertEqual(cli.HELP_WIDTH, 78)
         for columns in (None, 80, 200):
             for argv in [()] + [(name,) for name in self.COMMANDS]:
                 for line in self.help(*argv, columns=columns).splitlines():
-                    self.assertLessEqual(len(line), 80, (argv, columns, line))
+                    self.assertLessEqual(len(line), cli.HELP_WIDTH, (argv, columns, line))
         self.assertEqual(self.help(columns=200), self.help(columns=80))
         # A narrower terminal gets narrower paragraphs.
         narrow = self.help("import", columns=60).partition("\nexamples:\n")[0]
@@ -345,13 +351,10 @@ class IsolationTest(unittest.TestCase):
     the home at temp directories when it is loaded, so no test can write the
     user's own (docs/AUDIT.md A-23)."""
 
-    # ``fixture_world`` imports ``support`` first (checked below), so it does
-    # as well; ``tui_support`` does not.
-    FIRST = ("support", "fixture_world")
-    AFTER = ("agent_sessions", "tui_support")
-    # Modules that import ``tui_support`` and no ``support``. No write was seen
-    # from them (AUDIT A-23); to be removed with the import added.
-    KNOWN = ("test_tui_app.py", "test_tui_view.py")
+    # ``fixture_world`` and ``tui_support`` import ``support`` first (checked
+    # below), so they do as well.
+    FIRST = ("support", "fixture_world", "tui_support")
+    AFTER = ("agent_sessions",)
 
     def out_of_order(self, path) -> list[str]:
         """The modules ``path`` imports before ``support``, or without it."""
@@ -366,10 +369,11 @@ class IsolationTest(unittest.TestCase):
         self.assertGreater(len(modules), 40)
         wrong = {path.name: self.out_of_order(path) for path in modules}
         wrong = {name: early for name, early in wrong.items() if early}
-        self.assertEqual({n: e for n, e in wrong.items() if n not in self.KNOWN}, {})
+        self.assertEqual(wrong, {})
         # What stands in for ``support`` loads it before anything else of ours.
-        world = first_imports(TESTS / "fixture_world.py")
-        self.assertLess(world["support"], world["agent_sessions"])
+        for helper in ("fixture_world.py", "tui_support.py"):
+            imports = first_imports(TESTS / helper)
+            self.assertLess(imports["support"], imports["agent_sessions"], helper)
 
     def test_the_check_finds_what_it_is_for(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -379,7 +383,8 @@ class IsolationTest(unittest.TestCase):
                 ("import agent_sessions\nimport support\n", ["agent_sessions"]),
                 ("from agent_sessions import api\n", ["agent_sessions"]),
                 ("import os\nfrom agent_sessions.providers import base\n", ["agent_sessions"]),
-                ("import tui_support as support\n", ["tui_support"]),
+                ("import tui_support as support\nfrom agent_sessions import fmt\n", []),
+                ("from agent_sessions import fmt\nimport tui_support\n", ["agent_sessions"]),
                 (
                     "try:\n    import agent_sessions.api\nexcept ImportError:\n    pass\n",
                     ["agent_sessions"],
@@ -609,7 +614,7 @@ class DocumentsTest(unittest.TestCase):
         # The modules a defence is said to live in are modules of the package.
         security = self.read("docs/SECURITY.md")
         implemented = re.findall(r"(?m)^- Implemented: (.*(?:\n  .*)*)", security)
-        self.assertEqual(len(implemented), 12)
+        self.assertEqual(len(implemented), 13)
         for entry in implemented:
             modules = re.findall(r"`((?:providers/|tui/)?\w+\.py)`", entry)
             self.assertTrue(modules, entry)

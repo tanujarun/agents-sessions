@@ -10,6 +10,107 @@ so the version headings link to nothing: 0.1.0 is the state of the repository at
 Nothing in either version has been run against a real agent tool yet; the README lists what
 is still owed ("What has not been tried on a real tool").
 
+## [Unreleased]
+
+The fixes for the acceptance audit of 0.2.0 (`docs/AUDIT.md`; finding numbers in brackets).
+Not given a version number yet: nothing has been tagged or published, and which number the
+next release gets is the owner's decision. The program still says 0.2.0.
+
+### Security
+
+- Starting the browser in a folder that holds a `json.py`, `textual.py` or another module
+  of that name no longer runs it: the checkout's launcher keeps the current directory off
+  Python's path [A-01].
+- A sparse file of any size named like a transcript no longer keeps a scan reading for days:
+  at most 2 GiB of a file is read, and a cancel is seen inside a file [A-02].
+- In the C and POSIX locales, text from a store no longer reaches the terminal as raw C1
+  control bytes, and `--json` is valid UTF-8 in every locale [A-03].
+- A command on `PATH` is no longer taken for the real tool when it is a script that names an
+  installer in a form that is not understood: such a tool is "unknown" and never started;
+  `AGENT_SESSIONS_TRUST_TOOLS` vouches for one [A-09].
+- `export -o` refuses every session store (also one on a drive mounted since the last scan,
+  and a tool's store on this system that does not exist yet) and the program's own files
+  [A-10, N-21].
+- A Codex import no longer copies the source's line into the native `session_index.jsonl`:
+  it writes a new line from checked values, or none [A-11].
+- The TUI's folder input no longer draws the escape sequences of a folder name from another
+  drive [A-12].
+- A line can no longer cost hundreds of megabytes to parse, a SQLite value is limited to
+  16 MiB, and no database is opened in place, so no access time moves [A-16].
+- The lock file is never opened through a symbolic link, and a named pipe under the name of
+  the journal or the log no longer hangs a command [A-18].
+- Invisible characters (zero-width, soft hyphen, the tag characters) are replaced in what is
+  shown, and the Markdown export says how many there were [A-27].
+
+### Fixed
+
+- An import killed half way is settled by the next import or undo of that store, and a
+  second Ctrl-C or signal no longer cuts a roll back short [A-04].
+- A copy nested too deep, or with a path too long for the filesystem, is refused before
+  anything is written; on Python 3.11 its roll back used to fail and leave the copy [A-05].
+- An undo that could not remove everything keeps the import standing and exits 1, and the
+  next undo finishes it; a plain undo is refused while the tool's own files lie beside the
+  copy [A-06].
+- The memory test of the suite measures the scan, not the test runner, so `make test` no
+  longer fails on the first run in a fresh checkout [A-07].
+- Two undos of one import no longer tell the second one to force it; an undone import gets
+  one answer by key and by id [A-08, N-28].
+- A key that arrives twice in the TUI no longer ends it with a traceback [A-13].
+- The tests now hold every value the TUI draws to being cleaned, at several screen sizes;
+  ten ways of leaving one value uncleaned used to pass them [A-15].
+- The TUI's pager answers keys while it wraps a long transcript, and quitting no longer waits
+  for it [A-14].
+- An offline copy of a session no longer hides a mounted copy of the same session [A-17].
+- An index that cannot be used is kept aside as `index.json.unusable`, damaged entries are
+  left out one by one, the temp files of a killed save are removed, and a scan no longer
+  writes back a view older than an import's [A-19].
+- `verify` reports a store that appeared since the last deep scan as stale, not as a
+  difference [A-20].
+- `--debug` reaches the TUI, the tools the TUI starts no longer inherit `PYTHONPATH`, and
+  `tui` without a terminal is one line and exit 2 instead of hanging [A-21].
+- Undoing imports that share a directory leaves no empty directories behind, in either
+  order; a Grok import always uses the tool's own group name; a Grok `summary.json` with a
+  byte order mark imports [A-24].
+- A cached time that is not a time no longer stops `list` or the TUI [A-26].
+- Quitting the TUI is immediate during a scan, a folder listing or a transcript read; a
+  mount under way is cancelled and its `udisksctl` does not outlive the program [A-02].
+- `scan` prints the warnings about the cache itself; `open` of a foreign session that cannot
+  be imported says to continue it as a new session [A-25].
+- `map D: ~/dir` expands `~` [N-20]; `open --dry-run` says when a folder's name holds
+  characters printed as spaces [N-22]; a Claude import with `--to` a link names the project
+  directory after the real path [N-23].
+- `uninstall.sh --purge` also takes the program's files out of the directories
+  `AGENT_SESSIONS_STATE` and `AGENT_SESSIONS_CACHE` name, the index's `.unusable` copy and
+  lock included [N-24].
+- The launcher says so under a Python older than 3.11 [N-25]; `tui --help` is the full help
+  [N-13].
+- A log with a wider mode is tightened to 0600 [N-26]; a message that names a path that is
+  not UTF-8 is no longer dropped from the log [A-03].
+- In the TUI: a long suggested folder shows its end [N-32]; a typed folder with `..` is
+  checked and used as the same path [N-33]; `~` is the program's home [N-34]; `m` on a drive
+  that is not attached says so at once, and a typed NUL is refused in plain words [N-37].
+
+### Changed
+
+- `install.sh` no longer replaces a link or a desktop launcher that is not its own (it says
+  so; `--force` replaces them), treats a relative `XDG_DATA_HOME` as unset, and says what pip
+  and `update-desktop-database` write [A-22, N-11].
+- The cache, state and configuration directories are tightened to 0700 when they exist
+  wider [A-25].
+- The help's examples use key starts that reach into the id, and the help says that a start
+  has to; every help line fits 78 columns [A-25, N-04].
+- The TUI formats ages, sizes and times with the same code as the command line: a time
+  without a zone is UTC in both, and 999,950 bytes are `1.0 MB` [A-26, N-36].
+- `make dist` and `make dist-check` build and try the sdist and the wheel; the sdist carries
+  no tests; CI has time limits, a coverage floor of 94 % and a package job; `make lint` works
+  in a checkout whose path holds `[` or `]` [A-23, N-15, N-30].
+- The test suite can no longer write the user's own state, cache or home, whatever the
+  environment holds, and has tests for the three mutations the audit found unguarded [A-23].
+- The desktop launcher has `TryExec=omarchy-launch-tui`, and the wrong `Curses` classifier
+  is gone [N-15].
+- The documents say what the code does: SPEC, SECURITY, FORMATS, JSON.md and the README
+  [N-01 to N-10, N-12, N-14].
+
 ## [0.2.0] - 2026-10-13
 
 ### Security

@@ -36,9 +36,9 @@ Python standard library only.
 ```
 
 The screen above is the real program at 100 by 24 characters, drawn by Textual's headless
-test driver with the made-up sessions of the test suite (`tests/tui_support.py`). The
-fourth row is the selected one; the selection bar and the dimming of rows from other drives
-are colours and do not show in text.
+test driver with nine made-up sessions written for this page; they are not in the
+repository, and no test pins the picture. The fourth row is the selected one; the selection
+bar and the dimming of rows from other drives are colours and do not show in text.
 
 ## What it supports
 
@@ -77,7 +77,9 @@ Not supported, and why:
 ## Requirements
 
 - Linux.
-- Python 3.11, 3.12, 3.13 or 3.14. Every command but the TUI needs nothing else.
+- Python 3.11, 3.12, 3.13 or 3.14. Every command but the TUI needs nothing else. The
+  checkout's launcher, run by an older Python, says `agent-sessions needs Python 3.11 or
+  newer` and exits 1.
 - The TUI needs [Textual](https://textual.textualize.io/) 8.2.8 (pinned in
   `requirements-tui.txt`). `install.sh` puts it into a `.venv` inside the checkout;
   nothing is installed system-wide.
@@ -96,10 +98,21 @@ cd agent-sessions
 ./install.sh
 ```
 
-`install.sh` does three things and nothing else: it creates `.venv` in the checkout with
-the pinned Textual, links `~/.local/bin/agent-sessions` to `bin/agent-sessions`, and copies
-the desktop launcher to `~/.local/share/applications/agent-sessions.desktop`
-(`$XDG_DATA_HOME/applications` when that variable is set). It can be run again at any time.
+`install.sh` creates `.venv` in the checkout with the pinned Textual, links
+`~/.local/bin/agent-sessions` to `bin/agent-sessions`, and copies the desktop launcher to
+`~/.local/share/applications/agent-sessions.desktop` (`$XDG_DATA_HOME/applications` when that
+variable is an absolute path; a relative one is ignored with a warning, as the XDG
+specification says; `HOME` must be an absolute path). Besides those three, the tools it runs
+write two things: pip keeps its download cache (`~/.cache/pip`, unless pip is configured
+otherwise), and `update-desktop-database`, where it exists, rewrites `mimeinfo.cache` in the
+applications directory. It can be run again at any time.
+
+It does not take over what is not its own. A link at `~/.local/bin/agent-sessions` that
+points to another program is left, and the script stops before it makes anything; a file
+there that is not a link is never replaced. A desktop launcher you edited (another terminal
+in its `Exec` line, say) is kept, and the script says so; one an earlier version installed
+is replaced. `./install.sh --force` replaces both and says what it replaced.
+
 It stops with one line when `python3` is older than 3.11 or has no `venv` module with pip
 (`PYTHON=/path/to/python ./install.sh` uses another interpreter), and it warns when
 `~/.local/bin` is not on `PATH`. `./install.sh --dev` also installs the development tools.
@@ -127,9 +140,15 @@ Without `[tui]` every command works except the TUI, which then says how to get T
 ```
 
 `uninstall.sh` removes `~/.local/bin/agent-sessions` only when it is a link into this
-checkout, and the desktop launcher only when it is the file this checkout installs.
-`--purge` asks first (`--yes` skips the question) and removes `~/.cache/agent-sessions`,
-`~/.local/state/agent-sessions` and `~/.config/agent-sessions`. It never touches a session
+checkout, and the desktop launcher only when it is the file this checkout installs (or one
+an earlier version installed, byte for byte). `--purge` asks first (`--yes` skips the
+question; without a terminal and without `--yes` it removes nothing) and removes
+`~/.cache/agent-sessions`, `~/.local/state/agent-sessions` and `~/.config/agent-sessions`.
+When `AGENT_SESSIONS_STATE` or `AGENT_SESSIONS_CACHE` is set, it also takes the program's own
+files out of the directory each names, by name and nothing else (the log and its rotations,
+the lock files, the journal, the exported transcripts; the index, an index kept aside as
+`.unusable`, the temp files of a save that was cut short), and removes that directory only
+when nothing else is left in it. It never touches a session
 store, so imported sessions stay where they are; undo them with `agent-sessions unimport`
 before purging if you want them gone, because the journal that `unimport` reads is in the
 state directory. The checkout and its `.venv` are left; delete the directory to remove them.
@@ -150,7 +169,10 @@ sessions that changed; a full walk is made again when the set of mounted drives 
 the last one is older than a day.
 
 In the browser: arrow keys to move, Enter to resume the selected session in a new terminal
-window, `v` to read it, `?` for every key, `q` to quit.
+window, `v` to read it, `?` for every key, `q` to quit. `q` leaves at once, also during a
+scan or a mount (the mount is cancelled); an import or an undo under way is finished first,
+and the status line says so. `agent-sessions tui` needs a terminal on stdin, stdout and
+stderr: without one it prints one line and exits 2.
 
 ## The TUI keys
 
@@ -175,9 +197,12 @@ The mouse works too: click a tab or a row, scroll with the wheel, double-click t
 
 ## The command line by task
 
-A session is named by its **key** (the last column of `agent-sessions list --keys`), by a
-unique start of its key, or by its id. The examples use the start `claude:1a2b3c4d`; put a
-key of your own listing in its place. Every command has a `--help` with its options and
+A session is named by its **key** (the last column of `agent-sessions list --keys`), by its
+id, or by a start of its key that only one session has. A key is
+`<provider>:<store>:<id>`, and all the sessions of one store share `<provider>:<store>`, so a
+start has to reach into the id: `claude:1a2b3c4d` alone names every session of that store and
+is refused as ambiguous, `claude:1a2b3c4d:7f3e` names one. The examples use such starts; put
+a key of your own listing in their place. Every command has a `--help` with its options and
 more examples. `scan`, `list` and `status` take `--json`; the shapes are in
 [docs/JSON.md](docs/JSON.md).
 
@@ -186,7 +211,7 @@ more examples. `scan`, `list` and `status` take `--json`; the shapes are in
 ```sh
 agent-sessions list --provider claude --keys   # one provider, with the keys
 agent-sessions list --mounted                  # without sessions of drives that are not mounted
-agent-sessions show claude:1a2b3c4d            # what is known about a session, and its transcript
+agent-sessions show claude:1a2b3c4d:7f3e       # what is known about a session, and its transcript
 agent-sessions status                          # drives, stores, counts, tools, drive letters, warnings
 agent-sessions tui                             # the browser (also what no command does on a terminal)
 ```
@@ -194,34 +219,40 @@ agent-sessions tui                             # the browser (also what no comma
 **Resume a session of this system**
 
 ```sh
-agent-sessions open claude:1a2b3c4d --dry-run  # print the folder and the command, start nothing
-agent-sessions open claude:1a2b3c4d            # in a new terminal window
-agent-sessions open claude:1a2b3c4d --here     # in this terminal
+agent-sessions open claude:1a2b3c4d:7f3e --dry-run  # print the folder and the command, start nothing
+agent-sessions open claude:1a2b3c4d:7f3e            # in a new terminal window
+agent-sessions open claude:1a2b3c4d:7f3e --here     # in this terminal
 ```
 
 **Bring a session over from another drive, and take it back**
 
 ```sh
-agent-sessions import claude:1a2b3c4d --dry-run     # what would be copied and rewritten
-agent-sessions import claude:1a2b3c4d --open        # import, then resume the copy
-agent-sessions import codex:5e6f7a8b --to ~/Work/site    # its own folder is gone: use this one
-agent-sessions import antigravity:9c0d1e2f --experimental
-agent-sessions unimport claude:1a2b3c4d --dry-run   # what an undo would remove and leave
-agent-sessions unimport claude:1a2b3c4d             # asks, then removes the copy
+agent-sessions import claude:1a2b3c4d:7f3e --dry-run   # what would be copied and rewritten
+agent-sessions import claude:1a2b3c4d:7f3e --open      # import, then resume the copy
+agent-sessions import codex:5e6f7a8b:0199 --to ~/Work/site    # its own folder is gone: use this one
+agent-sessions import antigravity:9c0d1e2f:3b8a --experimental
+agent-sessions unimport claude:1a2b3c4d:7f3e --dry-run # what an undo would remove and leave
+agent-sessions unimport claude:1a2b3c4d:7f3e           # asks, then removes the copy
 ```
 
 **Carry a session on somewhere else**
 
 ```sh
-agent-sessions export claude:1a2b3c4d -o ~/notes/session.md   # the transcript as Markdown
-agent-sessions export claude:1a2b3c4d --format json           # one JSON object per turn
-agent-sessions continue gemini:1a2b3c4d --with claude --dry-run
-agent-sessions continue codex:5e6f7a8b --in ~/Work/site       # its own folder is gone
+agent-sessions export claude:1a2b3c4d:7f3e -o ~/notes/session.md   # the transcript as Markdown
+agent-sessions export claude:1a2b3c4d:7f3e --format json           # one JSON object per turn
+agent-sessions continue gemini:2c4e6a8b:5d1f --with claude --dry-run
+agent-sessions continue codex:5e6f7a8b:0199 --in ~/Work/site       # its own folder is gone
 ```
 
 `continue` starts the tool with a first message, and the tool sends that message to its
 model at once. `--dry-run` shows the folder, the exact command and the transcript file,
 and starts nothing.
+
+`export -o FILE` writes the file for you alone (0600) and never over an existing file
+without `--force`. It is refused, forced or not, inside a session store (any store the
+index knows, any tool's own store on this system, and a store on a drive mounted since the
+last scan) and inside the program's own cache, state or configuration directory; `-o ''`
+is a usage error.
 
 **Drives**
 
@@ -241,7 +272,11 @@ agent-sessions verify                    # count the sessions on disk without th
 ```
 
 Exit status: 0 success, 1 failure (one line on stderr says why), 2 wrong usage, 130 after
-Ctrl-C (143 and 129 after SIGTERM and SIGHUP). An import that is interrupted is rolled back.
+Ctrl-C (143 and 129 after SIGTERM and SIGHUP). An import that is interrupted is rolled back;
+a second Ctrl-C or signal waits until that is done. An import killed outright (or cut off by
+a power failure) is settled by the next import or undo into the same store: kept and
+recorded when its copy is whole, taken out otherwise. An undo that could not remove
+everything exits 1, says what it left, and leaves the import standing; run it again.
 
 ## Concepts
 
@@ -252,6 +287,11 @@ Ctrl-C (143 and 129 after SIGTERM and SIGHUP). An import that is interrupted is 
 - **Foreign.** A session in any other store, typically under `Users/<name>/` on a Windows
   partition. It can be read, viewed, exported and continued where it is. To resume it with
   its tool it has to be imported. Nothing is ever written to a foreign store.
+- **Skipped stores.** Some stores are found and counted (`status`, "skipped") but not
+  listed: Claude Desktop's history (a path with `local-agent-mode-sessions`), any store below
+  a `tests/fixtures` directory (sample stores a project keeps for its tests), and every store
+  inside the agent-sessions checkout the program runs from (fake homes its own tests and
+  trials leave).
 - **Offline.** A session of a drive that was scanned earlier and is not mounted now. It is
   listed from the index, with `offline` in the WHERE column. Its files cannot be read until
   the drive is mounted (`mount`, or `m` in the browser).
@@ -281,17 +321,24 @@ Written:
 | Path | What | Mode |
 |---|---|---|
 | `~/.cache/agent-sessions/index.json` | the index: stores, parsed sessions, remembered drives | file 0600, directory 0700 |
-| `~/.local/state/agent-sessions/imports.jsonl` | the import journal, one record per import and per undo | 0600, directory 0700 |
+| `~/.cache/agent-sessions/index.lock` | held by a scan from reading the index to saving it | 0600 |
+| `~/.cache/agent-sessions/index.json.unusable` | an index this version could not use, kept aside before a new one is saved | as it was |
+| `~/.local/state/agent-sessions/imports.jsonl` | the import journal: two records per import (it began; it was done or rolled back) and one per undo | 0600, directory 0700 |
 | `~/.local/state/agent-sessions/agent-sessions.log` (and `.1` to `.3`) | the log, rotated at 1 MB | 0600 |
 | `~/.local/state/agent-sessions/agent-sessions.lock` | held while an import or an undo runs | 0600 |
-| `~/.local/state/agent-sessions/handoff/<provider>-<id>.md` | the transcript `continue` exports; files older than 30 days are swept | 0600, directory 0700 |
+| `~/.local/state/agent-sessions/handoff/<provider>-<id>.md` | the transcript `continue` exports; the next `continue` that writes one removes those older than 30 days | 0600, directory 0700 |
 | `~/.config/agent-sessions/pathmap.json` | drive letters set by hand; written by `map` only | 0600 |
 | the native stores | the files of an imported session, only by `import`; removed only by `unimport` | as the import creates them |
 | the file `export -o` names | a transcript; never inside a session store, never over an existing file without `--force` | 0600 |
 
+The cache, state and configuration directories are 0700: made so, and tightened to 0700
+when they exist with a wider mode (a directory you named with `AGENT_SESSIONS_CACHE` for the
+index file itself is left alone).
+
 While an import runs it stages its files in a directory `.agent-sessions-import-<pid>-<time>`
 at the root of the native store; it is removed when the import ends, and one that a killed
-import left behind is swept by a later import once it is over an hour old.
+import left behind is swept by a later import into the same store once it is over an hour
+old.
 
 Environment variables:
 
@@ -301,7 +348,7 @@ Environment variables:
 | `TERMINAL` | your terminal, used as described above |
 | `AGENT_SESSIONS_TRUST_TOOLS` | comma-separated tool commands (`claude,codex`) you vouch for: started even when their script on `PATH` names an installer this program cannot follow |
 | `AGENT_SESSIONS_NOTIFY` | `0` switches the desktop notification of a failed resume off |
-| `AGENT_SESSIONS_HOME` | use this directory as the home: native stores, cache, state and configuration are looked for below it. For tests and trials |
+| `AGENT_SESSIONS_HOME` | use this directory as the home: native stores, cache, state and configuration are looked for below it. For tests and trials. `verify` walks the mounted drives only, so with a home outside them (under `/tmp`, which no walk enters) it reports that home's stores and sessions as differences |
 | `AGENT_SESSIONS_CACHE` | the cache directory (or the index file itself, when the value ends in `.json`) |
 | `AGENT_SESSIONS_STATE` | the state directory |
 | `AGENT_SESSIONS_MOUNTS` | a JSON list of mounts that replaces the system's mount table. For tests |
@@ -319,21 +366,30 @@ AGENT_SESSIONS_CACHE=$tmp/cache AGENT_SESSIONS_STATE=$tmp/state agent-sessions s
 
 The log is `~/.local/state/agent-sessions/agent-sessions.log` (`agent-sessions status`
 prints its path): scans, imports and undos, every command that was started, mounts,
-warnings, and the traceback of any unexpected error. `agent-sessions --debug <command>`
-logs more and copies the log to stderr. An unexpected error prints one line,
+warnings, and the traceback of any unexpected error. `agent-sessions --debug <command>` adds
+DEBUG lines (each store scanned, each session parsed or taken from the cache, waits for the
+scan lock, each tool's state, how a launch chose its window and folder) and copies the log
+to stderr, where an unexpected error then shows its traceback. `agent-sessions --debug`
+works for the browser too: the copy for stderr is held back while the screen is in use and
+printed when the browser quits. An unexpected error prints one line,
 `internal error: <type>: <message> (details in <log>)`, and exits 1.
 
 - **`the drive <name> is not mounted`.** The session is listed from the index, but its
   files are on a drive that is not mounted. `agent-sessions mount <name>` (or `m` in the
   browser) mounts it with `udisksctl`; the desktop asks for the password when one is
   needed. `status` shows each remembered drive as `mounted`, `attached, not mounted` or
-  `not attached`. Without `udisksctl`, mount the drive from your file manager and run
-  `agent-sessions scan`.
+  `not attached`, or as `not mounted` alone when its volume id is not known (such a drive
+  cannot be mounted from here). Without `udisksctl`, mount the drive from your file manager
+  and run `agent-sessions scan`.
 - **`<tool> is not installed (the command on PATH would install it)`.** The command of that
   name is a wrapper script that downloads and installs the tool when it is first run
   (`mise use … ; exec mise x …`). agent-sessions never starts such a wrapper, so that
   browsing sessions cannot install software. Run the tool yourself once to install it;
   `status` shows the state of every tool.
+- **`<tool> is unknown: a script that may install the tool`.** The command is a script that
+  names an installer (`mise`, `npx`, `npm`, `pnpm`, `pipx`, `uv`, `uvx`, `bunx`) in a way
+  agent-sessions cannot follow, so it is not started. If you know the tool is installed,
+  vouch for it: `AGENT_SESSIONS_TRUST_TOOLS=claude,codex agent-sessions`.
 - **`no terminal was found to open a window with`.** None of the known terminals is on
   `PATH`. Set `AGENT_SESSIONS_TERMINAL` to the command that starts yours, or use `--here`
   to run the tool in the current terminal.
@@ -352,7 +408,13 @@ logs more and copies the log to stderr. An unexpected error prints one line,
   recorded under that letter. Mount the drive, or say what it is: `agent-sessions map D: <dir>`.
 - **The list looks wrong or stale.** `agent-sessions scan --deep`, then
   `agent-sessions verify`, which counts the sessions on disk independently of the index
-  and names every difference.
+  and names every difference. A store that appeared after the last deep scan (a new
+  project, a drive mounted since) is not a difference: `verify` lists it as `stale` and
+  advises `scan --deep` first.
+- **`the cache could not be used`.** An index this version cannot read is moved to
+  `index.json.unusable` and a new one is built by the scan; the sessions of drives that are
+  not mounted come back when those drives are scanned again. Entries of the index that are
+  damaged are left out one by one, and `scan` says how many.
 
 ## Safety
 
@@ -361,7 +423,8 @@ logs more and copies the log to stderr. An unexpected error prints one line,
   folder that exists, and no shell is ever used.
 - Nothing outside the paths in the table above is written, and never a store on another
   drive. An import writes only below the native store and overwrites nothing.
-- Text from a session is cleaned of terminal control sequences before it is shown.
+- Text from a session is cleaned of terminal control sequences, and of characters that
+  reorder or hide text, before it is shown.
 - The cache, journal, log and exported transcripts hold titles, prompts and paths; they are
   created for the user alone.
 - When a session is resumed or continued, a model reads the old transcript. agent-sessions
@@ -405,14 +468,16 @@ use. The questions each run answers are listed in docs/FORMATS.md, "Open questio
 ## Development
 
 ```sh
-make dev         # .venv with Textual, ruff, mypy, coverage; the project installed editable
+make dev         # .venv with Textual, ruff, mypy, coverage, build; the project installed editable
 make test        # the engine suite, on the system Python, no venv needed
-make test-tui    # the TUI suite under .venv (about 3 minutes)
+make test-tui    # the TUI suite under .venv (about 4 minutes)
 make lint        # ruff check, ruff format --check, compileall
-make typecheck   # mypy (strict for the package)
-make coverage    # every suite in one run, then the report
+make typecheck   # mypy; for the package four checks are on (see pyproject.toml)
+make coverage    # every suite in one run, then the report; fails under 94 %
 make check       # lint, typecheck and both suites
 make format      # apply the formatter
+make dist        # an sdist and a wheel built from it, in dist/
+make dist-check  # install each into a venv of its own and run agent-sessions --version
 ```
 
 - **Layout.** `src/agent_sessions/` is the engine and the command line;
@@ -423,7 +488,10 @@ make format      # apply the formatter
   the app with Textual's headless pilot and a fake engine, and skips itself where Textual
   is not installed.
 - **Python versions.** The code targets 3.11 and is run on 3.11 to 3.14 by
-  `.github/workflows/ci.yml`. Locally: `mise exec python@3.11 -- python -m unittest discover -s tests`.
+  `.github/workflows/ci.yml`, which also runs the coverage floor and a package job
+  (`make dist`, `make dist-check`), each job with a time limit. The sdist carries no tests:
+  they need the checkout around them. Locally:
+  `mise exec python@3.11 -- python -m unittest discover -s tests`.
 - **Project rules.** `CLAUDE.md` is binding for every change, and the tests are held to it:
   a test never touches a real store, cache, state or configuration (it uses temp
   directories and the `AGENT_SESSIONS_*` overrides), never starts a terminal or an agent

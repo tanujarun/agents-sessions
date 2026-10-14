@@ -1213,3 +1213,172 @@ all were `tempfile.TemporaryDirectory`.
 One command of the audit was held by the machine's permission hook for ten minutes and
 never ran: its test data, a made-up log line, held the text of a destructive shell command.
 It was replaced by one without that text (`b/t17_log.py`).
+
+## 6. Disposition (2026-10-14)
+
+Added after the audit by the final pass of the hardening phase; the sections above are the
+auditor's and are unchanged. For every finding and nit: what was done, in which commit, and
+which test holds it. Commit hashes are those on `main` for the four fix branches (merged at
+`f2a93a8` import and undo, `1f2dba9` reading and output, `a7d3634` tests, scripts, build and
+CI, `1b8b59e` TUI and launcher) and those of the final pass's branch for the rest
+(`c7bd878` to the last commit of that branch; a rebase would change them). A test is named
+`file::Class.method`, or `file::Class` for every test of a class. "Fixed" means the code was
+changed and a test fails on the old behaviour; where a fix worker said so in its commit and
+this pass did not run it again, the row says so.
+
+### Findings
+
+| # | Disposition | Commits | Proven by |
+|---|---|---|---|
+| A-01 | fixed: the launcher starts the venv's Python with `-P` and a two-line bootstrap; the environment is handed on unchanged | 596a4b2 | `test_entry.py::LauncherTest.test_nothing_in_the_current_directory_is_imported`, `test_entry.py::LauncherOnATerminalTest` (the real launcher in a pty, from a directory with a planted `textual.py`, `json.py`, `logging.py`, `rich.py`, `argparse.py`) |
+| A-02 | fixed. Engine: at most 2 GiB of a file is read (`FILE_READ_MAX`), the cancel is seen every 4 MiB inside a file. TUI: every read runs in a daemon thread, quit sets every cancel and leaves at once; an import or undo is finished first. Mount: the wait for `udisksctl` takes the cancel, and a child still waited for at exit is terminated (this pass). Differently from the suggestion: holes are not skipped with `SEEK_DATA`; the byte budget alone bounds a sparse file | a23fd02, a3566b6, c7bd878 | `test_read_bounds.py::SparseFileTest`, `::ReadBudgetTest`, `::CancelContextTest`; `test_tui_app.py::LeaveTest`, `::LeaveOnATerminalTest`; `test_volumes.py::MountVolumeTest.test_a_cancel_ends_the_wait_and_the_child`, `test_volumes.py::StarterTest.test_a_program_that_ends_during_a_mount_leaves_no_child`, `test_offline.py::MountDriveTest.test_the_cancel_reaches_the_wait_for_the_mount` |
+| A-03 | fixed: `textsafe` replaces lone surrogates; the CLI encodes its output itself (`backslashreplace`) and writes bytes; `--json` is ASCII with `\u` escapes when stdout is not UTF-8; the log is opened with `backslashreplace` | d7168d3 | `test_textsafe.py::LocaleTest` (C, C.UTF-8, POSIX, `LC_ALL=C`, a Python left to ASCII), `::CliBoundaryTest.test_the_stream_s_own_error_handler_is_never_asked`, `::JsonEscapeTest.test_a_lone_surrogate_is_written_as_its_own_escape`; `test_logs.py::OwnFileTest` |
+| A-04 | fixed: a `begin` record before the first unit, flushed under the lock; `rollback` or `import` after it; `importer.recover` settles an open `begin` at the next import or undo of the store (forward when the copy reads back whole, with the staged manifest; else back); further signals held off during a roll back | 1f90ede, 4b88bc9 | `test_interrupts.py::SecondSignalTest`, `::KilledImportTest` (SIGKILL with everything staged, between two units, before the record), `::RecoverTest`; `test_journal.py::RecordKindsTest` |
+| A-05 | fixed: `importer.fits` refuses a copy deeper than 64 levels or a path or name over the filesystem's limits at plan time (in `check` and again in `execute`); each step of the roll back runs on its own | 278e6cb | `test_import_safety.py::DepthAndLengthTest`; `test_import_placing.py::NoReplaceTest.test_every_step_of_the_roll_back_is_tried_whatever_the_one_before_did` |
+| A-06 | fixed: an undo that could not remove everything is recorded `"complete": false`, the import stands, exit 1, the next undo finishes it; a plain undo is refused while the tool's extras exist. The constant and hint this made unreachable were removed in this pass | 8540e21, edeff34 | `test_unimport.py::UsedSinceTest.test_an_undo_that_could_not_remove_everything_does_not_settle_the_import`, `::UsedSinceTest.test_the_command_says_what_is_left_and_exits_one`, `::ExtrasTest.test_without_force_the_undo_is_refused_and_says_why`; `test_packaging.py::RemediesTest.test_what_an_undo_left_is_printed_with_its_reason_and_no_flag` |
+| A-07 | fixed: the driver reports `VmHWM` of the scanning child; the test asserts on the difference to the baseline scan | 5bf9ad9 | `test_hostile_files.py::HugeLineTest.test_the_measure_is_the_scan_s_own_peak`; in this pass the first `make test` in a fresh `git archive` copy (no bytecode cache) passed: 1883 tests, OK, 54 s, once |
+| A-08 | fixed: the plan before the question is made under the lock; an undone import gets one answer by key and by id | 45816f8 | `test_unimport.py::LockAndRecordTest.test_a_second_undo_while_the_first_is_half_way_is_told_there_is_none`, `::LockAndRecordTest.test_two_processes_undoing_the_same_import` |
+| A-09 | fixed: a `mise x`/`mise exec` call is found anywhere in a script and every one is followed; a `#!` script that names an installer and is not understood is `unknown` and never started. Differently from the suggestion: no question in the TUI; the setting is `AGENT_SESSIONS_TRUST_TOOLS` | 54a3821 | `test_tools.py::WrapperTextTest` (the audit's variants, the unknown state, the trusted list) |
+| A-10 | fixed: below any provider's native store root, below a directory a provider's `is_store` accepts on the way up, and the program's own files are refused | 19662ae | `test_export.py::FacadeTest.test_a_store_the_index_does_not_know_is_refused_too`, `::FacadeTest.test_the_program_s_own_files_are_refused` |
+| A-11 | fixed: the name line is written from three checked values; a source line that is not strict UTF-8 JSON with each key once, or has no valid time, adds none | 9f25a7b, 880c263, 455efbb | `test_importer.py::CodexImportTest.test_the_name_line_is_written_anew_and_never_copied`; on the real Codex session (section "Real data" below) the appended line was `{"id","thread_name","updated_at"}` |
+| A-12 | fixed: `SafeInput` draws `view.clean(value)`; a suggested folder that `clean` would change is not put in (the input starts at `~/` and says why); Tab leaves such names out and counts them | a3566b6 | `test_tui_app.py::HostileTest`; `test_tui_view.py::FolderTest.test_a_name_that_cannot_be_shown_is_never_completed` |
+| A-13 | fixed: a screen closes once (`_ClosesOnce`), a key for the list while another screen is on top is dropped, the pager and help open from the list only | a3566b6 | `test_tui_app.py::TwiceTest` |
+| A-14 | fixed: `wrap_line` cuts a long word in one pass; the pager wraps in timed slices, the visible turn first after a resize, and stops when closed | f3c43f5, a3566b6 | `test_tui_app.py::PagerResponsiveTest`; `test_tui_view.py::TranscriptTest.test_a_long_word_costs_its_length_not_its_square` |
+| A-15 | fixed: hostile text in every `Session` field and engine answer, asserted on the compositor's segments at three sizes; a view test per value. The fix worker reports that all ten surviving mutations are now caught; this pass did not run them again | a3566b6 | `test_tui_app.py::HostileTest`; `test_tui_view.py::HostileRowTest`, `::HostileDetailTest`, `::HostilePromptTest` |
+| A-16 | fixed: `JSONL_LINE_MAX` 16 MiB; `JSONL_STRUCTURE_MAX` (1,000,000 brackets, braces and commas) before a line or a whole JSON file is parsed; `SQLITE_LIMIT_LENGTH` 16 MiB. Differently from the suggestion: no database is opened in place at all (in memory up to 256 MiB, a larger one not opened), so no access time moves | a23fd02 | `test_read_bounds.py::DenseLineTest`, `::LargeDatabaseTest`, `::MemoryTest`; `test_base_helpers.py::SqliteTest.test_a_value_over_the_limit_fails_the_query_that_meets_it`, `::SqliteTest.test_a_file_too_large_to_load_is_not_opened_at_all` |
+| A-17 | fixed: on equal `updated` the copy on a mounted volume wins; a volume with no UUID found at one new mount point with the same stores is forgotten at the old path | 349fe7a | `test_index.py::CopiesTest`; `test_offline.py::MovedVolumeTest.test_a_volume_with_no_uuid_that_holds_the_same_stores_at_another_path` |
+| A-18 | fixed: the lock is opened with `O_NOFOLLOW` and must be a regular file; the journal is read through `open_ro` and appended through `open_regular`; the log is written only when it is a regular file, opened without waiting | c2b183c, d7168d3 | `test_journal.py::LockTest.test_a_link_under_the_locks_name_is_refused_and_never_written_through`, `::LockTest.test_a_named_pipe_under_the_locks_name_is_refused`, `::JournalTest.test_a_named_pipe_under_the_journals_name_is_an_error_not_a_wait`; `test_logs.py::OwnFileTest` |
+| A-19 | fixed: the cache is loaded entry by entry; one that cannot be used is moved to `index.json.unusable` before a save; dead `index.json.<pid>.tmp` are removed; a scan holds `index.lock` from load to save (30 s, then runs unsaved with a warning). This pass added both names to `uninstall.sh --purge` | 349fe7a, 65b678a | `test_index.py::CacheFileTest.test_a_damaged_entry_is_left_out_and_only_it`, `::CacheFileTest.test_a_file_that_is_no_cache_starts_empty_and_is_kept_aside`, `::CacheFileTest.test_temp_files_of_a_save_that_was_killed_are_removed`, `::ScanLockTest`; `test_install_scripts.py::UninstallTest.test_a_cache_named_by_its_index_file` |
+| A-20 | fixed: a store or skipped store the last deep scan could not have seen is `stale_stores`, not a difference; `verify --help` says to run `scan --deep` first | cd5a9fe | `test_index.py::VerifyTest.test_a_store_that_appeared_since_the_last_deep_scan_is_stale`; `test_cli.py::CliTest.test_verify`; on the real machine `verify` exited 0 before and after a deep scan (below) |
+| A-21 | fixed: the launcher reads the global options first (`--debug` reaches the TUI, its stderr copy printed after the screen is left), leaves the environment alone, and `tui` without a terminal (or with a stream closed) is one line and exit 2; an unrunnable venv Python is one line and exit 1 | 596a4b2 | `test_entry.py::NoTerminalTest`, `::LauncherTest`, `::StartsTheTuiTest.test_debug_reaches_it`, `::LauncherOnATerminalTest.test_debug_starts_the_tui_and_its_copy_of_the_log_waits_for_the_end`; `test_tui_view.py::EntryTest.test_the_tui_without_a_terminal_is_one_line_and_exit_2` |
+| A-22 | fixed: a link elsewhere stops `install.sh` before it makes anything; a launcher that is neither this checkout's nor an earlier version's is kept and reported; `--force` replaces both; a relative `XDG_DATA_HOME` is ignored and `HOME` must be absolute in both scripts; the header says what pip and `update-desktop-database` write | c3e5439 | `test_install_scripts.py::InstallTest.test_a_link_that_points_elsewhere_is_left_unless_forced`, `::ScriptTextTest.test_the_headers_say_what_else_is_written` |
+| A-23 | fixed, item by item: `support` sets the state, cache and home whatever is exported (d998fcb); every test module imports `support` first, the TUI modules included since `tui_support` does (d998fcb, b5ea665); the launcher's TUI branch and `tui.__main__` are tested (596a4b2); the stand-in Python no longer decides the version check (c3e5439); M16 (ac35549), M27 and M79 (5890608) are caught; the file map test asks git (d998fcb); `os.geteuid` is guarded (d998fcb); the sdist carries no tests (40fe042); CI has a build-and-install job, a coverage floor of 94 % and time limits (40fe042). Not fixed: mutation M83 (`fsutil._real_dir` following links) still hangs the discovery tests rather than failing them; tried again in this pass, `test_discover` did not finish in 200 s. CI's 20-minute job limit now ends such a run | d998fcb, ac35549, 40fe042, c3e5439, 596a4b2, b5ea665, 5890608 | `test_packaging.py::IsolationTest`, `::BuildTest`, `::PortableModulesTest`; `test_importer.py::ClaudeImportTest.test_a_taken_destination_is_refused_by_the_check_before_anything_is_copied` (M16); `test_continue.py::PlanTest.test_an_adapter_that_puts_anything_else_into_the_command_is_refused` (M27); `test_launch.py::PlanTest.test_a_relative_recorded_folder_is_never_started_in` (M79). In this pass, in scratch copies: M27 and M79 each fail their test; moving `import support` below the package's import in `tui_support` fails `IsolationTest` |
+| A-24 | fixed: an undo also removes the empty directories earlier undone imports into the store made; the Grok group is always `group_name(cwd)`; a `summary.json` with a BOM imports, the mark left out | 96df0e0, 4ba78f2 | `test_unimport.py::SharedDirectoryTest`; `test_importer.py::GrokImportTest.test_a_group_that_only_decodes_to_the_folder_is_not_used`, `::GrokImportTest.test_a_summary_that_starts_with_a_byte_order_mark_is_imported` |
+| A-25 | fixed: key examples reach into the id, in the help (36a1cad) and the README (4071553), and both say a start has to; `--debug` logs DEBUG lines (349fe7a) and the README says what it does; `scan` prints the cache's own warnings; our directories are tightened to 0700; `open` of a foreign session that cannot be imported says to continue it (f7f8b7e); SECURITY's link item says what the import does (4071553) | f7f8b7e, 349fe7a, 36a1cad, 4071553 | `test_cli.py::CliTest.test_scan_says_itself_what_it_could_not_keep`; `test_logs.py::OwnFileTest.test_our_directories_are_tightened_when_we_write_into_them`, `::DebugTest.test_the_cli_flag`; `test_launch.py::ForeignRefusalTest.test_a_foreign_session_that_cannot_be_imported_is_to_be_continued`; `test_index.py::CacheFileTest.test_the_cache_is_private`; `test_packaging.py::HelpTest.test_examples_where_they_help_and_every_one_is_a_command_that_parses` |
+| A-26 | fixed: a cached time is kept only as `parse_ts` writes it; one `fmt` module formats for both front ends and never raises. In this pass the TUI was switched to it, with one rule for both: a time without a zone is UTC (it was a dash in the TUI), the first and last two days of the calendar are a dash | cd34ef6, 7df5d0f, 1b82e0f, 1f7d81b | `test_fmt.py::CachedTimesTest`, `::AgeTest.test_a_time_without_a_zone_is_utc`, `::AgeTest.test_the_two_ends_of_the_calendar_are_not_placed`, `::LocalTimeTest.test_a_time_no_zone_can_express_is_empty`; `test_tui_app.py::UnplacedTimeTest`; `test_tui_view.py::AgeTest.test_an_odd_time_is_never_an_error` |
+| A-27 | fixed: every format character (Cf) and the whole tag block are replaced in readable output; the Markdown export replaces them and counts them in its header; JSON escapes them. Not covered: variation selectors (category Mn), now in SECURITY "What is not defended" 11 | d7168d3, 4071553 | `test_textsafe.py::CleanTest.test_what_the_audit_found_passing`; `test_export.py::MarkdownTest.test_invisible_characters_are_replaced_and_counted_in_the_header` |
+
+### Nits
+
+| # | Disposition | Commits | Proven by |
+|---|---|---|---|
+| N-01 | fixed: SPEC "Discovery" says a vanished mount's sessions stay listed as offline | 4071553 | document |
+| N-02 | fixed: SPEC "Read-only rule" says every database is read into memory | 4071553 | document |
+| N-03 | fixed: SPEC "Logs" says only the unexpected error names the log | 4071553 | document |
+| N-04 | fixed: the note under the top-level help is reflowed; the test holds every help line to `HELP_WIDTH` (78), not 80 | 36a1cad | `test_packaging.py::HelpTest.test_every_help_fits_its_width_whatever_the_terminal` (fails on the old note in a scratch copy) |
+| N-05 | fixed differently: the TUI example says "for example 136"; DoD item 3 keeps the number the phase set and points here for today's count | 4071553, 0e3c999 | document |
+| N-06 | fixed: JSON.md says `last_deep` is stamped after the walk and before the parsing | 4071553 | document |
+| N-07 | fixed differently: the README says the nine sessions were made for the page and that no test pins the picture | 4071553 | document |
+| N-08 | fixed: the README and the `pyproject.toml` comment say four checks are on, not `--strict` | 4071553 | document |
+| N-09 | fixed: README and SECURITY say a later real `continue` removes handoff files older than 30 days, and a later import into the same store sweeps a staging directory | 4071553 | document |
+| N-10 | fixed: FORMATS "Size caps" lists every cap with its constant (16 MiB whole files, the Codex index line, `EVIDENCE_MAX`, `WRAPPER_MAX`, the new bounds) | 4071553 | document |
+| N-11 | fixed: `install.sh`'s header and the README say what else is written | c3e5439, 4071553 | `test_install_scripts.py::ScriptTextTest.test_the_headers_say_what_else_is_written` |
+| N-12 | fixed: the README names the fourth wording (`not mounted`, no volume id) and every skip rule | 0e3c999 | document |
+| N-13 | fixed: `tui --help` is the parser's own text through the launcher too | 596a4b2 | `test_tui_view.py::EntryTest.test_tui_help_is_the_parsers_own` |
+| N-14 | fixed: SECURITY "What is not defended" 13 | 4071553 | document |
+| N-15 | partly: the `Curses` classifier is gone and the desktop file has `TryExec=omarchy-launch-tui`. Not done: `agent_sessions/__main__.py`. `python -m agent_sessions` would put the current directory first on `sys.path`, the hazard of A-01; the ways in are the installed `agent-sessions` entry point and the checkout's launcher | 40fe042, c3e5439 | `test_packaging.py::MetadataTest.test_what_an_index_page_would_show`; `test_install_scripts.py::ScriptTextTest.test_the_desktop_file_says_what_it_needs` |
+| N-16 | fixed: `MountsError` and `all_providers` re-exported from `api` | 17a9b87 | `test_cli.py::BehindTheFacadeTest.test_the_command_line_reaches_the_engine_through_the_facade_alone` |
+| N-17 | partly: one `mtime` helper for the adapters (17a9b87); `_now`, the size formatter and the TUI's copies of the age, size, project and time helpers are `fmt`'s, and `importer._pid_alive` is `fsutil.process_alive` (1f7d81b). Not done: `_join` (`discover`, `pathmap`), `_LETTER` (`api`, `pathmap`), the remembering `mkdir -p` (`fsutil.make_private_dir`, `importer._make_dirs`) and "link, else rename" (`importer._place`, `export._link`) stay in two places each: each pair differs in a detail (what a pattern is matched against, the mode, what a failure raises), and merging them touches the import and export paths at the end of a hardening phase, without a finding that they disagree | 17a9b87, 1f7d81b | `test_base_helpers.py::ParseTsTest.test_the_adapters_share_that_one_helper`; `test_tui_view.py::AgeTest.test_view_formats_with_fmt` |
+| N-18 | fixed: `fsutil.cache_dir`, `cli._not_implemented`, `launch._spawn` removed; in this pass also `unimport.EXTRA`, `api.LEFT_FOR_A_FORCED_UNDO` and the `: --force` hint, unreachable since A-06 | 17a9b87, edeff34 | `test_cli.py::BehindTheFacadeTest.test_no_dead_code_is_left` |
+| N-19 | not fixed, known debt: the long and deep functions are as they were. Splitting `index.finalise`, `index.scan`, `api.verify`, `importer._carry_out` and the others now would be a large refactor that no one would review before the phase ends, of code whose behaviour the fixes above were just pinned on | – | – |
+| N-20 | fixed: `map D: ~/dir` expands `~` | 17a9b87 | `test_letters.py::MapTest.test_a_tilde_is_expanded_by_the_command` |
+| N-21 | fixed: `export -o ''` exits 2; the program's own files are refused, forced or not | 19662ae | `test_export.py::CommandTest.test_an_empty_file_name_is_a_usage_error`, `::FacadeTest.test_the_program_s_own_files_are_refused` |
+| N-22 | fixed: `open --dry-run` and `continue --dry-run` say when a folder's name holds characters printed as spaces | 17a9b87 | `test_cli.py::SessionCommandsTest.test_open_dry_run_says_when_the_line_is_not_what_would_run`; `test_continue.py::CommandTest.test_dry_run_says_when_the_folder_cannot_be_shown` |
+| N-23 | fixed: Claude `--to` names the project directory after the real path | 7ff06b4 | `test_import_folder.py::ClaudeFolderTest.test_the_real_path_of_the_chosen_folder_names_the_directory` |
+| N-24 | fixed: `--purge` takes our files by name out of the named directories, the new `index.json.unusable` and `index.lock` included (this pass) | c3e5439, 65b678a | `test_install_scripts.py::UninstallTest.test_purge_takes_the_program_s_files_out_of_the_directories_the_environment_names`, `::UninstallTest.test_a_cache_named_by_its_index_file` |
+| N-25 | fixed: a Python older than 3.11 says so and exits 1. Not changed: the shebang stays `#!/usr/bin/env python3`, so with mise shims the interpreter can still depend on the directory; every one it finds now either runs the program or says it is too old | 596a4b2 | `test_entry.py::LauncherTest.test_a_python_that_is_too_old_says_so` |
+| N-26 | fixed: a wider log is tightened when opened. Rotation stays per process; a comment in `logs.py` says so | d7168d3 | `test_logs.py::OwnFileTest` |
+| N-27 | fixed: the next holder removes a stale lock file; the empty directories a killed first import made are taken out when the next import or undo settles its `begin` | c2b183c, 1f90ede | `test_journal.py::LockTest.test_a_holder_that_was_killed_leaves_a_file_the_next_holder_removes`; `test_interrupts.py::KilledImportTest` |
+| N-28 | fixed: an undone import asked for by key gets the answer an id gets | 45816f8 | `test_unimport.py::LockAndRecordTest.test_an_undone_import_asked_for_by_its_key_is_not_recorded` |
+| N-29 | not fixed: the install-name rule is still read off this machine's directories and not checked against mise's code. Checking it needs mise's source or running mise; a wrong guess makes a tool "not installed", which refuses a launch and installs nothing | – | – |
+| N-30 | fixed: ruff knows `agent_sessions` as first-party by name | 40fe042 | `test_packaging.py::BuildTest.test_lint_knows_the_package_by_name` |
+| N-31 | no action needed (an observation). Now 10 `noqa` and `type: ignore` in `src` and `bin`, each with its reason; this pass added none | – | – |
+| N-32 | fixed: a long suggested folder shows its end | a3566b6 | `test_tui_app.py::FolderNitsTest.test_a_long_suggested_folder_shows_its_end` |
+| N-33 | fixed: the typed folder is normalised first, then checked and used | a3566b6 | `test_tui_app.py::FolderNitsTest.test_a_folder_is_checked_as_it_is_used` |
+| N-34 | fixed: `~` is the engine's home | a3566b6 | `test_tui_app.py::FolderNitsTest.test_tilde_is_the_engines_home`; `test_tui_view.py::EngineTest.test_home_is_the_engines` |
+| N-35 | fixed: the wrapper test uses `create_autospec(api)` | a3566b6 | `test_tui_view.py::EngineTest.test_forwards_to_the_api` |
+| N-36 | partly: the helpers that were twice are one (`fmt`, for `cli` in cd34ef6 and for the TUI in 1f7d81b; 999,950 bytes are `1.0 MB`). Not done, known debt: `MainScreen` is now 1,375 lines and 144 methods (it grew with the quit, input and pager fixes); the worker scaffolding is still written out several times; splitting the screen is the same large unreviewed refactor as N-19, at the end of a hardening phase. Also left: `Engine.find_session` is used by a test only, and `Engine.home` and `list_folder` call `fsutil`, not `api`. `view.text_width` and Rich's `cell_len` still disagree for VS16 (1 against 2) and Hangul jamo (3 against 2); ZWJ sequences and the soft hyphen agree now, because `clean` replaces the joiner and the hyphen | cd34ef6, 1f7d81b | `test_fmt.py::SizeTest.test_the_unit_is_chosen_after_rounding`; `test_tui_view.py::AgeTest.test_view_formats_with_fmt` |
+| N-37 | fixed: SPEC says the start-up scan is the engine's choice (4071553); `m` on a drive that is absent says so at once; a NUL is refused in plain words | a3566b6, 4071553 | `test_tui_app.py::MountTest.test_a_drive_that_is_not_attached_gets_no_prompt`, `::FolderNitsTest.test_a_nul_is_refused_in_plain_words`; `test_tui_view.py::FolderTest.test_a_nul_is_refused_in_plain_words` |
+
+### Definition of done, items 1 and 3, as they hold now
+
+Item 1 (`make check` clean on Python 3.11 and 3.14; engine coverage not lower): **holds
+for what was run, once each, on 2026-10-14**, at the final pass's code (before this section
+was written):
+
+| Gate | Python | Result |
+|---|---|---|
+| `make lint` | venv 3.14.7 | clean (82 files formatted) |
+| `make typecheck` | venv 3.14.7 (`python_version = 3.11`) | no issues in 81 files |
+| `make test` | 3.14.7 | 1883 tests, OK (191 skipped: 190 need Textual, 1 needs shellcheck), 57 s |
+| `make test` in a fresh `git archive` copy | 3.14.7 | 1883 tests, OK, 54 s: the first run with no bytecode cache, A-07's case |
+| engine suite (`mise exec python@3.11 -- python -m unittest discover -s tests`) | 3.11.17 | 1883 tests, OK (191 skipped), 53 s |
+| `make test-tui` | venv 3.14.7, Textual 8.2.8 | 341 tests, OK, 250 s |
+| `make coverage` | venv 3.14.7 | 1883 tests, OK (1 skipped), 308 s; total **97 %** (branch), floor 94 % |
+| `make dist`, `make dist-check` | venv 3.14.7, then 3.14.7 | both built; each installed into a venv of its own and `agent-sessions --version` printed `agent-sessions 0.2.0`; no tests in the sdist |
+
+Not run: `make check` in a venv of Python 3.11 (lint, typecheck and the TUI suite on 3.11);
+only the engine suite ran on 3.11. Each gate ran once, so this says nothing new about
+flakiness beyond the fresh-copy run. Coverage per module against REVIEW's table (the
+"before" of this item): no engine module is lower (api 97 % against 94, cli 94 against 87,
+discover 92 against 92, importer 96 against 92, index 97 against 96, launch 99 against 96,
+mounts 99 against 96). Against this audit's own table four modules are lower by one to three
+points (api 97 against 98, index 97 against 98, logs 94 against 97, unimport 98 against 99:
+code added by the fixes, a few branches of it untested); `tui/__main__.py` went from 0 to
+90 %, the total from 96 to 97 %.
+
+Item 3 (the real machine lists its sessions with `verify` passing; with the Windows volume
+away its sessions stay listed as offline): **holds, with today's numbers.** Run on
+2026-10-14 with a copy of the real index as `AGENT_SESSIONS_CACHE` and a temp
+`AGENT_SESSIONS_STATE`, all four NTFS volumes mounted: `verify` on the index as it stood,
+exit 0 (`verify: the index matches the disks`, 16.0 s); `scan --deep` exit 0 in 2.9 to 3.2 s
+(10 stores, 156 skipped, 266 candidates); **188 sessions** (native: Claude 92, Codex 53,
+Grok 14; foreign, all on the Windows volume: Claude 23, Codex 1, Grok 1, Antigravity 4);
+`verify` after it, exit 0 (5.7 to 6.4 s). The count is not 135 or 136 because the user
+made sessions since: `~/.codex/sessions` holds 99 rollout files newer than 2026-10-13. Three
+`list --json` after scans were byte-identical. Unmounting needs the user's password and is
+not done by this project; the offline half was checked with the same index and a mount table
+without the Windows volume (`AGENT_SESSIONS_MOUNTS` naming `/` and `/home` only): 188 sessions
+listed, **29 offline** (Claude 23, Codex 1, Grok 1, Antigravity 4), `list --mounted` 159, and
+`show`, `import --dry-run` and `open --dry-run` of an offline one exit 1 with `the drive
+22EEA841EEA80F5B is not mounted`.
+
+### Real data (item 4 of the definition of done)
+
+In a throwaway home under `/tmp` (`AGENT_SESSIONS_HOME`, temp cache and state, the real mount
+table), every foreign session on the drives was imported: 29 (Claude 23, Codex 1, Grok 1,
+Antigravity 4 with `--experimental`), 0 refused, 0 failed, 0.1 to 1.3 s each. No Gemini
+session is listed on the drive (its one chat has no conversation), so there was no Gemini
+refusal to see. Each copy listed as native and launchable, and `open <copy> --dry-run` exited
+0 for all 29. Of the five sessions without a usable folder, the two Claude ones
+(`D:\Hypermedia\Ep2`, `F:\AI Projects\Website Works\UWW Sites`) were refused with the advice
+to choose a folder and imported with `--to`; the three Antigravity ones need no folder and
+imported without it (they then start in the home directory), and in a second throwaway home
+all three imported with `--to` and `open --dry-run` started each in the chosen folder. All
+29 (and the 3) were undone with `unimport --yes`, none forced. The throwaway home was then
+byte-identical to its state before (paths, sizes, SHA-256), except the documented Codex line:
+`.codex/session_index.jsonl` (136 bytes, 0600) holds
+`{"id":"01a04ca1-…","thread_name":"Inspect directory capabilities","updated_at":"2026-08-29T08:31:20.364482Z"}`,
+the A-11 form. Journal: 87 records, 29 each of `begin`, `import` and `undo`, none unsettled.
+The real Grok session was confirmed with `grok export` as FORMATS "Grok" §6 describes
+(exit 0, 854 lines; `~/.grok` identical before and after, 2,393 entries). A snapshot of the
+foreign stores on the four volumes (26,020 entries, 20,059 files hashed) was identical before
+and after everything; the real cache, state and `~/.grok` were identical; the only changes in
+the snapshot of the real home were the transcripts of the Claude Code session that ran this
+pass. The installed `~/.local/bin/agent-sessions` (a link to the main checkout) printed
+`agent-sessions 0.2.0`; the real TUI through it, in a private pty of 120 by 40 with a copy of
+the index, painted its first screen in 0.22 s and exited 0 after `j`, `k`, `?`, Esc, `q`.
+
+### Found during this pass
+
+- A mount under way when the TUI quit left `udisksctl` running: the wait ignored the cancel,
+  and the daemon thread it ran in is not waited for. Fixed in c7bd878 (the cancel, and the
+  exit hook, without which the child test still fails).
+- `verify` reports the stores of a home given with `AGENT_SESSIONS_HOME` as differences when
+  that home lies outside the walked mounts (`/tmp` is never walked): the index finds native
+  stores by their known place, the brute walk only on mounts. Seen with a throwaway home
+  under `/tmp` after an import (`store in the index but not on disk`, `session listed but
+  not on disk`). Not fixed (the override is for tests and trials); the README's row for
+  `AGENT_SESSIONS_HOME` says so.
+- The top-level help's note had a line of 79 columns (N-04) and its key example was the
+  ambiguous kind (A-25): fixed in 36a1cad.

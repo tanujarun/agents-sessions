@@ -62,8 +62,6 @@ if TYPE_CHECKING:
 # Agent CLIs that may be installed but have no adapter (SPEC non-goals).
 NO_READER_TOOLS = ("copilot", "crush", "cursor-agent", "opencode")
 EXPORT_FORMATS = exporting.FORMATS  # what ``export_transcript`` takes as ``fmt``
-# Why an undo left a file (``UnimportReport.left``) that a forced one removes.
-LEFT_FOR_A_FORCED_UNDO = undoing.EXTRA
 # An undo that removed part of a copy and could not remove the rest.
 UndoIncomplete = undoing.Incomplete
 HANDOFF_MAX_AGE = 30 * 24 * 3600  # seconds; an older handoff file goes with the next continue
@@ -1521,8 +1519,9 @@ def mount_drive(
 
     The mount is ``mounts.mount_volume``: it may wait for the password the
     desktop asks for. One that is mounted already is only scanned. Raises
-    ``NotFound``, or ``MountFailed`` with the reason. ``progress`` and
-    ``cancel`` are the scan's."""
+    ``NotFound``, or ``MountFailed`` with the reason. ``progress`` is the
+    scan's; ``cancel`` ends the wait for the mount (its child is terminated,
+    ``MountFailed``) and then the scan."""
     index = load_index()
     volume = find_volume(ref, index)
     log = logs.logger()
@@ -1539,7 +1538,7 @@ def mount_drive(
             "mount %s (volume id %s, last at %s)", volume["label"], volume["uuid"], volume["path"]
         )
         try:
-            where = mounts_mod.mount_volume(volume["uuid"])
+            where = mounts_mod.mount_volume(volume["uuid"], cancel=cancel)
         except MountFailed as exc:
             log.warning("mount %s failed: %s", volume["label"], exc.reason)
             raise
@@ -1603,7 +1602,6 @@ def remove_letter(letter: str) -> str:
 __all__ = [
     "EXPORT_FORMATS",
     "HANDOFF_MAX_AGE",
-    "LEFT_FOR_A_FORCED_UNDO",
     "NO_READER_TOOLS",
     "REMEDY_EXPERIMENTAL",
     "REMEDY_FOLDER",

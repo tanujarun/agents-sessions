@@ -21,6 +21,7 @@ system) every mount simply has no UUID and no filesystem label.
 
 from __future__ import annotations
 
+import atexit
 import dataclasses
 import json
 import os
@@ -29,6 +30,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -63,6 +65,8 @@ UDISKSCTL = "udisksctl"
 MOUNT_TIMEOUT = 120.0  # seconds ``mount_volume`` waits: a password may have to be typed
 NOT_INSTALLED = f"{UDISKSCTL} is not installed; mount the drive from your file manager"
 _STOP_WAIT = 5.0  # seconds a terminated child gets before it is killed
+_POLL = 0.25  # seconds between two looks at the cancel event while the child runs
+CANCELLED = "cancelled"
 _REASON_MAX = 300  # characters of the tool's own message that are passed on
 
 # Filesystems that hold a user's files on a disk. Everything else (proc,
@@ -405,6 +409,29 @@ def _stop(proc: Any) -> None:  # whatever ``starter`` returned
         pass  # it ended by itself in the meantime
 
 
+# The children ``mount_volume`` is waiting for. The TUI waits for a mount in
+# a daemon thread and leaves without waiting for it; the interpreter then
+# ends that thread wherever it is, so the cancel it set may not be seen.
+# What is still here when the program ends is terminated on the way out.
+_waiting: set[Any] = set()
+_waiting_lock = threading.Lock()
+
+
+def _stop_waiting() -> None:
+    """At exit: terminate every child a mount is still waiting for."""
+    with _waiting_lock:
+        children = list(_waiting)
+        _waiting.clear()
+    for proc in children:
+        try:
+            proc.terminate()
+        except OSError:
+            pass  # it ended by itself in the meantime
+
+
+atexit.register(_stop_waiting)
+
+
 def _last_line(*outputs: object) -> str:
     """The last line that says something, of the first output that has one,
     as a reason to show: one clean line of bounded length."""
@@ -416,7 +443,9 @@ def _last_line(*outputs: object) -> str:
     return ""
 
 
-def mount_volume(uuid: str, timeout: float = MOUNT_TIMEOUT) -> str:
+def mount_volume(
+    uuid: str, timeout: float = MOUNT_TIMEOUT, cancel: threading.Event | None = None
+) -> str:
     """Mount the volume with this filesystem UUID and return its mount
     point. One that is mounted already is returned as it is, and nothing is
     run.
@@ -427,7 +456,12 @@ def mount_volume(uuid: str, timeout: float = MOUNT_TIMEOUT) -> str:
     read back from the mount table, not from what the tool printed. Raises
     ``MountFailed`` with the reason: the UUID is not one or no such device is
     attached (nothing is run then), the tool is missing, its own last line
-    when it fails, or no answer in time (the child is terminated)."""
+    when it fails, or no answer in time (the child is terminated).
+
+    With ``cancel``, the wait looks at the event every ``_POLL`` seconds;
+    once it is set the child is terminated and ``MountFailed(CANCELLED)``
+    raised (the TUI sets it when it quits during a mount). An event set
+    before the start starts nothing."""
     if not isinstance(uuid, str) or not _uuid(uuid):
         raise MountFailed("that is not the id of a volume; nothing was mounted")
     device = _device_of(uuid)
@@ -438,6 +472,8 @@ def mount_volume(uuid: str, timeout: float = MOUNT_TIMEOUT) -> str:
         return where
     if shutil.which(UDISKSCTL) is None:
         raise MountFailed(NOT_INSTALLED)
+    if cancel is not None and cancel.is_set():
+        raise MountFailed(CANCELLED)
     argv = [UDISKSCTL, "mount", "--block-device", os.path.join(DEV_BY_UUID, uuid)]
     try:
         proc = starter(argv)
@@ -445,16 +481,16 @@ def mount_volume(uuid: str, timeout: float = MOUNT_TIMEOUT) -> str:
         raise MountFailed(NOT_INSTALLED) from None
     except OSError as exc:
         raise MountFailed(f"{UDISKSCTL} could not be started: {exc.strerror or exc}") from exc
+    with _waiting_lock:
+        _waiting.add(proc)
     try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _stop(proc)
-        raise MountFailed(
-            f"no answer after {timeout:g} s (was the password prompt answered?)"
-        ) from None
+        out, err = _wait(proc, timeout, cancel)
     except BaseException:
-        _stop(proc)  # interrupted while waiting: the child is not left behind
+        _stop(proc)  # no answer, cancelled or interrupted: the child is not left behind
         raise
+    finally:
+        with _waiting_lock:
+            _waiting.discard(proc)
     if proc.returncode != 0:
         reason = _last_line(err, out)
         raise MountFailed(reason or f"{UDISKSCTL} failed (exit status {proc.returncode})")
@@ -462,3 +498,25 @@ def mount_volume(uuid: str, timeout: float = MOUNT_TIMEOUT) -> str:
     if where is None:
         raise MountFailed(f"{UDISKSCTL} reported success, but the drive is not in the mount table")
     return where
+
+
+def _wait(proc: Any, timeout: float, cancel: threading.Event | None) -> tuple[object, object]:
+    """The outputs of ``proc`` once it has ended. In one wait of ``timeout``
+    seconds without ``cancel``; with it, in waits of ``_POLL`` seconds, the
+    event looked at between them. The time is counted in the waits that
+    ran out, which is what a real child takes. Raises ``MountFailed`` (no
+    answer in time, or cancelled); the caller stops the child."""
+    step = timeout if cancel is None else min(_POLL, timeout)
+    waited = 0.0
+    while True:
+        this = min(step, timeout - waited)
+        try:
+            out, err = proc.communicate(timeout=this)
+        except subprocess.TimeoutExpired:
+            waited += this
+        else:
+            return out, err
+        if cancel is not None and cancel.is_set():
+            raise MountFailed(CANCELLED)
+        if waited >= timeout:
+            raise MountFailed(f"no answer after {timeout:g} s (was the password prompt answered?)")

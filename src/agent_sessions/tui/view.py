@@ -15,10 +15,10 @@ import re
 import unicodedata
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta, tzinfo
+from datetime import datetime, tzinfo
 from typing import Any, Protocol
 
-from .. import textsafe
+from .. import fmt, textsafe
 
 APP_TITLE = "agent-sessions"
 ELLIPSIS = "…"
@@ -99,19 +99,13 @@ def text_width(text: str) -> int:
     return sum(map(char_width, text))
 
 
-_SURROGATES = dict.fromkeys(range(0xD800, 0xE000), textsafe.REPLACEMENT)
-
-
 def clean(text: object) -> str:
-    """One printable line: control characters (newline, tab, escape) and the
-    characters that reorder text become spaces, so no value can break a row
-    or move the cursor. The rule itself is ``textsafe.clean``.
-
-    A lone surrogate (what a byte that is not UTF-8 is read as, and what
-    JSON can spell) becomes a space as well: no terminal can be sent one,
-    and it is drawn as six characters in a place measured as one cell."""
-    text = textsafe.clean(text)
-    return text if text.isprintable() else text.translate(_SURROGATES)
+    """One printable line: control characters (newline, tab, escape), the
+    characters that reorder or hide text, and lone surrogates (what a byte
+    that is not UTF-8 is read as, and what JSON can spell) become spaces, so
+    no value can break a row or move the cursor. The rule itself is
+    ``textsafe.clean``."""
+    return textsafe.clean(text)
 
 
 def showable(text: object) -> bool:
@@ -151,69 +145,12 @@ def pad(text: str, width: int, align: str = "left") -> str:
 
 # --- time -------------------------------------------------------------------
 
-
-# The times that can be placed: the whole range of ``datetime`` but its two
-# ends, where a shift into another zone no longer fits.
-_EDGE = timedelta(days=2)
-_FIRST = datetime.min.replace(tzinfo=UTC) + _EDGE
-_LAST = datetime.max.replace(tzinfo=UTC) - _EDGE
-
-
-def parse_stamp(stamp: object) -> datetime | None:
-    """An ISO 8601 time as an aware datetime; None when it is absent,
-    malformed, or cannot be placed: one without a zone (which moment it
-    means is not known), or one at the very ends of the calendar."""
-    if not stamp or not isinstance(stamp, str):
-        return None
-    try:
-        moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-        if moment.utcoffset() is None or not _FIRST <= moment <= _LAST:
-            return None
-    except (ValueError, OverflowError):
-        return None
-    return moment
-
-
-def age_text(stamp: object, now: datetime) -> str:
-    """``now``, ``5m``, ``3h``, ``2d``, ``3w``, ``2mo``, ``1y``. The steps are
-    the ones `agent-sessions list` prints: seconds under a minute are ``now``,
-    days up to 13, weeks up to 59 days, months up to a year. ``-`` for a time
-    that is unknown or cannot be placed (``parse_stamp``)."""
-    then = parse_stamp(stamp)
-    if then is None:
-        return EMPTY
-    try:
-        seconds = max((now - then).total_seconds(), 0)
-    except (TypeError, OverflowError):  # a ``now`` without a zone, or out of range
-        return EMPTY
-    days = int(seconds // 86400)
-    if seconds < 60:
-        return "now"
-    if seconds < 3600:
-        return f"{int(seconds // 60)}m"
-    if days < 1:
-        return f"{int(seconds // 3600)}h"
-    if days < 14:
-        return f"{days}d"
-    if days < 60:
-        return f"{days // 7}w"
-    if days < 365:
-        return f"{days // 30}mo"
-    return f"{days // 365}y"
-
-
-def local_time(stamp: object, tz: tzinfo | None = None) -> str:
-    """``2026-10-10 17:58`` in the local zone (or ``tz``); ``-`` when
-    unknown, and for a time the platform cannot turn into a local one."""
-    moment = parse_stamp(stamp)
-    if moment is None:
-        return EMPTY
-    try:
-        local = moment.astimezone(tz)
-    except (OverflowError, OSError, ValueError):
-        return EMPTY
-    # Not strftime: its %Y gives "1", not "0001", on some Pythons.
-    return f"{local.year:04d}-{local.month:02d}-{local.day:02d} {local.hour:02d}:{local.minute:02d}"
+# One copy for both front ends (``agent_sessions.fmt``); the names the TUI has
+# always used stay. None of them raises, whatever a cache entry holds:
+# ``-`` for what cannot be placed.
+parse_stamp = fmt.parse_stamp
+age_text = fmt.age  # age_text(stamp, now)
+local_time = fmt.local_time  # local_time(stamp, tz=None)
 
 
 # --- rows -------------------------------------------------------------------
@@ -235,10 +172,8 @@ class Row:
 
 
 def project_name(cwd: str | None) -> str:
-    """The folder a session ran in: the last segment of its recorded cwd,
-    whichever separator it was written with."""
-    parts = [part for part in re.split(r"[\\/]+", cwd or "") if part]
-    return clean(parts[-1]) if parts else EMPTY
+    """The folder a session ran in (``fmt.project``), made safe to show."""
+    return clean(fmt.project(cwd))
 
 
 def make_row(session: SessionLike, where: str) -> Row:
@@ -586,17 +521,7 @@ def short_count(count: int) -> str:
     return f"{count / 1_000_000:.1f}M"
 
 
-def bytes_text(count: float | None) -> str:
-    """``812 B``, ``3.1 kB``, ``12.0 MB``, ``1.4 GB``."""
-    count = max(int(count or 0), 0)
-    if count < 1000:
-        return f"{count} B"
-    size = float(count)
-    for unit in ("kB", "MB", "GB"):
-        size /= 1000
-        if size < 1000 or unit == "GB":
-            return f"{size:.1f} {unit}"
-    return f"{size:.1f} GB"
+bytes_text = fmt.size  # ``812 B``, ``3.1 kB``, ``12.0 MB``, ``1.4 GB``
 
 
 def drive_count(mounts: Iterable[Mapping[str, Any]] | None) -> int:

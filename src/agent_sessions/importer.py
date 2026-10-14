@@ -52,10 +52,9 @@ import stat
 import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, BinaryIO
 
-from . import __version__, fsutil, journal
+from . import __version__, fmt, fsutil, journal
 from .errors import ImportFailed
 from .fsutil import listdir_ro, open_ro, state_dir
 from .model import UUID_PATTERN, make_key
@@ -361,15 +360,6 @@ def _text(value: object) -> str:
 # --- checks -----------------------------------------------------------------
 
 
-def human_size(count: int) -> str:
-    size = float(count)
-    for unit in ("B", "kB", "MB", "GB"):
-        if size < 1000 or unit == "GB":
-            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1000
-    return f"{count} B"
-
-
 def _anchor(path: str) -> str:
     """The nearest directory at or above ``path`` that exists."""
     current = os.path.abspath(path)
@@ -606,8 +596,8 @@ def check(plan: ImportPlan) -> None:
         raise ImportFailed(f"cannot check free space: {exc.strerror or exc}") from exc
     if free < need:
         raise ImportFailed(
-            f"not enough free space on {where}: {human_size(need)} needed "
-            f"(the copy plus {HEADROOM} %), {human_size(free)} free"
+            f"not enough free space on {where}: {fmt.size(need)} needed "
+            f"(the copy plus {HEADROOM} %), {fmt.size(free)} free"
         )
     read_journal()
 
@@ -657,10 +647,6 @@ def describe(plan: ImportPlan) -> dict:
 
 
 # --- execution --------------------------------------------------------------
-
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _missing(path: str) -> list[str]:
@@ -896,7 +882,7 @@ def _record(plan: ImportPlan, manifest: dict) -> dict:
     record = {
         "record": journal.IMPORT,
         "version": journal.VERSION,
-        "imported_at": _now(),
+        "imported_at": fmt.utc_now(),
         "provider": plan.provider,
         "id": plan.session_id,
         "source_key": plan.source_key,
@@ -985,7 +971,7 @@ def _rolled_back(begin: dict, removed: Iterable[str], recovered: bool) -> dict:
     return {
         "record": journal.ROLLBACK,
         "version": journal.VERSION,
-        "rolled_back_at": _now(),
+        "rolled_back_at": fmt.utc_now(),
         "provider": begin.get("provider"),
         "id": begin.get("id"),
         "destination_store": begin.get("destination_store"),
@@ -1152,7 +1138,7 @@ def _settle(begin: dict, root: str, read_back: ReadBack | None) -> dict | None:
                     "destination_files": destinations,
                     "manifest": manifest,
                     "recovered": True,
-                    "recovered_at": _now(),
+                    "recovered_at": fmt.utc_now(),
                 }
             )
         else:
@@ -1243,23 +1229,6 @@ def recover(
     return settled
 
 
-def _pid_alive(pid: int) -> bool:
-    """Whether a process with this id exists. Where that cannot be asked
-    without side effects (signal 0 is not a probe on Windows) the answer is
-    yes, so nothing is swept there."""
-    if os.name != "posix":
-        return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OverflowError:  # not a process id on this system
-        return False
-    except OSError:  # it exists and belongs to someone else
-        return True
-    return True
-
-
 def sweep_staging(native_root: StrPath) -> list[str]:
     """Remove the staging directories an import that died left at the root
     of a native store; returns the paths it removed.
@@ -1285,7 +1254,7 @@ def sweep_staging(native_root: StrPath) -> list[str]:
             continue
         if not stat.S_ISDIR(st.st_mode) or now - st.st_mtime <= STAGING_MAX_AGE:
             continue
-        if _pid_alive(int(match.group(1))):
+        if fsutil.process_alive(int(match.group(1))):
             continue
         shutil.rmtree(path, ignore_errors=True)
         if not os.path.lexists(path):
@@ -1546,7 +1515,6 @@ __all__ = [
     "file_copy",
     "fits",
     "free_space",
-    "human_size",
     "only_changed",
     "read_journal",
     "recover",

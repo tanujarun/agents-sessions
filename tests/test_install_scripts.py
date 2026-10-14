@@ -844,7 +844,7 @@ class UninstallTest(ScriptCase):
         "handoff/claude-aaaaaaaa-0000-4000-8000-000000000001.md",
         "handoff/codex-x.md.4242-18f3a.tmp",
     )
-    CACHE_FILES = ("index.json", "index.json.4242.tmp")
+    CACHE_FILES = ("index.json", "index.json.4242.tmp", "index.json.unusable", "index.lock")
 
     def named(self, name, files, others=()):
         """A directory an environment variable names, with the program's
@@ -885,7 +885,9 @@ class UninstallTest(ScriptCase):
     def test_what_else_is_in_a_named_directory_stays_and_so_does_the_directory(self):
         others = ("notes.txt", "handoff/mine.md", "handoff/sub/claude-x.md", "agent-sessions.logs")
         state = self.named("my state", self.STATE_FILES, others)
-        cache = self.named("my cache", self.CACHE_FILES, ("index.json.bak", "other.json"))
+        cache = self.named(
+            "my cache", self.CACHE_FILES, ("index.json.bak", "other.json", "index.lock.1")
+        )
         code, out, err = self.uninstall(
             "--purge", "--yes", AGENT_SESSIONS_STATE=str(state), AGENT_SESSIONS_CACHE=str(cache)
         )
@@ -895,7 +897,7 @@ class UninstallTest(ScriptCase):
             ["agent-sessions.logs", "handoff", "handoff/mine.md", "handoff/sub"]
             + ["handoff/sub/claude-x.md", "notes.txt"],
         )
-        self.assertEqual(self.below(cache), ["index.json.bak", "other.json"])
+        self.assertEqual(self.below(cache), ["index.json.bak", "index.lock.1", "other.json"])
         for top in (state / "handoff", state, cache):
             self.assertIn(f"left {top}: other files are in it\n", out)
             self.assertNotIn(f"removed {top}\n", out)
@@ -903,14 +905,19 @@ class UninstallTest(ScriptCase):
     def test_a_cache_named_by_its_index_file(self):
         """``AGENT_SESSIONS_CACHE`` that ends in ``.json`` is the index file
         itself: that file goes, and its directory only when it is empty."""
-        cache = self.named("idx", ("custom.json", "custom.json.7.tmp"), ("index.json",))
+        ours = ("custom.json", "custom.json.7.tmp", "custom.json.unusable", "custom.lock")
+        cache = self.named("idx", ours, ("index.json", "index.lock"))
         code, out, _err = self.uninstall(
             "--purge", "--yes", AGENT_SESSIONS_CACHE=str(cache / "custom.json")
         )
         self.assertEqual(code, 0)
-        self.assertEqual(self.below(cache), ["index.json"])  # not the index here: not ours
+        for rel in ours:
+            self.assertIn(f"removed {cache / rel}\n", out)
+        # Not the index here, nor its lock: not ours.
+        self.assertEqual(self.below(cache), ["index.json", "index.lock"])
         self.assertIn(f"left {cache}: other files are in it\n", out)
         (cache / "index.json").unlink()
+        (cache / "index.lock").unlink()
         (cache / "custom.json").write_text("x", encoding="utf-8")
         code, out, _err = self.uninstall(
             "--purge", "--yes", AGENT_SESSIONS_CACHE=str(cache / "custom.json")
