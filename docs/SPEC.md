@@ -1167,6 +1167,8 @@ As built:
 2. Every review finding has a regression test that fails on the old code.
 3. The real machine still lists the same 135 sessions with `verify` passing;
    with the Windows volume unmounted the 29 sessions stay listed as offline.
+   (135 when this was written; the number grows with every session the user
+   makes. What holds today is in `docs/AUDIT.md`, section 6.)
 4. In a throwaway home: every importable foreign session imports and undoes
    to a byte-identical store; the Grok import is confirmed by `grok export`
    in the network-less sandbox; the five sessions without a folder import

@@ -287,6 +287,11 @@ everything exits 1, says what it left, and leaves the import standing; run it ag
 - **Foreign.** A session in any other store, typically under `Users/<name>/` on a Windows
   partition. It can be read, viewed, exported and continued where it is. To resume it with
   its tool it has to be imported. Nothing is ever written to a foreign store.
+- **Skipped stores.** Some stores are found and counted (`status`, "skipped") but not
+  listed: Claude Desktop's history (a path with `local-agent-mode-sessions`), any store below
+  a `tests/fixtures` directory (sample stores a project keeps for its tests), and every store
+  inside the agent-sessions checkout the program runs from (fake homes its own tests and
+  trials leave).
 - **Offline.** A session of a drive that was scanned earlier and is not mounted now. It is
   listed from the index, with `offline` in the WHERE column. Its files cannot be read until
   the drive is mounted (`mount`, or `m` in the browser).
@@ -373,8 +378,9 @@ printed when the browser quits. An unexpected error prints one line,
   files are on a drive that is not mounted. `agent-sessions mount <name>` (or `m` in the
   browser) mounts it with `udisksctl`; the desktop asks for the password when one is
   needed. `status` shows each remembered drive as `mounted`, `attached, not mounted` or
-  `not attached`. Without `udisksctl`, mount the drive from your file manager and run
-  `agent-sessions scan`.
+  `not attached`, or as `not mounted` alone when its volume id is not known (such a drive
+  cannot be mounted from here). Without `udisksctl`, mount the drive from your file manager
+  and run `agent-sessions scan`.
 - **`<tool> is not installed (the command on PATH would install it)`.** The command of that
   name is a wrapper script that downloads and installs the tool when it is first run
   (`mise use … ; exec mise x …`). agent-sessions never starts such a wrapper, so that

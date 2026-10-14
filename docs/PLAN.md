@@ -146,9 +146,48 @@ SPEC "TUI additions".
 SPEC "Packaging": entry point starts the TUI, `uninstall.sh`, README, CHANGELOG,
 `docs/JSON.md`, `docs/SECURITY.md`, help texts, version 0.2.0.
 
-## 19. Acceptance audit — Heavy — after: 18 — [ ]
+## 19. Acceptance audit — Heavy — after: 18 — [x]
 
 Fresh eyes on the whole change against SPEC "Definition of done (phase 2)", on the
-real machine and in throwaway homes.
+real machine and in throwaway homes. `docs/AUDIT.md` (A-01 to A-27, N-01 to N-37), at
+commit 371cf8a.
 
-## 20. Audit fixes — Careful — after: 19 — [ ]
+## 20. Audit fixes — Careful — after: 19 — [x]
+
+Done as the four fix tasks below and the final pass (task 25). What became of each finding:
+`docs/AUDIT.md`, section 6.
+
+## 21. Audit fixes: import and undo integrity — Careful — after: 19 — [x]
+
+A-04, A-05, A-06, A-08, A-11, A-18, A-24, N-23, N-27, N-28: the `begin` and `rollback`
+records and `importer.recover`, `importer.fits`, incomplete undos, the plan under the lock,
+the Codex name line, the lock file and the journal as regular files. Merged at f2a93a8.
+
+## 22. Audit fixes: reading and output — Careful — after: 19 — [x]
+
+A-02 (engine), A-03, A-09, A-10, A-16, A-17, A-18 (log), A-19, A-20, A-25, A-26, A-27,
+N-16 to N-22, N-26: the read budget and bounds, `textsafe` and the CLI's own encoding,
+`tool_state` failing closed, `export -o`, the cache loaded entry by entry, `verify`'s stale
+stores, `fmt.py`. Merged at 1f2dba9.
+
+## 23. Audit fixes: tests, scripts, build and CI — Medium — after: 19 — [x]
+
+A-07, A-22, A-23, N-15, N-24, N-30: the memory test, `install.sh` and `uninstall.sh`,
+test isolation, the file map from the tracked files, `MANIFEST.in`, `make dist`,
+`make dist-check`, CI time limits, the coverage floor and the package job. Merged at
+a7d3634.
+
+## 24. Audit fixes: TUI and launcher — Careful — after: 19 — [x]
+
+A-01, A-02 (TUI), A-12, A-13, A-14, A-15, A-21, A-26 (TUI), N-13, N-25, N-32 to N-37: the
+`-P` bootstrap, quitting at once, `SafeInput`, keys that arrive twice, the pager's slices,
+hostile text in every TUI value. Merged at 1b8b59e.
+
+## 25. Final pass — Careful — after: 21, 22, 23, 24 — [x]
+
+The loose ends the fix tasks left in code (the mount cancelled on quit, one copy of the
+helpers, dead code, the TUI test isolation exception, the tests for M27 and M79,
+`uninstall.sh --purge` for the new file names, the help's key examples and width), every
+document brought in line with the code, the disposition of every finding in
+`docs/AUDIT.md` section 6, and the verification on the real machine (read-only) and in a
+throwaway home.
