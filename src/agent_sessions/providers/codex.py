@@ -15,15 +15,16 @@ from ..model import Candidate, Session, Store
 from ..pathmap import normalise
 from . import register
 from .base import (
-    JSONL_LINE_MAX,
-    NotSupported,
-    Provider,
-    Turn,
     clean_title,
     iter_jsonl,
+    JSONL_LINE_MAX,
     mtime,
+    NotSupported,
     parse_ts,
+    Provider,
     read_lines,
+    too_dense,
+    Turn,
     unreadable,
     warn,
 )
@@ -267,6 +268,8 @@ def _name_line(source: bytes, thread_id: str) -> bytes | None:
     name that can be written, or has no time: every line the tool writes
     has all three fields (FORMATS "Codex"), and one without is not written
     into its file."""
+    if too_dense(source):
+        return None
     try:
         record = json.loads(source.decode("utf-8"), object_pairs_hook=_once)
     except (ValueError, RecursionError):  # UnicodeDecodeError is a ValueError

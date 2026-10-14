@@ -371,7 +371,7 @@ class DenseLineTest(unittest.TestCase):
         allowed = {
             "base.py": 2,  # iter_jsonl, and load_json itself
             "claude.py": 1,  # the first line of a transcript, of at most 64 kB
-            "codex.py": 4,  # an index line of at most 64 kB; three in the import rewrite
+            "codex.py": 5,  # an index line of at most 64 kB, read and imported; three in the import rewrite
             "grok.py": 3,  # the import rewrite
         }
         root = Path(base.__file__).parent

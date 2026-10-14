@@ -774,14 +774,18 @@ class CodexImportTest(ImportCase):
         self.assertEqual(added, b"")
         read(self.home / ".codex" / "session_index.jsonl").decode("utf-8")  # still text
 
-    def test_a_name_that_cannot_be_written_as_text_is_not_written(self):
-        # A lone surrogate, escaped: valid JSON, and no text a tool can read back.
+    def test_a_name_with_a_lone_surrogate_is_written_cleaned(self):
+        # A lone surrogate, escaped: valid JSON, and no text a tool can read
+        # back. textsafe.clean replaces it, so what is written is plain UTF-8.
         added = self.name_line(
             b'{"id":"%s","thread_name":"a \\ud800 name","updated_at":"2026-08-29T08:31:16Z"}'
             % CODEX_WIN.encode(),
             self.MINE,
         )
-        self.assertEqual(added, b"")
+        self.assertNotEqual(added, b"")
+        line = added.decode("utf-8")  # strict: no surrogate got through
+        self.assertNotIn("\\ud800", line)
+        self.assertIn('"thread_name":"a   name"', line)
 
     def test_the_name_is_bounded_and_a_line_without_a_time_is_not_written(self):
         """Every line the tool writes has all three fields (FORMATS
