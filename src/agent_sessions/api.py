@@ -29,6 +29,7 @@ from . import index as index_mod
 from . import mounts as mounts_mod
 from . import providers as registry
 from . import unimport as undoing
+from .discover import Skipped
 from .errors import (
     REMEDY_EXPERIMENTAL,
     REMEDY_FOLDER,
@@ -48,7 +49,7 @@ from .fsutil import cache_file, home, log_file
 from .importer import NoFolder
 from .index import Index
 from .launch import ContinuePlan, LaunchPlan
-from .model import Session, make_key
+from .model import Session, Store, make_key
 from .mounts import NATIVE_LABEL, MountsError, list_mounts
 from .providers import all_providers
 from .providers.base import ExperimentalOnly, NotSupported, Provider, Turn, parse_ts
@@ -276,6 +277,27 @@ def _newer_than(sig: list, moment: str | None) -> bool:
     return any(mtime_ns is None or mtime_ns >= limit for _path, mtime_ns, _size in sig)
 
 
+def _appeared_since_deep(root: str, mount: str, index: Index) -> bool:
+    """Whether a store the index does not have may have come to be after
+    the last deep scan, which is the one that would have found it: that scan
+    did not walk its drive (the drive was mounted since), or the store's
+    directory changed at or after it (its modification or change time; a
+    directory made, moved or renamed since has both). Never for an index
+    that no deep scan ever made: one that has none lacks everything."""
+    if index.last_deep is None:
+        return False
+    if mount not in index.deep_mounts:
+        return True
+    limit = _epoch_ns(index.last_deep)
+    if limit is None:
+        return True
+    try:
+        found = os.stat(root)
+    except OSError:
+        return True  # gone again since the walk: nothing to hold against the index
+    return max(found.st_mtime_ns, found.st_ctime_ns) >= limit
+
+
 def _moved_on(sig: list) -> bool:
     """True when the files of a recorded signature are different now."""
     return index_mod.signature([row[0] for row in sig]) != sig
@@ -293,8 +315,11 @@ def verify(
     index: stores, skipped stores, cached parses, listed sessions.
     ``differences`` are faults (``ok`` is False when there is one). ``stale``
     lists what changed on disk after the last scan, which is not a fault of
-    the index. ``nested`` lists stores inside another store, which are not
-    listed by design.
+    the index; ``stale_stores`` lists the stores and skipped stores that are
+    on disk and not in the index and that appeared since the last deep scan
+    (``_appeared_since_deep``): a quick scan does not look for them, and the
+    next deep scan finds them. Their sessions are not compared. ``nested``
+    lists stores inside another store, which are not listed by design.
     """
     started = time.monotonic()
     providers = all_providers()
@@ -308,6 +333,7 @@ def verify(
         "cancelled": found.cancelled,
         "differences": [],
         "stale": [],
+        "stale_stores": [],
         "nested": [],
         "stores": 0,
         "sessions": 0,
@@ -323,17 +349,28 @@ def verify(
     differences: list[str] = []
     stale: list[str] = []
 
+    stale_stores: list[str] = []
+    new_stores: set[tuple[str, str]] = set()  # appeared since the last deep scan
     present = {m.path for m in mounts}
     mine = {(r["provider"], r["root"]) for r in index.store_rows if r["present"]}
     theirs = {(s.provider, s.root) for s in truth.stores}
+    on_disk: list[Store | Skipped] = [*truth.stores, *truth.skipped]
+    where = {(s.provider, s.root): s.mount for s in on_disk}
     for provider, root in sorted(theirs - mine):
-        differences.append(f"store on disk but not in the index: {provider} {root}")
+        if _appeared_since_deep(root, where[(provider, root)], index):
+            stale_stores.append(f"store new since the last deep scan: {provider} {root}")
+            new_stores.add((provider, root))
+        else:
+            differences.append(f"store on disk but not in the index: {provider} {root}")
     for provider, root in sorted(mine - theirs):
         differences.append(f"store in the index but not on disk: {provider} {root}")
     mine_skipped = {(s.provider, s.root) for s in index.skipped if s.mount in present}
     theirs_skipped = {(s.provider, s.root) for s in truth.skipped}
     for provider, root in sorted(theirs_skipped - mine_skipped):
-        differences.append(f"skipped store on disk but not in the index: {provider} {root}")
+        if _appeared_since_deep(root, where[(provider, root)], index):
+            stale_stores.append(f"skipped store new since the last deep scan: {provider} {root}")
+        else:
+            differences.append(f"skipped store on disk but not in the index: {provider} {root}")
     for provider, root in sorted(mine_skipped - theirs_skipped):
         differences.append(f"skipped store in the index but not on disk: {provider} {root}")
 
@@ -365,11 +402,24 @@ def verify(
                 if entry is not None and entry["session"] is not None:
                     stale_keys.add(make_key(provider, root, entry["session"]["id"]))
 
+    # The sessions of a store that is new since the last deep scan are not
+    # held against the index, nor are the other copies of those sessions
+    # (which copy is listed can depend on the new one).
+    new_sessions = {
+        (provider, cached["session"]["id"])
+        for provider, root in new_stores
+        for cached in (truth.parsed.get(f"{provider}:{root}") or {}).get("candidates", {}).values()
+        if cached["session"] is not None
+    }
+
     # The derived listing.
     listed = {s.key: s.to_dict() for s in index.sessions}
     wanted = {s.key: s.to_dict() for s in truth.sessions}
     for key in sorted(set(listed) | set(wanted)):
         if key in stale_keys:
+            continue
+        row = listed.get(key) or wanted[key]
+        if (row["provider"], row["id"]) in new_sessions:
             continue
         if key not in listed:
             differences.append(f"session on disk but not listed: {key}")
@@ -387,6 +437,7 @@ def verify(
         ok=not differences,
         differences=differences,
         stale=stale,
+        stale_stores=stale_stores,
         nested=sorted(f"{provider} {root}" for provider, root in nested),
         stores=len(theirs),
         sessions=len(truth.sessions),

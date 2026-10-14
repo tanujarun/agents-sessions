@@ -330,11 +330,28 @@ class CliTest(unittest.TestCase):
         self.assertIn("2 stores, 4 sessions on disk", out)
         self.assertIn("verify: the index matches the disks", out)
 
+        # A store a quick scan never looks for, made after the last deep scan:
+        # stale, with the advice (AUDIT A-20).
         hidden = self.box.store(self.disk / "node_modules" / "x")
+        code, out, _ = run("verify")
+        self.assertEqual(code, 0)
+        self.assertIn(f"stale: store new since the last deep scan: fake {hidden}\n", out)
+        self.assertIn(
+            "1 store appeared since the last deep scan; run `agent-sessions scan --deep` "
+            "first to compare them too\n",
+            out,
+        )
+        self.assertIn("verify: the index matches the disks", out)
+        # Made before it: a fault of the index.
+        data = json.loads(cache_file().read_text(encoding="utf-8"))
+        later = datetime.now(UTC) + timedelta(seconds=2)
+        data["last_deep"] = later.isoformat(timespec="seconds").replace("+00:00", "Z")
+        cache_file().write_text(json.dumps(data), encoding="utf-8")
         code, out, _ = run("verify")
         self.assertEqual(code, 1)
         self.assertIn(f"DIFFERENT: store on disk but not in the index: fake {hidden}", out)
         self.assertIn("verify: 1 difference", out)
+        self.assertIn("scan --deep", run("verify", "--help")[1])
 
     def test_verify_without_an_index_fails(self):
         code, out, _ = run("verify")

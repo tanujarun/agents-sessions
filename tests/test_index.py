@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -26,6 +27,16 @@ from agent_sessions.providers.claude import Claude
 
 def listing() -> str:
     return json.dumps([s.to_dict() for s in api.list_sessions()], sort_keys=True)
+
+
+def deep_scan_after_the_stores() -> None:
+    """Move the last deep scan two seconds later in the cache. Its time is
+    kept to the second, and a store made in the second of the scan counts as
+    one that may have appeared since (``api._appeared_since_deep``)."""
+    data = json.loads(cache_file().read_text())
+    later = datetime.now(UTC) + timedelta(seconds=2)
+    data["last_deep"] = later.isoformat(timespec="seconds").replace("+00:00", "Z")
+    cache_file().write_text(json.dumps(data))
 
 
 def bump(path: Path, seconds: int = 5) -> None:
@@ -1083,11 +1094,67 @@ class VerifyTest(IndexCase):
     def test_store_the_prune_list_hides(self):
         hidden = self.box.store(self.disk / "node_modules" / "pkg")
         api.scan(deep=True)
+        deep_scan_after_the_stores()
         result = api.verify()
         self.assertFalse(result["ok"])
         self.assertEqual(
             result["differences"], [f"store on disk but not in the index: fake {hidden}"]
         )
+
+    def test_a_store_that_appeared_since_the_last_deep_scan_is_stale(self):
+        """AUDIT A-20 (``d/real.py``): 44 fixture stores in agent worktrees,
+        made after the last deep scan, made ``verify`` fail on the real
+        machine until a deep scan."""
+        deep_scan_after_the_stores()
+        self.assertTrue(api.verify()["ok"])
+        data = json.loads(cache_file().read_text())
+        data["last_deep"] = "2020-01-01T00:00:00Z"  # the stores below are newer than that
+        cache_file().write_text(json.dumps(data))
+        hidden = self.box.store(
+            self.disk / "node_modules" / "pkg"
+        )  # where a quick scan never looks
+        self.box.session(hidden, "h")
+        skipped = self.box.store(self.disk / "tests" / "fixtures" / "x")
+        result = api.verify()
+        self.assertEqual(result["differences"], [])
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["stale_stores"],
+            [
+                f"store new since the last deep scan: fake {hidden}",
+                f"skipped store new since the last deep scan: fake {skipped}",
+            ],
+        )
+        # A drive that the last deep scan did not walk: the same.
+        late = self.box.mount("Late")
+        later = self.box.store(late / "x")
+        deep_scan_after_the_stores()
+        result = api.verify()
+        self.assertEqual(
+            result["stale_stores"], [f"store new since the last deep scan: fake {later}"]
+        )
+        self.assertEqual(
+            sorted(result["differences"]),
+            [
+                f"session on disk but not listed: {make_key('fake', hidden, 'h')}",
+                f"skipped store on disk but not in the index: fake {skipped}",
+                f"store on disk but not in the index: fake {hidden}",
+            ],
+        )  # older than the deep scan now: a fault
+        # After a deep scan, everything is compared again.
+        api.scan(deep=True)
+        deep_scan_after_the_stores()  # the scan's own second: see there
+        result = api.verify()
+        self.assertEqual((result["stale_stores"], result["ok"]), ([], False))
+
+    def test_without_any_deep_scan_a_missing_store_is_a_fault(self):
+        data = json.loads(cache_file().read_text())
+        data["last_deep"] = None
+        cache_file().write_text(json.dumps(data))
+        hidden = self.box.store(self.disk / "node_modules" / "pkg")
+        result = api.verify()
+        self.assertEqual(result["stale_stores"], [])
+        self.assertIn(f"store on disk but not in the index: fake {hidden}", result["differences"])
 
     def test_store_inside_a_store_is_a_note(self):
         inner = self.box.store(self.foreign / "plugins")
@@ -1109,6 +1176,7 @@ class VerifyTest(IndexCase):
         )
 
     def test_store_missing_from_the_index(self):
+        deep_scan_after_the_stores()
         data = json.loads(cache_file().read_text())
         data["stores"] = [s for s in data["stores"] if s["root"] != str(self.foreign)]
         cache_file().write_text(json.dumps(data))

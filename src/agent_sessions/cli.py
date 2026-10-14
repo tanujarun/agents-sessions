@@ -384,7 +384,9 @@ def build_parser() -> argparse.ArgumentParser:
         "verify",
         "Walk every mounted drive without the index, count the sessions on disk and "
         "compare them with what the index lists. Exit status 1 when they differ. Sessions "
-        "of drives that are not mounted are left out.",
+        "of drives that are not mounted are left out. What changed since the last scan is "
+        "reported as stale, not as a difference, and so is a store that appeared since the "
+        "last deep scan: run `scan --deep` first to have those compared too.",
     )
 
     drive_help = "a remembered drive: its label, drive letter (C:), mount path or volume id"
@@ -897,6 +899,13 @@ def _verify(args: argparse.Namespace) -> int:
         _out(
             f"{_count(len(result['stale']), 'candidate')} changed on disk after the last "
             f"scan; run `{PROG} scan`"
+        )
+    for line in result["stale_stores"]:
+        _out(f"stale: {line}")
+    if result["stale_stores"]:
+        _out(
+            f"{_count(len(result['stale_stores']), 'store')} appeared since the last deep "
+            f"scan; run `{PROG} scan --deep` first to compare them too"
         )
     for line in result["differences"]:
         _out(f"DIFFERENT: {line}")
