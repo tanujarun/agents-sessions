@@ -70,7 +70,6 @@ APPENDED_MAYBE = (
     "a line may have been added to this file of the tool's (the import was interrupted and "
     "recorded later); it is left as it is"
 )
-EXTRA = "made by the tool after the import; removed only by a forced undo"
 NOT_EMPTY = "not empty: it holds something this import did not create"
 NOT_NAMED = "not named after the session; a record without a manifest cannot say more"
 
@@ -608,7 +607,6 @@ __all__ = [
     "APPENDED",
     "APPENDED_MAYBE",
     "DIFFERENCES_SHOWN",
-    "EXTRA",
     "LEGACY",
     "NOT_EMPTY",
     "NOT_NAMED",

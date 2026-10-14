@@ -121,8 +121,6 @@ class NeutralMessagesTest(unittest.TestCase):
 
     def test_the_reasons_that_had_a_flag_say_it_in_plain_words(self):
         self.assertIn("can only be undone by force", unimport.LEGACY)
-        self.assertIn("removed only by a forced undo", unimport.EXTRA)
-        self.assertEqual(api.LEFT_FOR_A_FORCED_UNDO, unimport.EXTRA)
 
 
 class RemediesTest(unittest.TestCase):
@@ -181,13 +179,16 @@ class RemediesTest(unittest.TestCase):
             ):
                 self.assertEqual(run(*command), (1, "", f"agent-sessions: {printed}\n"), word)
 
-    def test_what_an_undo_left_for_a_forced_one_names_the_flag(self):
+    def test_what_an_undo_left_is_printed_with_its_reason_and_no_flag(self):
+        """What the tool made beside a copy is never left by an undo: a plain
+        undo is refused while it is there, and a forced one removes it. So no
+        reason an undo leaves a file for names a flag."""
         report = api.UnimportReport(
             "antigravity",
             "id",
             None,
             None,
-            left=[("/n/a.db-wal", unimport.EXTRA), ("/n/dir", unimport.NOT_EMPTY)],
+            left=[("/n/index.jsonl", unimport.APPENDED), ("/n/dir", unimport.NOT_EMPTY)],
             dry_run=True,
         )
         out = io.StringIO()
@@ -196,10 +197,12 @@ class RemediesTest(unittest.TestCase):
         self.assertEqual(
             out.getvalue().splitlines(),
             [
-                f"would leave /n/a.db-wal ({unimport.EXTRA}: --force)",
+                f"would leave /n/index.jsonl ({unimport.APPENDED})",
                 f"would leave /n/dir ({unimport.NOT_EMPTY})",
             ],
         )
+        for why in (unimport.APPENDED, unimport.APPENDED_MAYBE, unimport.NOT_EMPTY):
+            self.assertIsNone(FLAG.search(why), why)
 
 
 class HelpTest(unittest.TestCase):

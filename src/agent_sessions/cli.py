@@ -1091,8 +1091,7 @@ def _print_undo(report: api.UnimportReport) -> None:
     for path in report.removed:
         _out(f"{removed} {path}")
     for path, why in report.left:
-        flag = ": --force" if why == api.LEFT_FOR_A_FORCED_UNDO else ""
-        _out(f"{left} {path} ({why}{flag})")
+        _out(f"{left} {path} ({why})")
 
 
 def _unimport(args: argparse.Namespace) -> int:
