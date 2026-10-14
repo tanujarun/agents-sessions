@@ -299,6 +299,7 @@ Environment variables:
 |---|---|
 | `AGENT_SESSIONS_TERMINAL` | the command that opens a terminal window, for example `foot -e`; the tool's command is appended. Without it: `omarchy-launch-tui`, else `xdg-terminal-exec`, else `$TERMINAL`, else the first installed of alacritty, kitty, foot, ghostty, wezterm, gnome-terminal, konsole, xterm |
 | `TERMINAL` | your terminal, used as described above |
+| `AGENT_SESSIONS_TRUST_TOOLS` | comma-separated tool commands (`claude,codex`) you vouch for: started even when their script on `PATH` names an installer this program cannot follow |
 | `AGENT_SESSIONS_NOTIFY` | `0` switches the desktop notification of a failed resume off |
 | `AGENT_SESSIONS_HOME` | use this directory as the home: native stores, cache, state and configuration are looked for below it. For tests and trials |
 | `AGENT_SESSIONS_CACHE` | the cache directory (or the index file itself, when the value ends in `.json`) |

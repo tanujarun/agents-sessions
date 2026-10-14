@@ -21,7 +21,14 @@ from fixture_world import CLAUDE_NATIVE, CODEX_NATIVE, World
 from support import WRAPPER, FakePath, Sandbox
 
 from agent_sessions import api, cli, launch
-from agent_sessions.launch import INSTALLED, NOT_FOUND, NOT_INSTALLED, ToolState, tool_state
+from agent_sessions.launch import (
+    INSTALLED,
+    NOT_FOUND,
+    NOT_INSTALLED,
+    UNKNOWN,
+    ToolState,
+    tool_state,
+)
 
 POSIX = os.name == "posix"
 # The four wrappers of ~/.local/bin, byte for byte (FORMATS "What is on PATH").
@@ -229,45 +236,176 @@ class WrapperTextTest(ToolCase):
         self.install("npm-xai-official-grok", "1.0.50", "node_modules", ".bin", "grok")
         self.assertEqual(self.state("g"), (True, True, INSTALLED))
 
-    def test_what_is_not_such_a_wrapper_counts_as_installed(self):
+    def test_a_script_that_names_no_installer_is_the_tool(self):
         for name, text in (
             ("another script", '#!/bin/sh\nexec "/opt/venv/bin/python" -m prompt_maxxer "$@"\n'),
             (
                 "detached app",
                 '#!/usr/bin/env bash\nsetsid -f "$HOME/Applications/X.AppImage" "$@"\n',
             ),
-            ("mise run", '#!/bin/bash\nexec mise run tool "$@"\n'),
-            ("no exec", '#!/bin/bash\nmise x "tool" -- "tool" "$@"\n'),
-            ("no separator", '#!/bin/bash\nexec mise x "tool" "tool" "$@"\n'),
-            ("no arguments passed on", '#!/bin/bash\nexec mise x "tool" -- "tool"\n'),
-            ("other arguments", '#!/bin/bash\nexec mise x "tool" -- "tool" --yolo "$@"\n'),
-            ("an option for a spec", '#!/bin/bash\nexec mise x -q -- "tool" "$@"\n'),
-            ("a path for a tool", '#!/bin/bash\nexec mise x "tool" -- "/bin/tool" "$@"\n'),
-            ("not the last command", '#!/bin/bash\nexec mise x "tool" -- "tool" "$@"\necho done\n'),
-            ("quotes that do not close", '#!/bin/bash\nexec mise x "tool -- "tool" "$@"\n'),
-            ("no shebang", 'exec mise x "tool" -- "tool" "$@"\n'),
             ("only a shebang", "#!/bin/bash\n"),
-            ("empty", ""),
             (
-                "a long program",
-                "#!/bin/bash\n" + "true\n" * 9 + 'exec mise x "tool" -- "tool" "$@"\n',
+                "a Python entry point",
+                "#!/usr/bin/python3\nimport sys\nfrom tool import main\nmain()\n",
             ),
             (
-                "a large file",
-                "#!/bin/bash\n# " + "x" * 5000 + '\nexec mise x "tool" -- "tool" "$@"\n',
+                "installers in comments only",
+                "#!/bin/sh\n# installed with npm or mise\nexec /opt/t\n",
             ),
+            (
+                "a path with .mise in it (aube's shim)",
+                '#!/bin/sh\nexec node "$basedir/../.mise/@x+tool@1/bin/tool" "$@"\n',
+            ),
+            ("a word that only contains one", '#!/bin/sh\nexec uvicorn-tool --npmrc "$@"\n'),
         ):
             with self.subTest(name=name):
                 self.assertFalse(self.is_wrapper(text))
                 self.assertEqual(self.state("tool"), (True, False, INSTALLED))
         for name, data in (
             ("a program", b"\x7fELF" + b"\0" * 200),
+            ("no shebang", b'exec mise x "tool" -- "tool" "$@"\n'),  # not run as a script
+            ("empty", b""),
             ("a NUL in a script", b'#!/bin/bash\n\0\nexec mise x "tool" -- "tool" "$@"\n'),
-            ("not UTF-8", b'#!/bin/bash\n# \xff\xfe\nexec mise x "tool" -- "tool" "$@"\n'),
         ):
             with self.subTest(name=name):
                 self.command("tool", data)
                 self.assertEqual(self.state("tool"), (True, False, INSTALLED))
+
+    # AUDIT A-09 (``b/t02_wrappers.py``): variants of the known wrapper whose
+    # tool is not installed. 9 of 11 counted as installed and would have
+    # been started, which installs the tool.
+    BASE = '#!/bin/bash\nexport MISE_MINIMUM_RELEASE_AGE=0\nmise use -g --quiet "tool" || exit 1\n'
+    EXEC = 'exec mise x "tool" -- "tool" "$@"\n'
+    VARIANTS = {
+        "exact form (control)": BASE + EXEC,
+        '"${@}" instead of "$@"': BASE + 'exec mise x "tool" -- "tool" "${@}"\n',
+        "no exec": BASE + 'mise x "tool" -- "tool" "$@"\n',
+        "exec env -u VAR mise x (hermes)": BASE
+        + 'exec env -u UV_PYTHON mise x "tool" -- "tool" "$@"\n',
+        "one more option (-q)": BASE + 'exec mise x -q "tool" -- "tool" "$@"\n',
+        "a line after exec": BASE + EXEC + "exit $?\n",
+        "nine commands": BASE + "true\n" * 6 + EXEC,
+        "comment header over 4 kB": "#!/bin/bash\n# " + "x" * 4100 + "\n" + BASE[12:] + EXEC,
+        "CRLF line ends": (BASE + EXEC).replace("\n", "\r\n"),
+        "a line continued": BASE + 'exec mise x "tool" \\\n  -- "tool" "$@"\n',
+        "mise exec, a global option first": BASE + 'exec mise --quiet exec tool -- tool "$@"\n',
+        "a path for mise": BASE + 'exec /usr/bin/mise x "tool" -- "tool" "$@"\n',
+        "other arguments": BASE + 'exec mise x "tool" -- "tool" --yolo "$@"\n',
+        "no arguments passed on": BASE + 'exec mise x "tool" -- "tool"\n',
+        "if-guarded install (hermes)": (
+            "#!/bin/bash\nif ! mise where tool >/dev/null 2>&1; then\n"
+            '  mise use -g --quiet tool || exit 1\nfi\nexec mise x tool -- tool "$@"\n'
+        ),
+        "after a semicolon": BASE + 'cd /; exec mise x "tool" -- "tool" "$@"\n',
+    }
+    LATIN_1 = (BASE.replace("export", "# caf\xe9\nexport") + EXEC).encode("latin-1")
+    # Scripts that name an installer and are not followed: unknown, not started.
+    NOT_FOLLOWED = {
+        "npx auto-install wrapper": '#!/bin/sh\nexec npx -y @anthropic-ai/claude-code "$@"\n',
+        "npm exec": '#!/bin/sh\nexec npm exec --yes -- tool "$@"\n',
+        "pnpm dlx": '#!/bin/sh\nexec pnpm dlx tool "$@"\n',
+        "pipx run": '#!/bin/sh\nexec pipx run tool "$@"\n',
+        "uvx": '#!/bin/sh\nexec uvx tool "$@"\n',
+        "uv tool run": '#!/bin/sh\nexec uv tool run tool "$@"\n',
+        "bunx": '#!/bin/sh\nexec bunx tool "$@"\n',
+        "an installer by its path": "#!/bin/sh\n/usr/bin/npx -y tool\n",
+        "an installer in a command substitution": '#!/bin/sh\nx="$(npx -y tool)"\n',
+        "mise run": '#!/bin/bash\nexec mise run tool "$@"\n',
+        "mise x without a separator": '#!/bin/bash\nexec mise x "tool" "tool" "$@"\n',
+        "mise x with an option for a spec": '#!/bin/bash\nexec mise x -q -- "tool" "$@"\n',
+        "mise x with a path for a tool": '#!/bin/bash\nexec mise x "tool" -- "/bin/tool" "$@"\n',
+        "mise x with a variable": '#!/bin/bash\nT=tool\nexec mise x "$T" -- "$T" "$@"\n',
+        "mise x, quotes that do not close": '#!/bin/bash\nexec mise x "tool -- "tool" "$@"\n',
+        "a node script that runs npx": (
+            "#!/usr/bin/env node\nrequire('child_process').execSync('npx -y tool')\n"
+        ),
+        "the installer beyond a 4 kB header": "#!/bin/sh\n# " + "x" * 5000 + "\nexec npx tool\n",
+    }
+
+    def test_every_form_of_the_wrapper_is_followed(self):
+        """Wherever the ``mise x`` call stands and however it is written,
+        its tool decides: not installed here, installed once it is."""
+        for name, text in self.VARIANTS.items():
+            with self.subTest(name=name):
+                self.command("tool", text)
+                self.assertEqual(self.state("tool"), (False, True, NOT_INSTALLED))
+        self.command("tool", self.LATIN_1)
+        self.assertEqual(self.state("tool"), (False, True, NOT_INSTALLED))
+        self.install("tool", "1.0", "tool")
+        for name, text in self.VARIANTS.items():
+            with self.subTest(name=name, installed=True):
+                self.command("tool", text)
+                self.assertEqual(self.state("tool"), (True, True, INSTALLED))
+
+    def test_a_script_that_names_an_installer_and_is_not_followed_is_unknown(self):
+        self.install("tool", "1.0", "tool")  # whatever mise has, the script is not followed
+        for name, text in self.NOT_FOLLOWED.items():
+            with self.subTest(name=name):
+                self.command("tool", text)
+                self.assertEqual(tool_state("tool").detail, UNKNOWN)
+                self.assertEqual(self.state("tool"), (False, False, UNKNOWN))
+        self.assertEqual(UNKNOWN, "unknown: a script that may install the tool")
+
+    def test_every_mise_call_must_have_its_tool(self):
+        text = '#!/bin/sh\nmise x other -- other --version\nexec mise x tool -- tool "$@"\n'
+        self.command("tool", text)
+        self.install("tool", "1", "tool")
+        self.assertEqual(self.state("tool"), (False, True, NOT_INSTALLED))
+        self.install("other", "1", "other")
+        self.assertEqual(self.state("tool"), (True, True, INSTALLED))
+        # An option's value counts as a spec: it is not installed, so neither is the tool.
+        self.command("tool", '#!/bin/sh\nexec mise x --cd /work tool -- tool "$@"\n')
+        self.assertEqual(self.state("tool"), (False, True, NOT_INSTALLED))
+
+    def test_only_the_start_of_a_command_is_read(self):
+        """The first 64 KiB: what an installer named after them changes nothing."""
+        head = "#!/bin/sh\n" + "# padding\n" * (launch.WRAPPER_MAX // 10)
+        with mock.patch.object(launch, "open_ro", wraps=launch.open_ro) as opened:
+            self.command("tool", head + "exec npx tool\n")
+            self.assertEqual(self.state("tool"), (True, False, INSTALLED))
+        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(launch.WRAPPER_MAX, 64 * 1024)
+
+    def test_hermes_as_omarchy_writes_it(self):
+        """``~/.local/bin/hermes`` on this machine (2026-10-13), read as a file."""
+        text = (
+            '#!/bin/bash\n\n# Written by omarchy-install-hermes-cli.\n\nexport UV_PYTHON="3.13"\n'
+            "export MISE_MINIMUM_RELEASE_AGE=0\n"
+            "if ! [[ -d \"$(mise where 'pipx:hermes-agent[extras=all]' 2>/dev/null)"
+            '/hermes-agent/lib/python3.13" ]]; then\n'
+            '  echo "Installing Hermes on Python 3.13 (this takes a minute)..." >&2\n'
+            "  if omarchy-cmd-missing uv && ! mise where uv >/dev/null 2>&1; then\n"
+            "    mise use -g --quiet uv@latest || exit 1\n  fi\n"
+            "  mise use -g --quiet --force 'pipx:hermes-agent[extras=all]' || exit 1\nfi\n"
+            "exec env -u UV_PYTHON mise x 'pipx:hermes-agent[extras=all]' -- hermes \"$@\"\n"
+        )
+        self.command("hermes", text)
+        self.assertEqual(self.state("hermes"), (False, True, NOT_INSTALLED))
+        self.assertEqual(
+            launch._wrapper(str(self.bin / "hermes")), ("pipx:hermes-agent[extras=all]", "hermes")
+        )
+
+    def test_a_tool_the_user_vouches_for(self):
+        self.command("tool", self.NOT_FOLLOWED["npx auto-install wrapper"])
+        self.command("other", self.VARIANTS["exact form (control)"].replace("tool", "other"))
+        path = str(self.bin / "tool")
+        for value, trusted in (
+            ("tool", True),
+            (" other , tool ", True),
+            ("tool2,toolx", False),
+            ("", False),
+            (",", False),
+        ):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {launch.TRUST_ENV: value}):
+                state = tool_state("tool")
+                if trusted:
+                    self.assertEqual(state, ToolState(path, True, False, launch.TRUSTED))
+                else:
+                    self.assertEqual(state.detail, UNKNOWN)
+        with mock.patch.dict(os.environ, {launch.TRUST_ENV: "other"}):
+            self.assertEqual(self.state("other"), (True, True, launch.TRUSTED))
+            self.assertEqual(self.state("tool"), (False, False, UNKNOWN))
+        self.assertEqual(launch.TRUST_ENV, "AGENT_SESSIONS_TRUST_TOOLS")
 
     @unittest.skipUnless(POSIX and os.geteuid() != 0, "needs a file that cannot be read")
     def test_a_command_that_cannot_be_read_counts_as_installed(self):
@@ -499,6 +637,34 @@ class WiringTest(unittest.TestCase):
         self.assertEqual(
             status["no_reader"], [{"tool": "opencode", "path": str(bin_dir / "opencode")}]
         )
+
+    def test_a_script_that_may_install_the_tool_is_never_started(self):
+        self.w.path.wrapper("codex", text='#!/bin/sh\nexec npx -y @openai/codex "$@"\n')
+        launch.forget_tools()
+        index = self.w.scan()
+        codex = self.w.session(CODEX_NATIVE, "native", index)
+        self.assertEqual(
+            (codex.launchable, codex.note),
+            (False, "the codex command may install Codex CLI; it is not started"),
+        )
+        reason = (
+            "codex on PATH is a script that may install the tool, and it was not started; "
+            "to start it all the same, name it in AGENT_SESSIONS_TRUST_TOOLS"
+        )
+        for options in (dict(dry_run=True), dict()):
+            with self.assertRaises(api.LaunchFailed) as caught:
+                api.open_session(codex, **options)
+            self.assertEqual(caught.exception.reason, reason)
+        with self.assertRaises(api.LaunchFailed):
+            api.continue_session(codex, dry_run=True)
+        self.assertEqual(self.w.started, [])
+        tools = {t["tool"]: t for t in api.status()["tools"]}
+        self.assertEqual((tools["codex"]["detail"], tools["codex"]["installed"]), (UNKNOWN, False))
+        with mock.patch.dict(os.environ, {launch.TRUST_ENV: "codex"}):
+            index = self.w.scan()
+            self.assertTrue(self.w.session(CODEX_NATIVE, "native", index).launchable)
+            api.open_session(CODEX_NATIVE)
+        self.assertEqual(len(self.w.started), 1)
 
     def test_status_as_text(self):
         self.w.path.wrapper("crush")

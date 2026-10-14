@@ -289,6 +289,14 @@ def _volume(data: Any) -> dict[str, Any]:  # one row of the cache's ``volumes``:
     }
 
 
+def _not_launchable(provider: base.Provider) -> str:
+    """The note of a native session whose tool cannot be started here."""
+    label = provider.label or provider.name
+    if provider.binary and launch.tool_state(provider.binary).detail == launch.UNKNOWN:
+        return f"the {provider.binary} command may install {label} CLI; it is not started"
+    return f"{label} CLI is not installed"
+
+
 class Index:
     def __init__(self, path: StrPath | None = None) -> None:
         self.path = Path(path) if path is not None else None
@@ -955,7 +963,7 @@ class Index:
                     s.cwd_local, s.cwd_exists = folder, True
                 s.launchable = usable.get(s.provider, False)
                 if not s.launchable and not s.note and s.provider in by_name:
-                    s.note = f"{by_name[s.provider].label} CLI is not installed"
+                    s.note = _not_launchable(by_name[s.provider])
             else:
                 s.imported_as = native.get((s.provider, s.id))
         sessions.sort(key=lambda s: s.key)
