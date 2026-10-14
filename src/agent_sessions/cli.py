@@ -616,8 +616,14 @@ def _print_scan(summary: dict) -> None:
         f"({summary['parsed']:,} parsed, {summary['cached']:,} from cache)"
         + (f"; {offline:,} more offline, on drives not mounted" if offline else "")
     )
-    if summary["warnings"]:
-        _out(f"warnings: {len(summary['warnings'])} (see `{PROG} status`)")
+    # What is about the cache itself is not kept in it: `status` cannot
+    # show it later, so it is said here.
+    about_cache = api.cache_warnings(summary)
+    for warning in about_cache:
+        _err(warning)
+    kept = len(summary["warnings"]) - len(about_cache)
+    if kept:
+        _out(f"warnings: {kept} (see `{PROG} status`)")
 
 
 def _list(args: argparse.Namespace) -> int:
@@ -626,7 +632,8 @@ def _list(args: argparse.Namespace) -> int:
         # No cache, or one that cannot be used: an empty listing would look
         # like "no sessions". stdout stays the listing alone.
         _err("no usable cache; scanning…")
-        api.scan()
+        for warning in api.cache_warnings(api.scan()):
+            _err(warning)
         index = api.load_index(offline=not args.mounted)
     sessions = api.list_sessions(args.provider, index=index)
     if args.json:

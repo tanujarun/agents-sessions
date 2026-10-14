@@ -428,6 +428,25 @@ class HereTest(LaunchCase):
         self.assertEqual(self.w.notified, [reason])
 
 
+class ForeignRefusalTest(LaunchCase):
+    foreign = ("claude", "gemini")
+
+    def test_a_foreign_session_that_cannot_be_imported_is_to_be_continued(self):
+        """AUDIT A-25: ``open`` of a foreign Gemini session said ``import it
+        first``, and ``import`` of it always refuses."""
+        gemini = self.w.session(GEMINI_WIN, "foreign")
+        with self.assertRaises(api.LaunchFailed) as caught:
+            api.open_session(gemini, dry_run=True)
+        self.assertEqual(
+            caught.exception.reason,
+            "this session is on C: and cannot be imported; continue it as a new session",
+        )
+        with self.assertRaises(api.LaunchFailed) as caught:
+            api.open_session(CLAUDE_WIN)  # importable: as before
+        self.assertEqual(caught.exception.reason, "this session is on C:; import it first")
+        self.assertEqual(self.w.started, [])
+
+
 class StarterTest(LaunchCase):
     def test_default_starter_is_detached(self):
         proc = mock.Mock()

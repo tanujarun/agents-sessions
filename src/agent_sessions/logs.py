@@ -97,7 +97,9 @@ class PrivateRotatingFile(logging.handlers.RotatingFileHandler):
         ``handleError``): looked at before the open, so that a device is not
         even opened, and again on the descriptor, since the name can be
         given to something else in between."""
-        fsutil.make_private_dir(os.path.dirname(self.baseFilename))
+        directory = os.path.dirname(self.baseFilename)
+        fsutil.make_private_dir(directory)
+        fsutil.keep_private(directory)  # one an older version made wider
         try:
             regular = stat.S_ISREG(os.stat(self.baseFilename).st_mode)
         except FileNotFoundError:

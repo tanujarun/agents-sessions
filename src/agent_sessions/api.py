@@ -135,6 +135,15 @@ def scan(
     return summary
 
 
+def cache_warnings(summary: dict) -> list[str]:
+    """The warnings of a scan's summary that are about the cache file
+    itself (not saved, kept aside, damaged entries left out): a front end
+    shows them at once, since the cache that was not written cannot show
+    them later."""
+    prefix = f"{cache_file()}: "
+    return [warning for warning in summary["warnings"] if warning.startswith(prefix)]
+
+
 def list_sessions(provider: str | None = None, index: Index | None = None) -> list[Session]:
     """Listed sessions, newest ``updated`` first, ties by key. ``provider``
     is a provider name; an unknown one raises ValueError."""
@@ -673,6 +682,7 @@ def open_session(
     """
     session = find_session(ref, index)
     where = None
+    importable = True
     if session.origin != "native":
         index = index if index is not None else load_index()
         copy = _native_copy(session, index)  # imported: resume that one
@@ -686,14 +696,18 @@ def open_session(
             where = index.where(session)
             if where == NATIVE_LABEL:  # another store on this machine's own disks
                 where = session.store
+            options = import_options(session, index)
+            importable = options.possible or options.needs_folder or options.experimental
     provider = _provider(session)
     if dry_run:
-        return launch.launch(session, provider, where=where, here=here, dry_run=True)
+        return launch.launch(
+            session, provider, where=where, here=here, dry_run=True, importable=importable
+        )
     log = logs.logger()
     try:
         # Planned once more, for the log: with ``here`` the launch below
         # replaces this process and nothing could be written after it.
-        planned = launch.plan(session, provider, where, here)
+        planned = launch.plan(session, provider, where, here, importable)
     except LaunchFailed:
         pass  # the launch below fails the same way; it notifies, and is logged there
     else:
@@ -705,7 +719,7 @@ def open_session(
             shlex.join(planned.command),
         )
     try:
-        return launch.launch(session, provider, where=where, here=here)
+        return launch.launch(session, provider, where=where, here=here, importable=importable)
     except LaunchFailed as exc:
         log.warning("launch %s refused: %s", session.key, exc.reason)
         raise
@@ -848,6 +862,8 @@ def _hand_over(session: Session, source: Provider, plan: ContinuePlan) -> int:
     try:
         fsutil.make_private_dir(fsutil.state_dir())
         fsutil.make_private_dir(directory)
+        fsutil.keep_private(fsutil.state_dir())
+        fsutil.keep_private(directory)
     except OSError as exc:
         raise ExportFailed(
             f"the directory {directory} cannot be made: {exc.strerror or exc}; nothing was started"
@@ -1528,6 +1544,7 @@ __all__ = [
     "UnimportReport",
     "all_providers",
     "cache_file",
+    "cache_warnings",
     "can_import",
     "continue_options",
     "continue_session",

@@ -193,7 +193,17 @@ class CliTest(unittest.TestCase):
                     cache_file().write_text(damage, encoding="utf-8")
                     self.assertRegex(Index.load().load_error, r"^unreadable: .+")
                     self.assertEqual(api.load_index().sessions, [])
-                    self.assertEqual(run(*argv), (0, expected[1], self.NOTICE))
+                    code, out, err = run(*argv)
+                    self.assertEqual((code, out), (0, expected[1]))
+                    kept = cache_file().with_name("index.json.unusable")
+                    self.assertRegex(
+                        err,
+                        rf"^{re.escape(self.NOTICE)}agent-sessions: "
+                        rf"{re.escape(str(cache_file()))}: "
+                        rf"the cache could not be used \(unreadable: .+\); it was kept as "
+                        rf"{re.escape(str(kept))} and a new one was written\n$",
+                    )
+                    self.assertEqual(kept.read_text(encoding="utf-8"), damage)
                     self.assertIsNone(Index.load().load_error)
                     self.assertEqual(run(*argv), expected)
 
@@ -352,6 +362,21 @@ class CliTest(unittest.TestCase):
         self.assertIn(f"DIFFERENT: store on disk but not in the index: fake {hidden}", out)
         self.assertIn("verify: 1 difference", out)
         self.assertIn("scan --deep", run("verify", "--help")[1])
+
+    def test_scan_says_itself_what_it_could_not_keep(self):
+        """AUDIT A-25: with a cache that cannot be written, ``scan`` said
+        ``warnings: 1 (see status)``, and ``status`` had none."""
+        self.box.cache.write_text("a file where the directory should be", encoding="utf-8")
+        code, out, err = run("scan")
+        self.assertEqual(code, 0)
+        self.assertNotIn("warnings:", out)
+        self.assertRegex(
+            err, rf"^agent-sessions: {re.escape(str(cache_file()))}: cache not saved: "
+        )
+        self.assertEqual(run("status")[1].count("warnings: 0"), 1)
+        code, out, err = run("scan", "--json")
+        self.assertEqual((code, err), (0, ""))  # JSON has it, in its warnings
+        self.assertEqual(len(api.cache_warnings(json.loads(out))), 1)
 
     def test_verify_without_an_index_fails(self):
         code, out, _ = run("verify")

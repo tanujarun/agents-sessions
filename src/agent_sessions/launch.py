@@ -562,12 +562,18 @@ def _check(argv: list[str], binary: str, given: list[str], what: str, done: str)
 
 
 def plan(
-    session: Session, provider: Provider, where: str | None = None, here: bool = False
+    session: Session,
+    provider: Provider,
+    where: str | None = None,
+    here: bool = False,
+    importable: bool = True,
 ) -> LaunchPlan:
     """The resume command for ``session``; starts nothing.
 
-    ``where`` names the place a foreign session is on, for the refusal.
-    Raises ``LaunchFailed`` with the reason when it cannot be resumed.
+    ``where`` names the place a foreign session is on, for the refusal;
+    ``importable`` says whether it can be imported (the refusal then says
+    to import it, else to continue it as a new session). Raises
+    ``LaunchFailed`` with the reason when it cannot be resumed.
 
     A session's fields are data from a file, possibly one that came from
     another drive. Two rules keep them from being read as options of the
@@ -580,7 +586,11 @@ def plan(
     label = provider.label or provider.name
     if session.origin != "native":
         place = where or session.mount_label or "another drive"
-        raise LaunchFailed(f"this session is on {place}; import it first")
+        if importable:
+            raise LaunchFailed(f"this session is on {place}; import it first")
+        raise LaunchFailed(
+            f"this session is on {place} and cannot be imported; continue it as a new session"
+        )
     if not provider.resumable:
         raise LaunchFailed(
             f"{label} sessions cannot be resumed here: the {label} CLI is not installed"
@@ -710,11 +720,15 @@ def launch(
     where: str | None = None,
     here: bool = False,
     dry_run: bool = False,
+    importable: bool = True,
 ) -> LaunchPlan:
     """Resume ``session``: in a new terminal window, or with ``here`` in this
     process (``chdir`` then ``exec``; it does not return). ``dry_run`` only
-    builds the plan. A real failure also sends a desktop notification."""
-    return _start(lambda: plan(session, provider, where, here), provider.binary, here, dry_run)
+    builds the plan. A real failure also sends a desktop notification.
+    ``where`` and ``importable`` are ``plan``'s."""
+    return _start(
+        lambda: plan(session, provider, where, here, importable), provider.binary, here, dry_run
+    )
 
 
 def launch_new(

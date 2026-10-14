@@ -230,6 +230,41 @@ class OwnFileTest(LogCase):
         self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
         self.assertEqual(self.messages(), ["one", "two"])
 
+    @unittest.skipUnless(POSIX, "file modes")
+    def test_our_directories_are_tightened_when_we_write_into_them(self):
+        """AUDIT A-25: README says 0700; the directories 0.1.0 made were 0755
+        and stayed so."""
+        self.state.mkdir(mode=0o700)
+        os.chmod(self.state, 0o755)  # noqa: S103  (the mode an older version left)
+        logs.logger().info("one")
+        self.assertEqual(stat.S_IMODE(os.stat(self.state).st_mode), 0o700)
+        config = fsutil.config_dir()
+        config.mkdir(parents=True)
+        os.chmod(config, 0o755)  # noqa: S103  (the mode an older version left)
+        disk = self.box.mount("Disk")
+        api.set_letter("D:", str(disk))
+        self.assertEqual(stat.S_IMODE(os.stat(config).st_mode), 0o700)
+
+    @unittest.skipUnless(POSIX, "file modes")
+    def test_keep_private(self):
+        target = self.box.root / "ours"
+        target.mkdir()
+        os.chmod(target, 0o751)  # noqa: S103  (wide on purpose: what is tightened)
+        self.assertTrue(fsutil.keep_private(target))
+        self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o700)
+        self.assertFalse(fsutil.keep_private(target))  # already private
+        link = self.box.root / "link"
+        wide = self.box.root / "wide"
+        wide.mkdir()
+        os.chmod(wide, 0o755)  # noqa: S103  (wide on purpose: a link to it is not followed)
+        os.symlink(wide, link)
+        self.assertFalse(fsutil.keep_private(link))
+        self.assertEqual(stat.S_IMODE(os.stat(wide).st_mode), 0o755)
+        afile = self.box.root / "file"
+        afile.write_text("x")
+        self.assertFalse(fsutil.keep_private(afile))
+        self.assertFalse(fsutil.keep_private(self.box.root / "missing"))
+
     def test_a_message_the_file_cannot_hold_is_escaped_not_dropped(self):
         """``import <key> (store <path>)`` was lost whenever the path was
         not UTF-8: the file was opened strict, and the write failed."""
