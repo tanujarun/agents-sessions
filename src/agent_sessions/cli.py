@@ -73,8 +73,10 @@ _DESCRIPTION = (
 )
 
 _KEY_NOTE = (
-    f"A session is named by its key (`{PROG} list --keys`), by a unique start\n"
-    "of its key, or by its id."
+    f"A session is named by its key (`{PROG} list --keys`), by its id, or\n"
+    "by a start of its key that only one session has. A key is\n"
+    "<provider>:<store>:<id>, and all the sessions of a store share the first two\n"
+    "parts: a start has to reach into the id."
 )
 
 
@@ -196,7 +198,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="leave out the sessions of drives that are not mounted",
     )
 
-    key_help = "a session key (`list --keys`), a unique start of one, or a session id"
+    key_help = (
+        "a session key (`list --keys`), a start of one that reaches into the id, or a session id"
+    )
     p = command(
         "open",
         "Resume a session of this system's own store with its tool, in a new terminal "
@@ -204,10 +208,10 @@ def build_parser() -> argparse.ArgumentParser:
         "it is: import it first, or continue it as a new session. The tool is started only "
         "when it is installed.",
         _examples(
-            f"{PROG} open claude:1a2b3c4d --dry-run",
+            f"{PROG} open claude:1a2b3c4d:7f3e --dry-run",
             "    print the folder and the command, start nothing",
-            f"{PROG} open claude:1a2b3c4d",
-            f"{PROG} open claude:1a2b3c4d --here",
+            f"{PROG} open claude:1a2b3c4d:7f3e",
+            f"{PROG} open claude:1a2b3c4d:7f3e --here",
             "    in this terminal: the tool takes the place of this command",
         ),
     )
@@ -224,13 +228,13 @@ def build_parser() -> argparse.ArgumentParser:
         "overwritten, and the copy is recorded so that `unimport` can take it back. Prints "
         "the key of the copy.",
         _examples(
-            f"{PROG} import claude:1a2b3c4d --dry-run",
+            f"{PROG} import claude:1a2b3c4d:7f3e --dry-run",
             "    what would be copied and rewritten; nothing is written",
-            f"{PROG} import claude:1a2b3c4d --open",
+            f"{PROG} import claude:1a2b3c4d:7f3e --open",
             "    import, then resume the copy in a new window",
-            f"{PROG} import codex:5e6f7a8b --to ~/Work/site",
+            f"{PROG} import codex:5e6f7a8b:0199 --to ~/Work/site",
             "    for a session whose own folder is gone or was not recorded",
-            f"{PROG} import antigravity:9c0d1e2f --experimental",
+            f"{PROG} import antigravity:9c0d1e2f:3b8a --experimental",
             "    an import that no real resume has confirmed yet",
         ),
     )
@@ -265,11 +269,11 @@ def build_parser() -> argparse.ArgumentParser:
         "Directories are removed only when they are empty, and a line the import added "
         "to a file of the tool's is left; both are reported.",
         _examples(
-            f"{PROG} unimport claude:1a2b3c4d --dry-run",
+            f"{PROG} unimport claude:1a2b3c4d:7f3e --dry-run",
             "    what would be removed and what would be left; nothing is removed",
-            f"{PROG} unimport claude:1a2b3c4d",
+            f"{PROG} unimport claude:1a2b3c4d:7f3e",
             "    asks before it removes anything",
-            f"{PROG} unimport claude:1a2b3c4d --force --yes",
+            f"{PROG} unimport claude:1a2b3c4d:7f3e --force --yes",
             "    also when the copy was used since: its new turns are lost",
         ),
     )
@@ -301,10 +305,10 @@ def build_parser() -> argparse.ArgumentParser:
         "section per turn and a line per tool call) or JSON lines (one object per turn: "
         "role, text, ts). With -o it is written to a file that only you can read.",
         _examples(
-            f"{PROG} export claude:1a2b3c4d | less",
-            f"{PROG} export claude:1a2b3c4d -o ~/notes/session.md",
+            f"{PROG} export claude:1a2b3c4d:7f3e | less",
+            f"{PROG} export claude:1a2b3c4d:7f3e -o ~/notes/session.md",
             "    refused when the file exists, unless --force is given",
-            f"{PROG} export claude:1a2b3c4d --format json",
+            f"{PROG} export claude:1a2b3c4d:7f3e --format json",
             "    one JSON object per turn (docs/JSON.md)",
         ),
     )
@@ -330,11 +334,11 @@ def build_parser() -> argparse.ArgumentParser:
         "the state directory, and the tool is started with a fixed first message that "
         "names that file. The tool sends that message to its model as soon as it starts.",
         _examples(
-            f"{PROG} continue gemini:1a2b3c4d --with claude --dry-run",
+            f"{PROG} continue gemini:2c4e6a8b:5d1f --with claude --dry-run",
             "    the folder, the command and the transcript file; starts nothing",
-            f"{PROG} continue codex:5e6f7a8b --in ~/Work/site",
+            f"{PROG} continue codex:5e6f7a8b:0199 --in ~/Work/site",
             "    for a session whose own folder is gone",
-            f"{PROG} continue claude:9c0d1e2f --with codex --here",
+            f"{PROG} continue claude:3d5f7b9a:c2e8 --with codex --here",
             "    in this terminal instead of a new window",
         ),
     )

@@ -294,11 +294,14 @@ class HelpTest(unittest.TestCase):
             del args
         self.assertGreater(seen, 20)
 
-    def test_every_help_fits_80_columns_whatever_the_terminal(self):
+    def test_every_help_fits_its_width_whatever_the_terminal(self):
+        """``HELP_WIDTH`` (78) columns, as SPEC says: the text written by hand
+        (the notes under the groups) included (AUDIT N-04)."""
+        self.assertEqual(cli.HELP_WIDTH, 78)
         for columns in (None, 80, 200):
             for argv in [()] + [(name,) for name in self.COMMANDS]:
                 for line in self.help(*argv, columns=columns).splitlines():
-                    self.assertLessEqual(len(line), 80, (argv, columns, line))
+                    self.assertLessEqual(len(line), cli.HELP_WIDTH, (argv, columns, line))
         self.assertEqual(self.help(columns=200), self.help(columns=80))
         # A narrower terminal gets narrower paragraphs.
         narrow = self.help("import", columns=60).partition("\nexamples:\n")[0]
