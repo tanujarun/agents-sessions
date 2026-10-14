@@ -10,9 +10,13 @@ writes the document adds one after every piece.
 Everything in a transcript is text from a store, possibly one on another
 drive. The Markdown is made of ``textsafe.clean`` text: a title, a folder or
 a tool's name is one line whatever it holds, and the text of a turn keeps
-its line breaks and tabs and nothing else a terminal would act on. The JSON
-lines are exact data with those characters as ``\\uXXXX`` escapes
-(``textsafe.json_escape``; docs/JSON.md has the form).
+its line breaks and tabs and nothing else a terminal would act on. Characters
+that draw nothing (zero-width ones, the soft hyphen, the tag block) are
+replaced like the rest, and the header says how many there were: the
+document is what ``continue`` hands to a model, and whoever reads it first
+should see all that the model will. The JSON lines are exact data with those
+characters as ``\\uXXXX`` escapes (``textsafe.json_escape``; docs/JSON.md
+has the form).
 
 ``write`` puts a document into a file, whole or not at all.
 
@@ -31,7 +35,7 @@ from . import __version__, fsutil, textsafe
 from .errors import REMEDY_OVERWRITE, ExportFailed
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
 
     from .fsutil import StrPath
     from .model import Session
@@ -53,18 +57,53 @@ def _heading(role: str) -> str:
     return _HEADINGS.get(role) or textsafe.clean(role).strip() or _UNKNOWN
 
 
-def markdown(session: Session, label: str, turns: Iterable[Turn]) -> Iterator[str]:
+def _twice(turns: Iterable[Turn] | Callable[[], Iterable[Turn]]) -> Callable[[], Iterable[Turn]]:
+    """A function that gives the turns from the first one, each time it is
+    called. Something that can be walked only once is refused."""
+    if callable(turns):
+        return turns
+    if iter(turns) is turns:
+        raise TypeError(
+            "the turns are read twice: pass a list, or a function that reads them again"
+        )
+    return lambda: turns
+
+
+def _invisible(session: Session, label: str, turns: Iterable[Turn]) -> int:
+    """How many characters that draw nothing the document's values hold
+    (``textsafe.invisible``): each is a space in the document."""
+    shown = (session.title or session.id, label, session.id, session.cwd)
+    count = sum(textsafe.invisible(value) for value in shown)
+    for turn in turns:
+        count += textsafe.invisible(turn.text)
+        if turn.role != TOOL_ROLE and turn.role not in _HEADINGS:
+            count += textsafe.invisible(turn.role)
+    return count
+
+
+def markdown(
+    session: Session, label: str, turns: Iterable[Turn] | Callable[[], Iterable[Turn]]
+) -> Iterator[str]:
     """The transcript as Markdown, piece by piece.
 
     First the header: the title as ``#`` (the id when there is none), then a
     list: the tool (``label``), the session id, the folder as recorded, when
-    it started and was last updated, how many messages it has, and what
-    exported it. Then one ``## User`` or ``## Assistant`` section per turn,
-    with the turn's time in the heading when it is known, and one line
+    it started and was last updated, how many messages it has, how many
+    invisible characters were replaced by spaces when there were any, and
+    what exported it. Then one ``## User`` or ``## Assistant`` section per
+    turn, with the turn's time in the heading when it is known, and one line
     ``> tool: <name>`` per tool call, the calls that follow one another in
     one block.
+
+    The turns are read twice: once for that count, which the header needs
+    before the first section, and once for the sections. ``turns`` is
+    something that can be walked again (a list), or a function that gives
+    them afresh (an adapter's transcript is read from its files both times,
+    and neither time held in memory).
     """
+    again = _twice(turns)
     count = _UNKNOWN if session.messages is None else str(session.messages)
+    hidden = _invisible(session, label, again())
     header = [
         f"# {textsafe.clean(session.title or session.id)}",
         "",
@@ -74,11 +113,13 @@ def markdown(session: Session, label: str, turns: Iterable[Turn]) -> Iterator[st
         f"- started: {textsafe.clean(session.started or _UNKNOWN)}",
         f"- updated: {textsafe.clean(session.updated or _UNKNOWN)}",
         f"- messages: {count}",
-        f"- exported by agent-sessions {__version__}",
     ]
+    if hidden:
+        header.append(f"- invisible characters: {hidden:,} replaced by spaces")
+    header.append(f"- exported by agent-sessions {__version__}")
     yield "\n".join(header)
     last = None
-    for turn in turns:
+    for turn in again():
         if turn.role == TOOL_ROLE:
             line = f"> tool: {textsafe.clean(turn.text)}"
             yield line if last == TOOL_ROLE else "\n" + line

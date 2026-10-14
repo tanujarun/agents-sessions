@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import re
 import sqlite3
@@ -26,6 +25,8 @@ from .base import (
     between,
     clean_title,
     iter_jsonl,
+    load_json,
+    mtime,
     open_sqlite_ro,
     parse_ts,
     read_small,
@@ -227,13 +228,6 @@ def _user_request(content: object) -> str:
     return (content if wrapped is None else wrapped).strip()
 
 
-def _mtime(path: StrPath) -> str | None:
-    try:
-        return parse_ts(os.stat(path).st_mtime, unit="s")
-    except OSError:
-        return None
-
-
 def _text(value: object) -> str:
     return value if isinstance(value, str) else ""
 
@@ -370,13 +364,13 @@ class Antigravity(Provider):
         started = (
             parse_ts(pb_timestamp(pb_first(conv["blob"], 2)))
             or parse_ts(pb_timestamp(pb_first(conv["first"], 1)))
-            or _mtime(db)
+            or mtime(db)
         )
         modified = _text(row.get("last_modified_time"))
         updated = (
             (parse_ts(modified) if not modified.startswith("0001-") else None)
             or parse_ts(pb_timestamp(pb_first(conv["last"], 1)))
-            or _mtime(db)
+            or mtime(db)
         )
 
         files = [str(db)]
@@ -450,7 +444,7 @@ class Antigravity(Provider):
         if not isinstance(value, str) or not value.strip():
             return None
         try:
-            uris = json.loads(value)
+            uris = load_json(value)
         except (ValueError, RecursionError):
             return None
         return uri_to_path(uris[0]) if isinstance(uris, list) and uris else None
@@ -462,7 +456,7 @@ class Antigravity(Provider):
         if not raw:
             return None
         try:
-            data = json.loads(raw.decode("utf-8-sig", "replace"))
+            data = load_json(raw)
         except (ValueError, RecursionError):
             warn("not valid JSON", path)
             return None

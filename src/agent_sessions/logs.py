@@ -1,14 +1,19 @@
 """The log: ``<state dir>/agent-sessions.log`` (docs/SPEC.md "Logs").
 
 A rotating file (1 MB, three older files kept), UTF-8, created 0600 in a
-state directory created 0700. What goes into it is decided where it happens
+state directory created 0700; a log that is there with a wider mode is
+tightened when it is opened. What goes into it is decided where it happens
 (``api`` for scans, imports and launches, so the CLI and the TUI log alike);
 this module is the plumbing:
 
 - nothing is set up, and no file or directory made, until the first message
   is written (importing the package creates nothing);
 - a log that cannot be written never breaks a command and never prints: with
-  a read-only or missing state directory the messages are dropped;
+  a read-only or missing state directory the messages are dropped. Only a
+  regular file is written to, and opening it never waits: a named pipe or a
+  device under the log's name is left alone and the messages are dropped;
+- a message is never lost to its own text: a character the file cannot
+  hold is written as a backslash escape;
 - every message is made safe on its way out (``textsafe.clean``): a log is
   read in a terminal, and titles, folders and ids come from stores on other
   drives. A traceback goes below its message, every line of it indented, so
@@ -28,6 +33,7 @@ import io
 import logging
 import logging.handlers
 import os
+import stat
 import sys
 import threading
 import time
@@ -57,21 +63,61 @@ class SafeFormatter(logging.Formatter):
         return "\n".join(lines)
 
 
+# An open must never wait: a named pipe under the log's name would hold
+# every command that logs until something read from it. O_NOCTTY: a terminal
+# device under that name must not become this process's controlling terminal.
+_NO_WAIT = getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
+
+
 class PrivateRotatingFile(logging.handlers.RotatingFileHandler):
     """The log file: opened only when there is something to write, created
     0600 in a directory created 0700, and silent when that cannot be done
-    (the next message tries again)."""
+    (the next message tries again).
+
+    Rotation is per process: two processes that log at the same time (the
+    TUI and a command beside it) each rename the file when they find it
+    full, so a few lines can end up in an older file than their neighbours.
+    Nothing is lost by it, and a log is not worth a lock."""
 
     def __init__(self, path: Path) -> None:
         super().__init__(
-            path, maxBytes=MAX_BYTES, backupCount=BACKUPS, encoding="utf-8", delay=True
+            path,
+            maxBytes=MAX_BYTES,
+            backupCount=BACKUPS,
+            encoding="utf-8",
+            # A message that names a path which is not UTF-8 is written with
+            # the odd bytes spelled out, not dropped.
+            errors="backslashreplace",
+            delay=True,
         )
 
     def _open(self) -> io.TextIOWrapper:
-        fsutil.make_private_dir(os.path.dirname(self.baseFilename))
-        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        """Open the log for appending. Raises ``OSError`` for anything under
+        its name that is not a regular file (``emit`` then drops the message,
+        ``handleError``): looked at before the open, so that a device is not
+        even opened, and again on the descriptor, since the name can be
+        given to something else in between."""
+        directory = os.path.dirname(self.baseFilename)
+        fsutil.make_private_dir(directory)
+        fsutil.keep_private(directory)  # one an older version made wider
+        try:
+            regular = stat.S_ISREG(os.stat(self.baseFilename).st_mode)
+        except FileNotFoundError:
+            regular = True  # about to be created
+        if not regular:
+            raise fsutil.NotRegularFile(self.baseFilename)
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | _NO_WAIT
         fd = os.open(self.baseFilename, flags, fsutil.PRIVATE_FILE)
-        return os.fdopen(fd, "a", encoding=self.encoding, errors=self.errors)
+        try:
+            found = os.fstat(fd)
+            if not stat.S_ISREG(found.st_mode):
+                raise fsutil.NotRegularFile(self.baseFilename)
+            if stat.S_IMODE(found.st_mode) & ~fsutil.PRIVATE_FILE and hasattr(os, "fchmod"):
+                os.fchmod(fd, fsutil.PRIVATE_FILE)  # made by an older version, or by hand
+            return os.fdopen(fd, "a", encoding=self.encoding, errors=self.errors)
+        except BaseException:
+            os.close(fd)
+            raise
 
     def handleError(self, record: logging.LogRecord) -> None:
         """A message that cannot be written is dropped: no traceback on

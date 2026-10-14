@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
-from .. import launch
+from .. import fmt, launch
 from ..fsutil import home, listdir_ro, subdirs
-from ..importer import human_size
 from ..model import Candidate, Session, Store
 from . import register
 from .base import (
@@ -20,6 +18,8 @@ from .base import (
     Turn,
     clean_title,
     iter_jsonl,
+    load_json,
+    mtime,
     open_ro,
     parse_ts,
     read_small,
@@ -203,7 +203,7 @@ def _load(path: Path) -> tuple[dict, list[dict]] | None:
     except OSError:
         large = False  # the read below reports that
     if large:
-        warn(f"larger than {human_size(_CHAT_MAX)}; not read", path)
+        warn(f"larger than {fmt.size(_CHAT_MAX)}; not read", path)
         return None
     meta, messages = apply_records(iter_jsonl(path))
     if meta.get("sessionId") and meta.get("projectHash"):
@@ -219,7 +219,7 @@ def _load(path: Path) -> tuple[dict, list[dict]] | None:
         warn("no session metadata record; too large to try as one JSON object", path)
         return None
     try:
-        legacy = json.loads(raw.decode("utf-8-sig", "replace"))
+        legacy = load_json(raw)
     except (ValueError, RecursionError):
         legacy = None
     if not isinstance(legacy, dict) or "sessionId" not in legacy:
@@ -227,13 +227,6 @@ def _load(path: Path) -> tuple[dict, list[dict]] | None:
         return None
     found = legacy.get("messages")
     return legacy, [m for m in found if isinstance(m, dict)] if isinstance(found, list) else []
-
-
-def _mtime(path: StrPath) -> str | None:
-    try:
-        return parse_ts(os.stat(path).st_mtime, unit="s")
-    except OSError:
-        return None
 
 
 def _read_text(path: StrPath) -> str:
@@ -380,8 +373,8 @@ class Gemini(Provider):
             "id": session_id,
             "title": title,
             "title_source": title_source,
-            "started": start or last or _mtime(path),
-            "updated": last or start or _mtime(path),
+            "started": start or last or mtime(path),
+            "updated": last or start or mtime(path),
             "messages": messages,
         }
 
@@ -392,7 +385,7 @@ class Gemini(Provider):
         if not text:
             return None
         try:
-            data = json.loads(text)
+            data = load_json(text)
         except (ValueError, RecursionError):
             warn("not valid JSON", projects_json)
             return None

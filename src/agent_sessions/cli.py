@@ -3,21 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import contextlib
 import json
 import os
-import re
 import shlex
 import shutil
 import signal
 import sys
 from collections.abc import Iterable, Iterator, Sequence
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, TextIO
 
-from . import __version__, api, logs, textsafe
-from .mounts import MountsError
-from .providers import all_providers
+from . import __version__, api, fmt, logs, textsafe
 
 if TYPE_CHECKING:
     from .index import Index
@@ -188,8 +185,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--provider",
         metavar="P",
-        help="only this provider: " + ", ".join(provider.name for provider in all_providers()),
-        choices=[provider.name for provider in all_providers()],
+        help="only this provider: " + ", ".join(provider.name for provider in api.all_providers()),
+        choices=[provider.name for provider in api.all_providers()],
     )
     p.add_argument("--json", action="store_true", help="JSON output")
     p.add_argument("--keys", action="store_true", help="add the session key as a last column")
@@ -348,7 +345,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TOOL",
         help=(
             "the tool to start instead of the session's own: "
-            + ", ".join(provider.name for provider in all_providers())
+            + ", ".join(provider.name for provider in api.all_providers())
         ),
     )
     p.add_argument(
@@ -387,7 +384,9 @@ def build_parser() -> argparse.ArgumentParser:
         "verify",
         "Walk every mounted drive without the index, count the sessions on disk and "
         "compare them with what the index lists. Exit status 1 when they differ. Sessions "
-        "of drives that are not mounted are left out.",
+        "of drives that are not mounted are left out. What changed since the last scan is "
+        "reported as stale, not as a difference, and so is a store that appeared since the "
+        "last deep scan: run `scan --deep` first to have those compared too.",
     )
 
     drive_help = "a remembered drive: its label, drive letter (C:), mount path or volume id"
@@ -436,18 +435,53 @@ def build_parser() -> argparse.ArgumentParser:
 # sequences. Nothing below this block writes to a stream itself: readable text
 # goes through ``_out`` or ``_err``, JSON through ``_json``, the progress line
 # through ``_progress``, a question through ``_ask``, and each of those makes
-# its text safe on the way out (``textsafe``). tests/test_textsafe.py holds
-# this module to that.
+# its text safe on the way out (``textsafe``); the one function that writes,
+# ``_write``, encodes the text itself. tests/test_textsafe.py holds this
+# module to that.
 
 
-def _emit(stream: TextIO, text: str) -> None:
-    """Write one line that is already safe; a path with bytes that are not
-    UTF-8 is escaped, not fatal."""
+def _utf8(stream: TextIO | None) -> bool:
+    """Whether the stream writes UTF-8 (a stream that names no encoding is
+    taken to)."""
     try:
-        stream.write(text + "\n")
-    except UnicodeEncodeError:
-        encoding = getattr(stream, "encoding", None) or "utf-8"
-        stream.write(text.encode(encoding, "backslashreplace").decode(encoding) + "\n")
+        return codecs.lookup(getattr(stream, "encoding", None) or "utf-8").name == "utf-8"
+    except LookupError:
+        return False
+
+
+def _write(stream: TextIO | None, text: str, flush: bool = False) -> None:
+    """The one place that writes to a stream. ``text`` is safe already.
+
+    It is encoded here and the bytes go to the stream's buffer, so what
+    happens to a character the encoding does not have is decided here and
+    not by the stream: it is written as a backslash escape. Left to itself,
+    Python's stdout in the C and POSIX locales writes a lone surrogate back
+    as the raw byte it stands for (``surrogateescape``), and 0x9B is a CSI;
+    a path that is not UTF-8 holds such surrogates, and so can a title.
+    """
+    if stream is None:  # the stream was closed before the program started
+        return
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    try:
+        data = text.encode(encoding, "backslashreplace")
+    except LookupError:  # an encoding this Python does not know
+        encoding = "utf-8"
+        data = text.encode(encoding, "backslashreplace")
+    buffer = getattr(stream, "buffer", None)
+    if buffer is None:
+        # Text with no bytes below it (a StringIO): it gets what the bytes say.
+        stream.write(data.decode(encoding, "replace"))
+        if flush:
+            stream.flush()
+        return
+    buffer.write(data)
+    if flush or getattr(stream, "line_buffering", False):
+        buffer.flush()  # a terminal shows the line now, as when the stream wrote it
+
+
+def _emit(stream: TextIO | None, text: str) -> None:
+    """Write one line that is already safe."""
+    _write(stream, text + "\n")
 
 
 def _out(text: object, multiline: bool = False) -> None:
@@ -465,29 +499,27 @@ def _err(text: object) -> None:
 def _json(value: object) -> None:
     """Print a value as JSON: exact data, with the characters a terminal
     would act on written as ``\\uXXXX`` escapes."""
-    document = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False)
-    _emit(sys.stdout, textsafe.json_escape(document))
+    _json_line(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False))
 
 
 def _json_line(document: str) -> None:
-    """Print one line of JSON text the engine made (``export --format
-    json``): exact data, and like ``_json`` with nothing in it a terminal
-    would act on."""
-    _emit(sys.stdout, textsafe.json_escape(document))
+    """Print JSON text (the engine's own for ``export --format json``):
+    exact data, with nothing in it a terminal would act on, and always
+    valid UTF-8: where the stream's encoding is another one, everything
+    beyond ASCII is escaped too."""
+    _emit(sys.stdout, textsafe.json_escape(document, ascii_only=not _utf8(sys.stdout)))
 
 
 def _progress(text: str = "") -> None:
     """Replace the progress line on stderr; no text clears it."""
-    sys.stderr.write("\r\033[K" + textsafe.clean(text))
-    sys.stderr.flush()
+    _write(sys.stderr, "\r\033[K" + textsafe.clean(text), flush=True)
 
 
 def _ask(question: str) -> bool:
     """Ask a yes/no question and read the answer from stdin; only ``y`` or
     ``yes`` is a yes. The question goes to stderr, so stdout stays what the
     command prints."""
-    sys.stderr.write(textsafe.clean(question) + " [y/N] ")
-    sys.stderr.flush()
+    _write(sys.stderr, textsafe.clean(question) + " [y/N] ", flush=True)
     return sys.stdin.readline().strip().lower() in ("y", "yes")
 
 
@@ -506,44 +538,11 @@ def _count(n: int, word: str, plural: str | None = None) -> str:
     return f"{n:,} {word if n == 1 else (plural or word + 's')}"
 
 
-def _size(count: int) -> str:
-    """A byte count in decimal units: ``812 B``, ``116.7 kB``, ``123.7 MB``."""
-    size = float(count)
-    for unit in ("B", "kB", "MB"):
-        if size < 1000:
-            return f"{int(size)} B" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1000
-    return f"{size:.1f} GB"
-
-
-def _age(stamp: str | None, now: datetime) -> str:
-    if not stamp:
-        return "-"
-    try:
-        then = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-    except ValueError:
-        return "-"
-    seconds = max((now - then).total_seconds(), 0)
-    days = int(seconds // 86400)
-    if seconds < 60:
-        return "now"
-    if seconds < 3600:
-        return f"{int(seconds // 60)}m"
-    if days < 1:
-        return f"{int(seconds // 3600)}h"
-    if days < 14:
-        return f"{days}d"
-    if days < 60:
-        return f"{days // 7}w"
-    if days < 365:
-        return f"{days // 30}mo"
-    return f"{days // 365}y"
-
-
-def _project(cwd: str | None) -> str:
-    """The folder a session ran in: the last segment of its recorded cwd."""
-    parts = [p for p in re.split(r"[\\/]+", cwd or "") if p]
-    return parts[-1] if parts else "-"
+# How a listing words a byte count, an age and a project's name: the one
+# copy both front ends use (``fmt``).
+_size = fmt.size
+_age = fmt.age
+_project = fmt.project
 
 
 def _walk_rows(mounts: list[dict], walks: dict | None) -> list[list[str]]:
@@ -617,8 +616,14 @@ def _print_scan(summary: dict) -> None:
         f"({summary['parsed']:,} parsed, {summary['cached']:,} from cache)"
         + (f"; {offline:,} more offline, on drives not mounted" if offline else "")
     )
-    if summary["warnings"]:
-        _out(f"warnings: {len(summary['warnings'])} (see `{PROG} status`)")
+    # What is about the cache itself is not kept in it: `status` cannot
+    # show it later, so it is said here.
+    about_cache = api.cache_warnings(summary)
+    for warning in about_cache:
+        _err(warning)
+    kept = len(summary["warnings"]) - len(about_cache)
+    if kept:
+        _out(f"warnings: {kept} (see `{PROG} status`)")
 
 
 def _list(args: argparse.Namespace) -> int:
@@ -627,7 +632,8 @@ def _list(args: argparse.Namespace) -> int:
         # No cache, or one that cannot be used: an empty listing would look
         # like "no sessions". stdout stays the listing alone.
         _err("no usable cache; scanning…")
-        api.scan()
+        for warning in api.cache_warnings(api.scan()):
+            _err(warning)
         index = api.load_index(offline=not args.mounted)
     sessions = api.list_sessions(args.provider, index=index)
     if args.json:
@@ -635,11 +641,10 @@ def _list(args: argparse.Namespace) -> int:
         return 0
     if index.last_quick is None:
         _err(f"no index yet; run `{PROG} scan`")
-    now = datetime.now(UTC)
     _table(
         [
             [
-                _age(s.updated or s.started, now),
+                _age(s.updated or s.started),
                 index.where(s),
                 s.provider,
                 s.title or "-",
@@ -871,7 +876,8 @@ def _map(args: argparse.Namespace) -> int:
     if args.dir is None:
         _err(f"map: say which directory {args.letter} stands for, or use --remove")
         return 2
-    letter, directory = api.set_letter(args.letter, args.dir)
+    # ``~`` is expanded here, as for every folder this command line takes.
+    letter, directory = api.set_letter(args.letter, os.path.expanduser(args.dir))
     _out(f"{letter} -> {directory}")
     return 0
 
@@ -901,6 +907,13 @@ def _verify(args: argparse.Namespace) -> int:
             f"{_count(len(result['stale']), 'candidate')} changed on disk after the last "
             f"scan; run `{PROG} scan`"
         )
+    for line in result["stale_stores"]:
+        _out(f"stale: {line}")
+    if result["stale_stores"]:
+        _out(
+            f"{_count(len(result['stale_stores']), 'store')} appeared since the last deep "
+            f"scan; run `{PROG} scan --deep` first to compare them too"
+        )
     for line in result["differences"]:
         _out(f"DIFFERENT: {line}")
     if result["differences"]:
@@ -910,9 +923,28 @@ def _verify(args: argparse.Namespace) -> int:
     return 0
 
 
+# Said below a printed command whose text is not the command: a folder's name
+# can hold characters that are not shown (they are printed as spaces).
+_NOT_AS_SHOWN = (
+    "note: the folder's name holds characters that cannot be shown; they are printed as "
+    "spaces, so the line above is not exactly what runs"
+)
+
+
+def _as_shown(*texts: str) -> bool:
+    """Whether every text is printed as it is: nothing in it is replaced on
+    the way out."""
+    return all(textsafe.clean(text) == text for text in texts)
+
+
 def _print_plan(plan: LaunchPlan) -> None:
-    """A launch plan as a line a shell could run, and its note."""
-    _out(f"cd {shlex.quote(plan.cwd)} && {shlex.join(plan.command)}")
+    """A launch plan as a line a shell could run, quoted for one
+    (``shlex``), and its note. When the line cannot be printed as it is,
+    that is said too."""
+    line = f"cd {shlex.quote(plan.cwd)} && {shlex.join(plan.command)}"
+    _out(line)
+    if not _as_shown(line):
+        _out(_NOT_AS_SHOWN)
     if plan.note:
         _out(f"note: {plan.note}")
 
@@ -1107,7 +1139,9 @@ def _unimport(args: argparse.Namespace) -> int:
 def _show(args: argparse.Namespace) -> int:
     index = api.load_index()
     session = api.find_session(args.key, index=index)
-    label = next((p.label for p in all_providers() if p.name == session.provider), session.provider)
+    label = next(
+        (p.label for p in api.all_providers() if p.name == session.provider), session.provider
+    )
     rows: list[list[object]] = [
         ["title", session.title or "-"],
         ["provider", label],
@@ -1139,6 +1173,9 @@ def _show(args: argparse.Namespace) -> int:
 
 
 def _export(args: argparse.Namespace) -> int:
+    if args.output == "":
+        _err("export: -o needs a file name")
+        return 2
     if args.output is not None:
         # ``~`` and a relative path are this command's to resolve: the engine
         # takes an absolute path and nothing else.
@@ -1168,8 +1205,11 @@ def _continue(args: argparse.Namespace) -> int:
         plan = api.continue_session(
             args.key, tool=args.tool, folder=folder, here=args.here, dry_run=True
         )
+        command = shlex.join(plan.command)
         _out(f"folder: {plan.cwd}")
-        _out(f"command: {shlex.join(plan.command)}")
+        _out(f"command: {command}")
+        if not _as_shown(plan.cwd, command):
+            _out(_NOT_AS_SHOWN)
         _out(f"transcript: {plan.handoff}")
         _out(_FIRST_MESSAGE)
         return 0
@@ -1210,11 +1250,6 @@ def _on_a_terminal() -> bool:
         return sys.stdin.isatty() and sys.stdout.isatty()
     except (AttributeError, ValueError):  # a stream that was closed or replaced
         return False
-
-
-def _not_implemented(args: argparse.Namespace) -> int:
-    _err(f"{args.command}: not implemented")
-    return 1
 
 
 def _quiet_stdout() -> None:
@@ -1333,7 +1368,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # signal does to it stays what it is under the launcher script.
             return _tui(args)
         with _signals():
-            code = _COMMANDS.get(command, _not_implemented)(args)
+            code = _COMMANDS[command](args)
             sys.stdout.flush()
         return code
     except BrokenPipeError:
@@ -1342,7 +1377,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except api.ApiError as exc:
         _err(_reason(exc))
         return 1
-    except MountsError as exc:
+    except api.MountsError as exc:
         _err(exc)
         return 1
     except KeyboardInterrupt:

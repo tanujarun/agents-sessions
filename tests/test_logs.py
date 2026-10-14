@@ -193,6 +193,98 @@ class NeverBreaksTest(LogCase):
         self.assertEqual(self.messages()[-1], "after")
 
 
+class OwnFileTest(LogCase):
+    """AUDIT A-18 (the log's part), A-03 and N-26."""
+
+    WRITE = "from agent_sessions import logs\nlogs.logger().info('hello')\nprint('done')\n"
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes")
+    def test_a_named_pipe_under_the_logs_name_holds_nothing_up(self):
+        """``scan`` hung on it: the open waited for a reader."""
+        self.state.mkdir(parents=True)
+        os.mkfifo(self.path)
+        ((code, out, err),) = finish(self, [python_child(self.WRITE)], timeout=20)
+        self.assertEqual((code, out, err), (0, "done\n", ""))
+        self.assertTrue(stat.S_ISFIFO(os.stat(self.path).st_mode))  # left as it is
+        # With a reader on the other end the open would succeed: still not written to.
+        reader = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        logs.logger().info("not into a pipe")
+        self.assertEqual(os.read(reader, 100), b"")
+        self.assertEqual(os.listdir(self.state), [LOG_NAME])
+
+    @unittest.skipUnless(POSIX, "devices")
+    def test_a_link_to_a_device_is_not_opened(self):
+        self.state.mkdir(parents=True)
+        os.symlink("/dev/zero", self.path)
+        with mock.patch.object(os, "open", side_effect=AssertionError("opened")) as opened:
+            logs.logger().info("hello")
+        opened.assert_not_called()
+
+    @unittest.skipUnless(POSIX, "file modes")
+    def test_a_log_with_a_wider_mode_is_tightened(self):
+        logs.logger().info("one")
+        logs.close()
+        os.chmod(self.path, 0o644)
+        logs.logger().info("two")
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
+        self.assertEqual(self.messages(), ["one", "two"])
+
+    @unittest.skipUnless(POSIX, "file modes")
+    def test_our_directories_are_tightened_when_we_write_into_them(self):
+        """AUDIT A-25: README says 0700; the directories 0.1.0 made were 0755
+        and stayed so."""
+        self.state.mkdir(mode=0o700)
+        os.chmod(self.state, 0o755)  # noqa: S103  (the mode an older version left)
+        logs.logger().info("one")
+        self.assertEqual(stat.S_IMODE(os.stat(self.state).st_mode), 0o700)
+        config = fsutil.config_dir()
+        config.mkdir(parents=True)
+        os.chmod(config, 0o755)  # noqa: S103  (the mode an older version left)
+        disk = self.box.mount("Disk")
+        api.set_letter("D:", str(disk))
+        self.assertEqual(stat.S_IMODE(os.stat(config).st_mode), 0o700)
+
+    @unittest.skipUnless(POSIX, "file modes")
+    def test_keep_private(self):
+        target = self.box.root / "ours"
+        target.mkdir()
+        os.chmod(target, 0o751)  # noqa: S103  (wide on purpose: what is tightened)
+        self.assertTrue(fsutil.keep_private(target))
+        self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o700)
+        self.assertFalse(fsutil.keep_private(target))  # already private
+        link = self.box.root / "link"
+        wide = self.box.root / "wide"
+        wide.mkdir()
+        os.chmod(wide, 0o755)  # noqa: S103  (wide on purpose: a link to it is not followed)
+        os.symlink(wide, link)
+        self.assertFalse(fsutil.keep_private(link))
+        self.assertEqual(stat.S_IMODE(os.stat(wide).st_mode), 0o755)
+        afile = self.box.root / "file"
+        afile.write_text("x")
+        self.assertFalse(fsutil.keep_private(afile))
+        self.assertFalse(fsutil.keep_private(self.box.root / "missing"))
+
+    def test_a_message_the_file_cannot_hold_is_escaped_not_dropped(self):
+        """``import <key> (store <path>)`` was lost whenever the path was
+        not UTF-8: the file was opened strict, and the write failed."""
+        handler = logs.PrivateRotatingFile(self.path)
+        self.addCleanup(handler.close)
+        self.assertEqual(handler.errors, "backslashreplace")
+        record = logging.LogRecord("x", logging.INFO, "f", 1, "store caf\udce9 \ud800", (), None)
+        handler.emit(record)  # the handler's own format: nothing has cleaned the text
+        handler.close()
+        self.assertEqual(self.path.read_bytes(), b"store caf\\udce9 \\ud800\n")
+
+    def test_a_path_that_is_not_utf8_is_logged(self):
+        logs.logger().info("import %s (store %s)", "claude:1:2", "/media/caf\udce9/.claude")
+        logs.logger().info("after")
+        self.assertEqual(
+            self.messages(), ["import claude:1:2 (store /media/caf /.claude)", "after"]
+        )
+        self.path.read_bytes().decode("utf-8")  # strict
+
+
 class SafeTextTest(LogCase):
     """A log is read in a terminal, and its values come from stores."""
 
@@ -255,10 +347,18 @@ class DebugTest(LogCase):
         code, out, err = run("--debug", "scan")
         self.assertEqual(code, 0)
         self.assertIn("scan: quick", out)
-        logged = [LINE.match(line).group(4) for line in err.splitlines()]
+        lines = [LINE.match(line) for line in err.splitlines()]
+        logged = [line.group(4) for line in lines if line.group(3) == "INFO"]
         self.assertEqual(len(logged), 1)
         self.assertTrue(logged[0].startswith("scan quick: "))
-        self.assertEqual(len(self.messages()), 2)  # both scans are in the file
+        # AUDIT A-25: --debug logs more than it did (nothing at DEBUG level).
+        debug = [line.group(4) for line in lines if line.group(3) == "DEBUG"]
+        store = self.box.home / ".fake"
+        self.assertIn(f"scan: fake store {store}: 1 candidates", debug)
+        self.assertIn(f"scan: {store}: a from the cache", debug)
+        self.assertTrue(any(line.startswith("tool fake-agent: ") for line in debug), debug)
+        self.assertEqual(len(self.messages("INFO")), 2)  # both scans are in the file
+        self.assertEqual(self.messages("DEBUG"), debug)  # and the second one's details
         # The flag held for that command only: the next one is quiet again.
         self.assertEqual(run("scan")[2], "")
         self.assertEqual(len(logging.getLogger(logs.NAME).handlers), 2)  # the null one, the file

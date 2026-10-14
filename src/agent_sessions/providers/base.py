@@ -8,19 +8,18 @@ warnings an adapter records instead of raising.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import re
 import sqlite3
-import stat
 import threading
-import urllib.parse
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar, NamedTuple
 
-from .. import importer, textsafe
+from .. import fmt, importer, textsafe
 from ..fsutil import NotRegularFile, open_ro
 from ..model import UUID_PATTERN, Candidate, Session, Store
 
@@ -29,23 +28,35 @@ if TYPE_CHECKING:
     from ..pathmap import PathMap
 
 __all__ = [
+    "FILE_READ_MAX",
+    "JSONL_LINE_MAX",
+    "JSONL_STRUCTURE_MAX",
     "SQLITE_ERRORS",
+    "SQLITE_MEMORY_MAX",
+    "SQLITE_VALUE_MAX",
+    "Cancelled",
     "Candidate",
     "ExperimentalOnly",
+    "FileTooLong",
     "NotSupported",
     "Provider",
     "Session",
     "Store",
     "Warnings",
     "between",
+    "cancellable",
+    "check_cancelled",
     "clean_title",
     "collect_warnings",
     "iter_jsonl",
+    "load_json",
+    "mtime",
     "open_ro",
     "open_sqlite_ro",
     "parse_ts",
     "read_lines",
     "read_small",
+    "too_dense",
     "unreadable",
     "warn",
 ]
@@ -309,21 +320,92 @@ _BOM = b"\xef\xbb\xbf"
 # The longest line of a JSONL file that is read, in bytes with its line
 # break. The longest in any real store is 2.74 MB (docs/FORMATS.md); a file
 # on another drive can hold one of any length, and a line is parsed whole.
-JSONL_LINE_MAX = 32 * 1024 * 1024
+JSONL_LINE_MAX = 16 * 1024 * 1024
+# How many brackets, braces and commas a line may hold. What a line costs
+# to parse goes by these, not by its bytes: every one of them makes an
+# object (a list, a dict, an entry), about 100 bytes at the worst
+# (``{"a":0},`` measured on Python 3.11 and 3.14), so 16 MiB of ``[],`` took
+# 460 MB to hold and a million of them take 100 MB. With the line itself and
+# its decoded text that keeps a scan below some 300 MB whatever one line
+# holds. The densest line in the real stores has 29,405, and no line of more
+# than 256 kB has more than 80: those are images and long texts.
+JSONL_STRUCTURE_MAX = 1_000_000
+# How much of one file is read. A sparse file costs nothing to make and has
+# any size (``truncate -s 1P``): without a budget its hole is read to the end,
+# one dropped megabyte after the other, for days. No real session file comes
+# near this; what a longer one holds beyond it is not read.
+FILE_READ_MAX = 2 * 1024 * 1024 * 1024
 _PIECE = 1024 * 1024  # how much of a line is read at a time
+_CHECK_EVERY = 4 * _PIECE  # bytes between two looks at the scan's cancel event
 
 
-def read_lines(fh: BinaryIO, limit: int | None = None) -> Iterator[bytes | None]:
+class Cancelled(BaseException):
+    """Raised inside a long read when the scan it belongs to was cancelled
+    (``cancellable``). Not an ``Exception``: no reader that catches errors
+    to carry on with the next record may swallow it."""
+
+
+class FileTooLong(OSError):
+    """``read_lines`` stopped at its byte budget: the file is longer. An
+    ``OSError``, so a caller that reports an unreadable file reports this."""
+
+    def __init__(self, budget: int) -> None:
+        super().__init__(errno.EFBIG, f"longer than {fmt.size(budget)}")
+        self.budget = budget
+
+
+_reading = threading.local()
+
+
+@contextlib.contextmanager
+def cancellable(event: threading.Event | None) -> Iterator[None]:
+    """For the block, let ``event`` end the long reads of this thread: once
+    it is set, ``read_lines`` (and with it ``iter_jsonl``) and the load of a
+    database raise ``Cancelled`` within a few megabytes. The index puts this
+    around the parse of one candidate, so cancelling a scan does not wait
+    for the file it happens to be in."""
+    before = getattr(_reading, "cancel", None)
+    _reading.cancel = event
+    try:
+        yield
+    finally:
+        _reading.cancel = before
+
+
+def check_cancelled() -> None:
+    """Raise ``Cancelled`` when the read in progress was cancelled."""
+    event = getattr(_reading, "cancel", None)
+    if event is not None and event.is_set():
+        raise Cancelled()
+
+
+def read_lines(
+    fh: BinaryIO, limit: int | None = None, budget: int | None = None
+) -> Iterator[bytes | None]:
     """The lines of a binary file, each with its line break. A line of more
     than ``limit`` bytes (default ``JSONL_LINE_MAX``) comes out as None: it
     is read and dropped a piece at a time, so no more than ``limit`` bytes
-    plus one piece are ever held, however long the line is."""
+    plus one piece are ever held, however long the line is.
+
+    At most ``budget`` bytes of the file are read (default
+    ``FILE_READ_MAX``): a file that goes on raises ``FileTooLong`` after the
+    last line that ended within them. Raises ``Cancelled`` when the scan
+    this read is part of is cancelled (``cancellable``)."""
     limit = JSONL_LINE_MAX if limit is None else limit
+    budget = FILE_READ_MAX if budget is None else budget
     pieces: list[bytes] = []
     size = 0
+    total = 0
+    checked = 0
     while True:
-        piece = fh.readline(_PIECE)
+        piece = fh.readline(min(_PIECE, budget + 1 - total))
         if piece:
+            total += len(piece)
+            if total > budget:
+                raise FileTooLong(budget)
+            if total - checked >= _CHECK_EVERY:
+                checked = total
+                check_cancelled()
             size += len(piece)
             if size > limit:
                 pieces.clear()
@@ -332,10 +414,11 @@ def read_lines(fh: BinaryIO, limit: int | None = None) -> Iterator[bytes | None]
             if not piece.endswith(b"\n"):
                 continue  # the line goes on; at the end of the file the next read is empty
         if size:
-            yield None if size > limit else b"".join(pieces)
+            line = None if size > limit else b"".join(pieces)
+            pieces.clear()  # not held beside the line while the caller works on it
+            yield line
         if not piece:
             return
-        pieces.clear()
         size = 0
 
 
@@ -352,9 +435,50 @@ def read_small(path: StrPath, limit: int) -> bytes | None:
     except OSError:
         return None
     if len(data) > limit:
-        warn(f"larger than {importer.human_size(limit)}; not read", path)
+        warn(f"larger than {fmt.size(limit)}; not read", path)
         return None
     return data
+
+
+def too_dense(document: bytes | str) -> bool:
+    """Whether a JSON document (a line of a JSONL file, a whole file) holds
+    more brackets, braces and commas than ``JSONL_STRUCTURE_MAX``. Counted
+    in the text as it is, what stands between quotes included: the count is
+    never below what the parser meets. A document shorter than the limit
+    cannot pass it and is not counted."""
+    if len(document) <= JSONL_STRUCTURE_MAX:
+        return False
+    marks = (b",", b"[", b"{") if isinstance(document, bytes) else (",", "[", "{")
+    count = 0
+    for mark in marks:
+        count += document.count(mark)  # type: ignore[arg-type]  # bytes in bytes, str in str
+        if count > JSONL_STRUCTURE_MAX:
+            return True
+    return False
+
+
+class TooDense(ValueError):
+    """A JSON document was not parsed: it holds more brackets and commas
+    than ``JSONL_STRUCTURE_MAX``. A ``ValueError``, so a caller that takes
+    a file which is not JSON in its stride takes this one the same way."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            f"more than {JSONL_STRUCTURE_MAX:,} brackets and commas; not parsed as JSON"
+        )
+
+
+def load_json(document: bytes | str) -> Any:
+    """``json.loads`` for a whole document read from a store: bytes are
+    taken as UTF-8 (a byte order mark at the start is passed over, what is
+    not UTF-8 replaced). Raises ``ValueError`` for what is not JSON and for
+    a document that is too dense to parse (``TooDense``), ``RecursionError``
+    for one nested too deeply; catch both."""
+    if too_dense(document):
+        raise TooDense()
+    if isinstance(document, bytes):
+        document = document.decode("utf-8-sig", "replace")
+    return json.loads(document)
 
 
 def iter_jsonl(path: StrPath) -> Iterator[dict[str, Any]]:
@@ -362,10 +486,15 @@ def iter_jsonl(path: StrPath) -> Iterator[dict[str, Any]]:
 
     Blank lines, lines that do not parse (a half-written last line of a live
     session, a line nested too deeply) and lines that are not objects are
-    skipped silently. A line longer than ``JSONL_LINE_MAX`` is skipped
-    without being held in memory, with a warning. A file that cannot be read
-    (one that is not a regular file included) yields what was read so far
-    and records a warning.
+    skipped silently. Skipped with a warning, and without being parsed: a
+    line longer than ``JSONL_LINE_MAX`` (it is not held in memory either),
+    and a line with more than ``JSONL_STRUCTURE_MAX`` brackets and commas. A
+    file that cannot be read (one that is not a regular file included)
+    yields what was read so far and records a warning; so does a file longer
+    than ``FILE_READ_MAX``, of which only that much is read.
+
+    Raises ``Cancelled`` when the scan this read is part of is cancelled
+    (``cancellable``).
     """
     try:
         fh = open_ro(path)
@@ -377,33 +506,53 @@ def iter_jsonl(path: StrPath) -> Iterator[dict[str, Any]]:
         lines = read_lines(fh)
         while True:
             try:
-                raw = next(lines, b"")
+                line = next(lines, b"")
+            except FileTooLong as exc:
+                size = fmt.size(exc.budget)
+                warn(f"longer than {size}; only the first {size} were read", path)
+                return
             except OSError as exc:
                 warn(f"read error: {exc.strerror or exc}", path)
                 return
-            if raw is None:
+            if line is None:
                 first = False
-                size = importer.human_size(JSONL_LINE_MAX)
+                size = fmt.size(JSONL_LINE_MAX)
                 warn(f"a line longer than {size} was skipped", path)
                 continue
-            if not raw:
+            if not line:
                 return
             if first:
                 first = False
-                if raw.startswith(_BOM):
-                    raw = raw[len(_BOM) :]
-            line = raw.rstrip(b"\n").rstrip(b"\r")
-            if not line.strip():
+                if line.startswith(_BOM):
+                    line = line[len(_BOM) :]
+            if line.isspace():
                 continue
+            if too_dense(line):
+                warn(
+                    f"a line with more than {JSONL_STRUCTURE_MAX:,} brackets and commas "
+                    "was skipped",
+                    path,
+                )
+                continue
+            # One copy at a time: the bytes go before the text is parsed.
+            text = line.decode("utf-8", "replace")
+            del line
             try:
-                record = json.loads(line.decode("utf-8", "replace"))
+                record = json.loads(text)
             except (ValueError, RecursionError):
                 continue
+            del text
             if isinstance(record, dict):
                 yield record
 
 
-SQLITE_MEMORY_MAX = 64 * 1024 * 1024  # larger files are opened in place
+# The largest database that is read: more than any conversation database
+# holds (the largest in the real stores is 1.9 MB). It is loaded whole.
+SQLITE_MEMORY_MAX = 256 * 1024 * 1024
+# The longest text or blob, and the longest row, a query may give
+# (SQLITE_LIMIT_LENGTH; SQLite's own default is a gigabyte). A value in a
+# file from another drive can be as large as the file.
+SQLITE_VALUE_MAX = 16 * 1024 * 1024
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 _SQLITE_HEADER = 100
 
@@ -424,7 +573,9 @@ def _harden(con: sqlite3.Connection) -> None:
     untrusted input. ``cell_size_check`` on: cell sizes on a b-tree page are
     checked when it is loaded, not assumed. Defensive mode (where this
     Python can set it, 3.12 and later): no statement can change the schema
-    table or the pages directly.
+    table or the pages directly. And no value or row longer than
+    ``SQLITE_VALUE_MAX`` is handed out: a query that meets one fails
+    (``sqlite3.DataError``) instead of building it in memory.
     """
     con.execute("pragma query_only = 1")
     con.execute("pragma trusted_schema = off")
@@ -433,6 +584,7 @@ def _harden(con: sqlite3.Connection) -> None:
     setconfig = getattr(con, "setconfig", None)
     if defensive is not None and setconfig is not None:
         setconfig(defensive, True)
+    con.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, SQLITE_VALUE_MAX)
 
 
 def _plain_schema(con: sqlite3.Connection) -> None:
@@ -464,88 +616,91 @@ def _plain_schema(con: sqlite3.Connection) -> None:
         )
 
 
-def _sqlite_in_memory(path: StrPath) -> sqlite3.Connection | None:
-    """A read-only in-memory copy of a SQLite file, or None when the file is
-    missing, too large, not a database, or this Python cannot load one.
+def _sqlite_bytes(path: StrPath) -> bytearray:
+    """The bytes of a SQLite file, read through ``open_ro``: SQLite itself
+    never opens the file, so its access time stays where it was and nothing
+    appears beside it. Raises ``sqlite3.Error`` for a file that is missing or
+    unreadable, larger than ``SQLITE_MEMORY_MAX`` (it is not read then), or
+    not a database by its first bytes.
 
-    The bytes are read through ``open_ro``, so SQLite itself never opens the
-    file and its access time stays where it was. Header bytes 18 and 19 (file
-    format write and read version) say 2 for a WAL database; the copy gets 1,
-    because a WAL database in memory would look for a journal it cannot have.
+    Header bytes 18 and 19 (file format write and read version) say 2 for a
+    WAL database; the copy gets 1, because a WAL database in memory would
+    look for a journal it cannot have.
     """
-    if not hasattr(sqlite3.Connection, "deserialize"):
-        return None
+    data = bytearray()
     try:
-        if os.stat(path).st_size > SQLITE_MEMORY_MAX:
-            return None
         with open_ro(path) as fh:
-            data = fh.read(SQLITE_MEMORY_MAX + 1)
-    except OSError:
-        return None
-    if (
-        len(data) > SQLITE_MEMORY_MAX
-        or len(data) < _SQLITE_HEADER
-        or not data.startswith(_SQLITE_MAGIC)
-    ):
-        return None
-    if data[18] == 2 or data[19] == 2:
-        patched = bytearray(data)
-        for offset in (18, 19):
-            if patched[offset] == 2:
-                patched[offset] = 1
-        data = bytes(patched)
-    con = None
-    try:
-        con = sqlite3.connect(":memory:")
-        _harden(con)  # before the file's bytes are loaded: no statement runs on them unprotected
-        con.deserialize(data)
-        con.execute("select count(*) from sqlite_master").fetchone()
-        return con
-    except (sqlite3.Error, OverflowError, ValueError):
-        if con is not None:
-            con.close()
-        return None
+            if os.fstat(fh.fileno()).st_size > SQLITE_MEMORY_MAX:
+                raise sqlite3.DataError(
+                    f"larger than {fmt.size(SQLITE_MEMORY_MAX)}, which no conversation "
+                    "database is; not opened"
+                )
+            checked = 0
+            while len(data) <= SQLITE_MEMORY_MAX:
+                piece = fh.read(min(_PIECE, SQLITE_MEMORY_MAX + 1 - len(data)))
+                if not piece:
+                    break
+                data += piece
+                if len(data) - checked >= _CHECK_EVERY:
+                    checked = len(data)
+                    check_cancelled()
+    except NotRegularFile:
+        raise sqlite3.OperationalError("not a regular file") from None
+    except OSError as exc:
+        raise sqlite3.OperationalError(
+            f"unable to open database file: {exc.strerror or exc}"
+        ) from None
+    if len(data) > SQLITE_MEMORY_MAX:  # it grew while it was read
+        raise sqlite3.DataError(f"larger than {fmt.size(SQLITE_MEMORY_MAX)}; not opened")
+    if len(data) < _SQLITE_HEADER or not data.startswith(_SQLITE_MAGIC):
+        raise sqlite3.DatabaseError("file is not a database")
+    for offset in (18, 19):
+        if data[offset] == 2:
+            data[offset] = 1
+    return data
 
 
 def open_sqlite_ro(path: StrPath, plain_schema: bool = True) -> sqlite3.Connection:
     """Open a SQLite file for reading without leaving a trace.
 
-    Files up to 64 MB are read through ``open_ro`` and loaded into an
-    in-memory connection (see ``_sqlite_in_memory``). Anything else, and any
-    file that does not load that way, is opened in place with
-    ``mode=ro&immutable=1``: plain ``mode=ro`` creates or rewrites
-    ``-shm``/``-wal`` next to a WAL database, ``immutable=1`` does not.
+    The file is read through ``open_ro`` and loaded into an in-memory
+    connection (``_sqlite_bytes``); SQLite never opens it. A plain open
+    would: ``mode=ro`` creates or rewrites ``-shm``/``-wal`` next to a WAL
+    database, and even ``immutable=1`` moves the file's access time. A file
+    of more than ``SQLITE_MEMORY_MAX`` is not opened at all.
 
-    Either way the connection refuses writes, and rows still in a hot
-    ``-wal`` are not visible. The file is not trusted: the connection is
-    hardened before any statement reads it (``_harden``), and a database
-    whose schema holds anything but ordinary tables and indexes is refused
-    (``_plain_schema``; ``plain_schema=False`` leaves that check out, for a
-    database that is known to hold more).
+    The connection refuses writes, and rows still in a hot ``-wal`` are not
+    visible. The file is not trusted: the connection is hardened before the
+    file's bytes are loaded (``_harden``), so no statement ever runs on them
+    unprotected; a value or a row of more than ``SQLITE_VALUE_MAX`` fails the
+    query that meets it; and a database whose schema holds anything but
+    ordinary tables and indexes is refused (``_plain_schema``;
+    ``plain_schema=False`` leaves that check out, for a database that is
+    known to hold more).
 
-    Raises ``sqlite3.Error`` when the file cannot be opened or its schema
-    cannot be read, and at once for something that is not a regular file:
-    SQLite itself would open a named pipe and wait, or read a device. A
-    damaged database can also raise ``UnicodeDecodeError`` from a later
-    query; catch ``SQLITE_ERRORS``.
+    Raises ``sqlite3.Error`` when the file cannot be read, is too large or
+    is not a database with a schema that can be read, and at once for
+    something that is not a regular file. A damaged database can also raise
+    ``UnicodeDecodeError`` from a later query; catch ``SQLITE_ERRORS``.
     """
+    if not hasattr(sqlite3.Connection, "deserialize"):
+        raise sqlite3.NotSupportedError(
+            "this Python's sqlite3 cannot load a database from memory; not opened"
+        )
+    data = _sqlite_bytes(path)
+    con = sqlite3.connect(":memory:")
     try:
-        regular = stat.S_ISREG(os.stat(path).st_mode)
-    except OSError:
-        regular = True  # missing or unreachable: reported by the first query, as before
-    if not regular:
-        raise sqlite3.OperationalError("not a regular file")
-    con = _sqlite_in_memory(path)  # hardened before the bytes were loaded
-    try:
-        if con is None:
-            uri = "file:" + urllib.parse.quote(os.fspath(path)) + "?mode=ro&immutable=1"
-            con = sqlite3.connect(uri, uri=True)
-            _harden(con)
+        _harden(con)  # before the file's bytes are loaded
+        try:
+            con.deserialize(data)
+        except (OverflowError, ValueError) as exc:
+            raise sqlite3.DatabaseError(f"the database cannot be loaded: {exc}") from exc
+        del data
+        con.execute("select count(*) from sqlite_master").fetchone()
         if plain_schema:
             _plain_schema(con)
     except BaseException:
-        if con is not None:
-            con.close()
+        con.close()
         raise
     return con
 
@@ -662,6 +817,17 @@ def parse_ts(value: object, unit: str | None = None) -> str | None:
     except (OverflowError, ValueError):
         return None
     return _iso(moment)
+
+
+def mtime(path: StrPath) -> str | None:
+    """A file's modification time as ``parse_ts`` writes one, or None: the
+    time an adapter falls back to when the session's own records give none.
+    The filesystem counts in seconds, and that unit is said, so a damaged
+    time far in the future is no time instead of a guess at milliseconds."""
+    try:
+        return parse_ts(os.stat(path).st_mtime, unit="s")
+    except OSError:
+        return None
 
 
 def between(text: str, opening: str, closing: str) -> str | None:

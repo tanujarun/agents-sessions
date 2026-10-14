@@ -25,6 +25,7 @@ replace them, for example with ``mock.patch.object(launch, "starter", rec)``.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 import re
 import shlex
@@ -93,6 +94,7 @@ _ADAPTER_NAME = re.compile(r"[a-z][a-z0-9_]*")  # as it stands in a handoff file
 # ``_from_session``: what stands in for every text of the second session, and
 # the fields that are ours, not a store's.
 _PROBE = "00000000-0000-4000-8000-000000000000"
+_log = logging.getLogger(__name__)
 _NOT_DATA = ("provider", "origin")
 
 
@@ -101,9 +103,21 @@ _NOT_DATA = ("provider", "origin")
 INSTALLED = "installed"
 NOT_INSTALLED = "not installed (the command on PATH would install it)"
 NOT_FOUND = "not found"
+UNKNOWN = "unknown: a script that may install the tool"
+# Tool names, comma-separated, whose command the user vouches for: started
+# whatever its script looks like (``tool_state``).
+TRUST_ENV = "AGENT_SESSIONS_TRUST_TOOLS"
+TRUSTED = f"installed (vouched for in {TRUST_ENV})"
 
-WRAPPER_MAX = 4096  # bytes; the wrappers seen are 111 to 419 bytes long
-WRAPPER_COMMANDS = 8  # "a script of a few lines": more commands than this is a program
+WRAPPER_MAX = 64 * 1024  # bytes of a command that are read; the wrappers seen are 111 to 1,700
+# Programs that install software when they are run, as a script names them.
+INSTALLERS = ("mise", "npx", "npm", "pnpm", "pipx", "uv", "uvx", "bunx")
+# An installer named as a command: at the start of a word, or after a path,
+# a quote or what separates commands, and ending the word. ``.mise/x`` in a
+# path is not one; ``/usr/bin/npx`` and ``"$(mise where x)"`` are.
+_INSTALLER = re.compile(
+    r"(?:^|(?<=[\s;|&(`/\"'=]))(" + "|".join(INSTALLERS) + r")(?=$|[\s;|&)`\"'])", re.M
+)
 SEARCH_DEPTH = 3  # directories below a version in which the tool's executable may lie
 SEARCH_ENTRIES = 4000  # directory entries looked at for one tool, at most
 
@@ -114,7 +128,7 @@ class ToolState:
     (None: nothing); ``wrapper`` says that this is a script which installs
     the tool when it is missing; ``installed`` that the tool itself is there
     to be started; ``detail`` is one of ``INSTALLED``, ``NOT_INSTALLED``,
-    ``NOT_FOUND``, for a person."""
+    ``UNKNOWN``, ``TRUSTED``, ``NOT_FOUND``, for a person."""
 
     path: str | None
     installed: bool
@@ -122,52 +136,91 @@ class ToolState:
     detail: str
 
 
-def _wrapper(path: str) -> tuple[str, str] | None:
-    """``(mise spec, tool)`` when the file is an installing wrapper, else
-    None. Recognised by its text (docs/FORMATS.md "What is on PATH"):
-
-        #!/bin/bash
-        export MISE_MINIMUM_RELEASE_AGE=0
-        mise use -g --quiet "<spec>" || exit 1
-        exec mise x "<spec>" -- "<tool>" "$@"
-
-    A short script whose last command is that ``exec``; the quoting may
-    differ and ``mise exec`` is the same as ``mise x``. Anything else, a
-    real program included, is not a wrapper. The file is read, never run.
-    """
+def _read_script(path: str) -> str | None:
+    """The text of a script (a file that starts with ``#!``), its first
+    ``WRAPPER_MAX`` bytes; None for anything else, a program included, and
+    for a file that cannot be read: a script has to be readable to be run,
+    so one that is not is a program. Bytes that are not UTF-8 are replaced,
+    and do not hide the rest. The file is read, never run."""
     try:
         with open_ro(path) as fh:  # regular files only, and it never waits
-            head = fh.read(WRAPPER_MAX + 1)
+            head = fh.read(WRAPPER_MAX)
     except OSError:
         return None
-    if len(head) > WRAPPER_MAX or not head.startswith(b"#!") or b"\0" in head:
+    if not head.startswith(b"#!") or b"\0" in head:
         return None
-    try:
-        lines = head.decode("utf-8").splitlines()[1:]
-    except UnicodeDecodeError:
-        return None
-    commands = [
-        line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")
-    ]
-    if not commands or len(commands) > WRAPPER_COMMANDS:
-        return None
-    try:
-        words = shlex.split(commands[-1])
-    except ValueError:  # quotes that do not close
-        return None
-    if (
-        len(words) != 7
-        or words[0] != "exec"
-        or os.path.basename(words[1]) != "mise"
-        or words[2] not in ("x", "exec")
-        or words[4] != "--"
-        or words[6] != "$@"
-    ):
-        return None
-    spec, tool = words[3], words[5]
-    if not spec or spec.startswith("-") or not tool or tool != os.path.basename(tool):
-        return None
-    return spec, tool
+    return head.decode("utf-8", "replace")
+
+
+def _commands(text: str) -> list[list[str]]:
+    """The words of each command of a script, as a shell would split them,
+    with what separates commands (``;``, ``&&``, ``|``, a parenthesis) as
+    words of their own. A line that ends in a backslash goes on in the
+    next. A line that cannot be split (quotes that do not close there) is
+    left out: the caller treats a script it did not follow as unknown."""
+    found = []
+    for line in text.replace("\\\r\n", "").replace("\\\n", "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        try:
+            found.append(list(lexer))
+        except ValueError:
+            continue
+    return found
+
+
+_SEPARATORS = frozenset({";", "&", "&&", "|", "||", "(", ")", ";;", "|&"})
+
+
+def _mise_calls(text: str) -> list[tuple[list[str], str]] | None:
+    """Every ``mise x`` (or ``mise exec``) in the script, as ``(specs,
+    tool)``: ``mise [options] x [options] <spec>... -- <tool> [args]``,
+    wherever it stands (after ``exec``, ``env -u VAR``, in an ``if``).
+    Every word between ``x`` and ``--`` that is not an option counts as a
+    spec, so the value of an option is one too and has to be installed as
+    well: the safe side. None when such a call is there and is not of that
+    form (no ``--``, no spec, a spec or a tool that is not a plain word)."""
+    calls = []
+    for words in _commands(text):
+        for at, word in enumerate(words):
+            if os.path.basename(word) != "mise":
+                continue
+            rest = words[at + 1 :]
+            verb = next((i for i, w in enumerate(rest) if not w.startswith("-")), None)
+            if verb is None or rest[verb] not in ("x", "exec"):
+                continue
+            rest = rest[verb + 1 :]
+            end = next((i for i, w in enumerate(rest) if w in _SEPARATORS), len(rest))
+            rest = rest[:end]
+            if "--" not in rest:
+                return None
+            cut = rest.index("--")
+            specs = [w for w in rest[:cut] if not w.startswith("-")]
+            tool = rest[cut + 1] if cut + 1 < len(rest) else ""
+            plain = [*specs, tool]
+            if (
+                not specs
+                or not tool
+                or tool != os.path.basename(tool)
+                or tool.startswith("-")
+                or any(ch in w for w in plain for ch in "$`\\")  # a variable, a command
+            ):
+                return None
+            calls.append((specs, tool))
+    return calls
+
+
+def _wrapper(path: str) -> tuple[str, str] | None:
+    """``(mise spec, tool)`` of the first ``mise x`` call of an installing
+    wrapper, else None. Kept for the tests and the documents: ``_inspect``
+    judges every call."""
+    text = _read_script(path)
+    calls = _mise_calls(text) if text is not None else None
+    return (calls[0][0][0], calls[0][1]) if calls else None
 
 
 def _install_name(spec: str) -> str:
@@ -247,14 +300,38 @@ def _executable_below(root: str, tool: str) -> bool:
     return False
 
 
+def _installed(spec: str, tool: str) -> bool:
+    return _executable_below(os.path.join(_mise_installs(), _install_name(spec)), tool)
+
+
 def _inspect(path: str) -> ToolState:
-    found = _wrapper(path)
-    if found is None:
-        return ToolState(path, True, False, INSTALLED)  # a program, or a script of another kind
-    spec, tool = found
-    if _executable_below(os.path.join(_mise_installs(), _install_name(spec)), tool):
-        return ToolState(path, True, True, INSTALLED)
-    return ToolState(path, False, True, NOT_INSTALLED)
+    """Read the command ``path`` (docs/SPEC.md "Tool detection").
+
+    A program, and a script that names no installer, is the tool:
+    installed. A script that runs the tool through ``mise x`` (anywhere in
+    it, in any of the forms ``_mise_calls`` takes) is an installing
+    wrapper: the tool is installed when mise's install directory has it for
+    every spec of every such call. A script that names an installer
+    (``INSTALLERS``) and is not such a wrapper, or is one this module cannot
+    follow, is ``UNKNOWN``: it may install the tool, and it is not started."""
+    text = _read_script(path)
+    if text is None:
+        return ToolState(path, True, False, INSTALLED)  # a program
+    calls = _mise_calls(text)
+    if calls:
+        if all(_installed(spec, tool) for specs, tool in calls for spec in specs):
+            return ToolState(path, True, True, INSTALLED)
+        return ToolState(path, False, True, NOT_INSTALLED)
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    if calls is None or _INSTALLER.search(code):
+        return ToolState(path, False, False, UNKNOWN)
+    return ToolState(path, True, False, INSTALLED)  # a script of another kind
+
+
+def trusted_tools() -> frozenset[str]:
+    """The command names ``AGENT_SESSIONS_TRUST_TOOLS`` vouches for."""
+    value = os.environ.get(TRUST_ENV, "")
+    return frozenset(name.strip() for name in value.split(",") if name.strip())
 
 
 _inspected: dict[tuple[str, str], ToolState] = {}
@@ -262,10 +339,13 @@ _inspected: dict[tuple[str, str], ToolState] = {}
 
 def tool_state(binary: str) -> ToolState:
     """Whether the tool behind the command ``binary`` is installed: ``not
-    found`` when PATH has no such command, ``not installed`` when the command
-    is a wrapper whose tool is missing from mise's installs, ``installed``
-    otherwise (a wrapper whose tool is there, a real program, a script that
-    is not such a wrapper).
+    found`` when PATH has no such command; ``not installed`` when the
+    command is a wrapper whose tool is missing from mise's installs;
+    ``unknown`` for a script that names an installer and is not a wrapper
+    that can be followed; ``installed`` otherwise (a wrapper whose tool is
+    there, a real program, a script that names no installer). A command the
+    user vouches for (``AGENT_SESSIONS_TRUST_TOOLS``) is installed whatever
+    its script is.
 
     Files only; no program is started. What a file says is remembered for
     the life of the process (``forget_tools`` drops it), so asking for every
@@ -273,11 +353,15 @@ def tool_state(binary: str) -> ToolState:
     """
     path = shutil.which(binary) if binary else None
     if path is None:
+        _log.debug("tool %s: %s", binary, NOT_FOUND)
         return ToolState(None, False, False, NOT_FOUND)
     key = (path, _mise_installs())
     state = _inspected.get(key)
     if state is None:
         state = _inspected[key] = _inspect(path)
+        _log.debug("tool %s: %s (%s)", binary, state.detail, path)
+    if not state.installed and binary in trusted_tools():
+        return ToolState(path, True, state.wrapper, TRUSTED)
     return state
 
 
@@ -312,10 +396,6 @@ def _detached(command: list[str], cwd: str | None = None) -> None:
     threading.Thread(target=proc.wait, daemon=True).start()
 
 
-def _spawn(command: list[str], cwd: str | None) -> None:
-    _detached(command, cwd)
-
-
 def _notice(reason: object) -> str:
     """The text of a notification: one line with nothing a terminal or a
     notification daemon would act on (``textsafe.clean``), and never an
@@ -336,7 +416,7 @@ def _notify(reason: str) -> None:
         _detached([tool, "--app-name=agent-sessions", NOTIFY_TITLE, _notice(reason)])
 
 
-starter = _spawn  # starter(command, cwd): open the terminal window
+starter = _detached  # starter(command, cwd): open the terminal window
 notifier = _notify  # notifier(reason): tell the desktop about a failure
 
 
@@ -371,6 +451,13 @@ def terminal_command(app_id: str, argv: list[str]) -> list[str]:
     ``LaunchFailed`` when there is none, naming the variable that settles it.
     Files only (``shutil.which``); nothing is started.
     """
+    found = _terminal_command(app_id, argv)
+    _log.debug("launch: the window is opened with %s", found[: len(found) - len(argv)])
+    return found
+
+
+def _terminal_command(app_id: str, argv: list[str]) -> list[str]:
+    """``terminal_command`` without its log line."""
     chosen = os.environ.get(TERMINAL_ENV, "").strip()
     if chosen:
         try:
@@ -460,6 +547,11 @@ def _check(argv: list[str], binary: str, given: list[str], what: str, done: str)
     state = tool_state(tool) if argv else ToolState(None, False, False, NOT_FOUND)
     if state.path is None:
         raise LaunchFailed(f"{tool} is not installed (not found on PATH)")
+    if state.detail == UNKNOWN:
+        raise LaunchFailed(
+            f"{tool} on PATH is a script that may install the tool, and it was not started; "
+            f"to start it all the same, name it in {TRUST_ENV}"
+        )
     if not state.installed:
         # Starting the wrapper would install the tool: never from here.
         raise LaunchFailed(f"{tool} is {state.detail}")
@@ -470,12 +562,18 @@ def _check(argv: list[str], binary: str, given: list[str], what: str, done: str)
 
 
 def plan(
-    session: Session, provider: Provider, where: str | None = None, here: bool = False
+    session: Session,
+    provider: Provider,
+    where: str | None = None,
+    here: bool = False,
+    importable: bool = True,
 ) -> LaunchPlan:
     """The resume command for ``session``; starts nothing.
 
-    ``where`` names the place a foreign session is on, for the refusal.
-    Raises ``LaunchFailed`` with the reason when it cannot be resumed.
+    ``where`` names the place a foreign session is on, for the refusal;
+    ``importable`` says whether it can be imported (the refusal then says
+    to import it, else to continue it as a new session). Raises
+    ``LaunchFailed`` with the reason when it cannot be resumed.
 
     A session's fields are data from a file, possibly one that came from
     another drive. Two rules keep them from being read as options of the
@@ -488,7 +586,11 @@ def plan(
     label = provider.label or provider.name
     if session.origin != "native":
         place = where or session.mount_label or "another drive"
-        raise LaunchFailed(f"this session is on {place}; import it first")
+        if importable:
+            raise LaunchFailed(f"this session is on {place}; import it first")
+        raise LaunchFailed(
+            f"this session is on {place} and cannot be imported; continue it as a new session"
+        )
     if not provider.resumable:
         raise LaunchFailed(
             f"{label} sessions cannot be resumed here: the {label} CLI is not installed"
@@ -618,11 +720,15 @@ def launch(
     where: str | None = None,
     here: bool = False,
     dry_run: bool = False,
+    importable: bool = True,
 ) -> LaunchPlan:
     """Resume ``session``: in a new terminal window, or with ``here`` in this
     process (``chdir`` then ``exec``; it does not return). ``dry_run`` only
-    builds the plan. A real failure also sends a desktop notification."""
-    return _start(lambda: plan(session, provider, where, here), provider.binary, here, dry_run)
+    builds the plan. A real failure also sends a desktop notification.
+    ``where`` and ``importable`` are ``plan``'s."""
+    return _start(
+        lambda: plan(session, provider, where, here, importable), provider.binary, here, dry_run
+    )
 
 
 def launch_new(
@@ -648,6 +754,12 @@ def _start(planned: Callable[[], _Plan], binary: str, here: bool, dry_run: bool)
     share. ``binary`` names the tool when the system cannot say what failed."""
     try:
         made = planned()
+        _log.debug(
+            "launch: %s, in %s%s",
+            "this process" if here else "a new window",
+            made.cwd,
+            " (a dry run: nothing is started)" if dry_run else "",
+        )
         if dry_run:
             return made
         if here:
@@ -683,6 +795,9 @@ __all__ = [
     "NOT_INSTALLED",
     "TERMINALS",
     "TERMINAL_ENV",
+    "TRUSTED",
+    "TRUST_ENV",
+    "UNKNOWN",
     "XDG_TERMINAL",
     "ContinuePlan",
     "LaunchFailed",
@@ -697,4 +812,5 @@ __all__ = [
     "plan_new",
     "terminal_command",
     "tool_state",
+    "trusted_tools",
 ]

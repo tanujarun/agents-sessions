@@ -1,12 +1,14 @@
 """The helpers adapters share: JSONL, SQLite, timestamps, titles, warnings."""
 
 import contextlib
+import io
 import os
 import sqlite3
 import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -123,9 +125,10 @@ class SqliteTest(TempCase):
         self.assertEqual((before.st_mtime_ns, before.st_size), (after.st_mtime_ns, after.st_size))
 
     def test_plain_ro_would_create_sidecars(self):
-        """The reason for immutable=1 (FORMATS "Rules common to all providers")."""
+        """The reason SQLite itself never opens a store's file (FORMATS
+        "Rules common to all providers")."""
         path = self.make_wal_db()
-        con = sqlite3.connect(f"file:{base.urllib.parse.quote(str(path))}?mode=ro", uri=True)
+        con = sqlite3.connect(f"file:{urllib.parse.quote(str(path))}?mode=ro", uri=True)
         con.execute("select v from t").fetchall()
         made = self.siblings(path)
         con.close()
@@ -212,18 +215,82 @@ class SqliteTest(TempCase):
         self.assertEqual(con.execute("select v from t").fetchone(), ("caf\u00e9",))
         con.close()
 
-    def test_large_file_falls_back_to_the_immutable_open(self):
+    def test_a_file_too_large_to_load_is_not_opened_at_all(self):
+        """AUDIT A-16: a database over the limit used to be opened in place
+        by SQLite, which moved its access time and gave out values of any
+        size. Nothing of it is read now."""
         path = self.make_wal_db()
-        with mock.patch.object(base, "SQLITE_MEMORY_MAX", 1024):  # the file is larger
-            con = open_sqlite_ro(path)
-        self.assertFalse(self.in_memory(con))
-        self.assertEqual(con.execute("select v from t").fetchall(), [("row",)])
-        with self.assertRaises(sqlite3.OperationalError):
-            con.execute("insert into t values ('x')")
-        con.close()
-        self.assertEqual(self.siblings(path), [path.name])
+        os.utime(path, ns=(1_000_000_000, os.stat(path).st_mtime_ns))
+        reads = []
 
-    def test_failed_load_falls_back_to_the_immutable_open(self):
+        class Counting(io.BufferedReader):
+            def read(self, size=-1):
+                reads.append(size)
+                return super().read(size)
+
+        real = base.open_ro
+        with (
+            mock.patch.object(base, "SQLITE_MEMORY_MAX", 1024),  # the file is larger
+            mock.patch.object(base, "open_ro", lambda p: Counting(real(p).detach())),
+            self.assertRaises(sqlite3.DataError) as caught,
+        ):
+            open_sqlite_ro(path)
+        self.assertEqual(
+            str(caught.exception),
+            "larger than 1.0 kB, which no conversation database is; not opened",
+        )
+        self.assertEqual(reads, [])
+        self.assertEqual(self.siblings(path), [path.name])
+        if getattr(os, "O_NOATIME", 0):
+            self.assertEqual(os.stat(path).st_atime_ns, 1_000_000_000)
+        # At the limit exactly it is read.
+        with mock.patch.object(base, "SQLITE_MEMORY_MAX", os.path.getsize(path)):
+            open_sqlite_ro(path).close()
+        self.assertEqual(base.SQLITE_MEMORY_MAX, 256 * 1024 * 1024)
+
+    def test_a_file_that_grows_past_the_limit_while_it_is_read(self):
+        path = self.make_wal_db()
+        data = path.read_bytes()
+        empty = self.tmp / "empty"
+        empty.write_bytes(b"")
+
+        class Growing(io.BytesIO):
+            """Its size was nothing when it was asked; then it has it all."""
+
+            def fileno(self):
+                return self.small.fileno()
+
+        with open(empty, "rb") as small:
+            Growing.small = small
+            with (
+                mock.patch.object(base, "SQLITE_MEMORY_MAX", len(data) - 1),
+                mock.patch.object(base, "open_ro", lambda p: Growing(data)),
+                self.assertRaises(sqlite3.DataError) as caught,
+            ):
+                open_sqlite_ro(path)
+        self.assertIn("not opened", str(caught.exception))
+
+    def test_sqlite_never_opens_the_file_itself(self):
+        """One ``connect`` in the module, and it is the one in memory: no
+        ``immutable=1`` open is left to fall back to."""
+        source = Path(base.__file__).read_text(encoding="utf-8")
+        self.assertEqual(source.count("sqlite3.connect("), 1)
+        self.assertIn('sqlite3.connect(":memory:")', source)
+        self.assertNotIn("uri=True", source)
+        opened = []
+        real = sqlite3.connect
+        good = self.make_wal_db()
+        with mock.patch.object(
+            base.sqlite3, "connect", lambda target, *a, **k: opened.append(target) or real(target)
+        ):
+            open_sqlite_ro(good).close()
+            for name in ("missing.sqlite", "text.db"):
+                with self.assertRaises(sqlite3.Error):
+                    open_sqlite_ro(self.tmp / name)
+                (self.tmp / "text.db").write_bytes(b"not a database " * 40)
+        self.assertEqual(opened, [":memory:"])
+
+    def test_a_load_that_fails_is_an_error_not_another_way_in(self):
         path = self.make_wal_db()
 
         class NoDeserialize(sqlite3.Connection):
@@ -231,20 +298,41 @@ class SqliteTest(TempCase):
                 raise sqlite3.OperationalError("deserialize is not available")
 
         real = sqlite3.connect
-        with mock.patch.object(
-            base.sqlite3,
-            "connect",
-            lambda target, *a, **k: real(
-                target,
-                *a,
-                **dict(k, **({"factory": NoDeserialize} if target == ":memory:" else {})),
+        with (
+            mock.patch.object(
+                base.sqlite3, "connect", lambda target, *a, **k: real(target, factory=NoDeserialize)
             ),
+            self.assertRaises(sqlite3.OperationalError),
         ):
-            con = open_sqlite_ro(path)
-        self.assertFalse(self.in_memory(con))
-        self.assertEqual(con.execute("select v from t").fetchall(), [("row",)])
-        con.close()
+            open_sqlite_ro(path)
+        with (
+            mock.patch.object(base.sqlite3, "Connection", object),  # a build without deserialize
+            self.assertRaises(sqlite3.NotSupportedError),
+        ):
+            open_sqlite_ro(path)
         self.assertEqual(self.siblings(path), [path.name])
+
+    def test_a_value_over_the_limit_fails_the_query_that_meets_it(self):
+        """AUDIT A-16: a 300 MB value in one row cost the scan 625 MB."""
+        path = self.tmp / "big.sqlite"
+        con = sqlite3.connect(path)
+        con.execute("create table t (id integer primary key, v blob)")
+        con.execute("insert into t values (1, zeroblob(2000)), (2, zeroblob(100))")
+        con.commit()
+        con.close()
+        with mock.patch.object(base, "SQLITE_VALUE_MAX", 1000):
+            con = open_sqlite_ro(path)
+        self.assertEqual(con.getlimit(sqlite3.SQLITE_LIMIT_LENGTH), 1000)
+        self.assertEqual(con.execute("select length(v) from t where id = 2").fetchone(), (100,))
+        self.assertEqual(len(con.execute("select v from t where id = 2").fetchone()[0]), 100)
+        with self.assertRaises(sqlite3.DataError) as caught:
+            con.execute("select v from t where id = 1").fetchone()
+        self.assertIn("too big", str(caught.exception))
+        self.assertIsInstance(caught.exception, base.SQLITE_ERRORS)
+        con.close()
+        with contextlib.closing(open_sqlite_ro(path)) as con:  # the real limit: 16 MiB
+            self.assertEqual(con.getlimit(sqlite3.SQLITE_LIMIT_LENGTH), 16 * 1024 * 1024)
+            self.assertEqual(len(con.execute("select v from t where id = 1").fetchone()[0]), 2000)
 
     def test_files_that_are_not_databases(self):
         for name, content in (
@@ -256,25 +344,21 @@ class SqliteTest(TempCase):
             path = self.tmp / name
             path.write_bytes(content)
             with self.subTest(name=name):
-                try:
-                    con = open_sqlite_ro(path)
-                    rows = con.execute("select name from sqlite_master").fetchall()
-                    con.close()
-                except sqlite3.Error:
-                    rows = None  # as before: the error comes on open or first query
-                self.assertIn(rows, (None, []))
+                with self.assertRaises(sqlite3.DatabaseError):
+                    open_sqlite_ro(path)
                 self.assertEqual(path.read_bytes(), content)
                 self.assertFalse((self.tmp / (name + "-wal")).exists())
                 self.assertFalse((self.tmp / (name + "-shm")).exists())
 
-    def test_every_fixture_database_reads_the_same_both_ways(self):
-        """The in-memory copy and the immutable open see the same rows."""
+    def test_every_fixture_database_reads_as_sqlite_itself_reads_it(self):
+        """The in-memory copy holds the rows a plain immutable open of the
+        file sees (that open is this test's own; the package has none)."""
         checked = 0
         for path in sorted(FIXTURES.rglob("*")):
             if path.suffix not in (".db", ".sqlite") or not path.is_file():
                 continue
             before = sorted(p.name for p in path.parent.iterdir())
-            uri = "file:" + base.urllib.parse.quote(str(path)) + "?mode=ro&immutable=1"
+            uri = "file:" + urllib.parse.quote(str(path)) + "?mode=ro&immutable=1"
             dumps = []
             # Grok's search index holds FTS virtual tables: the schema check is left out.
             for con in (open_sqlite_ro(path, plain_schema=False), sqlite3.connect(uri, uri=True)):
@@ -403,25 +487,31 @@ class ParseTsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "f"
             path.write_text("x", encoding="utf-8")
-            from agent_sessions.providers import antigravity, claude, codex, gemini, grok
+            os.utime(path, (1790000000, 1790000000))
+            self.assertEqual(base.mtime(str(path)), "2026-09-21T14:13:20.000000Z")
+            self.assertEqual(base.mtime(path), "2026-09-21T14:13:20.000000Z")
+            self.assertIsNone(base.mtime(path / "missing"))
+            # A clock that was at zero when the file was written: no time, not 1970.
+            os.utime(path, (5, 5))
+            self.assertIsNone(base.mtime(str(path)))
+            # A damaged time far in the future is seconds too, and so no
+            # time: taken for milliseconds it would read as the year 2026.
+            try:
+                os.utime(path, (1790000000123, 1790000000123))
+            except (OSError, OverflowError):
+                return  # this filesystem cannot hold such a time
+            if os.stat(path).st_mtime == 1790000000123:
+                self.assertIsNone(base.mtime(str(path)))
+                self.assertEqual(parse_ts(os.stat(path).st_mtime), "2026-09-21T14:13:20.123000Z")
 
-            for module in (antigravity, claude, codex, gemini, grok):
-                os.utime(path, (1790000000, 1790000000))
-                self.assertEqual(module._mtime(str(path)), "2026-09-21T14:13:20.000000Z")
-                # A clock that was at zero when the file was written: no time, not 1970.
-                os.utime(path, (5, 5))
-                self.assertIsNone(module._mtime(str(path)))
-                # A damaged time far in the future is seconds too, and so no
-                # time: taken for milliseconds it would read as the year 2026.
-                try:
-                    os.utime(path, (1790000000123, 1790000000123))
-                except (OSError, OverflowError):
-                    continue  # this filesystem cannot hold such a time
-                if os.stat(path).st_mtime == 1790000000123:
-                    self.assertIsNone(module._mtime(str(path)))
-                    self.assertEqual(
-                        parse_ts(os.stat(path).st_mtime), "2026-09-21T14:13:20.123000Z"
-                    )
+    def test_the_adapters_share_that_one_helper(self):
+        """AUDIT N-17: each of the five had a copy of its own."""
+        from agent_sessions.providers import antigravity, claude, codex, gemini, grok
+
+        for module in (antigravity, claude, codex, gemini, grok):
+            with self.subTest(module=module.__name__):
+                self.assertIs(module.mtime, base.mtime)
+                self.assertFalse(hasattr(module, "_mtime"))
 
     def test_protobuf_pair(self):
         self.assertEqual(parse_ts({1: 1790000000, 2: 987654321}), "2026-09-21T14:13:20.987654Z")

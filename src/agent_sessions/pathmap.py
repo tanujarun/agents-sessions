@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .errors import ApiError
-from .fsutil import config_dir, listdir_ro, make_private_dir, open_private
+from .fsutil import config_dir, keep_private, listdir_ro, make_private_dir, open_private
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -118,6 +118,7 @@ def _write_overrides(data: Mapping[str, object]) -> None:
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         make_private_dir(path.parent)
+        keep_private(path.parent)
         try:
             with open_private(tmp) as fh:
                 json.dump(data, fh, indent=2, sort_keys=True)

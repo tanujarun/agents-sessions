@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import re
 import shlex
 import shutil
 import sys
@@ -26,9 +27,9 @@ from fixture_world import (
     World,
     files_below,
 )
-from support import FakePath, Sandbox, state_names
+from support import FakePath, Sandbox, claude_transcript, state_names
 
-from agent_sessions import api, cli, launch
+from agent_sessions import api, cli, fsutil, launch, mounts, providers
 from agent_sessions.fsutil import cache_file
 from agent_sessions.index import CACHE_VERSION, Index
 from agent_sessions.model import make_key
@@ -192,7 +193,17 @@ class CliTest(unittest.TestCase):
                     cache_file().write_text(damage, encoding="utf-8")
                     self.assertRegex(Index.load().load_error, r"^unreadable: .+")
                     self.assertEqual(api.load_index().sessions, [])
-                    self.assertEqual(run(*argv), (0, expected[1], self.NOTICE))
+                    code, out, err = run(*argv)
+                    self.assertEqual((code, out), (0, expected[1]))
+                    kept = cache_file().with_name("index.json.unusable")
+                    self.assertRegex(
+                        err,
+                        rf"^{re.escape(self.NOTICE)}agent-sessions: "
+                        rf"{re.escape(str(cache_file()))}: "
+                        rf"the cache could not be used \(unreadable: .+\); it was kept as "
+                        rf"{re.escape(str(kept))} and a new one was written\n$",
+                    )
+                    self.assertEqual(kept.read_text(encoding="utf-8"), damage)
                     self.assertIsNone(Index.load().load_error)
                     self.assertEqual(run(*argv), expected)
 
@@ -329,11 +340,43 @@ class CliTest(unittest.TestCase):
         self.assertIn("2 stores, 4 sessions on disk", out)
         self.assertIn("verify: the index matches the disks", out)
 
+        # A store a quick scan never looks for, made after the last deep scan:
+        # stale, with the advice (AUDIT A-20).
         hidden = self.box.store(self.disk / "node_modules" / "x")
+        code, out, _ = run("verify")
+        self.assertEqual(code, 0)
+        self.assertIn(f"stale: store new since the last deep scan: fake {hidden}\n", out)
+        self.assertIn(
+            "1 store appeared since the last deep scan; run `agent-sessions scan --deep` "
+            "first to compare them too\n",
+            out,
+        )
+        self.assertIn("verify: the index matches the disks", out)
+        # Made before it: a fault of the index.
+        data = json.loads(cache_file().read_text(encoding="utf-8"))
+        later = datetime.now(UTC) + timedelta(seconds=2)
+        data["last_deep"] = later.isoformat(timespec="seconds").replace("+00:00", "Z")
+        cache_file().write_text(json.dumps(data), encoding="utf-8")
         code, out, _ = run("verify")
         self.assertEqual(code, 1)
         self.assertIn(f"DIFFERENT: store on disk but not in the index: fake {hidden}", out)
         self.assertIn("verify: 1 difference", out)
+        self.assertIn("scan --deep", run("verify", "--help")[1])
+
+    def test_scan_says_itself_what_it_could_not_keep(self):
+        """AUDIT A-25: with a cache that cannot be written, ``scan`` said
+        ``warnings: 1 (see status)``, and ``status`` had none."""
+        self.box.cache.write_text("a file where the directory should be", encoding="utf-8")
+        code, out, err = run("scan")
+        self.assertEqual(code, 0)
+        self.assertNotIn("warnings:", out)
+        self.assertRegex(
+            err, rf"^agent-sessions: {re.escape(str(cache_file()))}: cache not saved: "
+        )
+        self.assertEqual(run("status")[1].count("warnings: 0"), 1)
+        code, out, err = run("scan", "--json")
+        self.assertEqual((code, err), (0, ""))  # JSON has it, in its warnings
+        self.assertEqual(len(api.cache_warnings(json.loads(out))), 1)
 
     def test_verify_without_an_index_fails(self):
         code, out, _ = run("verify")
@@ -350,9 +393,10 @@ class CliTest(unittest.TestCase):
         run("scan")
         text = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
         with contextlib.redirect_stdout(text):
-            cli._out("caf\xe9 \udcff")
+            cli._out("caf\xe9 \udcff")  # the odd byte of a file name: a space, as a control is
+            cli._json("caf\xe9 \udcff")  # exact, in what JSON has for it
         text.flush()
-        self.assertEqual(text.buffer.getvalue(), b"caf\\xe9 \\udcff\n")
+        self.assertEqual(text.buffer.getvalue(), b'caf\\xe9  \n"caf\\u00e9 \\udcff"\n')
 
 
 class SessionCommandsTest(unittest.TestCase):
@@ -381,6 +425,34 @@ class SessionCommandsTest(unittest.TestCase):
         self.assertEqual(
             run("open", CODEX_SEGMENTED, "--dry-run"),
             (0, self.command(CODEX_SEGMENTED, self.home, "codex", "resume"), ""),
+        )
+        self.assertEqual((self.w.started, self.w.notified), ([], []))
+
+    def test_open_dry_run_says_when_the_line_is_not_what_would_run(self):
+        """AUDIT N-22: the control characters of a folder's name are printed
+        as spaces, so the ``cd`` line of such a folder is not the command."""
+        odd = self.home / "ev\x1b[2Jil \u202edir"
+        odd.mkdir()
+        session_id = "aaaaaaaa-0000-4000-8000-0000000000e1"
+        claude_transcript(self.home / ".claude", session_id, str(odd))
+        self.w.scan()
+        code, out, err = run("open", session_id, "--dry-run")
+        self.assertEqual((code, err), (0, ""))
+        lines = out.splitlines()
+        self.assertEqual(len(lines), 2)
+        shown = shlex.quote(str(odd)).replace("\x1b", " ").replace("\u202e", " ")
+        self.assertEqual(
+            lines[0],
+            f"cd {shown} && omarchy-launch-tui --app-id=org.omarchy.claude claude "
+            f"--resume {session_id}",
+        )
+        self.assertNotIn("\x1b", out)
+        self.assertEqual(lines[1], cli._NOT_AS_SHOWN)
+        self.assertIn("not exactly what runs", lines[1])
+        # A name with a space or a quote is shown exactly, quoted: no note.
+        code, out, err = run("open", CLAUDE_NATIVE, "--dry-run")
+        self.assertEqual(
+            out.splitlines(), [self.command(CLAUDE_NATIVE, self.home / "My Proj")[:-1]]
         )
         self.assertEqual((self.w.started, self.w.notified), ([], []))
 
@@ -765,6 +837,34 @@ class FindSessionTest(unittest.TestCase):
         turns = [api.Turn("user", "hello", None)]
         with mock.patch("support.FakeProvider.transcript", return_value=turns, create=True):
             self.assertEqual(list(api.transcript("aaa-1", self.index)), turns)
+
+
+class BehindTheFacadeTest(unittest.TestCase):
+    def test_the_command_line_reaches_the_engine_through_the_facade_alone(self):
+        """AUDIT N-16: SPEC says neither front end reaches behind ``api``;
+        ``cli`` imported ``mounts.MountsError`` and ``providers.all_providers``."""
+        source = Path(cli.__file__).read_text(encoding="utf-8")
+        engine = {"api", "fmt", "logs", "textsafe", "__version__", "tui"}
+        imported = set()
+        for line in source.splitlines():
+            found = re.match(r"\s*from \.(\w*) import (.+)", line)
+            if found and found.group(1):
+                imported.add(found.group(1))
+            elif found:
+                imported |= {name.strip() for name in found.group(2).split(",")}
+        typing_only = {"index", "launch", "model"}  # under TYPE_CHECKING: names for annotations
+        self.assertEqual(imported - typing_only, engine)
+        self.assertIs(api.MountsError, mounts.MountsError)
+        self.assertIs(api.all_providers, providers.all_providers)
+        self.assertLessEqual({"MountsError", "all_providers"}, set(api.__all__))
+        self.assertFalse(hasattr(cli, "MountsError") or hasattr(cli, "all_providers"))
+
+    def test_no_dead_code_is_left(self):
+        """AUDIT N-18: three functions nothing called."""
+        self.assertFalse(hasattr(cli, "_not_implemented"))
+        self.assertFalse(hasattr(fsutil, "cache_dir"))
+        self.assertFalse(hasattr(launch, "_spawn"))
+        self.assertIs(launch.starter, launch._detached)  # the hook's default, under its one name
 
 
 class AgeTest(unittest.TestCase):

@@ -119,24 +119,23 @@ class HardenTest(TempCase):
             wanted["defensive"] = True
         return wanted
 
-    def test_both_ways_of_opening_are_hardened(self):
+    def test_the_connection_is_hardened(self):
         path = self.copy()
         with contextlib.closing(open_sqlite_ro(path)) as con:
             self.assertEqual(con.execute("pragma database_list").fetchall()[0][2], "")  # in memory
             self.assertEqual(self.settings(con), self.expected())
+            self.assertEqual(con.getlimit(sqlite3.SQLITE_LIMIT_LENGTH), base.SQLITE_VALUE_MAX)
             self.assertEqual(con.execute("select count(*) from steps").fetchone(), (8,))
+        # There is no second way in: a file too large to load is refused.
         with (
-            mock.patch.object(base, "SQLITE_MEMORY_MAX", 1024),  # too large: opened in place
-            contextlib.closing(open_sqlite_ro(path)) as con,
+            mock.patch.object(base, "SQLITE_MEMORY_MAX", 1024),
+            self.assertRaises(sqlite3.DataError),
         ):
-            self.assertNotEqual(con.execute("pragma database_list").fetchall()[0][2], "")
-            self.assertEqual(self.settings(con), self.expected())
-            self.assertEqual(con.execute("select count(*) from steps").fetchone(), (8,))
+            open_sqlite_ro(path)
         self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), ["c.db"])
 
     def test_nothing_runs_on_the_file_before_the_settings_are_made(self):
-        """In memory, the settings are in place before the bytes are loaded;
-        in place, before the first statement that reads the schema."""
+        """The settings are in place before the bytes are loaded."""
         events: list[str] = []
 
         class Recording(sqlite3.Connection):
@@ -151,6 +150,10 @@ class HardenTest(TempCase):
             def setconfig(self, *args):
                 events.append("setconfig")
                 return super().setconfig(*args)
+
+            def setlimit(self, *args):
+                events.append("setlimit")
+                return super().setlimit(*args)
 
         real = sqlite3.connect
         path = self.copy()
@@ -167,14 +170,8 @@ class HardenTest(TempCase):
             self.assertEqual(events[0], "pragma query_only")
             if hasattr(sqlite3.Connection, "setconfig"):
                 self.assertLess(events.index("setconfig"), loaded, events)
+            self.assertLess(events.index("setlimit"), loaded, events)
             self.assertLess(loaded, first_read)
-            events.clear()
-            with mock.patch.object(base, "SQLITE_MEMORY_MAX", 1024):
-                open_sqlite_ro(path).close()
-            first_read = next(i for i, e in enumerate(events) if e.startswith("select"))
-            self.assertEqual(events[0], "pragma query_only")
-            self.assertLess(events.index("pragma cell_size_check"), first_read, events)
-            self.assertLess(events.index("pragma trusted_schema"), first_read, events)
 
     def test_no_python_without_setconfig_is_left_out(self):
         """Python 3.11 has no ``Connection.setconfig``: the rest still applies."""
@@ -191,12 +188,8 @@ class HardenTest(TempCase):
 
 class PlainSchemaTest(TempCase):
     def refused(self, path) -> str:
-        for limit in (base.SQLITE_MEMORY_MAX, 1024):  # in memory, then in place
-            with (
-                mock.patch.object(base, "SQLITE_MEMORY_MAX", limit),
-                self.assertRaises(sqlite3.DatabaseError) as caught,
-            ):
-                open_sqlite_ro(path)
+        with self.assertRaises(sqlite3.DatabaseError) as caught:
+            open_sqlite_ro(path)
         self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), [path.name])
         return str(caught.exception)
 
@@ -271,22 +264,20 @@ class DamagedDatabaseTest(TempCase):
         path = self.tmp / name
         path.write_bytes(data)
         outcomes = []
-        for limit in (base.SQLITE_MEMORY_MAX, 1024):
-            with mock.patch.object(base, "SQLITE_MEMORY_MAX", limit):
-                try:
-                    with contextlib.closing(open_sqlite_ro(path)) as con:
-                        con.execute("SELECT count(*) FROM steps").fetchone()
-                        con.execute("SELECT metadata FROM steps ORDER BY idx").fetchall()
-                    outcomes.append("read")
-                except base.SQLITE_ERRORS as exc:
-                    outcomes.append(type(exc).__name__)
+        try:
+            with contextlib.closing(open_sqlite_ro(path)) as con:
+                con.execute("SELECT count(*) FROM steps").fetchone()
+                con.execute("SELECT metadata FROM steps ORDER BY idx").fetchall()
+            outcomes.append("read")
+        except base.SQLITE_ERRORS as exc:
+            outcomes.append(type(exc).__name__)
         self.assertEqual(path.read_bytes(), data)
         self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), [name])
         return outcomes
 
     def test_truncated_and_scrambled(self):
         good = GOOD_DB.read_bytes()
-        self.assertEqual(self.read(good), ["read", "read"])
+        self.assertEqual(self.read(good), ["read"])
         for damage in (truncated, scrambled, scrambled_pages):
             outcomes = self.read(damage(good))
             self.assertNotIn("read", outcomes, damage.__name__)

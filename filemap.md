@@ -33,7 +33,7 @@
 - `src/agent_sessions/__init__.py` — package marker, `__version__`
 - `src/agent_sessions/model.py` — `Session` (`for_store`, `from_dict`; `offline`: listed from the cache, its
   drive is not mounted), `Store`, `Candidate`, `make_key`, `UUID_PATTERN` (the default session id grammar)
-- `src/agent_sessions/fsutil.py` — our own locations (`home`, `cache_file`, `cache_dir`, `state_dir`, `config_dir`,
+- `src/agent_sessions/fsutil.py` — our own locations (`home`, `cache_file`, `state_dir`, `config_dir`,
   `log_file`, `lock_file`, `handoff_dir`, env overrides), the check of a folder a user named
   (`existing_folder`: what `import --to` and `continue --in` take) and trace-free reads (`open_ro`, `subdirs`, `listdir_ro`: `O_NOATIME` where the
   platform has it). `open_ro` never waits and reads regular files only: `NotRegularFile` for a named pipe, a
@@ -51,6 +51,9 @@
   write on an appending descriptor, fsync), `open_for_append`/`write` for a caller that holds the lock; the
   two kinds of record, `IMPORT` and `UNDO`; which imports still stand: `ident`, `not_undone` and
   `find_record` (the last import of a session that no undo took back)
+- `src/agent_sessions/fmt.py` — small values as a listing shows them, one copy for both front ends: `age`,
+  `size` (bytes), `project` (the last segment of a folder), `local_time`, `parse_stamp`; each gives `-` for
+  what it cannot place and never raises; and `utc_now`, the clock the engine stamps its files with
 - `src/agent_sessions/textsafe.py` — the one sanitiser for text from a store: `clean` (control and
   bidirectional characters become spaces; `multiline` keeps line feed and tab), `json_escape` (the same
   characters as `\uXXXX` in `--json` output), the set `UNSAFE`. Used by the CLI's output helpers, `clean_title`,
@@ -79,8 +82,11 @@
   `resumable` property, `new_session_argv`: the command for a new session with a first prompt, `evidence_files` and `path_evidence`: recorded folders beyond the sessions' own, for
   the path map; `import_plan` and `import_session` with a chosen folder (`target`) and `experimental`;
   `undo_extras`: what the tool adds beside an imported session), `NotSupported`, `ExperimentalOnly` (an
-  import that is done only when asked for; carries the warning to show first), shared helpers (`iter_jsonl`, `read_lines` and `JSONL_LINE_MAX`,
-  `read_small`, `open_sqlite_ro`, `parse_ts` (nothing outside 1990 to 2100; `unit` for epoch numbers),
+  import that is done only when asked for; carries the warning to show first), shared helpers (`iter_jsonl`, `read_lines` and
+  the bounds of a read: `JSONL_LINE_MAX`, `JSONL_STRUCTURE_MAX` with `too_dense` and `load_json`,
+  `FILE_READ_MAX`; `cancellable`, which lets a scan's cancel event end a read (`Cancelled`);
+  `read_small`, `open_sqlite_ro` (always a copy in memory: `SQLITE_MEMORY_MAX`, `SQLITE_VALUE_MAX`), `mtime`,
+  `parse_ts` (nothing outside 1990 to 2100; `unit` for epoch numbers),
   `clean_title`, `open_ro`), warnings (`warn`, `collect_warnings`)
 - `src/agent_sessions/providers/{claude,codex,grok,antigravity,gemini}.py` — the adapters: store signature,
   `candidates`, `parse`, `transcript`, `resume_argv`, `new_session_argv`, and `import_plan` (Claude, Codex and Grok; Antigravity
@@ -160,6 +166,9 @@
   an old Python, no `venv`, the `PATH` warning, the desktop file's validation, what is not ours and is
   left, `--purge` with its question (a pty), `--yes`; a guard that the real home's installation is
   unchanged; `shellcheck` when it is installed
+- `tests/test_fmt.py` — `fmt` (the steps of an age, units chosen after rounding, nothing it is given makes
+  it raise), that the command line uses that one copy, and the cached times a listing computes with
+  (a time the cache holds that `parse_ts` would not write is dropped on load and read again by the next scan)
 - `tests/test_base_helpers.py` — `iter_jsonl`, `open_sqlite_ro`, `parse_ts`, `clean_title`, warnings, model
 - `tests/test_mounts.py` — mountinfo parsing and filtering, env override, `find_mount`
 - `tests/test_volumes.py` — `mounts` on a fake `/dev/disk` tree and mount table: UUID and label of each
@@ -244,6 +253,11 @@
 - `tests/test_hostile_files.py` — named pipes, devices and directories named like session files (`open_ro`,
   whole scans in a child process under a timeout), over-long lines and the 200 MB line's memory ceiling, size
   caps of files read whole, deeply nested JSON
+- `tests/test_read_bounds.py` — what one file can cost a scan: the byte budget per file (`FILE_READ_MAX`)
+  on sparse files of 16 GiB and 1 PiB (real scans in child processes), a cancel that is seen inside a file
+  (`base.cancellable`), lines and whole documents with too many brackets and commas
+  (`JSONL_STRUCTURE_MAX`, `load_json`), the peak memory of a scan for the dearest lines (`VmHWM` of a
+  child), and databases with a value over `SQLITE_VALUE_MAX` or larger than `SQLITE_MEMORY_MAX`
 - `tests/test_sqlite_hardening.py` — `open_sqlite_ro` on files that are not trusted: the settings made before
   anything is read, schemas with a view, a trigger or a virtual table refused, truncated and scrambled
   databases as one skipped candidate each

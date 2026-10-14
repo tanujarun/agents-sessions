@@ -459,6 +459,17 @@ class MapTest(unittest.TestCase):
         if POSIX:
             self.assertEqual(stat.S_IMODE(os.stat(self.file).st_mode), 0o600)  # tightened
 
+    def test_a_tilde_is_expanded_by_the_command(self):
+        """AUDIT N-20: ``--to``, ``--in`` and ``-o`` expanded it, ``map`` did
+        not, and refused the directory as not absolute."""
+        with mock.patch.dict(os.environ, {"HOME": str(self.data)}):
+            self.assertEqual(run("map", "D:", "~/proj"), (0, f"D: -> {self.data / 'proj'}\n", ""))
+            self.assertEqual(run("map", "E:", "~"), (0, f"E: -> {self.data}\n", ""))
+            # The engine takes an absolute path and nothing else, as before.
+            with self.assertRaises(ApiError):
+                api.set_letter("F:", "~/proj")
+        self.assertEqual(self.saved(), {"D:": str(self.data / "proj"), "E:": str(self.data)})
+
     def test_set_again_replaces(self):
         run("map", "D:", str(self.data))
         run("map", "D:", str(self.disk))

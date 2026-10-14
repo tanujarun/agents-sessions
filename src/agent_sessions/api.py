@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import os
+import pathlib
 import re
 import shlex
 import stat
@@ -28,6 +29,7 @@ from . import index as index_mod
 from . import mounts as mounts_mod
 from . import providers as registry
 from . import unimport as undoing
+from .discover import Skipped
 from .errors import (
     REMEDY_EXPERIMENTAL,
     REMEDY_FOLDER,
@@ -47,13 +49,15 @@ from .fsutil import cache_file, home, log_file
 from .importer import NoFolder
 from .index import Index
 from .launch import ContinuePlan, LaunchPlan
-from .model import Session, make_key
+from .model import Session, Store, make_key
 from .mounts import NATIVE_LABEL, MountsError, list_mounts
 from .providers import all_providers
 from .providers.base import ExperimentalOnly, NotSupported, Provider, Turn, parse_ts
 
 if TYPE_CHECKING:
     import threading
+
+    from .fsutil import StrPath
 
 # Agent CLIs that may be installed but have no adapter (SPEC non-goals).
 NO_READER_TOOLS = ("copilot", "crush", "cursor-agent", "opencode")
@@ -131,6 +135,15 @@ def scan(
     for warning in summary["warnings"]:
         log.warning("scan: %s", warning)
     return summary
+
+
+def cache_warnings(summary: dict) -> list[str]:
+    """The warnings of a scan's summary that are about the cache file
+    itself (not saved, kept aside, damaged entries left out): a front end
+    shows them at once, since the cache that was not written cannot show
+    them later."""
+    prefix = f"{cache_file()}: "
+    return [warning for warning in summary["warnings"] if warning.startswith(prefix)]
 
 
 def list_sessions(provider: str | None = None, index: Index | None = None) -> list[Session]:
@@ -275,6 +288,27 @@ def _newer_than(sig: list, moment: str | None) -> bool:
     return any(mtime_ns is None or mtime_ns >= limit for _path, mtime_ns, _size in sig)
 
 
+def _appeared_since_deep(root: str, mount: str, index: Index) -> bool:
+    """Whether a store the index does not have may have come to be after
+    the last deep scan, which is the one that would have found it: that scan
+    did not walk its drive (the drive was mounted since), or the store's
+    directory changed at or after it (its modification or change time; a
+    directory made, moved or renamed since has both). Never for an index
+    that no deep scan ever made: one that has none lacks everything."""
+    if index.last_deep is None:
+        return False
+    if mount not in index.deep_mounts:
+        return True
+    limit = _epoch_ns(index.last_deep)
+    if limit is None:
+        return True
+    try:
+        found = os.stat(root)
+    except OSError:
+        return True  # gone again since the walk: nothing to hold against the index
+    return max(found.st_mtime_ns, found.st_ctime_ns) >= limit
+
+
 def _moved_on(sig: list) -> bool:
     """True when the files of a recorded signature are different now."""
     return index_mod.signature([row[0] for row in sig]) != sig
@@ -292,8 +326,11 @@ def verify(
     index: stores, skipped stores, cached parses, listed sessions.
     ``differences`` are faults (``ok`` is False when there is one). ``stale``
     lists what changed on disk after the last scan, which is not a fault of
-    the index. ``nested`` lists stores inside another store, which are not
-    listed by design.
+    the index; ``stale_stores`` lists the stores and skipped stores that are
+    on disk and not in the index and that appeared since the last deep scan
+    (``_appeared_since_deep``): a quick scan does not look for them, and the
+    next deep scan finds them. Their sessions are not compared. ``nested``
+    lists stores inside another store, which are not listed by design.
     """
     started = time.monotonic()
     providers = all_providers()
@@ -307,6 +344,7 @@ def verify(
         "cancelled": found.cancelled,
         "differences": [],
         "stale": [],
+        "stale_stores": [],
         "nested": [],
         "stores": 0,
         "sessions": 0,
@@ -322,17 +360,28 @@ def verify(
     differences: list[str] = []
     stale: list[str] = []
 
+    stale_stores: list[str] = []
+    new_stores: set[tuple[str, str]] = set()  # appeared since the last deep scan
     present = {m.path for m in mounts}
     mine = {(r["provider"], r["root"]) for r in index.store_rows if r["present"]}
     theirs = {(s.provider, s.root) for s in truth.stores}
+    on_disk: list[Store | Skipped] = [*truth.stores, *truth.skipped]
+    where = {(s.provider, s.root): s.mount for s in on_disk}
     for provider, root in sorted(theirs - mine):
-        differences.append(f"store on disk but not in the index: {provider} {root}")
+        if _appeared_since_deep(root, where[(provider, root)], index):
+            stale_stores.append(f"store new since the last deep scan: {provider} {root}")
+            new_stores.add((provider, root))
+        else:
+            differences.append(f"store on disk but not in the index: {provider} {root}")
     for provider, root in sorted(mine - theirs):
         differences.append(f"store in the index but not on disk: {provider} {root}")
     mine_skipped = {(s.provider, s.root) for s in index.skipped if s.mount in present}
     theirs_skipped = {(s.provider, s.root) for s in truth.skipped}
     for provider, root in sorted(theirs_skipped - mine_skipped):
-        differences.append(f"skipped store on disk but not in the index: {provider} {root}")
+        if _appeared_since_deep(root, where[(provider, root)], index):
+            stale_stores.append(f"skipped store new since the last deep scan: {provider} {root}")
+        else:
+            differences.append(f"skipped store on disk but not in the index: {provider} {root}")
     for provider, root in sorted(mine_skipped - theirs_skipped):
         differences.append(f"skipped store in the index but not on disk: {provider} {root}")
 
@@ -364,11 +413,24 @@ def verify(
                 if entry is not None and entry["session"] is not None:
                     stale_keys.add(make_key(provider, root, entry["session"]["id"]))
 
+    # The sessions of a store that is new since the last deep scan are not
+    # held against the index, nor are the other copies of those sessions
+    # (which copy is listed can depend on the new one).
+    new_sessions = {
+        (provider, cached["session"]["id"])
+        for provider, root in new_stores
+        for cached in (truth.parsed.get(f"{provider}:{root}") or {}).get("candidates", {}).values()
+        if cached["session"] is not None
+    }
+
     # The derived listing.
     listed = {s.key: s.to_dict() for s in index.sessions}
     wanted = {s.key: s.to_dict() for s in truth.sessions}
     for key in sorted(set(listed) | set(wanted)):
         if key in stale_keys:
+            continue
+        row = listed.get(key) or wanted[key]
+        if (row["provider"], row["id"]) in new_sessions:
             continue
         if key not in listed:
             differences.append(f"session on disk but not listed: {key}")
@@ -386,6 +448,7 @@ def verify(
         ok=not differences,
         differences=differences,
         stale=stale,
+        stale_stores=stale_stores,
         nested=sorted(f"{provider} {root}" for provider, root in nested),
         stores=len(theirs),
         sessions=len(truth.sessions),
@@ -488,8 +551,11 @@ def export_transcript(
     id, the folder as recorded, the times, the message count and what
     exported it), a ``## User`` or ``## Assistant`` section per turn and a
     line ``> tool: <name>`` per tool call; all of it text made safe to show
-    (``textsafe.clean``). ``fmt="json"``: one JSON object per turn and line
-    (``role``, ``text``, ``ts``), exact data (docs/JSON.md).
+    (``textsafe.clean``). Invisible characters are replaced too, and the
+    header says how many there were: for that the transcript is read once
+    before the header is made, and again for the sections. ``fmt="json"``:
+    one JSON object per turn and line (``role``, ``text``, ``ts``), exact
+    data (docs/JSON.md).
 
     Raises at once, before anything is read: ``NotFound``, ``Offline`` for a
     session whose drive is not mounted, ``ExportFailed`` for a format that
@@ -501,21 +567,69 @@ def export_transcript(
     session = find_session(ref, index)
     _need_files(session)
     provider = _provider(session)
-    turns = provider.transcript(session)
     if fmt == exporting.JSON_LINES:
-        return exporting.json_lines(turns)
-    return exporting.markdown(session, provider.label or provider.name, turns)
+        return exporting.json_lines(provider.transcript(session))
+    label = provider.label or provider.name
+    return exporting.markdown(session, label, lambda: provider.transcript(session))
+
+
+def _below(real: str, root: StrPath) -> bool:
+    """Whether the real path ``real`` is ``root`` or lies below it, both
+    taken as the places they really are."""
+    there = os.path.realpath(root)
+    return real == there or real.startswith(there.rstrip(os.sep) + os.sep)
 
 
 def _in_a_store(path: str, index: Index) -> str | None:
     """The root of the session store ``path`` lies in, or None. Whatever
-    links lead there: both are compared as the places they really are."""
+    links lead there: both are compared as the places they really are.
+
+    Not only the stores the index knows: a store on a drive mounted since
+    the last scan is one too. So is every provider's native store, whether
+    it exists yet or not (the tool makes it when it first runs), and any
+    directory on the way up whose name is one a store has and that the
+    provider takes for a store (``Provider.is_store``), as a scan would."""
     real = os.path.realpath(path)
+    providers = all_providers()
     roots = [store.root for store in index.stores] + [store.root for store in index.skipped]
-    for root in sorted(roots):
-        there = os.path.realpath(root)
-        if real == there or real.startswith(there.rstrip(os.sep) + os.sep):
+    for provider in providers:
+        native = provider.native_store()
+        if native is not None:
+            roots.append(os.fspath(native))
+    for root in sorted(set(roots), key=lambda root: (-len(root), root)):  # the closest first
+        if _below(real, root):
             return root
+    current = os.path.dirname(real)
+    while True:
+        name = os.path.basename(current)
+        for provider in providers:
+            if name not in provider.dir_names:
+                continue
+            try:
+                if provider.is_store(pathlib.Path(current)):
+                    return current
+            except OSError:
+                continue
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def _own_file(path: str) -> str | None:
+    """The directory or file of this program's own that ``path`` lies in,
+    or None: the state directory, the configuration directory, the cache
+    directory (or, where ``AGENT_SESSIONS_CACHE`` names the index file
+    itself, that file, its lock and the files saved beside it)."""
+    real = os.path.realpath(path)
+    for own in (fsutil.own_cache_dir(), fsutil.state_dir(), fsutil.config_dir()):
+        if own is not None and _below(real, own):
+            return os.fspath(own)
+    index_file = os.path.realpath(fsutil.cache_file())
+    if real == index_file or real.startswith(index_file + "."):
+        return index_file
+    if real == os.path.realpath(fsutil.index_lock_file()):
+        return os.fspath(fsutil.index_lock_file())
     return None
 
 
@@ -533,16 +647,22 @@ def export_file(
     beside it, then moved into place), for the user alone (0600).
 
     Raises ``ExportFailed`` when the file exists and ``force`` is not set
-    (with it, a regular file is replaced), for a path that will not do, and
-    for one inside a session store, native or not, forced or not: nothing
-    here writes into a store. And what ``export_transcript`` raises."""
+    (with it, a regular file is replaced), for a path that will not do, for
+    one inside a session store, native or not, known to the index or not,
+    forced or not: nothing here writes into a store; and for one of this
+    program's own files (the cache, the state, the configuration). And what
+    ``export_transcript`` raises."""
     index = index if index is not None else load_index()
     pieces = export_transcript(ref, fmt, index)
     if isinstance(path, str) and path and "\0" not in path and os.path.isabs(path):
+        shown = os.path.normpath(path)
         store = _in_a_store(path, index)
         if store is not None:
+            raise ExportFailed(f"{shown} is inside the session store {store}; nothing was written")
+        own = _own_file(path)
+        if own is not None:
             raise ExportFailed(
-                f"{os.path.normpath(path)} is inside the session store {store}; nothing was written"
+                f"{shown} is one of this program's own files ({own}); nothing was written"
             )
     return exporting.write(path, pieces, overwrite=force)
 
@@ -564,6 +684,7 @@ def open_session(
     """
     session = find_session(ref, index)
     where = None
+    importable = True
     if session.origin != "native":
         index = index if index is not None else load_index()
         copy = _native_copy(session, index)  # imported: resume that one
@@ -577,14 +698,18 @@ def open_session(
             where = index.where(session)
             if where == NATIVE_LABEL:  # another store on this machine's own disks
                 where = session.store
+            options = import_options(session, index)
+            importable = options.possible or options.needs_folder or options.experimental
     provider = _provider(session)
     if dry_run:
-        return launch.launch(session, provider, where=where, here=here, dry_run=True)
+        return launch.launch(
+            session, provider, where=where, here=here, dry_run=True, importable=importable
+        )
     log = logs.logger()
     try:
         # Planned once more, for the log: with ``here`` the launch below
         # replaces this process and nothing could be written after it.
-        planned = launch.plan(session, provider, where, here)
+        planned = launch.plan(session, provider, where, here, importable)
     except LaunchFailed:
         pass  # the launch below fails the same way; it notifies, and is logged there
     else:
@@ -596,7 +721,7 @@ def open_session(
             shlex.join(planned.command),
         )
     try:
-        return launch.launch(session, provider, where=where, here=here)
+        return launch.launch(session, provider, where=where, here=here, importable=importable)
     except LaunchFailed as exc:
         log.warning("launch %s refused: %s", session.key, exc.reason)
         raise
@@ -739,6 +864,8 @@ def _hand_over(session: Session, source: Provider, plan: ContinuePlan) -> int:
     try:
         fsutil.make_private_dir(fsutil.state_dir())
         fsutil.make_private_dir(directory)
+        fsutil.keep_private(fsutil.state_dir())
+        fsutil.keep_private(directory)
     except OSError as exc:
         raise ExportFailed(
             f"the directory {directory} cannot be made: {exc.strerror or exc}; nothing was started"
@@ -751,7 +878,8 @@ def _hand_over(session: Session, source: Provider, plan: ContinuePlan) -> int:
             HANDOFF_MAX_AGE // 86400,
             directory,
         )
-    pieces = exporting.markdown(session, source.label or source.name, source.transcript(session))
+    label = source.label or source.name
+    pieces = exporting.markdown(session, label, lambda: source.transcript(session))
     return exporting.write(plan.handoff, pieces, overwrite=True)
 
 
@@ -1492,6 +1620,7 @@ __all__ = [
     "LaunchFailed",
     "LaunchPlan",
     "MountFailed",
+    "MountsError",
     "NoFolder",
     "NotFound",
     "Offline",
@@ -1499,7 +1628,9 @@ __all__ = [
     "UndoFailed",
     "UndoIncomplete",
     "UnimportReport",
+    "all_providers",
     "cache_file",
+    "cache_warnings",
     "can_import",
     "continue_options",
     "continue_session",

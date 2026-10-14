@@ -22,6 +22,8 @@ from .base import (
     between,
     clean_title,
     iter_jsonl,
+    load_json,
+    mtime,
     parse_ts,
     read_small,
     unreadable,
@@ -257,13 +259,6 @@ def _title(scan: _Scan, session_id: str) -> tuple[str, str]:
     return clean_title(session_id[:8]), "id"
 
 
-def _mtime(path: StrPath) -> str | None:
-    try:
-        return parse_ts(os.stat(path).st_mtime, unit="s")
-    except OSError:
-        return None
-
-
 @register
 class Claude(Provider):
     name = "claude"
@@ -325,7 +320,7 @@ class Claude(Provider):
             files.append(side)
         fallback = None
         if scan.started is None or scan.updated is None:
-            fallback = _mtime(path)
+            fallback = mtime(path)
         return Session.for_store(
             store,
             id=session_id,
@@ -352,7 +347,7 @@ class Claude(Provider):
         if raw is None:
             return []
         try:
-            config = json.loads(raw.decode("utf-8-sig", "replace"))
+            config = load_json(raw)
         except (ValueError, RecursionError):
             return []
         projects = config.get("projects") if isinstance(config, dict) else None

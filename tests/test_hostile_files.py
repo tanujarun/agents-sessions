@@ -404,7 +404,9 @@ class ReadLinesTest(TempCase):
         self.assertEqual(seen.items, [])
 
     def test_the_limit_is_far_above_any_real_line(self):
-        self.assertGreaterEqual(base.JSONL_LINE_MAX, 10 * 2_740_000)  # FORMATS: 2.74 MB
+        self.assertGreaterEqual(base.JSONL_LINE_MAX, 6 * 2_740_000)  # FORMATS: 2.74 MB
+        # The densest real line holds 29,405 brackets and commas (in 131 kB).
+        self.assertGreaterEqual(base.JSONL_STRUCTURE_MAX, 30 * 29_405)
 
 
 @unittest.skipUnless(POSIX, "needs resource limits")
