@@ -24,7 +24,6 @@ keywords = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
-    "Environment :: Console :: Curses",
     "Intended Audience :: Developers",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
@@ -47,6 +46,7 @@ dev = [
     "ruff==0.17.0",
     "mypy==2.4.0",
     "coverage==7.16.2",
+    "build==1.6.1",  # `make dist`
 ]
 
 [project.scripts]
@@ -85,6 +85,10 @@ ignore = [
 # The test helpers put <repo>/src on sys.path when imported, so they must come
 # before the first `agent_sessions` import: their own section, ahead of it.
 section-order = ["future", "standard-library", "third-party", "test-support", "first-party", "local-folder"]
+# Said by name, not left to be found under `src`: ruff reads `src` as a glob
+# below the checkout's path, and in a checkout whose path holds `[` or `]` it
+# finds nothing there, so every import of the package counted as third-party.
+known-first-party = ["agent_sessions"]
 
 [tool.ruff.lint.isort.sections]
 test-support = ["support", "tui_support", "fixture_world"]
@@ -141,3 +145,7 @@ branch = true
 [tool.coverage.report]
 show_missing = true
 skip_empty = true
+# The floor `make coverage` (and CI's coverage job) fails under: two points
+# below the total of all suites in one run when it was set (96 %, branch
+# coverage, Python 3.14). Raise it with the total; never lower it to pass.
+fail_under = 94

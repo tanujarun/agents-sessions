@@ -4,9 +4,14 @@ on:
   push:
   pull_request:
 
+# Every job has a time limit: a test that waits for ever (a walk that follows
+# a link in a circle, a child that never answers) must fail the job, not hold
+# a runner until the service ends it. The limits are several times what the
+# job takes.
 jobs:
   linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -27,10 +32,43 @@ jobs:
       - name: TUI tests
         run: make test-tui
 
+  # Every suite in one run under coverage. `coverage report` fails when the
+  # total is under `fail_under` (pyproject.toml).
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install .[tui,dev] into .venv
+        run: make dev
+      - name: All suites under coverage, with the floor
+        run: make coverage
+
+  # What a user of the package gets: the sdist, the wheel built from it, each
+  # installed into a venv of its own and the installed command run.
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install .[tui,dev] into .venv
+        run: make dev
+      - name: Build the sdist and the wheel
+        run: make dist
+      - name: Install each and run agent-sessions --version
+        run: make dist-check
+
   # The Windows port is planned, not done: this job shows how far the engine
   # is from it and must not fail the build.
   windows:
     runs-on: windows-latest
+    timeout-minutes: 20
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4

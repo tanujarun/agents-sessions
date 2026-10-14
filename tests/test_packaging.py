@@ -674,6 +674,108 @@ class DocumentsTest(unittest.TestCase):
         self.assertIn(f"Version {version}.", self.section(self.read("docs/SPEC.md"), "Packaging"))
 
 
+CONSOLE = "Environment :: Console"
+
+
+class BuildTest(unittest.TestCase):
+    """What is built and what CI holds it to (docs/AUDIT.md A-23). The build
+    itself is `make dist` and `make dist-check`; CI runs both."""
+
+    def read(self, name) -> str:
+        return (REPO / name).read_text(encoding="utf-8")
+
+    def jobs(self) -> dict[str, str]:
+        """The text of each job of the workflow, by name."""
+        text = self.read(".github/workflows/ci.yml")
+        body = text[text.index("\njobs:\n") + len("\njobs:\n") :]
+        starts = list(re.finditer(r"(?m)^  ([a-z][\w-]*):\n", body))
+        ends = [found.start() for found in starts[1:]] + [len(body)]
+        return {
+            found.group(1): body[found.end() : end] for found, end in zip(starts, ends, strict=True)
+        }
+
+    def test_the_sdist_carries_no_tests(self):
+        """Without ``MANIFEST.in`` setuptools ships ``tests/test_*.py`` alone,
+        without ``support.py`` and the fixtures: tests that cannot run."""
+        lines = [
+            line
+            for line in self.read("MANIFEST.in").splitlines()
+            if line and not line.startswith("#")
+        ]
+        self.assertEqual(lines, ["include CHANGELOG.md", "prune tests"])
+        self.assertTrue((REPO / "CHANGELOG.md").is_file())
+
+    def test_make_dist_builds_and_make_dist_check_installs(self):
+        makefile = self.read("Makefile")
+        dist = re.search(r"(?m)^dist:.*\n((?:\t.*\n)+)", makefile)
+        self.assertIsNotNone(dist)
+        self.assertIn("-m build --outdir dist", dist.group(1))
+        check = re.search(r"(?m)^dist-check:.*\n((?:\t.*\n)+)", makefile)
+        self.assertIsNotNone(check)
+        for words in ("dist/*.whl dist/*.tar.gz", 'agent-sessions" --version', "tests(/|$$)"):
+            self.assertIn(words, check.group(1))
+        phony = re.search(r"(?m)^\.PHONY: (.*)$", makefile).group(1).split()
+        for target in re.findall(r"(?m)^([a-z][a-z-]*):", makefile):
+            self.assertIn(target, phony)
+        with open(REPO / "pyproject.toml", "rb") as handle:
+            dev = tomllib.load(handle)["project"]["optional-dependencies"]["dev"]
+        self.assertEqual([pin.split("==")[0] for pin in dev], ["ruff", "mypy", "coverage", "build"])
+        for pin in dev:
+            self.assertRegex(pin, r"^[a-z]+==\d+\.\d+\.\d+$")
+
+    def test_every_ci_job_has_a_time_limit(self):
+        jobs = self.jobs()
+        self.assertEqual(sorted(jobs), ["coverage", "linux", "package", "windows"])
+        for name, text in jobs.items():
+            limit = re.search(r"(?m)^    timeout-minutes: (\d+)$", text)
+            self.assertIsNotNone(limit, name)
+            self.assertLessEqual(int(limit.group(1)), 30, name)
+
+    def test_ci_runs_every_gate_on_every_python_and_builds_the_package(self):
+        jobs = self.jobs()
+
+        def runs(name):
+            return re.findall(r"(?m)^        run: (.*)$", jobs[name])
+
+        matrix = re.search(r"python-version: \[(.*)\]", jobs["linux"]).group(1)
+        self.assertEqual(matrix, '"3.11", "3.12", "3.13", "3.14"')
+        self.assertEqual(
+            runs("linux"), ["make dev", "make lint", "make typecheck", "make test", "make test-tui"]
+        )
+        self.assertEqual(runs("coverage"), ["make dev", "make coverage"])
+        self.assertEqual(runs("package"), ["make dev", "make dist", "make dist-check"])
+        self.assertEqual(runs("windows"), ["python -m unittest discover -s tests -v"])
+        self.assertIn("continue-on-error: true", jobs["windows"])
+        for name in ("linux", "coverage", "package"):
+            self.assertNotIn("continue-on-error", jobs[name])
+        makefile = self.read("Makefile")
+        for name in jobs:
+            for command in runs(name):
+                if command.startswith("make "):
+                    self.assertRegex(makefile, rf"(?m)^{command.split()[1]}:", command)
+
+    def test_coverage_has_a_floor(self):
+        with open(REPO / "pyproject.toml", "rb") as handle:
+            report = tomllib.load(handle)["tool"]["coverage"]["report"]
+        self.assertIsInstance(report["fail_under"], int)
+        self.assertGreaterEqual(report["fail_under"], 90)
+        self.assertLess(report["fail_under"], 100)
+        coverage = re.search(r"(?m)^coverage:.*\n((?:\t.*\n)+)", self.read("Makefile"))
+        self.assertTrue(coverage.group(1).rstrip().endswith("coverage report"))  # no --fail-under=0
+
+    def test_lint_knows_the_package_by_name(self):
+        """N-30: found only under ``src``, the package was third-party to
+        ruff in a checkout whose path holds ``[`` or ``]`` (``src`` is read
+        as a glob below that path), and `make lint` failed on every import."""
+        with open(REPO / "pyproject.toml", "rb") as handle:
+            isort = tomllib.load(handle)["tool"]["ruff"]["lint"]["isort"]
+        self.assertEqual(isort["known-first-party"], ["agent_sessions"])
+        self.assertLess(
+            isort["section-order"].index("test-support"),
+            isort["section-order"].index("first-party"),
+        )
+
+
 class MetadataTest(unittest.TestCase):
     def setUp(self):
         with open(REPO / "pyproject.toml", "rb") as handle:
@@ -693,7 +795,8 @@ class MetadataTest(unittest.TestCase):
             self.assertIn(f"Programming Language :: Python :: 3.{minor}", classifiers)
         self.assertIn("Operating System :: POSIX :: Linux", classifiers)
         self.assertIn("Environment :: Console", classifiers)
-        self.assertIn("Environment :: Console :: Curses", classifiers)
+        # Textual draws the screen itself; it is not a curses program (N-15).
+        self.assertEqual([c for c in classifiers if c.startswith("Environment")], [CONSOLE])
 
     def test_no_license_is_claimed_before_the_owner_chose_one(self):
         self.assertNotIn("license", self.project)
