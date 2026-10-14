@@ -612,7 +612,9 @@ class UsedSinceTest(UndoCase):
         self.assertTrue((self.transcript / "inside").exists())
         self.assertFalse(self.side.exists())
 
-    def test_what_cannot_be_removed_is_left_and_the_rest_still_goes(self):
+    def failing_unlink(self):
+        """``os.unlink`` that cannot remove the transcript, as when its
+        directory is read-only for a moment."""
         real = os.unlink
 
         def unlink(path, *args, **kwargs):
@@ -620,8 +622,12 @@ class UsedSinceTest(UndoCase):
                 raise PermissionError(13, "Permission denied", str(self.transcript))
             return real(path, *args, **kwargs)
 
-        with mock.patch.object(os, "unlink", unlink):
-            report = api.unimport(CLAUDE_WIN)
+        return mock.patch.object(os, "unlink", unlink)
+
+    def test_what_cannot_be_removed_is_left_and_the_rest_still_goes(self):
+        with self.failing_unlink(), self.assertRaises(api.UndoIncomplete) as caught:
+            api.unimport(CLAUDE_WIN)
+        report = caught.exception.report
         self.assertIn(
             (str(self.transcript), "could not be removed: Permission denied"), report.left
         )
@@ -635,6 +641,49 @@ class UsedSinceTest(UndoCase):
         undone = self.records()[-1]
         self.assertEqual(undone["removed"], sorted(report.removed))
         self.assertEqual([item["path"] for item in undone["left"]], [p for p, _ in report.left])
+        self.assertIs(undone["complete"], False)
+
+    def test_an_undo_that_could_not_remove_everything_does_not_settle_the_import(self):
+        """docs/AUDIT.md A-06: it counted as the undo. The copy that was
+        left could then be neither undone (no import was recorded any more)
+        nor imported again (its names were taken)."""
+        with self.failing_unlink(), self.assertRaises(api.UndoIncomplete) as caught:
+            api.unimport(CLAUDE_WIN)
+        self.assertEqual(
+            caught.exception.reason,
+            "the undo is not complete: 1 of the files and directories of the imported copy "
+            f"could not be removed: {self.transcript} (could not be removed: Permission "
+            "denied). The import still stands; an undo asked for again removes the rest",
+        )
+        self.assertEqual(caught.exception.remedy, "")  # nothing to force: ask again
+        # The import still stands: listed as imported, found by the next undo.
+        self.assertEqual(len(unimport.not_undone(self.records())), 1)
+        self.assertEqual(self.source().imported_as, self.w.session(CLAUDE_WIN, "native").key)
+        # Asked again, plainly: the files the first one removed are not
+        # taken for a copy that was used since, and the rest goes.
+        planned = api.unimport(CLAUDE_WIN, dry_run=True)
+        self.assertEqual(planned.differences, [])
+        report = api.unimport(CLAUDE_WIN)
+        self.assertEqual(report.differences, [])
+        self.assertIn(str(self.transcript), report.removed)
+        self.assertFalse((self.home / ".claude").exists())
+        self.assertEqual([r["record"] for r in self.records()], ["import", "undo", "undo"])
+        self.assertIs(self.records()[-1]["complete"], True)
+        self.assertEqual(unimport.not_undone(self.records()), [])
+        api.import_session(self.source())  # and it can be imported again
+
+    def test_the_command_says_what_is_left_and_exits_one(self):
+        with self.failing_unlink():
+            code, out, err = run("unimport", CLAUDE_WIN, "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn(f"left {self.transcript} (could not be removed: Permission denied)\n", out)
+        self.assertTrue(out.startswith("removed "), out)
+        self.assertTrue(err.startswith("agent-sessions: the undo is not complete: 1 of"), err)
+        self.assertTrue(err.endswith("an undo asked for again removes the rest\n"), err)
+        code, out, err = run("unimport", CLAUDE_WIN, "--yes")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines()[0], f"removed {self.transcript}")
+        self.assertFalse((self.home / ".claude").exists())
 
 
 class OddFilesAndRacesTest(UndoCase):
@@ -694,8 +743,8 @@ class OddFilesAndRacesTest(UndoCase):
         self.assertIn(str(self.side_file), made.files)
         self.assertIn(str(self.side), made.dirs)
         shutil.rmtree(self.side)  # by someone else, meanwhile
-        removed, left = unimport._carry_out(made)
-        self.assertEqual(left, [])
+        removed, left, failed = unimport._carry_out(made)
+        self.assertEqual((left, failed), ([], []))
         self.assertNotIn(str(self.side_file), removed)
         self.assertNotIn(str(self.side), removed)
         gone = (str(self.side_file), str(self.side))
@@ -715,7 +764,10 @@ class OddFilesAndRacesTest(UndoCase):
             return real(path, *args, **kwargs)
 
         with mock.patch.object(os, "rmdir", rmdir):
-            removed, left = unimport._carry_out(made)
+            removed, left, failed = unimport._carry_out(made)
+        # A directory that filled up is left as the plan leaves one; one
+        # that could not be removed is what makes the undo not complete.
+        self.assertEqual(failed, [str(self.target.parent)])
         self.assertEqual(late.read_text(), "just arrived")
         self.assertEqual(
             left,
@@ -1087,17 +1139,45 @@ class ExtrasTest(UndoCase):
         for provider in (Claude(), Codex(), Grok(), Gemini()):
             self.assertEqual(provider.undo_extras(AGY_WIN, self.home / "x"), [])
 
-    def test_without_force_they_are_left_and_reported(self):
-        report = api.unimport(AGY_WIN)
-        self.assertFalse(self.db.exists())
-        for path in self.extras:
-            self.assertTrue(path.exists())
-            self.assertIn((str(path), unimport.EXTRA), report.left)
-        self.assertIn((str(self.dst / "conversations"), unimport.NOT_EMPTY), report.left)
-        self.assertEqual(
-            files_below(self.dst), sorted(os.path.relpath(p, self.dst) for p in self.extras)
+    def test_without_force_the_undo_is_refused_and_says_why(self):
+        """docs/AUDIT.md A-06: a plain undo removed the database and left
+        the tool's files beside it; the forced undo that should have taken
+        them found no import recorded, and the import found the lock file
+        in its way."""
+        reason = self.refused(AGY_WIN)
+        self.assertTrue(
+            reason.startswith("the tool has opened the imported copy since the import: "),
+            reason,
         )
-        self.assertIn("removed only by a forced undo", unimport.EXTRA)
+        self.assertTrue(
+            reason.endswith(
+                "Nothing was removed; a forced undo removes the copy and what the tool made "
+                "beside it"
+            ),
+            reason,
+        )
+        for path in self.extras:
+            self.assertIn(f"{path} was made by the tool since the import", reason)
+        with self.assertRaises(api.UndoFailed) as caught:
+            api.unimport(AGY_WIN)
+        self.assertEqual(caught.exception.remedy, "force")
+        self.assertEqual(
+            caught.exception.differences,
+            [f"{path} was made by the tool since the import" for path in self.extras],
+        )
+        self.assertTrue(self.db.exists())
+        # The command names its flag; the forced undo takes everything.
+        code, out, err = run("unimport", AGY_WIN, "--yes")
+        self.assertEqual((code, out), (1, ""))
+        self.assertTrue(err.endswith("what the tool made beside it (--force)\n"), err)
+        api.unimport(AGY_WIN, force=True)
+        self.assertEqual(files_below(self.dst), [])
+
+    def test_one_of_them_is_enough(self):
+        for path in self.extras[:2]:
+            path.unlink()
+        reason = self.refused(AGY_WIN)
+        self.assertIn(f"{self.extras[2]} was made by the tool since the import", reason)
 
     def test_with_force_they_go_too(self):
         planned = api.unimport(AGY_WIN, force=True, dry_run=True)
@@ -1122,8 +1202,8 @@ class ExtrasTest(UndoCase):
         with open(self.db, "ab") as fh:
             fh.write(b"\0" * 4096)
         reason = self.refused(AGY_WIN)
-        self.assertIn("was used since the import", reason)
-        self.assertIn(str(self.db), reason)
+        self.assertIn("the tool has opened the imported copy since the import", reason)
+        self.assertIn(f"{self.db} was ", reason)
         api.unimport(AGY_WIN, force=True)
         self.assertEqual(files_below(self.dst), [])
 
@@ -1240,6 +1320,7 @@ class LockAndRecordTest(UndoCase):
                     + imported["manifest"]["dirs"]
                 ),
                 "left": [],
+                "complete": True,
                 "agent_sessions_version": "0.2.0",
             },
         )

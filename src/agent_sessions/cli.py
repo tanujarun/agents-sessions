@@ -1084,7 +1084,15 @@ def _unimport(args: argparse.Namespace) -> int:
         if not _ask(f"Remove the imported copy {name}, {what}?{used}"):
             _err("nothing was removed")
             return 1
-    report = api.unimport(args.key, force=args.force)
+    try:
+        report = api.unimport(args.key, force=args.force)
+    except api.UndoIncomplete as exc:
+        # What went is printed as for an undo that went through; the line
+        # after it says what is left and that the import still stands.
+        if isinstance(exc.report, api.UnimportReport):
+            _print_undo(exc.report)
+        _err(_reason(exc))
+        return 1
     _print_undo(report)
     _err(
         f"removed the imported copy {name}: "

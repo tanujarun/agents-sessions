@@ -147,6 +147,9 @@ def not_undone(records: Iterable[dict]) -> list[dict]:
     that is still standing, so the records are settled in order: an ``undo``
     cancels the nearest import before it of the same provider and id.
 
+    An undo whose record says ``"complete": false`` could not remove all
+    of the copy, and takes nothing back: the next undo goes on from it.
+
     Only an ``import`` record is an import that stands: a ``begin`` is one
     that had not ended when it was written, and a ``rollback`` says that it
     never did (``unsettled`` has the ones that are still open)."""
@@ -158,12 +161,29 @@ def not_undone(records: Iterable[dict]) -> list[dict]:
             continue
         if kind == IMPORT:
             standing.append(record)
-        elif kind == UNDO:
+        elif kind == UNDO and record.get("complete") is not False:
             for position in range(len(standing) - 1, -1, -1):
                 if ident(standing[position]) == whose:
                     del standing[position]
                     break
     return standing
+
+
+def removed_already(records: Iterable[dict], record: dict) -> set[str]:
+    """What the undos of the import ``record`` (one of ``records``) that did
+    not finish (``"complete": false``) removed: the files a later undo of it
+    finds gone, and must not take for a sign that the copy was used."""
+    whose = ident(record)
+    found: set[str] = set()
+    after = False
+    for other in records:
+        if other is record:
+            after = True
+        elif after and other.get("record") == UNDO and other.get("complete") is False:
+            removed = other.get("removed")
+            if ident(other) == whose and isinstance(removed, list):
+                found.update(path for path in removed if isinstance(path, str))
+    return found
 
 
 def _whose_store(record: dict) -> tuple[str, str, object] | None:
@@ -301,6 +321,7 @@ __all__ = [
     "open_for_append",
     "path",
     "read",
+    "removed_already",
     "unsettled",
     "write",
 ]

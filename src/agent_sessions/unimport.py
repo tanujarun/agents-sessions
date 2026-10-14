@@ -56,7 +56,7 @@ from .errors import REMEDY_FORCE, UndoFailed
 from .journal import find_record, not_undone
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Collection, Iterable
 
     from .fsutil import StrPath
 
@@ -64,6 +64,12 @@ DIFFERENCES_SHOWN = 5  # how many differences a refusal names
 
 # Why something is left where it is.
 APPENDED = "a line was added to this file of the tool's; it is left as it is"
+# The same for an import that did not finish and was recorded later
+# (``importer.recover``): whether its line was added is not known.
+APPENDED_MAYBE = (
+    "a line may have been added to this file of the tool's (the import was interrupted and "
+    "recorded later); it is left as it is"
+)
 EXTRA = "made by the tool after the import; removed only by a forced undo"
 NOT_EMPTY = "not empty: it holds something this import did not create"
 NOT_NAMED = "not named after the session; a record without a manifest cannot say more"
@@ -154,13 +160,36 @@ def _outside(path: object, root: str) -> UndoFailed:
     )
 
 
-def _difference(item: dict) -> str | None:
-    """How a file differs from what the record says of it, or None."""
+def _used(differences: list[str], opened: list[str]) -> UndoFailed:
+    """The refusal of an undo whose copy was used since the import."""
+    if opened:
+        start = "the tool has opened the imported copy since the import"
+        end = "a forced undo removes the copy and what the tool made beside it"
+    else:
+        start, end = (
+            "the imported copy was used since the import",
+            "a forced undo removes it all the same",
+        )
+    every = opened + differences
+    more = len(every) - DIFFERENCES_SHOWN
+    return UndoFailed(
+        f"{start}: "
+        + "; ".join(every[:DIFFERENCES_SHOWN])
+        + (f"; and {more} more" if more > 0 else "")
+        + f". Nothing was removed; {end}",
+        differences=every,
+        remedy=REMEDY_FORCE,
+    )
+
+
+def _difference(item: dict, gone: Collection[str] = ()) -> str | None:
+    """How a file differs from what the record says of it, or None. A file
+    in ``gone`` (an undo that did not finish removed it) may be gone."""
     path = item["path"]
     try:
         st = os.lstat(path)
     except FileNotFoundError:
-        return f"{path} is gone"
+        return None if path in gone else f"{path} is gone"
     except OSError as exc:
         return f"{path} cannot be read ({exc.strerror or exc})"
     if not stat.S_ISREG(st.st_mode):
@@ -239,16 +268,20 @@ def plan(
     native_root: StrPath,
     extras: Iterable[str] = (),
     force: bool = False,
+    gone: Iterable[str] = (),
 ) -> UndoPlan:
     """What undoing ``record`` would remove and leave, with the native store
     as it is now. ``extras`` are the provider's (``Provider.undo_extras``).
-    Reads only.
+    ``gone`` is what an earlier undo of this import that did not finish
+    removed already (``journal.removed_already``): such a file being gone
+    is no difference. Reads only.
 
     Raises ``UndoFailed`` for everything an undo refuses: a record for
     another native store, a damaged one, a path outside the native store, a
-    record without a manifest (unless ``force``), and files that differ from
-    the record (unless ``force``; the exception's ``differences`` lists them
-    all, the reason names the first few)."""
+    record without a manifest (unless ``force``), files that differ from
+    the record, and extras that are there: the tool has opened the copy
+    (both unless ``force``; the exception's ``differences`` lists them all,
+    the reason names the first few)."""
     root = os.fspath(native_root)
     ident = journal.ident(record)
     if ident is None:
@@ -263,38 +296,39 @@ def plan(
         )
     made = UndoPlan(provider, session_id, root, record, bool(force))
     going: dict[str, int] = {}  # what is removed: path -> size
+    extras = list(extras)
+    for path in extras:
+        if not importer.below(root, path):
+            raise _outside(path, root)
+    # What the tool makes beside a copy once it has opened it: then the copy
+    # is in use, and only a forced undo takes it, those files included.
+    opened = [
+        f"{path} was made by the tool since the import" for path in extras if os.path.lexists(path)
+    ]
     if "manifest" not in record:
         if not force:
             raise UndoFailed(LEGACY, remedy=REMEDY_FORCE)
         dirs = _legacy(record, root, session_id, going, made.left)
     else:
         items, dirs = _manifest(record, root)
-        made.differences = [text for text in map(_difference, items) if text is not None]
-        if made.differences and not force:
-            shown = "; ".join(made.differences[:DIFFERENCES_SHOWN])
-            more = len(made.differences) - DIFFERENCES_SHOWN
-            raise UndoFailed(
-                "the imported copy was used since the import: "
-                + shown
-                + (f"; and {more} more" if more > 0 else "")
-                + ". Nothing was removed; a forced undo removes it all the same",
-                differences=made.differences,
-                remedy=REMEDY_FORCE,
-            )
+        removed = set(gone)
+        made.differences = [
+            text for item in items if (text := _difference(item, removed)) is not None
+        ]
+        if (made.differences or opened) and not force:
+            raise _used(made.differences, opened)
         for item in items:
             _removable(item["path"], going, made.left)
+    made.differences += opened
 
     appended = record.get("appended")
+    why = APPENDED_MAYBE if record.get("recovered") is True else APPENDED
     for path in appended if isinstance(appended, list) else []:
         if isinstance(path, str):
-            made.left.append((path, APPENDED))
-    for path in extras:
-        if not importer.below(root, path):
-            raise _outside(path, root)
-        if force:
+            made.left.append((path, why))
+    if force:
+        for path in extras:
             _removable(path, going, made.left)
-        elif os.path.lexists(path):
-            made.left.append((path, EXTRA))
 
     # A directory goes when everything in it goes; worked out here, on the
     # names, so that a dry run says what the real run does.
@@ -321,10 +355,14 @@ def plan(
     return made
 
 
-def _carry_out(made: UndoPlan) -> tuple[list[str], list[tuple[str, str]]]:
-    """Remove what a plan lists; returns ``(removed, left)``. What cannot be
-    removed is left and reported, never fatal: the rest still goes."""
+def _carry_out(made: UndoPlan) -> tuple[list[str], list[tuple[str, str]], list[str]]:
+    """Remove what a plan lists; returns ``(removed, left, failed)``. What
+    cannot be removed is left and reported, never fatal: the rest still
+    goes. ``failed`` is what the plan set out to remove and could not: an
+    undo with anything in it is not complete. A directory that holds
+    something by now is not a failure: it is left as the plan leaves one."""
     removed: list[str] = []
+    failed: list[str] = []
     left = list(made.left)
     for path in made.files:
         try:
@@ -333,6 +371,7 @@ def _carry_out(made: UndoPlan) -> tuple[list[str], list[tuple[str, str]]]:
             continue  # gone since the plan was made: nothing to remove
         except OSError as exc:
             left.append((path, f"could not be removed: {exc.strerror or exc}"))
+            failed.append(path)
             continue
         removed.append(path)
     for path in made.dirs:
@@ -345,15 +384,20 @@ def _carry_out(made: UndoPlan) -> tuple[list[str], list[tuple[str, str]]]:
                 left.append((path, NOT_EMPTY))
             else:
                 left.append((path, f"could not be removed: {exc.strerror or exc}"))
+                failed.append(path)
             continue
         removed.append(path)
     for directory in sorted({os.path.dirname(path) for path in removed}):
         fsutil.fsync_dir(directory)  # best effort; one that went with the rest cannot be opened
-    return removed, sorted(set(left))
+    return removed, sorted(set(left)), sorted(failed)
 
 
-def undo_record(made: UndoPlan, removed: list[str], left: list[tuple[str, str]]) -> dict:
-    """The journal record of an undo."""
+def undo_record(
+    made: UndoPlan, removed: list[str], left: list[tuple[str, str]], complete: bool = True
+) -> dict:
+    """The journal record of an undo. One that is not ``complete`` could not
+    remove everything it set out to: it does not take the import back
+    (``journal.not_undone``), and the next undo goes on from it."""
     record = made.record
     return {
         "record": journal.UNDO,
@@ -369,8 +413,29 @@ def undo_record(made: UndoPlan, removed: list[str], left: list[tuple[str, str]])
         "differences": list(made.differences),
         "removed": sorted(removed),
         "left": [{"path": path, "why": why} for path, why in left],
+        "complete": complete,
         "agent_sessions_version": __version__,
     }
+
+
+class Incomplete(UndoFailed):
+    """An undo removed part of a copy and could not remove the rest. Its
+    record says so (``"complete": false``): the import still stands, and an
+    undo asked for again goes on from where this one stopped. ``plan`` is
+    what was removed and left (as ``undo`` returns it), ``record`` the
+    journal's line; ``report`` is the facade's to fill in (``api.unimport``)."""
+
+    def __init__(self, made: UndoPlan, record: dict, failed: list[str]) -> None:
+        shown = "; ".join(f"{path} ({why})" for path, why in made.left if path in failed)
+        super().__init__(
+            f"the undo is not complete: {len(failed)} of the files and directories of the "
+            f"imported copy could not be removed: {shown}. The import still stands; an undo "
+            "asked for again removes the rest"
+        )
+        self.plan = made
+        self.record = record
+        self.failed = failed
+        self.report: object = None
 
 
 def _unfinished(records: Iterable[dict], provider: str, session_id: str, root: str) -> bool:
@@ -407,11 +472,13 @@ def undo(
     undone like any other; one that is not is taken out, and the undo ends
     with ``TAKEN_OUT``: there is no import left to undo.
 
-    Raises ``UndoFailed``, and then nothing was removed. Two exceptions say
-    so in their reason: ``TAKEN_OUT``, and the one for a copy that went
-    while the journal could not take the record of it (the import then
-    still stands in the journal, with its files gone, and a forced undo
-    settles it)."""
+    Raises ``UndoFailed``, and then nothing was removed. The exceptions say
+    so in their reason: ``TAKEN_OUT``; ``Incomplete``, for an undo that
+    removed part of the copy and could not remove the rest (recorded as
+    such: the import still stands, and the next undo goes on from it); and
+    the one for a copy that went while the journal could not take the
+    record of it (the import then still stands in the journal, with its
+    files gone, and a forced undo settles it)."""
     extras = list(extras)
     root = os.fspath(native_root)
     records = read_records()
@@ -422,7 +489,7 @@ def undo(
     if dry_run:
         if record is None:
             raise UndoFailed(UNFINISHED)
-        return plan(record, root, extras, force), None
+        return plan(record, root, extras, force, journal.removed_already(records, record)), None
     try:
         # The state directory is there: the record was read from it.
         with fsutil.lock():
@@ -441,13 +508,13 @@ def undo(
                 if _unfinished(records, provider, session_id, root):
                     raise UndoFailed(NOT_SETTLED)
                 raise UndoFailed(NO_RECORD, no_record=True)
-            made = plan(record, root, extras, force)
+            made = plan(record, root, extras, force, journal.removed_already(records, record))
             # Opened before anything goes: what can still fail for the
             # journal afterwards is one small write.
             fd, created = journal.open_for_append()
             try:
-                removed, left = _carry_out(made)
-                written = undo_record(made, removed, left)
+                removed, left, failed = _carry_out(made)
+                written = undo_record(made, removed, left, complete=not failed)
                 try:
                     journal.write(fd, written)
                 except OSError as exc:
@@ -475,11 +542,14 @@ def undo(
     made.files = [path for path in made.files if path in gone]
     made.dirs = [path for path in made.dirs if path in gone]
     made.left = left
+    if failed:
+        raise Incomplete(made, written, failed)
     return made, written
 
 
 __all__ = [
     "APPENDED",
+    "APPENDED_MAYBE",
     "DIFFERENCES_SHOWN",
     "EXTRA",
     "LEGACY",
@@ -489,6 +559,7 @@ __all__ = [
     "NO_RECORD",
     "TAKEN_OUT",
     "UNFINISHED",
+    "Incomplete",
     "UndoFailed",
     "UndoPlan",
     "find_record",

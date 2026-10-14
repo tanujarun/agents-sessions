@@ -60,6 +60,8 @@ NO_READER_TOOLS = ("copilot", "crush", "cursor-agent", "opencode")
 EXPORT_FORMATS = exporting.FORMATS  # what ``export_transcript`` takes as ``fmt``
 # Why an undo left a file (``UnimportReport.left``) that a forced one removes.
 LEFT_FOR_A_FORCED_UNDO = undoing.EXTRA
+# An undo that removed part of a copy and could not remove the rest.
+UndoIncomplete = undoing.Incomplete
 HANDOFF_MAX_AGE = 30 * 24 * 3600  # seconds; an older handoff file goes with the next continue
 
 _P = ParamSpec("_P")
@@ -1181,6 +1183,26 @@ def _undo_target(ref: Session | str, index: Index) -> tuple[str, str]:
     return session.provider, session.id
 
 
+def _undo_report(
+    name: str, session_id: str, made: undoing.UndoPlan, dry_run: bool
+) -> UnimportReport:
+    keys = [made.record.get(key) for key in ("native_key", "source_key")]
+    native_key, source_key = (key if isinstance(key, str) else None for key in keys)
+    return UnimportReport(
+        provider=name,
+        id=session_id,
+        native_key=native_key,
+        source_key=source_key,
+        removed=made.files + made.dirs,
+        files=len(made.files),
+        left=list(made.left),
+        differences=list(made.differences),
+        forced=made.forced,
+        dry_run=dry_run,
+        bytes=made.bytes,
+    )
+
+
 @_logged
 def unimport(
     ref: Session | str,
@@ -1194,12 +1216,17 @@ def unimport(
     it came from, or the id.
 
     Refused (``UndoFailed``, nothing removed) when no import of the session
-    is recorded (the exception's ``no_record`` is set), and when a file of
-    the copy differs from what the record says of it: the session was used
-    since (its ``differences`` name the files). ``force=True`` removes the copy
-    all the same, together with what the tool made beside it since
-    (``Provider.undo_extras``), and is the only way to undo an import
-    recorded without a manifest.
+    is recorded (the exception's ``no_record`` is set), when a file of the
+    copy differs from what the record says of it, and when the tool has
+    made its files beside the copy (``Provider.undo_extras``): the session
+    was used since (its ``differences`` name the files). ``force=True``
+    removes the copy all the same, together with what the tool made beside
+    it, and is the only way to undo an import recorded without a manifest.
+
+    An undo that removed part of the copy and could not remove the rest
+    raises ``UndoIncomplete``, whose ``report`` says what was removed and
+    what is left: the import still stands, and asking again goes on from
+    there.
 
     Directories go only when they are empty, and a line the import added to
     a file of the tool's stays: ``left`` says what was left and why. With
@@ -1231,6 +1258,13 @@ def unimport(
             dry_run,
             provider.read_back,
         )
+    except undoing.Incomplete as exc:
+        # Part of the copy went: what did and what is left is reported as
+        # for an undo that went through, and the listing is brought up to date.
+        exc.report = _undo_report(name, session_id, exc.plan, dry_run)
+        log.warning("unimport %s %s not complete: %s", name, session_id, exc.reason)
+        Index.load().scan(all_providers(), list_mounts(), deep=False)
+        raise
     except UndoFailed as exc:
         if exc.no_record and any(
             record.get("record") == "rollback"
@@ -1243,21 +1277,7 @@ def unimport(
         if not dry_run:
             log.warning("unimport %s %s refused: %s", name, session_id, exc.reason)
         raise exc from None
-    keys = [made.record.get(key) for key in ("native_key", "source_key")]
-    native_key, source_key = (key if isinstance(key, str) else None for key in keys)
-    report = UnimportReport(
-        provider=name,
-        id=session_id,
-        native_key=native_key,
-        source_key=source_key,
-        removed=made.files + made.dirs,
-        files=len(made.files),
-        left=list(made.left),
-        differences=list(made.differences),
-        forced=made.forced,
-        dry_run=dry_run,
-        bytes=made.bytes,
-    )
+    report = _undo_report(name, session_id, made, dry_run)
     if record is not None:
         log.info(
             "unimport %s %s: removed %d files and directories, left %d: %s",
@@ -1458,6 +1478,7 @@ __all__ = [
     "Offline",
     "Turn",
     "UndoFailed",
+    "UndoIncomplete",
     "UnimportReport",
     "cache_file",
     "can_import",
