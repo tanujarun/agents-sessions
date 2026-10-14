@@ -518,6 +518,21 @@ class KilledImportTest(StoppedImportCase):
         self.assertEqual(run("import", self.source.key)[0], 0)
         self.copy_is_whole()
 
+    def test_killed_between_two_units_then_undone_on_the_command_line(self):
+        self.between_units()
+        code, out, err = run("unimport", CLAUDE_WIN, "--yes")
+        self.assertEqual((code, out, err), (1, "", f"agent-sessions: {unimport.TAKEN_OUT}\n"))
+        self.assertFalse(self.native.exists())
+        self.assertEqual(self.kinds(), ["begin", "rollback"])
+
+    def test_killed_before_the_record_then_undone_on_the_command_line(self):
+        self.killed("placed")
+        code, _out, err = run("unimport", CLAUDE_WIN, "--yes")
+        self.assertEqual(code, 0, err)
+        self.assertIn("removed the imported copy", err)
+        self.assertFalse(self.native.exists())
+        self.assertEqual(self.kinds(), ["begin", "import", "undo"])
+
     def test_killed_with_everything_staged_and_nothing_in_place(self):
         begin = self.killed("first-unit")
         staging = os.path.relpath(begin["staging"], self.native)

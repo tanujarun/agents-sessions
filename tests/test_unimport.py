@@ -32,7 +32,15 @@ from fixture_world import (
     World,
     files_below,
 )
-from support import FIXTURES, LOG_NAME, finish, launcher_child, python_child, state_names
+from support import (
+    FIXTURES,
+    LOG_NAME,
+    finish,
+    launcher_child,
+    python_child,
+    state_names,
+    wait_for,
+)
 
 from agent_sessions import api, cli, fsutil, importer, journal, logs, unimport
 from agent_sessions.providers.antigravity import Antigravity
@@ -47,6 +55,24 @@ from agent_sessions import fsutil
 with fsutil.lock():
     print("held", flush=True)
     sys.stdin.read()
+"""
+# The command line, with an undo that waits two seconds between removing the
+# copy and writing its record, and says when it gets there (``mark``).
+SLOW_UNDO = """
+import time
+from agent_sessions import cli, unimport
+
+real = unimport.undo_record
+
+
+def slow(*args, **kwargs):
+    open(sys.argv[1], "w").close()
+    time.sleep(2)
+    return real(*args, **kwargs)
+
+
+unimport.undo_record = slow
+sys.exit(cli.main(sys.argv[2:]))
 """
 
 
@@ -1296,6 +1322,55 @@ class LockAndRecordTest(UndoCase):
         self.assertEqual(lost, f"agent-sessions: {unimport.NO_RECORD}\n")
         self.assertEqual([r["record"] for r in self.records()], ["import", "undo"])
         self.assertFalse((self.home / ".claude").exists())
+
+    @unittest.skipUnless(POSIX, "a process held between its removal and its record")
+    def test_a_second_undo_while_the_first_is_half_way_is_told_there_is_none(self):
+        """docs/AUDIT.md A-08: the second undo planned without the lock,
+        found the files the first had just removed gone, and was told the
+        copy was used since and to force it. One situation, one message."""
+        mark = self.w.box.root / "removed"
+        first = python_child(SLOW_UNDO, mark, "unimport", self.imported.key, "--yes")
+        try:
+            wait_for(self, mark)  # the files are gone; the record is not written yet
+            second = run("unimport", self.imported.key, "--yes")
+        finally:
+            ((status, _out, err),) = finish(self, [first])
+        self.assertEqual(status, 0, err)
+        self.assertEqual(second, (1, "", f"agent-sessions: {unimport.NO_RECORD}\n"))
+        # And afterwards, by every name it had: the same words.
+        for ref in (self.imported.key, CLAUDE_WIN, self.source_key):
+            for extra in ((), ("--force",)):
+                with self.subTest(ref=ref, extra=extra):
+                    code, out, err = run("unimport", ref, "--yes", *extra)
+                    self.assertEqual((code, out), (1, ""))
+                    self.assertEqual(err, f"agent-sessions: {unimport.NO_RECORD}\n")
+        self.assertEqual([r["record"] for r in self.records()], ["import", "undo"])
+
+    def test_an_undone_import_asked_for_by_its_key_is_not_recorded(self):
+        """docs/AUDIT.md N-28: by id the answer was "no import of this
+        session is recorded", by the copy's key "no session matches"."""
+        api.unimport(CLAUDE_WIN)
+        for ref in (self.imported.key, CLAUDE_WIN):
+            for dry_run in (True, False):
+                with self.assertRaises(api.UndoFailed) as caught:
+                    api.unimport(ref, dry_run=dry_run)
+                self.assertEqual(caught.exception.reason, unimport.NO_RECORD)
+                self.assertTrue(caught.exception.no_record)
+        # A key that never named an import is still not a session.
+        with self.assertRaises(api.NotFound):
+            api.unimport("claude:nope")
+
+    def test_the_plan_before_the_question_is_made_with_the_lock_held(self):
+        seen = []
+        real = unimport.plan
+
+        def plan(*args, **kwargs):
+            seen.append(fsutil.lock_file().exists())
+            return real(*args, **kwargs)
+
+        with mock.patch.object(unimport, "plan", plan):
+            self.assertEqual(run("unimport", CLAUDE_WIN, "--yes")[0], 0)
+        self.assertEqual(seen, [True, True])  # the one before the question, and the undo's
 
     def test_the_undo_record(self):
         imported = self.records()[0]

@@ -455,6 +455,7 @@ def undo(
     force: bool = False,
     dry_run: bool = False,
     read_back: importer.ReadBack | None = None,
+    under_lock: bool = False,
 ) -> tuple[UndoPlan, dict | None]:
     """Undo the last import of ``session_id`` that still stands: returns
     the plan that was carried out and the record added to the journal.
@@ -464,6 +465,13 @@ def undo(
     carried out with the state directory's lock held, so no import runs
     meanwhile, and the plan's ``files``, ``dirs`` and ``left`` are what was
     really removed and left.
+
+    ``dry_run`` with ``under_lock`` is the plan a front end makes before it
+    asks whether to undo for real: made the way the real undo makes it, with
+    the lock held (after an unfinished import was settled), and nothing
+    removed. A plan made without the lock while another undo of the same
+    import is half way through finds its files gone and calls the copy used;
+    one made with the lock finds that undo finished, and no import to undo.
 
     The first thing done with the lock held is to settle the imports into
     this native store that began and never ended (``importer.recover``;
@@ -486,7 +494,7 @@ def undo(
     unfinished = _unfinished(records, provider, session_id, root)
     if record is None and not unfinished:
         raise UndoFailed(NO_RECORD, no_record=True)
-    if dry_run:
+    if dry_run and not under_lock:
         if record is None:
             raise UndoFailed(UNFINISHED)
         return plan(record, root, extras, force, journal.removed_already(records, record)), None
@@ -509,6 +517,8 @@ def undo(
                     raise UndoFailed(NOT_SETTLED)
                 raise UndoFailed(NO_RECORD, no_record=True)
             made = plan(record, root, extras, force, journal.removed_already(records, record))
+            if dry_run:
+                return made, None
             # Opened before anything goes: what can still fail for the
             # journal afterwards is one small write.
             fd, created = journal.open_for_append()

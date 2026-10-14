@@ -1160,26 +1160,38 @@ class UnimportReport:
 def _undo_target(ref: Session | str, index: Index) -> tuple[str, str]:
     """The provider and session id ``ref`` names for an undo: those of a
     listed session (``find_session``: a key, a start of one, an id), else of
-    the import record that still stands whose native key, source key or id
-    ``ref`` is. The second way finds a copy whose session is not listed any
-    more (its files were removed by hand, its drive forgotten)."""
+    the import record that still stands, or the import that began and never
+    ended, whose native key, source key or id ``ref`` is. The second way
+    finds a copy whose session is not listed any more (its files were
+    removed by hand, its drive forgotten, it was never listed whole).
+
+    A reference to an import that was undone, and is not listed any more
+    for that reason, is answered as one by id is: no import of the session
+    is recorded (``UndoFailed``), not "no session matches"."""
     if isinstance(ref, Session):
         return ref.provider, ref.id
     try:
         session = find_session(ref, index)
     except NotFound as missing:
         text = ref.strip() if isinstance(ref, str) else ""
-        named = sorted(
-            {
-                (record["provider"], record["id"])
-                for record in undoing.not_undone(undoing.read_records())
-                if text
-                and text in (record.get("native_key"), record.get("source_key"), record.get("id"))
-            }
-        )
-        if len(named) != 1:
-            raise missing from None
-        return named[0]
+        records = undoing.read_records()
+
+        def names(record: dict) -> bool:
+            planned = record.get("import") if record.get("record") == "begin" else record
+            keys = planned if isinstance(planned, dict) else {}
+            return bool(text) and text in (
+                keys.get("native_key"),
+                keys.get("source_key"),
+                record.get("id"),
+            )
+
+        live = undoing.not_undone(records) + undoing.journal.unsettled(records)
+        named = sorted({(r["provider"], r["id"]) for r in live if names(r)})
+        if len(named) == 1:
+            return named[0]
+        if not named and any(r.get("record") == "import" and names(r) for r in records):
+            raise UndoFailed(undoing.NO_RECORD, no_record=True) from None
+        raise missing from None
     return session.provider, session.id
 
 
@@ -1209,6 +1221,7 @@ def unimport(
     force: bool = False,
     dry_run: bool = False,
     index: Index | None = None,
+    under_lock: bool = False,
 ) -> UnimportReport:
     """Take an import back: remove from the native store what the last
     import of this session created, and nothing else (``unimport``, the
@@ -1231,7 +1244,11 @@ def unimport(
     Directories go only when they are empty, and a line the import added to
     a file of the tool's stays: ``left`` says what was left and why. With
     ``dry_run=True`` nothing is touched and the report is what would be
-    done. Otherwise the undo is recorded in the journal and a quick scan
+    done; with ``under_lock`` too, the plan is made the way the real undo
+    makes it, with the state directory's lock held (a front end that asks
+    before it undoes plans so: a plan made beside another undo of the same
+    import would call the copy used, where there is no import left).
+    Otherwise the undo is recorded in the journal and a quick scan
     runs afterwards (an ``index`` passed in is not refreshed). Raises
     ``NotFound`` for a reference that names nothing."""
     index = index if index is not None else load_index()
@@ -1247,6 +1264,7 @@ def unimport(
     settled: list[dict] = []
     if not dry_run:
         log.info("unimport %s %s from %s%s", name, session_id, native, " (forced)" if force else "")
+    if under_lock or not dry_run:
         settled = _recover(provider)
     try:
         made, record = undoing.undo(
@@ -1257,6 +1275,7 @@ def unimport(
             force,
             dry_run,
             provider.read_back,
+            under_lock,
         )
     except undoing.Incomplete as exc:
         # Part of the copy went: what did and what is left is reported as

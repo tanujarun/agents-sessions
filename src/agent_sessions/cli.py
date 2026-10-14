@@ -1064,9 +1064,11 @@ def _print_undo(report: api.UnimportReport) -> None:
 
 
 def _unimport(args: argparse.Namespace) -> int:
-    # Planned first, without touching anything: every refusal comes from
-    # here, before a question is asked.
-    planned = api.unimport(args.key, force=args.force, dry_run=True)
+    # Planned first, removing nothing: every refusal comes from here, before
+    # a question is asked. The plan of a real undo is made the way the undo
+    # makes its own, with the lock held: one made beside another undo of the
+    # same import would call the copy used. A dry run takes no lock.
+    planned = api.unimport(args.key, force=args.force, dry_run=True, under_lock=not args.dry_run)
     name = planned.native_key or f"{planned.provider}:{planned.id}"
     what = (
         f"{_count(len(planned.removed), 'file or directory', 'files and directories')} "
