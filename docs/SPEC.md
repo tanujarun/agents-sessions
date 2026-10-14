@@ -99,6 +99,8 @@ src/agent_sessions/
   unimport.py     take an import back
   export.py       a transcript as Markdown or JSON lines
   blake3.py       one-chunk BLAKE3, for Grok's long group names
+  fmt.py          ages, sizes, project names, local times: one copy for both
+                  front ends (audit A-26)
 bin/agent-sessions   thin launcher (symlinked to ~/.local/bin by install.sh)
 install.sh, uninstall.sh   set up from a checkout, and take that back
 share/               agent-sessions.desktop (installed by install.sh)
@@ -225,8 +227,9 @@ It runs on `scan --deep`, and `scan` chooses it by itself when the set of
 mounts changed since the last deep pass or the last one is older than 24 h.
 It runs inline (the TUI calls it from a worker and can cancel it); nothing is
 detached. `scan` without a deep pass does steps 1-2 and re-parses only
-candidates whose signature changed. A mount that vanished
-keeps its sessions out of the listing but its stores stay remembered.
+candidates whose signature changed. A mount that vanished keeps its stores
+remembered, and its sessions stay listed as offline (phase 2, "Offline drives";
+phase 1 left them out of the listing).
 
 ### Read-only rule
 
@@ -235,8 +238,11 @@ Nothing outside the native stores, `~/.cache/agent-sessions/` and
 each written by one command the user gives: `~/.config/agent-sessions/pathmap.json`
 by `map`, and the file `export -o` names, never inside a store. See Phase 2
 "Drive letters" and "Continue as a new session".) **Every** SQLite file,
-native ones too, is opened with `file:<urllib-quoted path>?mode=ro&immutable=1`:
-plain `mode=ro` creates or rewrites `-shm`/`-wal` on these WAL databases.
+native ones too, is read through `fsutil.open_ro` into an in-memory database
+(`providers.base.open_sqlite_ro`; up to 256 MiB, a larger one is not opened at
+all), so no `-shm`/`-wal` file is created or rewritten beside it, as plain
+`mode=ro` does on these WAL databases. (Phase 1 opened a file in place with
+`?mode=ro&immutable=1`; since phase 2 nothing is opened in place: audit A-16.)
 Session files on other drives are opened with `os.O_NOATIME` where the
 platform has it (fall back silently), so a scan does not update access times.
 
@@ -317,29 +323,36 @@ agent-sessions verify                          compare index against a brute-for
 
 This is the phase 1 list, with the flags it has today; the commands phase 2
 added are under "CLI additions". `<key>` is a session key (`list --keys`), a
-unique start of one, or a session id. With no subcommand and no terminal, the
-help is printed and the exit code is 2.
+start of one that only one session has, or a session id. A key is
+`<provider>:<store-hash8>:<id>` and every session of a store shares the first
+two parts, so a start has to reach into the id. With no subcommand and no
+terminal, the help is printed and the exit code is 2.
 
 Exit codes: 0 ok, 1 failure, 2 usage (and, since phase 2, 130, 143 and 129
 after an interrupt: "CLI additions"). The engine functions behind these
 commands are importable; the TUI calls them directly, not through a subprocess.
 
 Text from a store is never printed as it is. Readable output replaces every
-control character and every character that reorders text (the C0 and C1
-controls, DEL, the bidirectional controls, U+2028, U+2029, U+FEFF) with a
-space, one for one; `--json` output stays exact data and writes the same
-characters as `\uXXXX` escapes (`textsafe`).
+control character and every character that reorders or hides text with a
+space, one for one: the C0 and C1 controls, DEL, U+2028, U+2029, the lone
+surrogates U+D800 to U+DFFF, and every format character (Unicode category Cf:
+the bidirectional controls, the zero-width characters, the soft hyphen,
+U+FEFF, the tag characters) with the rest of the tag block U+E0000 to U+E007F.
+`--json` output stays exact data and writes the same characters as `\uXXXX`
+escapes (`textsafe`). (Phase 1 had the controls, the bidirectional controls,
+U+2028, U+2029 and U+FEFF only; the rest came with audit A-03 and A-27.)
 
 ## TUI (function-first)
 
 Started by `agent-sessions` with no arguments, or from the desktop launcher
 (`share/agent-sessions.desktop`, which runs
 `omarchy-launch-tui --app-id=org.omarchy.sessions agent-sessions`).
-`bin/agent-sessions` re-executes itself under `.venv/bin/python` for the TUI
-when the venv exists; if Textual is missing it says how to install it and
-exits 1. Every other subcommand runs on the system Python with no venv. An
-installed package needs no launcher: `cli.main` starts the TUI itself (Phase 2
-"Packaging").
+`bin/agent-sessions` starts the TUI under `.venv/bin/python` when the venv
+exists (with `-P` and a two-line bootstrap, so that the current directory is
+never on `sys.path`: Phase 2 "Packaging"); if Textual is missing it says how
+to install it and exits 1. Every other subcommand runs on the Python that ran
+the launcher, with no venv. An installed package needs no launcher: `cli.main`
+starts the TUI itself (Phase 2 "Packaging").
 
 The screen as it is built, at 80 by 24, on the `All` tab with the fourth row
 selected (drawn by the test driver with the test suite's made-up sessions; the
@@ -415,9 +428,11 @@ terminal is narrower or short.
 
 Behaviour:
 
-- Start shows the cached index at once, then runs a quick scan in a background
+- Start shows the cached index at once, then runs a scan in a background
   thread and refreshes the list in place, keeping the selection on the same
-  session key. A full rescan shows progress in the status line (`scanning
+  session key. Which scan is the engine's choice, as for `scan` without
+  `--deep`: a quick one, or a full walk when the set of mounted drives changed
+  or the last walk is over a day old (phase 1 said "a quick scan"; audit N-37). A full rescan shows progress in the status line (`scanning
   Zephyro… 41k dirs`) and can be cancelled with Esc.
 - No blocking work on the UI thread; scans, imports and transcript loads run
   in Textual workers.
@@ -500,15 +515,25 @@ follow, each enforced in one place and again at the point of use:
   native store are followed: the store is the user's own, and nothing from
   a foreign store can create a link there (an import writes regular files
   and directories only).
-- Everything printed for a person passes `textsafe.clean` (control, C1 and
-  bidi characters). `--json` output is exact data with those characters
-  escaped.
+- Everything printed for a person passes `textsafe.clean` (control and C1
+  characters, lone surrogates, and every format character: bidi controls,
+  zero-width characters, the tag block). `--json` output is exact data with
+  those characters escaped, and valid UTF-8 in every locale.
 - Reads never block and never allocate without a bound: regular files only,
-  capped line and file sizes, a warning for what is skipped.
+  capped line and file sizes, at most 2 GiB read of any one file, a bound on
+  the brackets, braces and commas of a line before it is parsed, SQLite only
+  in memory, and a warning for what is skipped (FORMATS "Size caps"). A
+  scan's cancel is seen inside a file, not only between files.
 - What we keep holds titles, prompts and paths, and is for the user alone:
   the cache index and every file in the state directory (journal, log, lock)
-  are created 0600, the directories made for them 0700, and a cache file
-  with a wider mode is tightened when it is rewritten.
+  are created 0600, the directories made for them 0700, a cache file or a
+  log with a wider mode is tightened when it is opened for writing, and so
+  are our own directories (the cache directory, the state directory, the
+  configuration directory, the handoff directory) when they exist wider; a
+  directory the user named for the index file itself is left alone.
+- The lock file is never opened through a symbolic link and must be a
+  regular file; the journal is read and appended to as a regular file only,
+  and opening it never waits (audit A-18).
 
 ## Tool detection
 
@@ -516,13 +541,32 @@ On this machine every agent command in `~/.local/bin` except `agy` is a
 wrapper that **installs the tool when it is missing** (`mise use -g … ;
 exec mise x <spec> -- <tool>`). `shutil.which` therefore proves nothing.
 `launch.tool_state(binary)` (platform layer) answers `installed`,
-`not installed (the command on PATH would install it)` or `not found`, from
-files only: a wrapper is recognised by its text, its `mise x "<spec>"` spec
-is mapped to mise's install directory, and the tool counts as installed when
-an executable of that name exists there. The answer feeds `launchable`,
-`status`, `launch.plan` (which refuses to start a wrapper of a tool that is
-not installed, so the browser never installs software) and Gemini's
-`resumable`, which becomes "the real CLI is installed" instead of a constant.
+`not installed (the command on PATH would install it)`, `unknown: a script
+that may install the tool`, `installed (vouched for in
+AGENT_SESSIONS_TRUST_TOOLS)` or `not found`, from files only, reading at most
+64 KiB of the command (`WRAPPER_MAX`):
+
+- A `#!` script in which a `mise x` or `mise exec` call is found anywhere
+  (after `exec`, after `env -u VAR`, inside an `if`, after a `;`, with
+  options, with `"${@}"`, over a continued line, with CRLF line ends or a byte
+  that is not UTF-8) is a wrapper. Every such call is followed: its spec is
+  mapped to mise's install directory, and the tool counts as installed only
+  when an executable of that name exists there for every spec of every call;
+  otherwise it is not installed.
+- A `#!` script that names an installer as a command (`mise`, `npx`, `npm`,
+  `pnpm`, `pipx`, `uv`, `uvx`, `bunx`; `launch.INSTALLERS`) and has no such
+  call, or one that cannot be followed, is `unknown`: not launchable and
+  never started, with a refusal that names `AGENT_SESSIONS_TRUST_TOOLS`.
+- `AGENT_SESSIONS_TRUST_TOOLS` is a comma-separated list of commands the user
+  vouches for: such a command counts as installed whatever its script holds.
+- A program, and a script that names no installer, is installed.
+
+(Phase 1 and the first phase 2 version knew one exact wrapper text and took
+every other script for a program: audit A-09.) The answer feeds
+`launchable`, `status`, `launch.plan` (which refuses to start a wrapper of a
+tool that is not installed, or an `unknown` script, so the browser never
+installs software) and Gemini's `resumable`, which becomes "the real CLI is
+installed" instead of a constant.
 
 Terminal (`launch.terminal_command`, for a resume and a continue alike):
 `omarchy-launch-tui --app-id=<id> …` when present; else `xdg-terminal-exec
@@ -572,7 +616,12 @@ all the failure names that variable. `open --dry-run` and `continue
   no `cwd_local`, not launchable, note `drive not mounted`. WHERE shows
   `C: · offline` (`· imported` wins when a native copy exists). They are
   ordered and deduplicated like any other session, and an offline session
-  that was imported still resumes its native copy. The warnings cached for
+  that was imported still resumes its native copy. Of several copies of one
+  session with the same `updated`, the one whose store is on a mounted volume
+  is listed, then the one with the smaller store key (audit A-17). A volume
+  with no known UUID that was remembered at one path is forgotten there when
+  exactly one mounted volume now holds the same stores at the same places
+  below its mount point. The warnings cached for
   a store are shown only while its volume is mounted, and only the stores
   of mounted volumes are evidence for the path map; the letter of a volume
   that is away comes from the `volumes` table (or the override file).
@@ -595,7 +644,12 @@ all the failure names that variable. `open --dry-run` and `continue
   installed; mount the drive from your file manager`, or `no answer after
   120 s (was the password prompt answered?)` (the child is then
   terminated). `subprocess` is allowed in `mounts.py` for this one call,
-  which goes through the hook `mounts.starter`.
+  which goes through the hook `mounts.starter`. It takes a cancel event
+  (`api.mount_drive` hands on the scan's, which the TUI sets when it quits):
+  the wait then looks at it every 0.25 s, and once it is set the child is
+  terminated and `MountFailed("cancelled")` raised. A child still being
+  waited for when the program ends (the TUI waits in a daemon thread and
+  does not wait for it) is terminated on the way out (`atexit`).
 - A volume that comes back at another mount path (the same UUID, mounted,
   at a path other than the remembered one, which is not mounted): at scan
   time its remembered stores at the old path, their cached parses and its
@@ -614,7 +668,28 @@ all the failure names that variable. `open --dry-run` and `continue
   volume as `mounted`, `attached, not mounted` or `not attached`, with its
   letter and UUID (`not mounted` alone when no UUID is known).
 - `verify` compares mounted volumes only: the listing without the offline
-  sessions against the disks.
+  sessions against the disks. A store or a skipped store that is on disk and
+  not in the index is not a difference when the last deep scan could not
+  have seen it (its drive was not part of that scan, or the store's
+  directory changed at or after it): it is reported as stale
+  (`stale_stores`; the command prints `stale: …` and advises `scan --deep`
+  first), and its sessions are not compared. An index that no deep scan
+  ever made still fails on what it lacks (audit A-20).
+- The cache (`index.json`) is the user's, trusted but possibly malformed.
+  It is read through `open_ro` and loaded entry by entry: a store, skipped
+  store, mount, walk, volume, parse or candidate that is not what it should
+  be is left out, and only it, with one warning that counts them. A cached
+  `started` or `updated` that `parse_ts` would not have written is dropped
+  and the entry parsed again. A file that is not JSON, not an object or of
+  a version this program does not read is moved aside to
+  `index.json.unusable` (replacing an older one) before anything is saved,
+  and the scan says so; when it cannot be moved, nothing is saved. A scan
+  holds `index.lock` beside the index from loading to saving, so a scan
+  cannot write back a view older than one another process saved meanwhile;
+  it waits up to 30 s (`index.SCAN_LOCK_WAIT`) or until it is cancelled, and
+  then runs without saving, with a warning. `list`, `status` and the TUI's
+  first paint take no lock. A save removes `index.json.<pid>.tmp` files whose
+  process is gone (audit A-19).
 
 ## Drive letters
 
@@ -640,7 +715,8 @@ all the failure names that variable. `open --dry-run` and `continue
 - **A chosen folder** (`--to`, absolute, must exist): replaces the mapped
   folder, and is the only way to import a session whose folder is gone or
   not recorded. Per provider (FORMATS "Q8"): Claude changes the destination
-  directory only; Codex rewrites the same four cwd fields (a value equal to
+  directory only, named after the folder's real path (the tool looks a
+  session up under its physical working directory; audit N-23); Codex rewrites the same four cwd fields (a value equal to
   the recorded cwd becomes the folder, a value below it the same path below
   the folder, anything else goes through the path map); Grok uses the group
   name and `info.cwd` of the folder's real path. The record keeps both the
@@ -654,7 +730,11 @@ all the failure names that variable. `open --dry-run` and `continue
   is `<slug>-<16 hex of BLAKE3(cwd)>` (FORMATS "Q1"). BLAKE3 is implemented
   for inputs up to 1,024 bytes (one chunk, `blake3.py`) and checked against
   the published test vectors; a longer path is refused, and so is one that
-  is not valid UTF-8. The old `[A-Za-z0-9/ ]` limit goes.
+  is not valid UTF-8. The old `[A-Za-z0-9/ ]` limit goes. The group
+  directory is always that name; a directory of the native store that only
+  decodes to the same folder is not used (audit A-24). A `summary.json` that
+  starts with a UTF-8 byte order mark imports, and the mark is left out of
+  the copy.
 - **Antigravity**: copy-only, exactly as FORMATS "Q5" specifies, and only
   with `--experimental` (the TUI asks a second time and says why): one
   resume by hand has not been done yet, and the tool starts a new
@@ -668,6 +748,36 @@ all the failure names that variable. `open --dry-run` and `continue
   line, appended under a lock; a record lists every file and directory the
   import created with size and modification time. An old `imports.json` is
   read, never rewritten.
+- **An import that dies half way is settled by the next one** (audit A-04).
+  Each import writes a `begin` record before the first unit appears in the
+  native store, flushed to disk under the lock: the destinations, the
+  directories it made and is going to make, its staging directory, a
+  manifest of the staged files (size and modification time, which the
+  placed files will have) and the import record as it will be. It ends with
+  an `import` record, or with a `rollback` record once its own roll back has
+  taken everything out. The next import or undo of that native store
+  settles a `begin` that has neither after it (`importer.recover`, under the
+  lock): forward when every destination is there and the provider reads the
+  copy back as the planned session (an `import` record with `recovered:
+  true` and the staged manifest, so an undo still finds a copy that was used
+  since), otherwise back (the destinations that are there, the staging
+  directory and the directories it made, when empty, are removed, and a
+  `rollback` record is written). A whole copy is never removed. A `begin`
+  that names paths outside the store, or has no valid manifest, is closed
+  without removing anything.
+- **Refused at plan time** (`importer.fits`, in `check` and again in
+  `execute`, whatever the adapter planned; audit A-05): a copy that nests
+  more than 64 directories deep (`importer.DEPTH_MAX`), and one that needs a
+  path or a name longer than the filesystem allows at its destination or in
+  the staging directory (`os.pathconf`, else 4,096 and 255). The roll back's
+  steps run each on its own: every step is tried whatever the one before it
+  raised, and the first failure is raised at the end.
+- **The Codex name line** (step 4 of FORMATS "Codex" §6; audit A-11): the
+  line added to the native `session_index.jsonl` is written anew from three
+  checked values, `id`, `thread_name` (one clean line, at most 200
+  characters) and `updated_at` in `parse_ts` form; no byte of the source's
+  line is copied. A source line that is not strict UTF-8 JSON with each key
+  once, that leaves no name, or whose time is not valid adds no line.
 - **A copy is resumed in the folder of its import.** Claude's and
   Antigravity's copies keep the folder as the other machine recorded it, so
   the path map alone would lead to where that folder is found today (not
@@ -686,12 +796,26 @@ all the failure names that variable. `open --dry-run` and `continue
   files differs from the record (it is gone, not a regular file, of another
   size or modification time: the session was used since) unless `--force`;
   directories are removed only when empty; a line appended to a file the
-  tool owns (Codex `session_index.jsonl`) is left and reported; extra files
-  a tool creates beside an imported conversation (Antigravity `-wal`,
-  `-shm`, `presence/<id>.lock`: `Provider.undo_extras`) are removed only
-  with `--force`. The undo is itself a journal record (`"record": "undo"`:
-  what was removed, what was left and why, forced or not). It asks `y/N` on
-  a terminal and is refused without one unless `--yes`, like `forget`.
+  tool owns (Codex `session_index.jsonl`) is left and reported. While extra
+  files a tool creates beside an imported conversation exist (Antigravity
+  `-wal`, `-shm`, `presence/<id>.lock`: `Provider.undo_extras`), the tool has
+  opened the copy: a plain undo is refused before anything is removed, and
+  a forced one removes them with the copy (audit A-06). The undo is itself a
+  journal record (`"record": "undo"`: what was removed, what was left and
+  why, forced or not). It asks `y/N` on a terminal and is refused without
+  one unless `--yes`, like `forget`.
+  - An undo that could not remove everything it set out to remove (a file
+    or a directory of the copy whose removal failed) is recorded with
+    `"complete": false`: the import still stands, the command prints what
+    was removed and what was left and exits 1, and the next undo goes on
+    from there (the files the first one removed are not taken for a copy
+    that was used since).
+  - An undo also removes the directories that earlier imports into the
+    same native store, undone since, had made, when they are empty now: the
+    order in which imports that share a directory are undone does not
+    matter (audit A-24).
+  - An undo first settles what an import that died left in its store (the
+    `begin` records above); an undo of an import that only began says so.
   - Every file to be removed must be a path below the native store by the
     rule of an import destination (`importer.below`), whatever the journal
     says, and the record must be for this native store; otherwise nothing
@@ -701,9 +825,12 @@ all the failure names that variable. `open --dry-run` and `continue
   - A record without a manifest (the old `imports.json`) is undone only
     with `--force`, and then only the files and directories it names that
     carry the session's id in their own name.
-  - Comparison and removal happen under the state directory's lock;
+  - Comparison and removal happen under the state directory's lock, and so
+    does the plan the command shows before its question (audit A-08: a plan
+    made beside another undo of the same import called the copy used);
     `--dry-run` takes no lock, writes nothing and reports what would be
-    removed and left.
+    removed and left. An import that was undone, or is being undone, is
+    answered `no import of this session is recorded` by key and by id alike.
 - `api.import_options(session)` tells a front end what is possible:
   `possible`, `reason`, `needs_folder`, `experimental`, `warning`.
   `needs_folder` and `experimental` are set only when the import would then
@@ -790,9 +917,28 @@ agent-sessions continue <key> [--with TOOL] [--in DIR] [--dry-run] [--here]
 1 failure, 2 usage, 130 interrupted (Ctrl-C; SIGTERM and SIGHUP end a
 command the same way, with 128 + the signal: 143, 129). An interrupt prints
 one line and no traceback, and an import that was under way is rolled back
-first. An exception nobody planned for prints `internal error: <Type>:
+first: after the first SIGINT, SIGTERM or SIGHUP every further one is held
+off until the command is over, which then ends with the first one's status
+(a signal that was ignored when the command started stays ignored). A
+process killed outright (SIGKILL, a power cut) cannot roll back; it leaves
+a `begin` record that the next import or undo of that store settles
+("Import"). An exception nobody planned for prints `internal error: <Type>:
 <message> (details in <log>)` and exits 1; `--debug` shows the traceback.
-Every `--json` shape is documented in `docs/JSON.md` and pinned by a test.
+Every `--json` shape is documented in `docs/JSON.md` and pinned by a test;
+`--json` is always valid UTF-8 (written in ASCII with `\u` escapes when
+stdout is not UTF-8).
+
+`scan`, and the scan `list` runs when there is no usable cache, print the
+warnings about the cache itself on stderr (not saved, kept aside as
+`index.json.unusable`, damaged entries left out); the `warnings: N` line
+counts only what `status` can show. `export -o` refuses a path below any
+provider's native store (whether it exists yet or not), below a directory a
+provider's `is_store` accepts on the way up (a store on a drive mounted since
+the last scan), and inside the program's own state, configuration or cache
+directory (or, where `AGENT_SESSIONS_CACHE` names the index file, that file,
+its lock and the files beside it), forced or not; `export -o ''` is a usage
+error (audit A-10, N-21). `open` of a foreign session that cannot be imported
+says `continue it as a new session` instead of `import it first`.
 
 **Reasons name no flag.** A refusal's reason is made by the engine and shown
 by both front ends, so it says what is the case and never names a
@@ -818,17 +964,27 @@ document's two CLI sections and in the README.
 
 `<state>/agent-sessions.log`, rotating (1 MB, 3 files), mode 0600: scans
 (summary), imports and undos (plan and result), launches and continues (the
-command), mounts, warnings, and every unexpected exception with its traceback. A
-failure the user sees names the log. `--debug` also logs to stderr.
+command), mounts, warnings, and every unexpected exception with its traceback.
+The one failure that names the log is the unexpected one (`internal error: …
+(details in <log>)`); a refusal is one line that says why (phase 1 said every
+failure names the log; audit N-03). The log is opened without waiting and
+written only when it is a regular file, with `errors=backslashreplace` so that
+a message naming a path that is not UTF-8 is kept; a log with a wider mode is
+tightened to 0600 when it is opened. Rotation is per process. `--debug` logs
+at DEBUG level (each store scanned, each candidate parsed or taken from the
+cache, the scan lock's waits, each tool's state, the launch's window and folder
+decision) and copies the log to stderr; with the TUI, that copy is held back
+and printed when the screen is left.
 
 ## TUI additions
 
 - Offline rows: dimmed like foreign rows, WHERE `C: · offline`; the status
-  line counts them (`135 sessions · 29 offline`).
+  line counts them (for example `136 sessions · 29 offline`).
 - Enter (or `o`) on an offline row that has no native copy: prompt
   `<drive> is not mounted: [m] mount  [Esc] cancel`; when `volumes()` says
   the volume is `absent` there is no prompt, the status line says `<drive>
-  is not attached`. `m` on such a row mounts without asking
+  is not attached`, for `m` too, before anything is started (audit N-37).
+  `m` on such a row mounts without asking
   (`api.mount_drive` with the session's mount path, in a worker): the
   status line shows `mounting <drive>: answer the password prompt…` and the
   rest stays usable; then the progress of the scan the engine runs (Esc
@@ -887,6 +1043,34 @@ failure the user sees names the log. `--debug` also logs to stderr.
   `UndoFailed.no_record` and `.differences`, never by the text; any other
   refusal is shown as it is.
 - `?` lists all of it. Styling stays in `app.tcss`; the look is unchanged.
+- **Quitting** (`q`, Ctrl-C, SIGTERM, SIGHUP; audit A-02) is immediate. Every
+  engine call that only reads (the load, a scan, a mount and its scan, a
+  verdict, a folder listing, a transcript, a continue, an open, the dry run of
+  an undo) runs in a daemon thread that nothing waits for, and every cancel
+  event is set on the way out (the mount's child is terminated: "Offline
+  drives"). An import or an undo under way is finished, or rolled back, first:
+  the pager or the help is closed, the status line says `finishing the
+  import…` (or `the undo…`), no key does anything, and the program leaves when
+  the engine call returns.
+- **A key that arrives twice** (a key that repeats, a second press) closes or
+  opens a screen once: the pager and the help close once, a key meant for the
+  list while another screen is on top is dropped, and the pager or the help
+  opens only from the list (audit A-13).
+- **The pager** keeps every turn's lines and wraps them in slices from a
+  timer, answering keys between the slices; a word wider than a line is cut
+  in one pass. After a resize it wraps the turn on screen first, then outward,
+  keeping the line at the top in place, and shows the old lines cut to the
+  width meanwhile; it stops when it is closed (audit A-14).
+- **The folder input never shows a name `view.clean` would change** (audit
+  A-12): the input draws `view.clean(value)` (`SafeInput`, also for a paste);
+  a suggested folder whose name has such characters is not put in: the input
+  starts at `~/` and the status line says `this session's folder name has
+  characters that cannot be shown; type the folder`; Tab leaves such names
+  out of its completions and says how many it left out. `~` is the engine's
+  home (`AGENT_SESSIONS_HOME` when set). The typed folder is normalised first
+  (`..` taken away as text), then checked and used, so the path checked is
+  the path used (audit N-33). A NUL is refused in plain words (`a folder name
+  cannot contain a NUL character`), and nothing is asked of the disk for it.
 
 ## Packaging
 
@@ -904,8 +1088,23 @@ As built:
   terminal it prints the help and exits 2. The import of `agent_sessions.tui`
   is inside `cli._tui`, the one function that starts it, so `list`, `scan`
   and every other command still load neither that package nor Textual (a
-  test runs each in a fresh interpreter). `bin/agent-sessions` is unchanged:
-  it still re-executes under the checkout's `.venv` for the TUI.
+  test runs each in a fresh interpreter). `tui` without a terminal on stdin,
+  stdout and stderr (or with one of them closed) is one line, `the TUI needs
+  a terminal (stdin, stdout and stderr)`, and exit 2; no command without a
+  terminal is the help and exit 2 (audit A-21).
+- **The checkout's launcher** (`bin/agent-sessions`; audit A-01, A-21, N-13,
+  N-25). For the TUI (no command on a terminal, or `tui`, after any
+  `--debug`) it starts the venv's Python with `-P` and a two-line bootstrap
+  (`-c`) that puts `<repo>/src` on its `sys.path` from its arguments; the
+  environment is handed on unchanged (no `PYTHONPATH` of ours for the tools
+  the TUI starts to inherit). Every other command runs on the Python that ran
+  the launcher, with `src` in the place of the script's directory. The
+  current directory is never on `sys.path` either way: the program is started
+  in folders of other drives, and a `json.py` or `textual.py` there must not
+  run. `--debug` reaches the TUI; `tui --help` is the parser's own text. The
+  file parses on old Pythons: one older than 3.11 says `agent-sessions needs
+  Python 3.11 or newer (this is 3.x)` and exits 1. A venv Python that cannot
+  be run is one line and exit 1.
 - **Textual missing.** One line and exit 1. Which line depends on where the
   package runs from (`tui.checkout`: the package directory is
   `<root>/src/agent_sessions` and `<root>` holds `install.sh`, `pyproject.toml`
@@ -915,20 +1114,46 @@ As built:
   (Python 3.11 to 3.14, Linux, console). There is no license field: the owner
   has not chosen a licence, and the README says so. The wheel carries
   `agent_sessions/tui/app.tcss`.
-- **`install.sh`.** Fails with one line when `python3` (or `$PYTHON`) is older
-  than 3.11, has no `venv` with pip, or when `~/.local/bin/agent-sessions` is
-  a file that is not a symbolic link; installs the development tools only
-  with `--dev`; warns when `~/.local/bin` is not on `PATH` and when
-  `omarchy-launch-tui`, which the desktop launcher runs, is missing; validates
-  the desktop file with `desktop-file-validate` when that exists. Safe to run
-  again.
+- **`install.sh`.** Creates `.venv` with the pinned Textual, links
+  `~/.local/bin/agent-sessions` to the launcher and copies the desktop
+  launcher (`share/agent-sessions.desktop`, which has
+  `TryExec=omarchy-launch-tui`) into `~/.local/share/applications`
+  (`$XDG_DATA_HOME/applications` when that is an absolute path; a relative
+  one is ignored with a warning; `HOME` must be absolute). Besides those,
+  the tools it runs write: pip its download cache, and
+  `update-desktop-database`, where it exists, `mimeinfo.cache` in the
+  applications directory. Fails with one line when `python3` (or `$PYTHON`)
+  is older than 3.11 (checked on the numbers the interpreter prints), has no
+  `venv` with pip, or when `~/.local/bin/agent-sessions` is a file that is
+  not a symbolic link. A link there that points somewhere else is left and
+  the script stops before it makes anything; a desktop launcher that is
+  neither this checkout's nor one an earlier version installed
+  (`LAUNCHERS_BEFORE`, by SHA-256) is kept and reported; `--force` replaces
+  both and says so. Installs the development tools only with `--dev`; warns
+  when `~/.local/bin` is not on `PATH` and when `omarchy-launch-tui`, which
+  the desktop launcher runs, is missing; validates the desktop file with
+  `desktop-file-validate` when that exists. Safe to run again (audit A-22).
 - **`uninstall.sh`.** Removes `~/.local/bin/agent-sessions` only when it is a
   symbolic link to this checkout's launcher, and the desktop launcher only
-  when it is byte for byte the file this checkout installs. `--purge` also
-  removes `~/.cache/agent-sessions`, `~/.local/state/agent-sessions` and
-  `~/.config/agent-sessions` after a `y/N` question (`--yes` skips it;
-  without a terminal and without `--yes` it refuses before anything is
-  removed). It never touches a session store, the checkout or its `.venv`.
+  when it is byte for byte the file this checkout installs or one an earlier
+  version installed. `--purge` also removes `~/.cache/agent-sessions`,
+  `~/.local/state/agent-sessions` and `~/.config/agent-sessions` after a
+  `y/N` question (`--yes` skips it; without a terminal and without `--yes` it
+  refuses before anything is removed). With `AGENT_SESSIONS_STATE` or
+  `AGENT_SESSIONS_CACHE` set, it also takes the program's own files, by
+  name, out of the directory each names (the log and its rotations, the
+  lock, the journal, the handoff files; the index, its `.unusable` copy, its
+  `.lock`, the temp files of a save that was cut short), and removes such a
+  directory only when nothing else is left in it (audit N-24). It never
+  touches a session store, the checkout or its `.venv`.
+- **Build and CI.** `make dist` builds an sdist and a wheel from it;
+  `make dist-check` installs each into a venv of its own and runs
+  `agent-sessions --version` from outside the checkout. The sdist carries no
+  tests (`MANIFEST.in`: they need the checkout around them). CI
+  (`.github/workflows/ci.yml`) runs lint, typecheck and both suites on Python
+  3.11 to 3.14, a coverage job with a floor of 94 % (`fail_under`), and a
+  package job (`make dist`, `make dist-check`); every job has a time limit
+  (audit A-23, N-15).
 - **Documents.** `README.md`, `CHANGELOG.md`, `docs/SECURITY.md`,
   `docs/ADDING_A_PROVIDER.md`. Tests keep them from drifting: every command
   in the README and in this document's CLI sections, every environment

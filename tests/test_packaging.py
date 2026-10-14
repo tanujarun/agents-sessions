@@ -614,7 +614,7 @@ class DocumentsTest(unittest.TestCase):
         # The modules a defence is said to live in are modules of the package.
         security = self.read("docs/SECURITY.md")
         implemented = re.findall(r"(?m)^- Implemented: (.*(?:\n  .*)*)", security)
-        self.assertEqual(len(implemented), 12)
+        self.assertEqual(len(implemented), 13)
         for entry in implemented:
             modules = re.findall(r"`((?:providers/|tui/)?\w+\.py)`", entry)
             self.assertTrue(modules, entry)

@@ -11,20 +11,30 @@ Three commands have a JSON form: `list`, `scan` and `status`. A fourth,
 
 ## Rules for every output
 
-- One JSON document on stdout, UTF-8, followed by a line break. Nothing else
-  is written to stdout; messages go to stderr.
+- One JSON document on stdout, followed by a line break. It is always valid
+  UTF-8, in every locale: when stdout's encoding is not UTF-8 (the C or POSIX
+  locale, a Python left to ASCII) the document is written in ASCII, every
+  other character as a `\uXXXX` escape. Nothing else is written to stdout;
+  messages go to stderr.
 - It is printed with a two-space indent and **the keys of every object in
   alphabetical order**. The same index gives the same bytes: two `list
   --json` calls with no scan between them are byte-identical, and so are two
   after scans that found nothing changed.
 - The data is exact. Text from a store (a folder, a path, a warning) is
   not cleaned as it is in the readable output; a character a terminal would
-  act on (the C0 and C1 controls, DEL, the bidirectional controls, U+2028,
-  U+2029, U+FEFF) is written as a `\uXXXX` escape, which a JSON parser turns
-  back into that character. (A `title` never holds one: it is made one clean
-  line when the session is read.)
+  act on or that hides text (the C0 and C1 controls, DEL, U+2028, U+2029, the
+  lone surrogates, and every format character: the bidirectional controls,
+  the zero-width characters, the soft hyphen, U+FEFF, the tag block) is
+  written as a `\uXXXX` escape, which a JSON parser turns back into that
+  character. (A `title` never holds one: it is made one clean line when the
+  session is read.)
 - A path whose name holds bytes that are not UTF-8 has each such byte as
-  `\udcXX` (Python's `surrogateescape` form of the byte `XX`).
+  `\udcXX` (Python's `surrogateescape` form of the byte `XX`). A lone
+  surrogate is written as its own escape and parses back to the same lone
+  surrogate, with one exception that JSON itself makes: a high surrogate
+  (U+D800 to U+DBFF) directly followed by a low one (U+DC00 to U+DFFF) is
+  written as two escapes that a parser reads back as one character, the one
+  that pair stands for.
 - Times are UTC text. A session's `started` and `updated` are
   `YYYY-MM-DDTHH:MM:SS.ffffffZ`, always that width, so they sort as text.
   `last_quick`, `last_deep` and a volume's `last_seen` are
@@ -147,7 +157,7 @@ run.
 | `cache` | string | path of the index file |
 | `log` | string | path of the log file (it exists once something was logged) |
 | `last_quick` | string or null | when the last scan of any kind finished; null before the first |
-| `last_deep` | string or null | when the last deep scan finished; null before the first |
+| `last_deep` | string or null | when the walk of the last deep scan ended (it is stamped after the walk and before the sessions are parsed), to the second; null before the first |
 | `mounts` | array of StatusMount | the mounted filesystems in ascending order of `path`, then the unmounted ones that hold a remembered store, in ascending order of `path` |
 | `volumes` | array of Volume | every volume that holds a remembered store, mounted or not, in ascending order of `path` |
 | `providers` | array of ProviderStatus | one per provider, in ascending order of `name` |
@@ -261,7 +271,7 @@ scanned. `mount` and `forget` take any of `label`, `fs_label`, `letter`,
 | `path` | string or null | what PATH gives for it; null when nothing |
 | `installed` | boolean | true when the tool itself is there to be started |
 | `wrapper` | boolean | true when the command on PATH is a script that installs the tool when it is missing |
-| `detail` | string | `installed`, `not installed (the command on PATH would install it)` or `not found` |
+| `detail` | string | `installed`, `not installed (the command on PATH would install it)`, `unknown: a script that may install the tool` (a `#!` script that names an installer and cannot be followed; never started), `installed (vouched for in AGENT_SESSIONS_TRUST_TOOLS)` or `not found` |
 | `reader` | boolean | true when it is the command of one of `providers` |
 
 ### NoReaderTool
@@ -305,7 +315,8 @@ person, which is cleaned text and not part of this contract.
 `verify`, `open --dry-run`, `import --dry-run`, `unimport`, `show`,
 `continue`, `mount`, `forget` and `map` print text for a person and have no
 `--json`. Their data is available to a program through the engine
-(`agent_sessions.api`: `verify()`, `open_session(…, dry_run=True)`,
+(`agent_sessions.api`: `verify()`, whose result has `stale_stores` beside the
+differences, `open_session(…, dry_run=True)`,
 `import_plan()`, `import_options()`, `unimport(…, dry_run=True)`,
 `transcript()`, `continue_options()`, `continue_session(…, dry_run=True)`,
 `mount_drive()`, `forget_drive()`, `volumes()`, `set_letter()`,

@@ -122,7 +122,8 @@ warn_unused_ignores = true
 warn_redundant_casts = true
 
 [[tool.mypy.overrides]]
-# ...strict for the package, tui/ included (Textual ships its types).
+# ...stricter for the package, tui/ included (Textual ships its types): these four
+# checks, not all of `--strict`.
 module = ["agent_sessions", "agent_sessions.*"]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
