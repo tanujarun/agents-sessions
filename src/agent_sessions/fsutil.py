@@ -54,6 +54,24 @@ def cache_file() -> Path:
     return path if path.suffix == ".json" else path / "index.json"
 
 
+def own_cache_dir() -> Path | None:
+    """The cache directory when it is this program's own: the default one,
+    or the directory ``AGENT_SESSIONS_CACHE`` names. None when the variable
+    names the index file itself: the directory around it is one the user
+    chose, and is not ours to tighten or to fill."""
+    value = os.environ.get("AGENT_SESSIONS_CACHE")
+    if not value:
+        return cache_file().parent
+    path = Path(value)
+    return None if path.suffix == ".json" else path
+
+
+def index_lock_file() -> Path:
+    """The lock a scan holds from loading the cache to saving it
+    (``index.Index.scan``): ``index.lock`` beside the index file."""
+    return cache_file().with_suffix(".lock")
+
+
 def state_dir() -> Path:
     value = os.environ.get("AGENT_SESSIONS_STATE")
     return Path(value) if value else home() / ".local" / "state" / "agent-sessions"
@@ -136,6 +154,42 @@ def make_private_dir(path: StrPath, made: list[str] | None = None) -> list[str]:
             continue  # another process made it meanwhile
         made.append(directory)
     return made
+
+
+def keep_private(path: StrPath) -> bool:
+    """Make one of our own directories that exists the owner's alone (0700)
+    when its mode is wider: one an older version made with the default mode
+    (0.1.0 made the cache directory 0755). Only a real directory, not a
+    link, and only one this user owns; True when the mode was changed. Never
+    raises: a directory that cannot be changed stays as it is."""
+    try:
+        found = os.lstat(path)
+        mine = not hasattr(os, "geteuid") or found.st_uid == os.geteuid()
+        if not stat.S_ISDIR(found.st_mode) or not mine:
+            return False
+        if not stat.S_IMODE(found.st_mode) & ~PRIVATE_DIR:
+            return False
+        os.chmod(path, PRIVATE_DIR)
+    except OSError:
+        return False
+    return True
+
+
+def process_alive(pid: int) -> bool:
+    """Whether a process with this id exists. Where that cannot be asked
+    without side effects (signal 0 is not a probe on Windows) the answer is
+    yes, so that nothing of a live process is ever taken for left over."""
+    if os.name != "posix":
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OverflowError:  # not a process id on this system
+        return False
+    except OSError:  # it exists and belongs to someone else
+        return True
+    return True
 
 
 def open_private(path: StrPath) -> io.TextIOWrapper:

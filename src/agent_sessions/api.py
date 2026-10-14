@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import os
+import pathlib
 import re
 import shlex
 import stat
@@ -54,6 +55,8 @@ from .providers.base import ExperimentalOnly, NotSupported, Provider, Turn, pars
 
 if TYPE_CHECKING:
     import threading
+
+    from .fsutil import StrPath
 
 # Agent CLIs that may be installed but have no adapter (SPEC non-goals).
 NO_READER_TOOLS = ("copilot", "crush", "cursor-agent", "opencode")
@@ -508,15 +511,63 @@ def export_transcript(
     return exporting.markdown(session, label, lambda: provider.transcript(session))
 
 
+def _below(real: str, root: StrPath) -> bool:
+    """Whether the real path ``real`` is ``root`` or lies below it, both
+    taken as the places they really are."""
+    there = os.path.realpath(root)
+    return real == there or real.startswith(there.rstrip(os.sep) + os.sep)
+
+
 def _in_a_store(path: str, index: Index) -> str | None:
     """The root of the session store ``path`` lies in, or None. Whatever
-    links lead there: both are compared as the places they really are."""
+    links lead there: both are compared as the places they really are.
+
+    Not only the stores the index knows: a store on a drive mounted since
+    the last scan is one too. So is every provider's native store, whether
+    it exists yet or not (the tool makes it when it first runs), and any
+    directory on the way up whose name is one a store has and that the
+    provider takes for a store (``Provider.is_store``), as a scan would."""
     real = os.path.realpath(path)
+    providers = all_providers()
     roots = [store.root for store in index.stores] + [store.root for store in index.skipped]
-    for root in sorted(roots):
-        there = os.path.realpath(root)
-        if real == there or real.startswith(there.rstrip(os.sep) + os.sep):
+    for provider in providers:
+        native = provider.native_store()
+        if native is not None:
+            roots.append(os.fspath(native))
+    for root in sorted(set(roots), key=lambda root: (-len(root), root)):  # the closest first
+        if _below(real, root):
             return root
+    current = os.path.dirname(real)
+    while True:
+        name = os.path.basename(current)
+        for provider in providers:
+            if name not in provider.dir_names:
+                continue
+            try:
+                if provider.is_store(pathlib.Path(current)):
+                    return current
+            except OSError:
+                continue
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def _own_file(path: str) -> str | None:
+    """The directory or file of this program's own that ``path`` lies in,
+    or None: the state directory, the configuration directory, the cache
+    directory (or, where ``AGENT_SESSIONS_CACHE`` names the index file
+    itself, that file, its lock and the files saved beside it)."""
+    real = os.path.realpath(path)
+    for own in (fsutil.own_cache_dir(), fsutil.state_dir(), fsutil.config_dir()):
+        if own is not None and _below(real, own):
+            return os.fspath(own)
+    index_file = os.path.realpath(fsutil.cache_file())
+    if real == index_file or real.startswith(index_file + "."):
+        return index_file
+    if real == os.path.realpath(fsutil.index_lock_file()):
+        return os.fspath(fsutil.index_lock_file())
     return None
 
 
@@ -534,16 +585,22 @@ def export_file(
     beside it, then moved into place), for the user alone (0600).
 
     Raises ``ExportFailed`` when the file exists and ``force`` is not set
-    (with it, a regular file is replaced), for a path that will not do, and
-    for one inside a session store, native or not, forced or not: nothing
-    here writes into a store. And what ``export_transcript`` raises."""
+    (with it, a regular file is replaced), for a path that will not do, for
+    one inside a session store, native or not, known to the index or not,
+    forced or not: nothing here writes into a store; and for one of this
+    program's own files (the cache, the state, the configuration). And what
+    ``export_transcript`` raises."""
     index = index if index is not None else load_index()
     pieces = export_transcript(ref, fmt, index)
     if isinstance(path, str) and path and "\0" not in path and os.path.isabs(path):
+        shown = os.path.normpath(path)
         store = _in_a_store(path, index)
         if store is not None:
+            raise ExportFailed(f"{shown} is inside the session store {store}; nothing was written")
+        own = _own_file(path)
+        if own is not None:
             raise ExportFailed(
-                f"{os.path.normpath(path)} is inside the session store {store}; nothing was written"
+                f"{shown} is one of this program's own files ({own}); nothing was written"
             )
     return exporting.write(path, pieces, overwrite=force)
 

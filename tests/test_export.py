@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -35,7 +36,7 @@ from fixture_world import (
 )
 from support import claude_transcript, state_names
 
-from agent_sessions import __version__, api, cli, export, textsafe
+from agent_sessions import __version__, api, cli, export, fsutil, textsafe
 from agent_sessions.errors import ExportFailed, NotFound, Offline
 from agent_sessions.model import Session, Store
 from agent_sessions.providers.base import Turn
@@ -590,10 +591,91 @@ class FacadeTest(ExportCase):
         beside.mkdir()
         api.export_file(CLAUDE_NATIVE, str(beside / "x.md"))
 
+    def refused(self, path, store) -> None:
+        for force in (False, True):
+            with self.assertRaises(ExportFailed) as caught:
+                api.export_file(CLAUDE_NATIVE, str(path), force=force)
+            self.assertEqual(
+                caught.exception.reason,
+                f"{path} is inside the session store {store}; nothing was written",
+            )
+        self.assertFalse(os.path.lexists(path))
+
+    def test_a_store_the_index_does_not_know_is_refused_too(self):
+        """AUDIT A-10 (``feat/t11_misc.py``, ``b/t07_export.py``): the check
+        was as good as the last scan."""
+        # A drive mounted since the last scan, with a store on it.
+        late = self.w.box.mount("Late")
+        store = late / "Users" / "u" / ".claude"
+        (store / "projects" / "F--Proj").mkdir(parents=True)
+        self.refused(store / "projects" / "F--Proj" / "note.md", store)
+        self.refused(store / "note.md", store)
+        # Native roots that are not stores yet (no sessions/, no conversations/).
+        for root in (self.home / ".grok", self.home / ".gemini" / "antigravity-cli"):
+            shutil.rmtree(root, ignore_errors=True)
+            root.mkdir(parents=True)
+            self.refused(root / "x.md", root)
+        # A native root that does not exist yet: the tool makes it on its first run.
+        shutil.rmtree(self.home / ".codex")
+        self.refused(self.home / ".codex" / "x.md", self.home / ".codex")
+        # A directory named like a store that is one, below a folder of another drive.
+        other = self.w.box.mount("Other")
+        deep = other / "backup" / ".grok"
+        (deep / "sessions").mkdir(parents=True)
+        self.refused(deep / "sessions" / "x.md", deep)
+        # Named like one and not one: written.
+        plain = other / "notes" / ".grok"
+        plain.mkdir(parents=True)
+        api.export_file(CLAUDE_NATIVE, str(plain / "x.md"))
+        self.assertTrue((plain / "x.md").is_file())
+
+    def test_the_program_s_own_files_are_refused(self):
+        """AUDIT N-21: ``export -o <the cache> --force`` replaced the index."""
+        cache = fsutil.cache_file()
+        state = fsutil.state_dir()
+        config = fsutil.config_dir()
+        config.mkdir(parents=True, exist_ok=True)
+        before = cache.read_bytes()
+        for path, own in (
+            (cache, cache.parent),
+            (cache.parent / "index.lock", cache.parent),
+            (cache.parent / "other.md", cache.parent),
+            (state / "imports.jsonl", state),
+            (state / "handoff" / "x.md", state),
+            (state / "agent-sessions.log", state),
+            (config / "pathmap.json", config),
+        ):
+            for force in (False, True):
+                with self.subTest(path=path, force=force):
+                    with self.assertRaises(ExportFailed) as caught:
+                        api.export_file(CLAUDE_NATIVE, str(path), force=force)
+                    self.assertEqual(
+                        caught.exception.reason,
+                        f"{path} is one of this program's own files ({own}); nothing was written",
+                    )
+        self.assertEqual(cache.read_bytes(), before)
+        # Where the variable names the index file itself, its directory is the user's.
+        mine = self.home / "mine"
+        mine.mkdir()
+        named = mine / "my-index.json"
+        with mock.patch.dict(os.environ, {"AGENT_SESSIONS_CACHE": str(named)}):
+            for path in (named, mine / "my-index.json.unusable", mine / "my-index.lock"):
+                with self.assertRaises(ExportFailed):
+                    api.export_file(CLAUDE_NATIVE, str(path), index=self.index)
+            api.export_file(CLAUDE_NATIVE, str(mine / "notes.md"), index=self.index)
+        self.assertTrue((mine / "notes.md").is_file())
+
 
 class CommandTest(ExportCase):
     foreign = ("claude", "grok")
     native = ("claude", "grok")
+
+    def test_an_empty_file_name_is_a_usage_error(self):
+        """AUDIT N-21: ``-o ''`` said ``<cwd> is a directory``."""
+        self.assertEqual(
+            run("export", CLAUDE_NATIVE, "-o", ""),
+            (2, "", "agent-sessions: export: -o needs a file name\n"),
+        )
 
     def test_markdown_to_stdout(self):
         for ref in (CLAUDE_NATIVE, self.w.session(GROK_WIN, "foreign").key):

@@ -1147,6 +1147,9 @@ def _show(args: argparse.Namespace) -> int:
 
 
 def _export(args: argparse.Namespace) -> int:
+    if args.output == "":
+        _err("export: -o needs a file name")
+        return 2
     if args.output is not None:
         # ``~`` and a relative path are this command's to resolve: the engine
         # takes an absolute path and nothing else.
