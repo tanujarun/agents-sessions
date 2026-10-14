@@ -15,16 +15,16 @@ from ..model import Candidate, Session, Store
 from ..pathmap import normalise
 from . import register
 from .base import (
+    JSONL_LINE_MAX,
+    NotSupported,
+    Provider,
+    Turn,
     clean_title,
     iter_jsonl,
-    JSONL_LINE_MAX,
     mtime,
-    NotSupported,
     parse_ts,
-    Provider,
     read_lines,
     too_dense,
-    Turn,
     unreadable,
     warn,
 )
