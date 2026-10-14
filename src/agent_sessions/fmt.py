@@ -80,9 +80,11 @@ def local_time(stamp: object, tz: tzinfo | None = None) -> str:
     if moment is None:
         return EMPTY
     try:
-        return moment.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+        here = moment.astimezone(tz)
     except (OverflowError, ValueError, OSError):
         return EMPTY
+    # Not strftime: its "%Y" does not pad a year below 1000 on every platform.
+    return f"{here.year:04d}-{here.month:02d}-{here.day:02d} {here.hour:02d}:{here.minute:02d}"
 
 
 def size(count: object) -> str:
