@@ -48,10 +48,9 @@ import errno
 import os
 import stat
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from . import __version__, fsutil, importer, journal
+from . import __version__, fmt, fsutil, importer, journal
 from .errors import REMEDY_FORCE, UndoFailed
 from .journal import find_record, not_undone
 
@@ -107,10 +106,6 @@ class UndoPlan:
     left: list[tuple[str, str]] = field(default_factory=list)  # (path, why), by path
     differences: list[str] = field(default_factory=list)  # from the record; forced past
     bytes: int = 0  # of the files to remove
-
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def read_records() -> list[dict]:
@@ -416,7 +411,7 @@ def undo_record(
     return {
         "record": journal.UNDO,
         "version": journal.VERSION,
-        "undone_at": _now(),
+        "undone_at": fmt.utc_now(),
         "provider": made.provider,
         "id": made.session_id,
         "source_key": record.get("source_key"),

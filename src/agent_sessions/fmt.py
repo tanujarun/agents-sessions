@@ -13,12 +13,17 @@ Standard library only; imports nothing from this package.
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime, tzinfo
+from datetime import UTC, datetime, timedelta, tzinfo
 
 EMPTY = "-"  # what stands in a listing for a value that is not known
 
 _SEPARATORS = re.compile(r"[\\/]+")  # a folder as Windows or as Linux wrote it
 _UNITS = ("kB", "MB", "GB")
+# The times that can be placed: the whole range of ``datetime`` but its two
+# ends, where a shift into another zone no longer fits.
+_EDGE = timedelta(days=2)
+_FIRST = datetime.min.replace(tzinfo=UTC) + _EDGE
+_LAST = datetime.max.replace(tzinfo=UTC) - _EDGE
 
 
 def utc_now() -> str:
@@ -27,16 +32,20 @@ def utc_now() -> str:
 
 
 def parse_stamp(stamp: object) -> datetime | None:
-    """An ISO 8601 time as an aware datetime; None when it is absent or not
-    one. A time without a zone is taken as UTC, as ``parse_ts`` takes it."""
+    """An ISO 8601 time as an aware datetime; None when it is absent, not
+    one, or at the very ends of the calendar (the first and the last two
+    days), where a shift into a zone leaves ``datetime``'s range. A time
+    without a zone is taken as UTC, as ``parse_ts`` takes it."""
     if not stamp or not isinstance(stamp, str):
         return None
     try:
         moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-    except ValueError:
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        if not _FIRST <= moment <= _LAST:
+            return None
+    except (ValueError, OverflowError):
         return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=UTC)
     return moment
 
 

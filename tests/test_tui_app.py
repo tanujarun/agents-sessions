@@ -7,6 +7,7 @@ Needs Textual, so the whole module skips on a Python without it
 
 import asyncio
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -4226,20 +4227,24 @@ class HostileTest(TuiCase):
 
 
 class UnplacedTimeTest(TuiCase):
-    async def test_a_time_out_of_range_or_without_a_zone_is_a_dash(self):
+    async def test_a_time_out_of_range_is_a_dash_and_one_without_a_zone_is_utc(self):
+        """The TUI formats times with ``agent_sessions.fmt``, as the command
+        line does: a time without a zone is UTC (as ``parse_ts`` reads one),
+        and one at the ends of the calendar is a dash. Nothing raises."""
         india = timezone(timedelta(hours=5, minutes=30))
         sessions = [make_session("claude", n) for n in range(3)]
         sessions[0].updated = "9999-12-31T23:59:59.000000Z"
         sessions[1].updated = "2026-10-05T10:00:00"
         sessions[2].started, sessions[2].updated = "0001-01-01T00:00:00Z", None
+        wanted = ("-", "2026-10-05 15:30", "-")
         engine = FakeEngine(sessions)
         self.app = SessionsApp(engine=engine, clock=lambda: support.NOW, tz=india)
         async with self.app.run_test(size=(120, 40)) as pilot:
             await settle(pilot)
-            for session in sessions:
+            for session, when in zip(sessions, wanted, strict=True):
                 await self.select(pilot, session.key)
                 text = self.text()
-                self.assertRegex(text, r"updated +-")
+                self.assertRegex(text, rf"updated +{re.escape(when)}")
             self.assertTrue(self.app.is_running)
             self.assertFalse(self.exited())
 
