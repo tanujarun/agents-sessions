@@ -348,13 +348,10 @@ class IsolationTest(unittest.TestCase):
     the home at temp directories when it is loaded, so no test can write the
     user's own (docs/AUDIT.md A-23)."""
 
-    # ``fixture_world`` imports ``support`` first (checked below), so it does
-    # as well; ``tui_support`` does not.
-    FIRST = ("support", "fixture_world")
-    AFTER = ("agent_sessions", "tui_support")
-    # Modules that import ``tui_support`` and no ``support``. No write was seen
-    # from them (AUDIT A-23); to be removed with the import added.
-    KNOWN = ("test_tui_app.py", "test_tui_view.py")
+    # ``fixture_world`` and ``tui_support`` import ``support`` first (checked
+    # below), so they do as well.
+    FIRST = ("support", "fixture_world", "tui_support")
+    AFTER = ("agent_sessions",)
 
     def out_of_order(self, path) -> list[str]:
         """The modules ``path`` imports before ``support``, or without it."""
@@ -369,10 +366,11 @@ class IsolationTest(unittest.TestCase):
         self.assertGreater(len(modules), 40)
         wrong = {path.name: self.out_of_order(path) for path in modules}
         wrong = {name: early for name, early in wrong.items() if early}
-        self.assertEqual({n: e for n, e in wrong.items() if n not in self.KNOWN}, {})
+        self.assertEqual(wrong, {})
         # What stands in for ``support`` loads it before anything else of ours.
-        world = first_imports(TESTS / "fixture_world.py")
-        self.assertLess(world["support"], world["agent_sessions"])
+        for helper in ("fixture_world.py", "tui_support.py"):
+            imports = first_imports(TESTS / helper)
+            self.assertLess(imports["support"], imports["agent_sessions"], helper)
 
     def test_the_check_finds_what_it_is_for(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -382,7 +380,8 @@ class IsolationTest(unittest.TestCase):
                 ("import agent_sessions\nimport support\n", ["agent_sessions"]),
                 ("from agent_sessions import api\n", ["agent_sessions"]),
                 ("import os\nfrom agent_sessions.providers import base\n", ["agent_sessions"]),
-                ("import tui_support as support\n", ["tui_support"]),
+                ("import tui_support as support\nfrom agent_sessions import fmt\n", []),
+                ("from agent_sessions import fmt\nimport tui_support\n", ["agent_sessions"]),
                 (
                     "try:\n    import agent_sessions.api\nexcept ImportError:\n    pass\n",
                     ["agent_sessions"],
