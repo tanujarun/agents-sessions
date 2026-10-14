@@ -1578,6 +1578,108 @@ class TranscriptTest(unittest.TestCase):
         text = "the quick brown fox " * 9
         self.assertEqual(" ".join(view.wrap_text(text, 17)).split(), text.split())
 
+    @staticmethod
+    def wrap_as_before(line, width):
+        """``wrap_line`` as it was before it measured every character once:
+        what the single pass has to give, line for line."""
+        if width <= 0 or view.text_width(line) <= width:
+            return [line]
+        out = []
+        current, used = "", 0
+        for token in re.findall(r"\s+|\S+", line):
+            size = view.text_width(token)
+            if used + size <= width:
+                current, used = current + token, used + size
+                continue
+            if token.isspace():
+                if current.strip():
+                    out.append(current.rstrip())
+                current, used = "", 0
+                continue
+            if current.strip():
+                out.append(current.rstrip())
+                current, used = "", 0
+            elif used + 1 > width:
+                current, used = "", 0
+            while used + view.text_width(token) > width:
+                head = view._take(token, width - used) or token[:1]
+                token = token[len(head) :]
+                out.append(current + head)
+                current, used = "", 0
+            current, used = current + token, used + view.text_width(token)
+        if current.strip() or not out:
+            out.append(current.rstrip())
+        return out
+
+    def test_one_pass_gives_the_lines_the_old_wrapping_gave(self):
+        rng = random.Random(20261013)  # noqa: S311  (a fixed seed for a repeatable test)
+        pieces = (
+            "a",
+            "bc",
+            "word",
+            "x" * 37,
+            "é",
+            "ñandú",
+            "漢",
+            "漢字テキスト",
+            "🚀",
+            "e\u0301",
+            " ",
+            "  ",
+            "    ",
+        )
+        differing = 0
+        for _ in range(4000):
+            line = "".join(rng.choice(pieces) for _ in range(rng.randrange(1, 40)))
+            width = rng.choice((1, 2, 3, 5, 8, 13, 20, 40, 80))
+            new, old = view.wrap_line(line, width), self.wrap_as_before(line, width)
+            if new != old:
+                # The one case that was wrong before: a wide character after
+                # an indentation that left it one cell. The old lines ran over.
+                differing += 1
+                self.assertTrue(any(view.text_width(text) > width for text in old), (line, width))
+                if width > 1:
+                    self.assertTrue(
+                        all(view.text_width(text) <= width for text in new), (line, width)
+                    )
+            # Nothing but spaces is ever dropped.
+            self.assertEqual("".join(new).replace(" ", ""), line.replace(" ", ""), (line, width))
+        self.assertLess(differing, 400)
+
+    def test_a_wide_character_after_an_indentation_starts_a_line_of_its_own(self):
+        self.assertEqual(view.wrap_line("   漢字", 4), ["漢字"])
+        self.assertEqual(view.wrap_line("   漢字かな", 4), ["漢字", "かな"])
+        self.assertEqual(view.wrap_line("    x", 4), ["x"])  # as before: the indentation goes
+
+    def test_a_long_word_costs_its_length_not_its_square(self):
+        """A-14: one turn of 20,000 characters without a space took 0.3 s as
+        accented Latin and 0.6 s as CJK, on every key the pager got."""
+
+        def best(text, width):
+            times = []
+            for _ in range(5):
+                start = time.perf_counter()
+                lines = view.wrap_line(text, width)
+                times.append(time.perf_counter() - start)
+            self.assertEqual("".join(lines), text)
+            self.assertTrue(all(view.text_width(line) <= width for line in lines))
+            return min(times)
+
+        for name, ch in (("ASCII", "x"), ("accented Latin", "é"), ("CJK", "中")):
+            for width in (80, 20):
+                self.assertLess(best(ch * 20000, width), 0.020, (name, width))
+        self.assertEqual(len(view.wrap_line("中" * 20000, 80)), 500)
+        self.assertEqual(len(view.wrap_line("é" * 20000, 80)), 250)
+        # Ten times the word, about ten times the work (the old way: a hundred).
+        short, long = best("中" * 20000, 80), best("中" * 200000, 80)
+        self.assertLess(long, short * 40)
+
+    def test_the_whole_turn_is_wrapped_in_time(self):
+        for text in ("中" * 20000, "é" * 20000, "word " * 4000, ("中" * 300 + "。\n") * 60):
+            start = time.perf_counter()
+            view.transcript_lines("assistant", text, None, 80, UTC)
+            self.assertLess(time.perf_counter() - start, 0.1, text[:8])
+
     def test_wrap_text_keeps_line_breaks(self):
         self.assertEqual(
             view.wrap_text("one\n\ntwo\r\nthree\rfour", 80), ["one", "", "two", "three", "four"]

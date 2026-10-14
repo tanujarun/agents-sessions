@@ -9,6 +9,7 @@ value: those are in ``app.tcss``.
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import unicodedata
@@ -77,6 +78,7 @@ class Verdict:
 # --- display width ----------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=4096)  # a long transcript asks about the same few characters
 def char_width(ch: str) -> int:
     """Terminal cells one character takes: 0 for combining marks, joiners and
     control characters, 2 for wide (CJK, most emoji), else 1."""
@@ -1360,21 +1362,39 @@ def help_lines(width: int | None = None) -> list[str]:
 ROLE_LABELS = {"user": "User", "assistant": "Assistant", "tool": "Tool"}
 
 
-def _split_wide(word: str, width: int) -> tuple[str, str]:
-    """Cut a word that is wider than a line: (what fits, the rest). Always
-    takes at least one character so wrapping ends."""
-    head = _take(word, width) or word[:1]
-    return head, word[len(head) :]
+def _cut(word: str, room: int, width: int) -> tuple[list[str], str, int]:
+    """Cut a word that is wider than a line: ``(lines, rest, cells)``. The
+    first line fits in ``room`` cells, the others in ``width``; ``rest`` is
+    the end of the word that does not fill a line, ``cells`` wide. One pass
+    with a running width, so the cost grows with the word and not with its
+    square. Every line takes at least one character, so the cutting ends."""
+    if word.isascii():
+        cuts = range(room, len(word), width)
+        lines = [word[:room], *(word[cut : cut + width] for cut in cuts)]
+        return lines[:-1], lines[-1], len(lines[-1])
+    lines = []
+    start, used, limit = 0, 0, room
+    for position, ch in enumerate(word):
+        size = char_width(ch)
+        if used + size > limit and position > start:
+            lines.append(word[start:position])
+            start, used, limit = position, 0, width
+        used += size
+    return lines, word[start:], used
+
+
+_TOKENS = re.compile(r"\s+|\S+")
 
 
 def wrap_line(line: str, width: int) -> list[str]:
     """One paragraph wrapped to ``width`` cells at spaces; a word longer than
-    a line is cut. Leading indentation stays on the first line."""
+    a line is cut. Leading indentation stays on the first line. Every
+    character is measured once, however long a word is."""
     if width <= 0 or text_width(line) <= width:
         return [line]
     out: list[str] = []
     current, used = "", 0
-    for token in re.findall(r"\s+|\S+", line):
+    for token in _TOKENS.findall(line):
         size = text_width(token)
         if used + size <= width:
             current, used = current + token, used + size
@@ -1387,13 +1407,15 @@ def wrap_line(line: str, width: int) -> list[str]:
         if current.strip():
             out.append(current.rstrip())
             current, used = "", 0
-        elif used + 1 > width:
-            current, used = "", 0  # indentation as wide as the line: drop it
-        while used + text_width(token) > width:
-            head, token = _split_wide(token, width - used)
-            out.append(current + head)
-            current, used = "", 0
-        current, used = current + token, used + text_width(token)
+        elif used and used + char_width(token[0]) > width:
+            current, used = "", 0  # indentation that leaves no room: drop it
+        if used + size > width:
+            lines, token, size = _cut(token, width - used, width)
+            if lines:
+                out.append(current + lines[0])
+                out.extend(lines[1:])
+                current, used = "", 0
+        current, used = current + token, used + size
     if current.strip() or not out:
         out.append(current.rstrip())
     return out
