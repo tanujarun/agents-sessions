@@ -2,11 +2,14 @@
 the system Python: nothing here needs Textual."""
 
 import os
+import random
 import re
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
-from datetime import UTC, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -130,8 +133,52 @@ class AgeTest(unittest.TestCase):
         self.assertEqual(view.age_text("yesterday", NOW), "-")
         self.assertEqual(view.age_text(12345, NOW), "-")
         self.assertEqual(view.age_text(ago(hours=-5), NOW), "now")  # clock skew: the future
-        self.assertEqual(view.age_text("2026-10-12T11:00:00", NOW), "1h")  # naive = UTC
         self.assertEqual(view.age_text("2026-10-12T13:00:00+02:00", NOW), "1h")
+
+    # Times the cache's loader takes (any text) and no listing can place.
+    UNPLACED = (
+        "2026-10-05T10:00:00",  # no zone: which moment it means is not known
+        "9999-12-31T23:59:59.000000Z",  # a shift into a zone east of UTC leaves the calendar
+        "0001-01-01T00:00:00Z",  # and this one into a zone west of it
+        "0001-01-01T00:00:00+14:00",
+        "9999-12-31T23:59:59-12:00",
+    )
+
+    def test_a_time_that_cannot_be_placed_is_a_dash_and_never_an_error(self):
+        zones = (
+            None,
+            UTC,
+            timezone(timedelta(hours=5, minutes=30)),
+            timezone(-timedelta(hours=12)),
+        )
+        for stamp in self.UNPLACED:
+            self.assertIsNone(view.parse_stamp(stamp), stamp)
+            self.assertEqual(view.age_text(stamp, NOW), "-", stamp)
+            for tz in zones:
+                self.assertEqual(view.local_time(stamp, tz), "-", (stamp, tz))
+                session = support.make_session("claude", 1)
+                session.updated, session.started = stamp, None
+                self.assertEqual(view.detail_fields(session, None, tz)["updated"], "-")
+                session.updated, session.started = None, stamp
+                self.assertEqual(view.detail_fields(session, None, tz)["updated"], "-")
+        # Just inside the range every zone still fits.
+        for stamp in ("0001-01-03T00:00:00Z", "9999-12-29T23:59:59Z"):
+            self.assertIsNotNone(view.parse_stamp(stamp), stamp)
+            for tz in zones:
+                self.assertRegex(view.local_time(stamp, tz), r"^\d{4}-\d\d-\d\d \d\d:\d\d$")
+        self.assertEqual(view.age_text("9999-12-29T23:59:59Z", NOW), "now")
+        self.assertRegex(view.age_text("0001-01-03T00:00:00Z", NOW), r"^20\d\dy$")
+
+    def test_a_row_with_such_a_time_is_drawn(self):
+        for stamp in self.UNPLACED:
+            session = support.make_session("claude", 1)
+            session.updated = stamp
+            line = view.format_row(view.make_row(session, "Linux"), view.fit_columns(80), NOW)
+            self.assertTrue(line.endswith("-   Linux"), (stamp, line))
+
+    def test_a_clock_without_a_zone_is_no_error_either(self):
+        naive = datetime(2026, 10, 12, 12, 0, 0)
+        self.assertEqual(view.age_text(ago(minutes=5), naive), "-")
 
     def test_ages_fit_the_column(self):
         for days in (0, 1, 13, 14, 59, 60, 300, 364, 365, 20000):

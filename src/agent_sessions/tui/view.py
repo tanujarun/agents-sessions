@@ -14,7 +14,7 @@ import re
 import unicodedata
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, tzinfo
+from datetime import UTC, datetime, timedelta, tzinfo
 from typing import Any, Protocol
 
 from .. import textsafe
@@ -150,27 +150,40 @@ def pad(text: str, width: int, align: str = "left") -> str:
 # --- time -------------------------------------------------------------------
 
 
+# The times that can be placed: the whole range of ``datetime`` but its two
+# ends, where a shift into another zone no longer fits.
+_EDGE = timedelta(days=2)
+_FIRST = datetime.min.replace(tzinfo=UTC) + _EDGE
+_LAST = datetime.max.replace(tzinfo=UTC) - _EDGE
+
+
 def parse_stamp(stamp: object) -> datetime | None:
-    """An ISO 8601 time as an aware datetime; None when absent or malformed."""
+    """An ISO 8601 time as an aware datetime; None when it is absent,
+    malformed, or cannot be placed: one without a zone (which moment it
+    means is not known), or one at the very ends of the calendar."""
     if not stamp or not isinstance(stamp, str):
         return None
     try:
         moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-    except ValueError:
+        if moment.utcoffset() is None or not _FIRST <= moment <= _LAST:
+            return None
+    except (ValueError, OverflowError):
         return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=UTC)
     return moment
 
 
 def age_text(stamp: object, now: datetime) -> str:
     """``now``, ``5m``, ``3h``, ``2d``, ``3w``, ``2mo``, ``1y``. The steps are
     the ones `agent-sessions list` prints: seconds under a minute are ``now``,
-    days up to 13, weeks up to 59 days, months up to a year."""
+    days up to 13, weeks up to 59 days, months up to a year. ``-`` for a time
+    that is unknown or cannot be placed (``parse_stamp``)."""
     then = parse_stamp(stamp)
     if then is None:
         return EMPTY
-    seconds = max((now - then).total_seconds(), 0)
+    try:
+        seconds = max((now - then).total_seconds(), 0)
+    except (TypeError, OverflowError):  # a ``now`` without a zone, or out of range
+        return EMPTY
     days = int(seconds // 86400)
     if seconds < 60:
         return "now"
@@ -188,11 +201,17 @@ def age_text(stamp: object, now: datetime) -> str:
 
 
 def local_time(stamp: object, tz: tzinfo | None = None) -> str:
-    """``2026-10-10 17:58`` in the local zone (or ``tz``); ``-`` when unknown."""
+    """``2026-10-10 17:58`` in the local zone (or ``tz``); ``-`` when
+    unknown, and for a time the platform cannot turn into a local one."""
     moment = parse_stamp(stamp)
     if moment is None:
         return EMPTY
-    return moment.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+    try:
+        local = moment.astimezone(tz)
+    except (OverflowError, OSError, ValueError):
+        return EMPTY
+    # Not strftime: its %Y gives "1", not "0001", on some Pythons.
+    return f"{local.year:04d}-{local.month:02d}-{local.day:02d} {local.hour:02d}:{local.minute:02d}"
 
 
 # --- rows -------------------------------------------------------------------
