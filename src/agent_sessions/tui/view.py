@@ -94,14 +94,28 @@ def text_width(text: str) -> int:
     """Terminal cells a string takes."""
     if text.isascii():
         return len(text)
-    return sum(char_width(ch) for ch in text)
+    return sum(map(char_width, text))
+
+
+_SURROGATES = dict.fromkeys(range(0xD800, 0xE000), textsafe.REPLACEMENT)
 
 
 def clean(text: object) -> str:
     """One printable line: control characters (newline, tab, escape) and the
     characters that reorder text become spaces, so no value can break a row
-    or move the cursor. The rule itself is ``textsafe.clean``."""
-    return textsafe.clean(text)
+    or move the cursor. The rule itself is ``textsafe.clean``.
+
+    A lone surrogate (what a byte that is not UTF-8 is read as, and what
+    JSON can spell) becomes a space as well: no terminal can be sent one,
+    and it is drawn as six characters in a place measured as one cell."""
+    text = textsafe.clean(text)
+    return text if text.isprintable() else text.translate(_SURROGATES)
+
+
+def showable(text: object) -> bool:
+    """Whether a value can be shown as it is: ``clean`` would change
+    nothing in it."""
+    return isinstance(text, str) and clean(text) == text
 
 
 def _take(text: str, width: int) -> str:

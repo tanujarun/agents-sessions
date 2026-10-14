@@ -1,45 +1,108 @@
 #!/usr/bin/env python3
-"""Launcher: put <repo>/src on sys.path and run the CLI. No logic here.
+"""Launcher of a checkout: run the program from <repo>/src. None of the
+program's logic is here, only which Python runs it and what it may import.
 
-The TUI (no arguments on a terminal, or `tui` first) needs Textual, which
-lives in <repo>/.venv: for that case only, re-execute under the venv's
-Python. Every other subcommand stays on the system Python.
+The TUI (no command, or `tui`) needs Textual, which lives in <repo>/.venv:
+for it the venv's Python is started, with <repo>/src put on its path by the
+two lines of BOOTSTRAP. Every other command runs on this Python, with
+<repo>/src in the place of this script's directory on sys.path.
+
+The current directory is never on sys.path, whichever way: the program is
+started in folders of other drives, and a json.py or a textual.py there must
+not run. (`python -m` and `python -c` put it first; -P stops that.) The
+environment is handed on as it is: no PYTHONPATH of ours for the agent tools
+the TUI starts to inherit.
+
+This file has to parse on a Python older than the program needs, so that such
+a Python gets as far as saying so: no syntax here that an old one lacks.
 """
 
 import os
 import sys
-from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-SRC = str(REPO / "src")
+if sys.version_info < (3, 11):  # noqa: UP036  (said by the Python that is too old)
+    this = ".".join(str(part) for part in sys.version_info[:2])
+    sys.stderr.write("agent-sessions needs Python 3.11 or newer (this is " + this + ")\n")
+    sys.exit(1)
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+REPO = os.path.dirname(BIN)
+SRC = os.path.join(REPO, "src")
+VENV_PYTHONS = (
+    os.path.join(REPO, ".venv", "bin", "python"),
+    os.path.join(REPO, ".venv", "Scripts", "python.exe"),
+)
+
+# What the venv's Python runs for the TUI: argv[1] is SRC, the rest the options.
+BOOTSTRAP = (
+    "import sys; sys.path.insert(0, sys.argv[1])\n"
+    "from agent_sessions.tui.__main__ import main; sys.exit(main(sys.argv[2:]))"
+)
 
 
-def wants_tui(argv) -> bool:
-    if argv:
-        return argv[0] == "tui"
-    return sys.stdin.isatty() and sys.stdout.isatty()
+def is_debug(arg):
+    """`--debug`, or a start of it that argparse takes for it (`--d`)."""
+    return len(arg) > 2 and "--debug".startswith(arg)
 
 
-def run_tui(argv) -> int:
-    for python in (REPO / ".venv" / "bin" / "python", REPO / ".venv" / "Scripts" / "python.exe"):
-        if python.is_file():
-            env = dict(os.environ)
-            env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC, env.get("PYTHONPATH")]))
-            command = [str(python), "-m", "agent_sessions.tui", *argv]
-            os.execve(command[0], command, env)  # noqa: S606  (the venv's own Python, fixed argv)
+def tui_options(args, terminal):
+    """The options to start the TUI with when `args` ask for it and for
+    nothing else (`tui`, after any `--debug`; no command at all when
+    `terminal()` says a person is there); else None, and the command line is
+    the parser's to read: `tui --help`, and the help for no command without
+    a terminal."""
+    rest = list(args)
+    while rest and is_debug(rest[0]):
+        rest.pop(0)
+    if rest == ["tui"] or (rest == [] and terminal()):
+        return ["--debug"] if len(rest) < len(args) else []
+    return None
+
+
+def on_a_terminal():
+    """Asked only for no command: every other one loads nothing of the TUI."""
+    from agent_sessions.tui import on_a_terminal as person_there  # no Textual there
+
+    return person_there()
+
+
+def use_src():
+    """Put SRC on sys.path in the place of this script's directory (under
+    `python -c`, of the current one)."""
+    if sys.path and (sys.path[0] == "" or os.path.realpath(sys.path[0]) == BIN):
+        sys.path[0] = SRC
+    else:
+        sys.path.insert(0, SRC)
+
+
+def run_tui(options):
+    for python in VENV_PYTHONS:
+        if os.path.isfile(python):
+            command = [python, "-P", "-c", BOOTSTRAP, SRC] + options
+            try:
+                os.execv(python, command)  # noqa: S606  (the venv's own Python, fixed argv)
+            except OSError as exc:
+                failed = "cannot run " + python + ": " + (exc.strerror or str(exc))
+                sys.stderr.write(
+                    "agent-sessions: " + failed + "; run ./install.sh in " + REPO + "\n"
+                )
+                return 1
     # No venv: this Python will do if it has Textual; if not, the TUI says
     # how to install it and exits 1.
-    sys.path.insert(0, SRC)
     from agent_sessions.tui.__main__ import main
 
-    return main(argv)
+    return main(options)
+
+
+def run(args):
+    use_src()
+    options = tui_options(args, on_a_terminal)
+    if options is not None:
+        return run_tui(options)
+    from agent_sessions.cli import main
+
+    return main(args)
 
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
-    if wants_tui(args):
-        sys.exit(run_tui(args[1:]))
-    sys.path.insert(0, SRC)
-    from agent_sessions.cli import main
-
-    sys.exit(main())
+    sys.exit(run(sys.argv[1:]))

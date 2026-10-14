@@ -1801,16 +1801,24 @@ class EntryTest(unittest.TestCase):
         self.assertNotRegex(css, r"#[0-9a-fA-F]{3,8}\s*;")
         self.assertNotRegex(css, r"rgb\(|hsl\(")
 
-    def test_no_arguments_and_no_terminal_prints_help(self):
-        result = subprocess.run(
-            [sys.executable, self.launcher],
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            timeout=60,
-        )
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("usage: agent-sessions", result.stdout)
+    def test_the_tui_without_a_terminal_is_one_line_and_exit_2(self):
+        """A-21: it used to draw into the pipe and wait for keys for ever."""
+        from agent_sessions import tui
+
+        for argv in ([], ["tui"], ["--debug"], ["--debug", "tui"]):
+            result = subprocess.run(
+                [sys.executable, self.launcher, *argv],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=60,
+            )
+            self.assertEqual(result.returncode, 2, argv)
+            if "tui" in argv:
+                self.assertEqual((result.stdout, result.stderr), ("", tui.NO_TERMINAL + "\n"))
+            else:  # no command and no terminal: the help, as ever
+                self.assertEqual(result.stderr, "", argv)
+                self.assertTrue(result.stdout.startswith("usage: agent-sessions"), argv)
 
     def test_other_subcommands_still_run(self):
         result = subprocess.run(
@@ -1823,7 +1831,8 @@ class EntryTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("agent-sessions", result.stdout)
 
-    def test_tui_is_intercepted_before_the_cli(self):
+    def test_tui_help_is_the_parsers_own(self):
+        """N-13: the launcher printed a usage line of its own."""
         result = subprocess.run(
             [sys.executable, self.launcher, "tui", "--help"],
             capture_output=True,
@@ -1831,22 +1840,32 @@ class EntryTest(unittest.TestCase):
             stdin=subprocess.DEVNULL,
             timeout=60,
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("usage: agent-sessions [tui]", result.stderr)
-        self.assertNotIn("not implemented", result.stderr)
-        result = subprocess.run(
-            [sys.executable, self.launcher, "tui", "--bogus"],
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            timeout=60,
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        entry_point = self.run_py(
+            "import sys; sys.path.insert(0, 'src')\n"
+            "from agent_sessions import cli\n"
+            "cli.main(['tui', '--help'])"
         )
-        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, entry_point.stdout)
+        self.assertTrue(result.stdout.startswith("usage: agent-sessions tui [-h]\n"))
+        self.assertIn("Open the full-screen browser", result.stdout)
+        for stray in ("--bogus", "extra"):
+            result = subprocess.run(
+                [sys.executable, self.launcher, "tui", stray],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=60,
+            )
+            self.assertEqual((result.returncode, result.stdout), (2, ""), stray)
+            self.assertIn("usage: agent-sessions", result.stderr)
 
     def test_missing_textual_is_one_line_and_exit_1(self):
         result = self.run_py(
             "import sys; sys.path.insert(0, 'src')\n"
             "sys.modules['textual'] = None\n"  # as if it were not installed
+            "from agent_sessions import tui\n"
+            "tui.on_a_terminal = lambda: True\n"  # as if a person were there
             "from agent_sessions.tui.__main__ import main\n"
             "sys.exit(main([]))"
         )
