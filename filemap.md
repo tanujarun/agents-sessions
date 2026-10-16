@@ -339,6 +339,8 @@
   scan or a mount), fake sessions, `screen_text`, `settle`; hostile text and what is drawn of
   it (`HOSTILE`, `hostile`, `hostile_name`, `screen_segments`, `unsafe_on_screen`); the app as a program
   of its own in a private pseudo-terminal (`pty_run`, `pty_env`, `PTY_APP`, `pty_engine`, `plain`)
+- `tests/test_tui_eva.py` — `tui/eva.py` (numbers, signals, SIGNAL LOST, the wipe, severities, hazard bands,
+  hint plates, the MAGI votes) and the app with every transition on
 - `tests/test_tui_view.py` — every function of `tui/view.py`, `tui/engine.py`, the launcher and import rules
   (one import of `tui` outside it, in `cli._tui`); runs on the system Python
 - `tests/test_tui_app.py` — the app under Textual's pilot with the fake engine (`make test-tui`; skips itself
