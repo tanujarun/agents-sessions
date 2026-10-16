@@ -169,6 +169,7 @@ class Row:
     foreign: bool
     imported: bool
     haystack: str  # casefolded title, project and cwd, for the filter
+    offline: bool = False  # its drive is not mounted
 
 
 def project_name(cwd: str | None) -> str:
@@ -191,6 +192,7 @@ def make_row(session: SessionLike, where: str) -> Row:
         foreign=session.origin != "native",
         imported=bool(session.imported_as),
         haystack=haystack,
+        offline=bool(getattr(session, "offline", False)),
     )
 
 
@@ -431,6 +433,30 @@ def format_header(columns: Sequence[Column], pad_left: int = 0, pad_right: int =
     return _cells({column.name: column.title for column in columns}, columns, pad_left, pad_right)
 
 
+def row_cells(
+    row: Row,
+    columns: Iterable[Column],
+    now: datetime,
+    provider_labels: Mapping[str, str] | None = None,
+    pad_left: int = 0,
+    pad_right: int = 0,
+) -> list[tuple[str, str]]:
+    """One list line as ``(column name, cell text)`` pieces, each clipped
+    with an ellipsis and padded to its column, by display width."""
+    provider_labels = provider_labels or {}
+    values = {
+        "title": row.title,
+        "project": row.project,
+        "provider": provider_label(row.provider, provider_labels),
+        "age": age_text(row.stamp, now),
+        "where": row.where,
+    }
+    return [
+        (column.name, " " * pad_left + pad(values[column.name], column.width) + " " * pad_right)
+        for column in columns
+    ]
+
+
 def format_row(
     row: Row,
     columns: Iterable[Column],
@@ -441,15 +467,9 @@ def format_row(
 ) -> str:
     """One list line: every cell clipped with an ellipsis and padded to its
     column, by display width."""
-    provider_labels = provider_labels or {}
-    values = {
-        "title": row.title,
-        "project": row.project,
-        "provider": provider_label(row.provider, provider_labels),
-        "age": age_text(row.stamp, now),
-        "where": row.where,
-    }
-    return _cells(values, columns, pad_left, pad_right)
+    return "".join(
+        text for _, text in row_cells(row, columns, now, provider_labels, pad_left, pad_right)
+    )
 
 
 # --- layout for small terminals ---------------------------------------------

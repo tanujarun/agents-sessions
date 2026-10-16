@@ -1,160 +1,300 @@
 /* agent-sessions: every colour, border and spacing value of the TUI.
  *
- * Function-first: plain and readable, nothing decorative. Restyle here; the
- * Python side holds no style and reads the spacing it needs for fitting
- * (cell padding, tab padding, gutters) back from these rules.
+ * The look is NERV's (Neon Genesis Evangelion), and its rules are the show's:
+ * black ground, and colour only where it means something. Orange is the system
+ * speaking (frames, labels, the selection); green is nominal or live; red is
+ * an alert or a loss; cyan is data from outside (another drive). Frames are
+ * hard-edged with a label cut into the top (Pedro Fleming's FUI work); keys
+ * are drawn as plates. Palette after lotap's magi-theme. See tui/eva.py.
  *
- * Colours are the terminal's own: `ansi_default` and the sixteen `ansi_*`
- * names, with `dim`, `bold` and `reverse`. No hex values.
+ * The Python side holds no colour and reads the spacing it needs for fitting
+ * (cell padding, tab padding, gutters) back from these rules.
  *
  * Widget tree:
  *   MainScreen#main                (.-narrow below 80 columns, .-compact when
  *                                   the detail pane is dropped)
- *     #statusbar > #status-message (.-info | .-error), #status-summary (.-busy)
- *     #tabs > TabLabel.tab#tab-<provider> (.-active), #tab-all
- *     #header                      column headings
- *     SessionList#list             component classes below
- *     #detail > .detail-row > .detail-label, .detail-value#detail-<field>
- *     #prompt                      the prompts: one line, or two to four (a
+ *     #statusbar > #brand, #brand-sub, #status-message (.-info | .-error),
+ *                  #status-summary (.-busy, .-blink while a job runs)
+ *     #tabs > TabLabel.tab#tab-<provider> (.-active, .-flash), #tab-all
+ *     #board > #header (column headings), SessionList#list (classes below)
+ *     #lower > #detail > .detail-row > .detail-label, .detail-value#detail-<field>
+ *              MagiPanel#magi      the three MAGI votes (magi--* classes)
+ *     #stripe-top, #stripe-bottom  the hazard band of a prompt that is .-danger
+ *     #prompt (.-caution | .-danger, .-flash as it arrives)
+ *                                  the prompts: one line, or two to four (a
  *                                  reason, a warning) over the choices
  *     #folderbar > #folder-label, Input#folder
  *                                  a folder to type, in the prompt's place
  *     #filterbar > #filter-label, Input#filter
- *     #hints
+ *     KeyHints#hints               hints--key (a plate), hints--action
  *   HelpScreen > #help > #help-title, #help-text, #help-hint
  *   TranscriptScreen#pager > #pager-title, TranscriptView#pager-body,
  *                            #pager-footer > #pager-hints, #pager-status (.-error)
  */
 
+$void: #000000;
+$nerv: #ec7420;        /* the system: frames, labels, the selection */
+$amber: #f4b000;       /* values, titles */
+$alert: #f02020;       /* alert, loss, danger */
+$alert-deep: #a80808;  /* the ground of a danger band */
+$nominal: #50ff10;     /* nominal, live, approve */
+$mint: #60f0a0;        /* numerals */
+$external: #40c8e8;    /* data from another drive */
+$grid: #484848;        /* rules, the inactive */
+$ink: #e8e8e8;         /* text */
+$dim: #8a8a8a;         /* secondary text */
+$ember: #2a1300;       /* the dark of an orange plate */
+
 Screen {
-    background: ansi_default;
-    color: ansi_default;
+    background: $void;
+    color: $ink;
 }
 
 /* --- status line --------------------------------------------------------- */
-
 #statusbar {
     height: 1;
 }
-
+#brand {
+    width: auto;
+    height: 1;
+    padding: 0 1;
+    background: $alert;
+    color: $void;
+    text-style: bold;
+}
+#brand-sub {
+    width: auto;
+    height: 1;
+    padding: 0 1;
+    color: $alert;
+}
 #status-message {
     width: 1fr;
     height: 1;
     padding: 0 1;
+    color: $nerv;
     text-style: bold;
     text-wrap: nowrap;
     text-overflow: ellipsis;
 }
-
 #status-message.-info {
+    color: $amber;
     text-style: none;
 }
-
 #status-message.-error {
-    color: ansi_red;
-    text-style: none;
+    color: $alert;
+    text-style: bold;
 }
-
 #status-summary {
     width: auto;
     height: 1;
     padding: 0 1;
+    color: $mint;
     text-wrap: nowrap;
 }
+#status-summary.-busy {
+    color: $nominal;
+    text-style: bold;
+}
+#status-summary.-blink {
+    background: $nominal;
+    color: $void;
+}
 
-/* --- provider tabs --------------------------------------------------------- */
-
+/* --- provider tabs: numbered plates --------------------------------------- */
 #tabs {
     height: 1;
 }
-
 .tab {
     width: auto;
     height: 1;
     padding: 0 1;
+    color: $nerv;
     text-wrap: nowrap;
 }
-
 .tab.-active {
-    text-style: bold reverse;
+    background: $nerv;
+    color: $void;
+    text-style: bold;
+}
+.tab.-flash {
+    background: $ink;
+    color: $void;
 }
 
-/* --- list ------------------------------------------------------------------- */
-
+/* --- the board: header and list in one frame -------------------------------- */
+#board {
+    height: 1fr;
+    border: heavy $nerv;
+    border-title-color: $amber;
+    border-title-style: bold;
+    border-subtitle-color: $mint;
+}
 #header {
-    height: 2;
+    height: 1;
+    color: $amber;
     text-style: bold;
     text-wrap: nowrap;
-    border-top: solid ansi_default;
 }
-
 #list {
     height: 1fr;
     overflow-x: hidden;
     scrollbar-size-vertical: 1;
-    scrollbar-color: ansi_default;
-    scrollbar-color-hover: ansi_default;
-    scrollbar-color-active: ansi_default;
-    scrollbar-background: ansi_default;
-    scrollbar-background-hover: ansi_default;
-    scrollbar-background-active: ansi_default;
+    scrollbar-color: $nerv;
+    scrollbar-color-hover: $amber;
+    scrollbar-color-active: $amber;
+    scrollbar-background: $ember;
+    scrollbar-background-hover: $ember;
+    scrollbar-background-active: $ember;
 }
-
 /* Padding of every cell: left + right of neighbours is the column spacing. */
 #list > .session-list--cell {
     padding: 0 1;
 }
-
+#list > .session-list--row {
+    color: $ink;
+}
 #list > .session-list--foreign {
-    text-style: dim;
+    color: $dim;
 }
-
 #list > .session-list--cursor {
-    text-style: reverse;
+    background: $nerv;
+    color: $void;
+    text-style: bold;
 }
-
-#list > .session-list--empty {
+#list > .session-list--ghost {
+    background: $ember;
+}
+#list > .session-list--number {
+    color: $mint;
+}
+#list > .session-list--mark {
+    color: $nerv;
+    text-style: bold;
+}
+#list > .session-list--age {
+    color: $mint;
+}
+#list > .session-list--internal {
+    color: $nominal;
+}
+#list > .session-list--external {
+    color: $external;
+}
+#list > .session-list--imported {
+    color: $external;
     text-style: dim;
 }
-
-/* --- detail pane -------------------------------------------------------------- */
-
-#detail {
-    height: auto;
-    border-top: solid ansi_default;
+#list > .session-list--lost {
+    background: $alert-deep;
+    color: $ink;
+    text-style: bold;
+}
+#list > .session-list--beam {
+    color: $nerv;
+    text-style: bold;
+}
+#list > .session-list--empty {
+    color: $alert;
+    text-style: bold;
 }
 
+/* --- the lower deck: data sheet and MAGI ----------------------------------------- */
+#lower {
+    height: auto;
+}
+#detail {
+    width: 1fr;
+    height: auto;
+    border: solid $nerv;
+    border-title-color: $amber;
+    border-title-style: bold;
+}
 .detail-row {
     height: 1;
 }
-
 .detail-label {
-    width: 10;
+    width: 13;
     height: 1;
     padding: 0 1;
-    text-style: dim;
+    color: $nerv;
 }
-
 .detail-value {
     width: 1fr;
     height: 1;
+    color: $amber;
     text-wrap: nowrap;
     text-overflow: ellipsis;
 }
-
 #detail-row-main > .detail-value {
     width: auto;
     padding: 0 3 0 0;
 }
-
 /* The id gives way (with an ellipsis) so messages and updated always fit. */
 #detail-row-main > #detail-id {
     width: 1fr;
     min-width: 6;
 }
+#detail-import, #detail-note {
+    color: $ink;
+}
+#magi {
+    width: 38;
+    height: auto;
+    min-height: 5;
+    padding: 0 1;
+    border: solid $nerv;
+    border-title-color: $amber;
+    border-title-style: bold;
+}
+#magi > .magi--unit {
+    color: $nerv;
+    text-style: bold;
+}
+#magi > .magi--subject {
+    color: $amber;
+}
+#magi > .magi--note {
+    color: $dim;
+}
+#magi > .magi--approve {
+    background: $nominal;
+    color: $void;
+    text-style: bold;
+}
+#magi > .magi--reject {
+    background: $alert;
+    color: $ink;
+    text-style: bold;
+}
+#magi > .magi--pending {
+    background: $amber;
+    color: $void;
+    text-style: bold;
+}
+#magi > .magi--conditional {
+    background: $ember;
+    color: $amber;
+    text-style: bold;
+}
+#magi > .magi--none {
+    color: $grid;
+}
 
-/* --- prompt, filter, hints ------------------------------------------------------- */
-
+/* --- prompts: caution in orange, danger under a hazard band ------------------------ */
+#stripe-top, #stripe-bottom {
+    height: 1;
+    background: $void;
+    text-wrap: nowrap;
+}
+#stripe-top > .hazard--stripe, #stripe-bottom > .hazard--stripe {
+    color: $alert;
+}
+#stripe-top > .hazard--label, #stripe-bottom > .hazard--label {
+    background: $alert;
+    color: $void;
+    text-style: bold;
+}
 #prompt {
     height: auto;
     padding: 0 1;
@@ -162,147 +302,176 @@ Screen {
     text-wrap: nowrap;
     text-overflow: ellipsis;
 }
-
+#prompt.-caution {
+    border-left: thick $nerv;
+    background: $ember;
+    color: $amber;
+}
+#prompt.-danger {
+    border-left: thick $alert;
+    background: $alert-deep;
+    color: $ink;
+}
+#prompt.-flash {
+    background: $ink;
+    color: $void;
+}
 #filterbar, #folderbar {
     height: 1;
 }
-
 #filter-label, #folder-label {
     width: auto;
     height: 1;
     padding: 0 0 0 1;
+    color: $nerv;
     text-style: bold;
 }
-
 #filter, #folder {
     width: 1fr;
     height: 1;
     border: none;
     padding: 0 1;
-    background: ansi_default;
-    color: ansi_default;
+    background: $void;
+    color: $amber;
 }
-
 #filter:focus, #folder:focus {
     border: none;
 }
-
 #hints {
     height: auto;
     padding: 0 1;
-    text-style: dim;
     text-wrap: nowrap;
-    border-top: solid ansi_default;
+    border-top: solid $grid;
+}
+#hints > .hints--key {
+    background: $nerv;
+    color: $void;
+    text-style: bold;
+}
+#hints > .hints--action {
+    color: $dim;
 }
 
-/* A short terminal keeps its rows for the list. */
-#main.-compact #header,
+/* A short terminal keeps its rows for the list: no frames. */
+#main.-compact #board {
+    border: none;
+}
 #main.-compact #hints {
     border-top: none;
 }
 
-#main.-compact #header {
-    height: 1;
+/* A screen arriving flickers (motion): off, on, dim, on. */
+.-flicker-off {
+    opacity: 0%;
+}
+.-flicker-dim {
+    opacity: 35%;
 }
 
 /* --- help overlay ------------------------------------------------------------------ */
-
 HelpScreen {
-    background: ansi_default;
+    background: $void;
     align: center middle;
 }
-
 #help {
     width: auto;
     max-width: 100%;
     height: auto;
     max-height: 100%;
     padding: 0 1;
-    border: solid ansi_default;
+    background: $void;
+    border: heavy $nerv;
+    border-title-color: $amber;
+    border-title-style: bold;
     overflow-x: hidden;
     overflow-y: auto;
     scrollbar-size-vertical: 1;
-    scrollbar-color: ansi_default;
-    scrollbar-color-hover: ansi_default;
-    scrollbar-color-active: ansi_default;
-    scrollbar-background: ansi_default;
-    scrollbar-background-hover: ansi_default;
-    scrollbar-background-active: ansi_default;
+    scrollbar-color: $nerv;
+    scrollbar-color-hover: $amber;
+    scrollbar-color-active: $amber;
+    scrollbar-background: $ember;
+    scrollbar-background-hover: $ember;
+    scrollbar-background-active: $ember;
 }
-
 #help-title, #help-text, #help-hint {
     width: auto;
 }
-
 #help-title {
+    color: $nerv;
     text-style: bold;
     margin: 0 0 1 0;
 }
-
+#help-text {
+    color: $ink;
+}
 #help-hint {
-    text-style: dim;
+    color: $dim;
     margin: 1 0 0 0;
 }
 
 /* --- transcript pager ---------------------------------------------------------------- */
-
 #pager-title {
     height: 1;
     padding: 0 1;
+    background: $nerv;
+    color: $void;
     text-style: bold;
     text-wrap: nowrap;
     text-overflow: ellipsis;
 }
-
 #pager-body {
     height: 1fr;
     padding: 0 1;
     scrollbar-gutter: stable;   /* no re-wrap when the scrollbar appears */
-    border-top: solid ansi_default;
-    border-bottom: solid ansi_default;
+    border-top: heavy $nerv;
+    border-bottom: heavy $nerv;
+    border-title-color: $amber;
+    border-title-style: bold;
     overflow-x: hidden;
     scrollbar-size-vertical: 1;
-    scrollbar-color: ansi_default;
-    scrollbar-color-hover: ansi_default;
-    scrollbar-color-active: ansi_default;
-    scrollbar-background: ansi_default;
-    scrollbar-background-hover: ansi_default;
-    scrollbar-background-active: ansi_default;
+    scrollbar-color: $nerv;
+    scrollbar-color-hover: $amber;
+    scrollbar-color-active: $amber;
+    scrollbar-background: $ember;
+    scrollbar-background-hover: $ember;
+    scrollbar-background-active: $ember;
 }
-
 #pager-body > .transcript--role-user {
-    text-style: bold reverse;
-}
-
-#pager-body > .transcript--role-assistant {
+    background: $amber;
+    color: $void;
     text-style: bold;
 }
-
-#pager-body > .transcript--role-tool,
-#pager-body > .transcript--note {
-    text-style: dim;
+#pager-body > .transcript--role-assistant {
+    color: $nominal;
+    text-style: bold;
 }
-
+#pager-body > .transcript--role-tool {
+    color: $grid;
+}
+#pager-body > .transcript--note {
+    color: $dim;
+}
+#pager-body > .transcript--text {
+    color: $ink;
+}
 #pager-footer {
     height: 1;
 }
-
 #pager-hints {
     width: 1fr;
     height: 1;
     padding: 0 1;
-    text-style: dim;
+    color: $dim;
     text-wrap: nowrap;
     text-overflow: ellipsis;
 }
-
 #pager-status {
     width: auto;
     height: 1;
     padding: 0 1;
+    color: $mint;
     text-wrap: nowrap;
 }
-
 #pager-status.-error {
-    color: ansi_red;
+    color: $alert;
 }

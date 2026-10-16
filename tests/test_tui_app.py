@@ -89,6 +89,15 @@ async def until(condition, timeout: float = 5.0, what: str = "condition") -> Non
         await asyncio.sleep(0.01)
 
 
+def cells(line: str) -> list[str]:
+    """The words of a list line without the board's frame and the row
+    number in front (the NERV look draws both; the tests read the cells)."""
+    words = line.replace("┃", " ").split()
+    if words and (words[0] == "NO" or re.fullmatch(r"\d{3}▶?", words[0])):
+        words = words[1:]
+    return words
+
+
 @unittest.skipIf(textual is None, "Textual is not installed (run under .venv: make test-tui)")
 class TuiCase(unittest.IsolatedAsyncioTestCase):
     size = (120, 40)
@@ -242,7 +251,8 @@ class StartTest(TuiCase):
             await settle(pilot)
             lines = self.text().splitlines()
             self.assertEqual(len(lines), 40)
-            self.assertTrue(lines[0].strip().startswith("agent-sessions"))
+            self.assertTrue(lines[0].strip().startswith("NERV"))
+            self.assertIn("agent-sessions", lines[0])
             self.assertIn("2 drives · 34 sessions · scanned", lines[0])
             self.assertEqual(
                 lines[1].split(),
@@ -267,11 +277,11 @@ class StartTest(TuiCase):
                     "34",
                 ],
             )
-            self.assertEqual(lines[3].split(), ["TITLE", "PROJECT", "AGE", "WHERE"])
-            self.assertEqual(lines[4].split(), ["Already", "imported", "project-90", "1m", "Linux"])
-            self.assertEqual(lines[5].split()[-4:], ["2m", "C:", "·", "imported"])
+            self.assertEqual(cells(lines[3]), ["TITLE", "PROJECT", "AGE", "WHERE"])
+            self.assertEqual(cells(lines[4]), ["Already", "imported", "project-90", "1m", "Linux"])
+            self.assertEqual(cells(lines[5])[-4:], ["2m", "C:", "·", "imported"])
             text = "\n".join(lines)
-            for label in ("id", "messages", "updated", "cwd", "local", "store", "note", "import"):
+            for label in ("ID", "MESSAGES", "UPDATED", "CWD", "LOCAL", "STORE", "NOTE", "IMPORT"):
                 self.assertRegex(text, rf"(?m)^\s*{label}\s|\s{label}\s")
             self.assertIn("↑↓ move  ←→ provider  Enter resume", lines[-2])
             self.assertIn("/ filter  r rescan  R full rescan  ? help  q quit", lines[-1])
@@ -422,11 +432,11 @@ class TabTest(TuiCase):
         async with self.started() as pilot:
             await settle(pilot)
             self.assertEqual(
-                self.text().splitlines()[3].split(), ["TITLE", "PROJECT", "AGE", "WHERE"]
+                cells(self.text().splitlines()[3]), ["TITLE", "PROJECT", "AGE", "WHERE"]
             )
             await pilot.press("0")
             lines = self.text().splitlines()
-            self.assertEqual(lines[3].split(), ["TITLE", "PROVIDER", "PROJECT", "AGE", "WHERE"])
+            self.assertEqual(cells(lines[3]), ["TITLE", "PROVIDER", "PROJECT", "AGE", "WHERE"])
             self.assertIn("Codex", "\n".join(lines[4:12]))
             self.assertIn("Claude", lines[4])
 
@@ -1456,7 +1466,7 @@ class SizeTest(TuiCase):
             lines = self.check_frame(120, 40)
             self.assertIn("PROJECT", lines[3])
             self.assertTrue(self.main.query_one("#detail").display)
-            self.assertIn("store", "\n".join(lines))
+            self.assertIn("STORE", "\n".join(lines))
             self.assertEqual(len([line for line in lines if "claude session" in line]), 18)
             self.assertFalse(self.main.has_class("-narrow"))
             self.assertFalse(self.main.has_class("-compact"))
@@ -1475,7 +1485,7 @@ class SizeTest(TuiCase):
             self.assertGreaterEqual(self.rows.size.height, 8)
             await pilot.press("0")
             self.assertEqual(
-                self.check_frame(80, 24)[3].split(),
+                cells(self.check_frame(80, 24)[3]),
                 ["TITLE", "PROVIDER", "PROJECT", "AGE", "WHERE"],
             )
 
@@ -1483,7 +1493,7 @@ class SizeTest(TuiCase):
         async with self.started(size=(79, 24)) as pilot:
             await settle(pilot)
             lines = self.check_frame(79, 24)
-            self.assertEqual(lines[3].split(), ["TITLE", "AGE", "WHERE"])
+            self.assertEqual(cells(lines[3]), ["TITLE", "AGE", "WHERE"])
             self.assertTrue(self.main.query_one("#detail").display)
             self.assertTrue(self.main.has_class("-narrow"))
 
@@ -1558,7 +1568,7 @@ class SizeTest(TuiCase):
                 self.assertEqual("project" in names, width >= 80, (width, height))
                 await pilot.press("j", "k")
             self.assertEqual(
-                self.text().splitlines()[3].split(),
+                cells(self.text().splitlines()[3]),
                 ["TITLE", "PROVIDER", "PROJECT", "AGE", "WHERE"],
             )
             self.assertFalse(self.exited())
@@ -1719,13 +1729,11 @@ class HelpAndQuitTest(TuiCase):
             self.assertEqual(self.imported(), [])
             self.assertFalse(self.exited())
 
-    async def test_ansi_theme_and_no_inline_styles(self):
+    async def test_nerv_ground_and_no_inline_styles(self):
         async with self.started() as pilot:
             await settle(pilot)
-            self.assertTrue(self.app.current_theme.name.startswith("ansi"))
-            self.assertTrue(self.app.native_ansi_color)
             background = self.main.styles.background
-            self.assertTrue(background.ansi is not None or background.a == 0, background)
+            self.assertEqual((background.r, background.g, background.b, background.a), (0, 0, 0, 1))
             for widget in self.main.walk_children():
                 inline = widget.styles.inline
                 rules = set(inline.get_rules()) - {"display"}
@@ -1771,8 +1779,9 @@ class OfflineTest(OfflineCase):
     def line_style(self, key):
         """The style the list draws a row in."""
         index = [row.key for row in self.rows.rows].index(key)
-        strip = self.rows.render_line(index - self.rows.top)
-        return next(iter(strip)).style
+        segments = list(self.rows.render_line(index - self.rows.top))
+        # In front of the title: the row number and the selection mark.
+        return segments[2 if self.rows.number_width else 0].style
 
     def nothing_was_started(self) -> None:
         self.assertEqual(self.acted(), [])
@@ -1789,7 +1798,7 @@ class OfflineTest(OfflineCase):
             self.assertEqual((offline.where, offline.foreign), ("C: · offline", True))
             self.assertEqual(self.row(OFFLINE_IMPORTED).where, "C: · imported")
             line = next(line for line in self.text().splitlines() if "Offline one" in line)
-            self.assertIn("C: · offline", line)
+            self.assertIn("C: SIGNAL LOST", line)  # drawn so; the row keeps the engine's words
             self.assertFalse(foreign.imported)
             self.assertEqual(self.line_style(OFFLINE), self.line_style(FOREIGN))
             self.assertNotEqual(self.line_style(OFFLINE), self.line_style(IMPORTED_COPY))
@@ -4244,7 +4253,7 @@ class UnplacedTimeTest(TuiCase):
             for session, when in zip(sessions, wanted, strict=True):
                 await self.select(pilot, session.key)
                 text = self.text()
-                self.assertRegex(text, rf"updated +{re.escape(when)}")
+                self.assertRegex(text, rf"UPDATED +{re.escape(when)}")
             self.assertTrue(self.app.is_running)
             self.assertFalse(self.exited())
 

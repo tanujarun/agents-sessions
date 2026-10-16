@@ -2278,7 +2278,11 @@ class EntryTest(unittest.TestCase):
             self.assertNotRegex(text, r"\.styles\.\w+\s*=", name)
             self.assertNotRegex(text, r"Style\(|style=\"", name)
         css = (tui / "app.tcss").read_text(encoding="utf-8")
-        self.assertNotRegex(css, r"#[0-9a-fA-F]{3,8}\s*;")
+        # Every colour is one of the palette's variables, defined once at the
+        # top of the stylesheet; no rule names a colour of its own.
+        for line in css.splitlines():
+            if re.search(r"#[0-9a-fA-F]{3,8}\b", line):
+                self.assertRegex(line, r"^\$[a-z-]+: +#[0-9a-fA-F]{6};", line)
         self.assertNotRegex(css, r"rgb\(|hsl\(")
 
     def test_the_tui_without_a_terminal_is_one_line_and_exit_2(self):

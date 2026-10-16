@@ -16,6 +16,17 @@ The fixes for the acceptance audit of 0.2.0 (`docs/AUDIT.md`; finding numbers in
 Not given a version number yet: nothing has been tagged or published, and which number the
 next release gets is the owner's decision. The program still says 0.2.0.
 
+### Added
+
+- The browser takes the look of NERV's screens in Neon Genesis Evangelion: black ground with colour only
+  as a signal (orange system, green nominal, red alert, cyan external), numbered rows and provider plates,
+  framed panels, a LOCATION that reads SIGNAL LOST for a drive that is not mounted, a MAGI panel that
+  votes on resume, import and drive for the selected session, key hints drawn as plates, and a hazard
+  band over any question that cannot be taken back or sends a message to a model.
+- Transitions in the same spirit: a scan line wipes the list in on a tab switch and at start, the row
+  the selection leaves glows for a moment, a screen that opens flickers in, a danger band marches, a job
+  under way blinks. `AGENT_SESSIONS_MOTION=0` stills them.
+
 ### Security
 
 - Starting the browser in a folder that holds a `json.py`, `textual.py` or another module

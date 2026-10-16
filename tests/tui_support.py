@@ -22,6 +22,9 @@ from collections import namedtuple
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+# Transitions are timed frames; the suites assert on still screens.
+os.environ["AGENT_SESSIONS_MOTION"] = "0"
+
 REPO = Path(__file__).resolve().parent.parent
 _SRC = str(REPO / "src")
 if _SRC not in sys.path:

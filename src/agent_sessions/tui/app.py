@@ -50,10 +50,11 @@ from textual.message import Message
 from textual.screen import ModalScreen, Screen
 from textual.scroll_view import ScrollView
 from textual.strip import Strip
+from textual.widget import Widget
 from textual.widgets import Input, Static
 from textual.worker import Worker
 
-from . import view
+from . import eva, view
 from .engine import Engine
 
 if TYPE_CHECKING:
@@ -206,6 +207,15 @@ class SessionList(ScrollView, can_focus=True):
         "session-list--cursor",  # the selected row (added to one of the above)
         "session-list--cell",  # padding of every cell = the column spacing
         "session-list--empty",  # the "No sessions found" line
+        "session-list--number",  # the row number in front of a row (eva)
+        "session-list--mark",  # the selection mark after it
+        "session-list--age",  # the AGE cell
+        "session-list--internal",  # LOCATION of a session in this system's store
+        "session-list--external",  # ... on another drive, mounted
+        "session-list--imported",  # ... on another drive, with a copy here
+        "session-list--lost",  # ... on a drive that is not mounted: SIGNAL LOST
+        "session-list--beam",  # the scan line of a wipe (motion)
+        "session-list--ghost",  # the afterglow where the selection was (motion)
     }
 
     class Highlighted(Message):
@@ -244,6 +254,15 @@ class SessionList(ScrollView, can_focus=True):
         self._pad = (0, 0)
         self._header: str | None = None
         self._fit_width = -1
+        self.motion = False  # set by the screen from the app (``eva.motion_enabled``)
+        self._reveal: int | None = None  # rows a wipe has uncovered so far
+        self._reveal_timer: Timer | None = None
+        self._ghost: tuple[int, float] | None = None  # (row, until) of the afterglow
+
+    @property
+    def number_width(self) -> int:
+        """Cells in front of every row for its number: none when narrow."""
+        return eva.GUTTER if self.size.width >= eva.GUTTER_MIN_WIDTH else 0
 
     @property
     def current(self) -> view.Row | None:
@@ -285,13 +304,15 @@ class SessionList(ScrollView, can_focus=True):
         padding = self.get_component_styles("session-list--cell").padding
         self._pad = (padding.left, padding.right)
         self.columns = view.fit_columns(
-            self.size.width,
+            self.size.width - self.number_width,
             self.widths,
             show_provider=self.show_provider,
             show_project=self.show_project,
             cell_pad=padding.left + padding.right,
         )
-        header = view.format_header(self.columns, *self._pad)
+        header = " NO".ljust(self.number_width) * bool(self.number_width) + view.format_header(
+            self.columns, *self._pad
+        )
         if header != self._header:
             self._header = header
             self.post_message(self.Fitted(header))
@@ -302,10 +323,34 @@ class SessionList(ScrollView, can_focus=True):
             return
         index = min(max(index, 0), len(self.rows) - 1)
         if index != self.cursor:
+            if self.motion and 0 <= self.cursor < len(self.rows):
+                # The row it leaves glows for a moment, as a phosphor does.
+                self._ghost = (self.cursor, time.monotonic() + eva.FRAME * 3)
+                self.set_timer(eva.FRAME * 3, self.refresh)
             self.cursor = index
             self._show_cursor()
             self.refresh()
             self._announce()
+
+    def reveal(self) -> None:
+        """Wipe the rows in from the top behind a scan line (motion only; an
+        empty list has nothing to wipe in, and its one line shows at once)."""
+        if not self.motion or not self.rows:
+            return
+        if self._reveal_timer is not None:
+            self._reveal_timer.stop()
+        self._reveal = 0
+        self._reveal_timer = self.set_interval(eva.FRAME, self._reveal_more)
+        self.refresh()
+
+    def _reveal_more(self) -> None:
+        self._reveal = (self._reveal or 0) + eva.reveal_step(self.size.height)
+        if self._reveal > self.size.height:
+            self._reveal = None
+            if self._reveal_timer is not None:
+                self._reveal_timer.stop()
+                self._reveal_timer = None
+        self.refresh()
 
     def move(self, move: str) -> None:
         self.select(view.move_index(self.cursor, len(self.rows), move, page=self.size.height - 1))
@@ -342,6 +387,11 @@ class SessionList(ScrollView, can_focus=True):
 
     def render_line(self, y: int) -> Strip:
         width = self.size.width
+        if self._reveal is not None and y >= self._reveal:
+            if y == self._reveal:
+                beam = self.get_component_rich_style("session-list--beam")
+                return Strip([Segment("━" * width, beam)])
+            return Strip.blank(width, self.rich_style)
         if not self.rows:
             return self._empty_line(y, width)
         index = y + self.top
@@ -349,11 +399,33 @@ class SessionList(ScrollView, can_focus=True):
             return Strip.blank(width, self.rich_style)
         row = self.rows[index]
         names = ["session-list--foreign" if row.foreign else "session-list--row"]
-        if index == self.cursor:
+        selected = index == self.cursor
+        if selected:
             names.append("session-list--cursor")
+        elif self._ghost is not None and self._ghost[0] == index:
+            if time.monotonic() < self._ghost[1]:
+                names.append("session-list--ghost")
+            else:
+                self._ghost = None
         style = self.get_component_rich_style(*names)
-        text = view.format_row(row, self.columns, self.clock(), self.provider_labels, *self._pad)
-        return Strip([Segment(text, style)]).adjust_cell_length(width, style)
+        segments: list[Segment] = []
+        if self.number_width:
+            number = self.get_component_rich_style(*names, "session-list--number")
+            mark = self.get_component_rich_style(*names, "session-list--mark")
+            text = eva.gutter_text(index, selected)
+            segments += [Segment(text[:3], style if selected else number), Segment(text[3:], mark)]
+        cells = view.row_cells(
+            eva.drawn_row(row), self.columns, self.clock(), self.provider_labels, *self._pad
+        )
+        for name, text in cells:
+            if name == "where" and not selected:
+                cell = self.get_component_rich_style(*names, f"session-list--{eva.signal(row)}")
+            elif name == "age" and not selected:
+                cell = self.get_component_rich_style(*names, "session-list--age")
+            else:
+                cell = style
+            segments.append(Segment(text, cell))
+        return Strip(segments).adjust_cell_length(width, style)
 
     def _empty_line(self, y: int, width: int) -> Strip:
         """One centred line in the middle of the empty list."""
@@ -365,6 +437,83 @@ class SessionList(ScrollView, can_focus=True):
         return Strip(
             [Segment(" " * left, self.rich_style), Segment(text, style)]
         ).adjust_cell_length(width, self.rich_style)
+
+
+class MagiPanel(Static):
+    """The MAGI verdict on the selected session: three units, each voting on
+    one question (``eva.magi_votes``)."""
+
+    COMPONENT_CLASSES: ClassVar[set[str]] = {
+        "magi--unit",
+        "magi--subject",
+        "magi--note",
+        "magi--approve",
+        "magi--reject",
+        "magi--pending",
+        "magi--conditional",
+        "magi--none",
+    }
+
+    def show(self, votes: list[eva.Vote]) -> None:
+        width = max(self.size.width, 1)
+        text = Text(no_wrap=True, overflow="crop")
+        for number, vote in enumerate(votes):
+            if number:
+                text.append("\n")
+            for part, piece in eva.magi_line(vote, width):
+                kind = vote.state if part == "verdict" else part
+                text.append(piece, self.get_component_rich_style(f"magi--{kind}"))
+        self.update(text)
+
+
+class HazardBand(Static):
+    """The band over and under a prompt that cannot be taken back: diagonal
+    stripes with 警告 WARNING cut into them (``eva.stripe_parts``)."""
+
+    COMPONENT_CLASSES: ClassVar[set[str]] = {"hazard--stripe", "hazard--label"}
+
+    def draw(self, width: int, phase: int) -> None:
+        left, label, right = eva.stripe_parts(width, phase, eva.WARNING_LABEL)
+        stripe = self.get_component_rich_style("hazard--stripe")
+        text = Text(left, stripe, no_wrap=True, overflow="crop")
+        text.append(label, self.get_component_rich_style("hazard--label"))
+        text.append(right, stripe)
+        self.update(text)
+
+
+class KeyHints(Static):
+    """The key hints, each key drawn as a plate; the words are
+    ``view.hint_lines``' own."""
+
+    COMPONENT_CLASSES: ClassVar[set[str]] = {"hints--key", "hints--action"}
+
+    def show(self, lines: Iterable[str]) -> None:
+        text = Text(no_wrap=True, overflow="ellipsis")
+        for number, line in enumerate(lines):
+            if number:
+                text.append("\n")
+            for kind, piece in eva.hint_spans(line):
+                style = "hints--key" if kind == "key" else "hints--action"
+                text.append(piece, self.get_component_rich_style(style))
+        self.update(text)
+
+
+FLICKER_CLASSES = ("-flicker-off", "-flicker-dim")  # app.tcss gives them their opacity
+
+
+def flicker(widget: Widget) -> None:
+    """A screen that arrives catches like a cathode tube: it steps through
+    ``eva.flicker_frames`` (off, on, dim, on). Nothing when motion is off."""
+    if not getattr(widget.app, "motion", False):
+        return
+    for step, frame in enumerate(eva.flicker_frames()):
+        widget.set_timer(step * eva.FRAME or 0.001, partial(_flicker_to, widget, frame))
+
+
+def _flicker_to(widget: Widget, frame: str) -> None:
+    if widget.is_attached:
+        for name in FLICKER_CLASSES:
+            widget.set_class(name == f"-flicker-{frame}", name)
 
 
 class TabLabel(Static):
@@ -477,6 +626,10 @@ class MainScreen(_UiCalls, Screen):
         self._opening = False
         self._continuing = False
         self._starting = ""  # what the status line says while a continue starts
+        self.motion = False  # the app's (eva.motion_enabled), read on mount
+        self._stripe_phase = 0  # the march of a hazard band
+        self._stripe_timer: Timer | None = None
+        self._blink_timer: Timer | None = None
         self._verdicts: dict[str, view.Verdict] = {}
         self._verdict_pending: set[str] = set()
         self._verdict_timer: Timer | None = None
@@ -495,25 +648,36 @@ class MainScreen(_UiCalls, Screen):
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="statusbar"):
+            yield Static(eva.BRAND, id="brand", markup=False)
+            yield Static(eva.BRAND_SUB, id="brand-sub", markup=False)
             yield Static(view.APP_TITLE, id="status-message", markup=False)
             yield Static("", id="status-summary", markup=False)
         yield Horizontal(id="tabs")
-        yield Static("", id="header", markup=False)
-        yield SessionList(clock=self.clock, id="list")
-        with Vertical(id="detail"):
-            with Horizontal(classes="detail-row", id="detail-row-main"):
-                for name in view.DETAIL_FIELDS[:3]:
-                    yield Static(name, classes="detail-label", markup=False)
-                    yield Static(
-                        view.EMPTY, id=f"detail-{name}", classes="detail-value", markup=False
-                    )
-            for name in view.DETAIL_FIELDS[3:]:
-                with Horizontal(classes="detail-row", id=f"detail-row-{name}"):
-                    yield Static(name, classes="detail-label", markup=False)
-                    yield Static(
-                        view.EMPTY, id=f"detail-{name}", classes="detail-value", markup=False
-                    )
+        with Vertical(id="board"):
+            yield Static("", id="header", markup=False)
+            yield SessionList(clock=self.clock, id="list")
+        with Horizontal(id="lower"):
+            with Vertical(id="detail"):
+                with Horizontal(classes="detail-row", id="detail-row-main"):
+                    for number, name in enumerate(view.DETAIL_FIELDS[:3], 1):
+                        yield Static(
+                            f"{number:02d} {name.upper()}", classes="detail-label", markup=False
+                        )
+                        yield Static(
+                            view.EMPTY, id=f"detail-{name}", classes="detail-value", markup=False
+                        )
+                for number, name in enumerate(view.DETAIL_FIELDS[3:], 4):
+                    with Horizontal(classes="detail-row", id=f"detail-row-{name}"):
+                        yield Static(
+                            f"{number:02d} {name.upper()}", classes="detail-label", markup=False
+                        )
+                        yield Static(
+                            view.EMPTY, id=f"detail-{name}", classes="detail-value", markup=False
+                        )
+            yield MagiPanel("", id="magi", markup=False)
+        yield HazardBand("", id="stripe-top", markup=False)
         yield Static("", id="prompt", markup=False)
+        yield HazardBand("", id="stripe-bottom", markup=False)
         with Horizontal(id="folderbar"):
             yield Static("", id="folder-label", markup=False)
             # The text it opens with is a start to type after, not to replace.
@@ -521,7 +685,7 @@ class MainScreen(_UiCalls, Screen):
         with Horizontal(id="filterbar"):
             yield Static("/", id="filter-label", markup=False)
             yield SafeInput(id="filter", placeholder="title, project or folder")
-        yield Static("", id="hints", markup=False)
+        yield KeyHints("", id="hints", markup=False)
 
     @property
     def session_list(self) -> SessionList:
@@ -536,6 +700,13 @@ class MainScreen(_UiCalls, Screen):
         return self.query_one("#folder", SafeInput)
 
     def on_mount(self) -> None:
+        self.motion = bool(getattr(self.app, "motion", False))
+        self.session_list.motion = self.motion
+        self.query_one("#board").border_title = eva.BOARD_TITLE
+        self.query_one("#detail").border_title = eva.DETAIL_TITLE
+        self.query_one("#magi").border_title = eva.MAGI_TITLE
+        for name in ("#stripe-top", "#stripe-bottom"):
+            self.query_one(name).display = False
         self.query_one("#prompt").display = False
         self.query_one("#folderbar").display = False
         self.query_one("#filterbar").display = False
@@ -619,6 +790,12 @@ class MainScreen(_UiCalls, Screen):
             widget.styles.gutter.width + widget.styles.margin.width
             for widget in (left, right, self.query_one("#statusbar"))
         )
+        for name in ("#brand", "#brand-sub"):
+            brand = self.query_one(name)
+            if brand.display:
+                room -= brand.outer_size.width or (
+                    view.text_width(str(brand.render())) + brand.styles.gutter.width
+                )
         activity = self._activity or self._starting
         if activity:
             variants = [activity]
@@ -638,6 +815,19 @@ class MainScreen(_UiCalls, Screen):
         left.set_class(bool(self._message) and not self._message_error, "-info")
         right.update(summary)
         right.set_class(bool(activity), "-busy")
+        self._blink(bool(activity))
+
+    def _blink(self, on: bool) -> None:
+        """A job under way blinks its line, as the screens' status lamps do."""
+        if not self.motion:
+            return
+        right = self.query_one("#status-summary")
+        if on and self._blink_timer is None:
+            self._blink_timer = self.set_interval(0.45, lambda: right.toggle_class("-blink"))
+        elif not on and self._blink_timer is not None:
+            self._blink_timer.stop()
+            self._blink_timer = None
+            right.remove_class("-blink")
 
     # --- layout ----------------------------------------------------------
 
@@ -646,12 +836,16 @@ class MainScreen(_UiCalls, Screen):
 
     def _apply_layout(self) -> None:
         """Decide what a terminal of this size shows (``view.layout_for``)."""
-        hints = self.query_one("#hints", Static)
+        hints = self.query_one("#hints", KeyHints)
         layout = view.layout_for(
             self.size.width, self.size.height, hints.styles.gutter.width + hints.styles.margin.width
         )
         self.query_one("#detail").display = layout.show_detail
-        hints.update("\n".join(layout.hints))
+        self.query_one("#lower").display = layout.show_detail
+        self.query_one("#magi").display = self.size.width >= eva.MAGI_MIN_WIDTH
+        self.query_one("#brand-sub").display = self.size.width >= eva.MAGI_MIN_WIDTH
+        self.query_one("#brand").display = self.size.width >= 50
+        hints.show(layout.hints)
         self.set_class(not layout.show_project, "-narrow")
         self.set_class(not layout.show_detail, "-compact")
         if self.session_list.show_project != layout.show_project:
@@ -691,6 +885,13 @@ class MainScreen(_UiCalls, Screen):
         self.tab_name = self.tabs[self.tab_index].name
         self._render_tabs()
         self._refresh_rows(from_top=True)
+        if self.motion:
+            labels = list(self.query_one("#tabs").query(TabLabel))
+            if self.tab_index < len(labels):
+                plate = labels[self.tab_index]
+                plate.add_class("-flash")
+                self.set_timer(eva.FRAME * 2, lambda: plate.remove_class("-flash"))
+            self.session_list.reveal()
 
     @on(TabLabel.Pressed)
     def _tab_pressed(self, message: TabLabel.Pressed) -> None:
@@ -702,6 +903,7 @@ class MainScreen(_UiCalls, Screen):
 
     async def _apply_snapshot(self, snapshot: Snapshot, select_key: str | None = None) -> None:
         """Show a fresh reading of the index, keeping tab and selection."""
+        first = not self.loaded
         names = [tab.name for tab in self.tabs]
         self.snapshot = snapshot
         self.loaded = True
@@ -717,6 +919,8 @@ class MainScreen(_UiCalls, Screen):
         self._render_tabs()
         self._refresh_rows(select_key)
         self._render_status()
+        if first:
+            self.session_list.reveal()
 
     def _refresh_rows(self, select_key: str | None = None, from_top: bool = False) -> None:
         """Show the rows of the current tab and filter. The selection goes to
@@ -736,10 +940,13 @@ class MainScreen(_UiCalls, Screen):
             key,
             show_provider=provider == view.ALL,
             provider_labels=dict(self.snapshot.providers),
-            widths=view.column_widths(rows, dict(self.snapshot.providers)),
+            widths=view.column_widths(
+                [eva.drawn_row(row) for row in rows], dict(self.snapshot.providers)
+            ),
             empty_text=view.empty_text(self.loaded, self.needle),
             from_top=from_top,
         )
+        self.query_one("#board").border_subtitle = f"{len(rows):03d} ENTRIES"
 
     @staticmethod
     def _listed_under(row: view.Row, provider: str) -> bool:
@@ -782,6 +989,13 @@ class MainScreen(_UiCalls, Screen):
         verdict = self._verdicts.get(session.key) if session else None
         for name, value in view.detail_fields(session, verdict, self.tz).items():
             self.query_one(f"#detail-{name}", Static).update(value)
+        cursor = self.session_list.cursor
+        self.query_one("#detail").border_title = (
+            f"{eva.DETAIL_TITLE} ─ SESSION {eva.row_number(cursor)}"
+            if session is not None
+            else eva.DETAIL_TITLE
+        )
+        self.query_one("#magi", MagiPanel).show(eva.magi_votes(session, verdict))
 
     def _schedule_verdict(self) -> None:
         """Ask the engine what an import of the selected foreign session can
@@ -1013,6 +1227,7 @@ class MainScreen(_UiCalls, Screen):
         self._question = question
         self._render_prompt()
         self.query_one("#prompt").display = True
+        self._announce_prompt()
 
     def _render_prompt(self) -> None:
         """Word the prompt for the width there is."""
@@ -1022,6 +1237,42 @@ class MainScreen(_UiCalls, Screen):
         prompt = self.query_one("#prompt", Static)
         room = self.size.width - prompt.styles.gutter.width - prompt.styles.margin.width
         prompt.update("\n".join(self._prompt_lines(self.mode, question, room)))
+        danger = eva.severity(self.mode) == "danger"
+        prompt.set_class(danger, "-danger")
+        prompt.set_class(not danger, "-caution")
+        self._draw_stripes()
+
+    def _draw_stripes(self) -> None:
+        """The hazard band over and under a prompt that cannot be taken back."""
+        danger = self._question is not None and eva.severity(self.mode) == "danger"
+        show = danger and self.mode not in ("list", "folder") and self.size.height >= 12
+        for name, phase in (
+            ("#stripe-top", self._stripe_phase),
+            ("#stripe-bottom", -self._stripe_phase),
+        ):
+            band = self.query_one(name, HazardBand)
+            band.display = show
+            if show:
+                band.draw(self.size.width, phase)
+
+    def _announce_prompt(self) -> None:
+        """A prompt arrives: a danger band marches, a caution frame flashes."""
+        if not self.motion:
+            return
+        prompt = self.query_one("#prompt")
+        prompt.add_class("-flash")
+        self.set_timer(eva.FRAME * 2, lambda: prompt.remove_class("-flash"))
+        if eva.severity(self.mode) == "danger" and self._stripe_timer is None:
+            self._stripe_timer = self.set_interval(0.12, self._march)
+
+    def _march(self) -> None:
+        if self._question is None or eva.severity(self.mode) != "danger":
+            if self._stripe_timer is not None:
+                self._stripe_timer.stop()
+                self._stripe_timer = None
+            return
+        self._stripe_phase += 1
+        self._draw_stripes()
 
     @staticmethod
     def _prompt_lines(mode: str, question: Question, room: int) -> list[str]:
@@ -1050,6 +1301,7 @@ class MainScreen(_UiCalls, Screen):
         self.mode = "list"
         self._question = None
         self.query_one("#prompt").display = False
+        self._draw_stripes()
         self._hide_folder()
 
     def _take_prompt(self) -> Question | None:
@@ -1128,6 +1380,8 @@ class MainScreen(_UiCalls, Screen):
         """Ask for a folder: to import into, or to start a tool in."""
         question.purpose = purpose
         self.query_one("#prompt").display = False
+        for name in ("#stripe-top", "#stripe-bottom"):
+            self.query_one(name).display = False
         self.mode = "folder"
         self._question = question
         text = (question.folder if purpose == "continue" else "") or view.FOLDER_START
@@ -1832,7 +2086,10 @@ class HelpScreen(_ClosesOnce, ModalScreen):
             yield Static("Esc closes", id="help-hint", markup=False)
 
     def on_mount(self) -> None:
+        box = self.query_one("#help")
+        box.border_title = eva.HELP_TITLE
         self._fill()
+        flicker(box)
 
     def on_resize(self, event: events.Resize) -> None:
         self._fill()
@@ -2070,8 +2327,10 @@ class TranscriptScreen(_UiCalls, _ClosesOnce):
         return self.query_one("#pager-body", TranscriptView)
 
     def on_mount(self) -> None:
+        self.body.border_title = eva.PAGER_TITLE
         self.body.focus()
         self._render_status()
+        flicker(self.body)
         read(self, self._load_thread, "transcript")
 
     def on_unmount(self) -> None:
@@ -2164,6 +2423,7 @@ class SessionsApp(App):
         self.clock = clock
         self.tz = tz
         self.theme = THEME
+        self.motion = eva.motion_enabled()
         self._signals: list[int] = []
 
     def get_default_screen(self) -> Screen:

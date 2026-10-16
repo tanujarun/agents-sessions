@@ -328,6 +328,9 @@
   engine call that only reads, in a daemon thread), `SafeInput` (an input that draws its value cleaned),
   `_ClosesOnce` (a screen a key closes once), `SessionList` and `TranscriptView` (line-drawn, virtual,
   wrapped in timed slices), `TabLabel`, `HelpScreen`, `TranscriptScreen` (the pager)
+- `src/agent_sessions/tui/eva.py` — the Evangelion (NERV/MAGI) presentation layer, pure: row numbers and signals
+  (internal, external, imported, SIGNAL LOST), the MAGI votes, hazard bands, key-hint plates, the
+  transitions' frames and `AGENT_SESSIONS_MOTION`
 - `src/agent_sessions/tui/app.tcss` — every colour, border and spacing value; the widget tree it styles is
   listed at its top
 - `requirements-tui.txt` — the pinned Textual version `install.sh` installs into `.venv`
