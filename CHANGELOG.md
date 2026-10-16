@@ -18,6 +18,8 @@ next release gets is the owner's decision. The program still says 0.2.0.
 
 ### Added
 
+- Pictures of the browser for the README (`docs/media/`: three stills and a GIF), drawn from
+  made-up sessions by `tools/capture_media.py`, and a `list ai` shell function in the README's quick start.
 - The browser takes the look of NERV's screens in Neon Genesis Evangelion: black ground with colour only
   as a signal (orange system, green nominal, red alert, cyan external), numbered rows and provider plates,
   framed panels, a LOCATION that reads SIGNAL LOST for a drive that is not mounted, a MAGI panel that

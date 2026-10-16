@@ -40,6 +40,17 @@ test driver with nine made-up sessions written for this page; they are not in th
 repository, and no test pins the picture. The fourth row is the selected one; the selection
 bar and the dimming of rows from other drives are colours and do not show in text.
 
+The same program in a real-sized window, drawn from made-up sessions (none of it is from a real
+machine; `tools/capture_media.py` makes these pictures with Textual's headless driver):
+
+<p align="center">
+  <img src="docs/media/tui.gif" alt="The browser starting up, moving down the list and switching provider" width="900">
+</p>
+
+| All providers, 200 by 56 | One provider, a session selected | A smaller window, 110 by 32 |
+|---|---|---|
+| ![All providers](docs/media/tui-all.png) | ![One provider](docs/media/tui-claude.png) | ![A smaller window](docs/media/tui-narrow.png) |
+
 ## What it supports
 
 | Provider | List | Resume | Import from another drive | Continue as a new session |
@@ -167,6 +178,24 @@ The first `scan` walks every mounted drive, which takes a few seconds on a warm 
 and longer on a cold one. Later scans look at the known stores only and read just the
 sessions that changed; a full walk is made again when the set of mounted drives changed or
 the last one is older than a day.
+
+A shell shortcut, if you want one: put this in `~/.bashrc` and `list ai` opens the browser. A
+shell alias cannot hold a space, so it is a function; anything after `ai` goes to
+`agent-sessions` (`list ai status`).
+
+```bash
+list() {
+  if [ "$1" = ai ]; then
+    shift
+    agent-sessions "$@"
+  elif type -P list >/dev/null 2>&1; then
+    command list "$@"
+  else
+    echo "list: only 'list ai' is defined" >&2
+    return 1
+  fi
+}
+```
 
 In the browser: arrow keys to move, Enter to resume the selected session in a new terminal
 window, `v` to read it, `?` for every key, `q` to quit. `q` leaves at once, also during a

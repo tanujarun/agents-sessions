@@ -18,6 +18,9 @@
   the index enforces, the steps to add a reader, the state of the four tools without one
 - `docs/FORMATS.md` — per-provider on-disk formats, resume commands, import recipes, store discovery,
   drive letters, ground-truth counts, open questions
+- `tools/capture_media.py` — draws `docs/media/` for the README: runs the TUI headless against the test
+  suite's fake engine with made-up sessions, exports SVG, then `rsvg-convert` and `ffmpeg` make PNGs and the GIF
+- `docs/media/` — `tui-all.png`, `tui-claude.png`, `tui-narrow.png`, `tui.gif`: made-up data only, never a real store
 - `bin/agent-sessions` — launcher script; no logic
 - `install.sh` — set up from this checkout: `.venv` with the pinned Textual, the link in `~/.local/bin`,
   the desktop launcher; checks the Python version (its own floor, on the numbers) and `venv` first; `--dev`

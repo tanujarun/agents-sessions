@@ -104,6 +104,8 @@ test-support = ["support", "tui_support", "fixture_world"]
     "C408",    # dict(key=...) tables of keyword arguments read better than literals
     "RUF012",  # class-level tables of cases are constants, never mutated
 ]
+# The picture script runs rsvg-convert and ffmpeg with a fixed argv, no shell.
+"tools/**" = ["S603", "S607"]
 # Verbatim /proc/self/mountinfo lines inside one string.
 "tests/test_mounts.py" = ["E501"]
 
