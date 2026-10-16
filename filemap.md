@@ -327,10 +327,17 @@
   prompt on screen is about; `leave`: quitting at once, or after an import or an undo), `Reader` (an
   engine call that only reads, in a daemon thread), `SafeInput` (an input that draws its value cleaned),
   `_ClosesOnce` (a screen a key closes once), `SessionList` and `TranscriptView` (line-drawn, virtual,
-  wrapped in timed slices), `TabLabel`, `HelpScreen`, `TranscriptScreen` (the pager)
-- `src/agent_sessions/tui/eva.py` — the Evangelion (NERV/MAGI) presentation layer, pure: row numbers and signals
-  (internal, external, imported, SIGNAL LOST), the MAGI votes, hazard bands, key-hint plates, the
-  transitions' frames and `AGENT_SESSIONS_MOTION`
+  wrapped in timed slices), `TabLabel`, the readout's widgets (`SubjectColumn`, `Leader`, `StatePlate`,
+  `SegmentClock`, `MagiPanel`, `BootLog`, and the `LinePanel`s `ActivityCells`, `DriveBoard`,
+  `RelatedPanel`, `SyncGraph`, `CommLog`), `HelpScreen`, `TranscriptScreen` (the pager)
+- `src/agent_sessions/tui/eva.py` — the Evangelion (NERV/MAGI) presentation layer, pure: row numbers, signals
+  and signal marks, the subject column and its activity traces, seven-segment numerals and the clock, the
+  state plate, the leader line, the MAGI votes and their three-panel shape, the lifespan track and message
+  meter, activity cells, the drive board, related sessions, the sync graph and communication log, the boot
+  log, hazard bands,
+  key-hint plates and `AGENT_SESSIONS_MOTION`
+- `src/agent_sessions/tui/crt.py` — the cathode-ray screen: `Raster` (one per screen: sweep, interlace,
+  type-in) and `CrtMixin`, through which every widget draws
 - `src/agent_sessions/tui/app.tcss` — every colour, border and spacing value; the widget tree it styles is
   listed at its top
 - `requirements-tui.txt` — the pinned Textual version `install.sh` installs into `.venv`
@@ -339,8 +346,9 @@
   scan or a mount), fake sessions, `screen_text`, `settle`; hostile text and what is drawn of
   it (`HOSTILE`, `hostile`, `hostile_name`, `screen_segments`, `unsafe_on_screen`); the app as a program
   of its own in a private pseudo-terminal (`pty_run`, `pty_env`, `PTY_APP`, `pty_engine`, `plain`)
-- `tests/test_tui_eva.py` — `tui/eva.py` (numbers, signals, SIGNAL LOST, the wipe, severities, hazard bands,
-  hint plates, the MAGI votes) and the app with every transition on
+- `tests/test_tui_eva.py` — `tui/eva.py` (numbers, signals, SIGNAL LOST, segments, traces, the leader, the
+  subject column, the plate, the MAGI votes and shape, the boot log, hazard bands, hint plates) and the app
+  with every transition on (boot, sweep, type-in, interlace)
 - `tests/test_tui_view.py` — every function of `tui/view.py`, `tui/engine.py`, the launcher and import rules
   (one import of `tui` outside it, in `cli._tui`); runs on the system Python
 - `tests/test_tui_app.py` — the app under Textual's pilot with the fake engine (`make test-tui`; skips itself

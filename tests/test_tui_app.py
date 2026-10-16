@@ -89,11 +89,22 @@ async def until(condition, timeout: float = 5.0, what: str = "condition") -> Non
         await asyncio.sleep(0.01)
 
 
+# A terminal where the data sheet runs the full width under the list: the
+# tests that read a long note or import line whole use it (beside the list
+# those lines wrap).
+STACKED = (100, 30)
+
+
 def cells(line: str) -> list[str]:
-    """The words of a list line without the board's frame and the row
-    number in front (the NERV look draws both; the tests read the cells)."""
+    """The words of a list line without the board's frame, the panels beside
+    it, the row number and the signal mark in front (the NERV look draws them
+    all; the tests read the cells)."""
+    if "│" in line:  # the board is the widest of the frames side by side
+        line = max(line.split("│"), key=len)
     words = line.replace("┃", " ").split()
-    if words and (words[0] == "NO" or re.fullmatch(r"\d{3}▶?", words[0])):
+    if words and (words[0] == "NO" or re.fullmatch(r"\d{3}▶?[▌░▒▓]?", words[0])):
+        words = words[1:]
+    if words and words[0] in ("▌", "░", "▒", "▓"):  # the signal mark
         words = words[1:]
     return words
 
@@ -307,7 +318,8 @@ class StartTest(TuiCase):
             await settle(pilot)
             self.assertEqual(len(self.rows.rows), 5000)
             self.assertEqual(len(self.rows.children), 0)
-            self.assertLess(len(list(self.main.walk_children())), 60)
+            # The screen's own widgets (panels, plates, fields), not one a row.
+            self.assertLess(len(list(self.main.walk_children())), 80)
             started = time.monotonic()
             await pilot.press("G")
             await pilot.press("pageup", "pageup", "k", "k")
@@ -1428,7 +1440,7 @@ class ErrorTest(TuiCase):
             def scan(self, deep=None, progress=None, cancel=None):
                 return fake.scan(deep, progress, cancel)
 
-        async with self.started(engine=Partial()) as pilot:
+        async with self.started(engine=Partial(), size=STACKED) as pilot:
             self.engine = fake
             await settle(pilot)
             await self.select(pilot, NATIVE)
@@ -1457,6 +1469,57 @@ class ErrorTest(TuiCase):
             await pilot.press("q")
             await settle(pilot)
             self.assertFalse(self.exited())
+
+
+class PanelsTest(TuiCase):
+    """The panels round the log, on a terminal with room for them all."""
+
+    size = (330, 80)
+
+    async def test_every_panel_shows_what_the_engine_said(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await until(lambda: "hello there" in self.text(), what="the communication log")
+            text = self.text()
+            for name in ("#activity", "#drives", "#related", "#sync", "#comm"):
+                self.assertTrue(self.main.query_one(name).display, name)
+            self.assertTrue(self.main.query_one("#magi").roomy)
+            for words in (
+                "ACTIVITY",
+                "DRIVES",
+                "D-01",
+                "RELATED",
+                "SYNC GRAPH",
+                "COMMUNICATION LOG",
+            ):
+                self.assertIn(words, text)
+            self.assertIn("NOW", text.splitlines()[3])  # the track's ruler
+            self.assertIn("MESSAGES", text.splitlines()[3])
+            self.assertGreater(self.rows.track, 0)
+            first = self.selected()
+            self.assertEqual(self.engine.called("transcript"), [first])
+            await pilot.press("j")
+            await until(lambda: len(self.engine.called("transcript")) == 2, what="the next read")
+            await pilot.press("k")  # read before: kept, not read again
+            await settle(pilot)
+            await asyncio.sleep(app_mod.PREVIEW_DELAY * 2)
+            self.assertEqual(len(self.engine.called("transcript")), 2)
+            self.assertEqual(self.opened(), [])
+
+    async def test_a_session_that_cannot_be_read_says_so(self):
+        self.engine.fail["transcript"] = FakeError("the session file is gone")
+        async with self.started() as pilot:
+            await settle(pilot)
+            await until(lambda: "信号途絶 the session file is gone" in self.text(), what="the log")
+            self.assertFalse(self.exited())
+
+    async def test_short_and_wide_drops_what_does_not_fit(self):
+        async with self.started(size=(300, 30)) as pilot:
+            await settle(pilot)
+            self.check_frame(300, 30)
+            self.assertFalse(self.main.query_one("#target-clock").display)
+            self.assertFalse(self.main.query_one("#magi").roomy)
+            self.assertFalse(self.main.query_one("#activity").display)
 
 
 class SizeTest(TuiCase):
@@ -1547,6 +1610,9 @@ class SizeTest(TuiCase):
                 (10, 3),
                 (1, 1),
                 (200, 60),
+                (330, 80),  # every panel round the log
+                (300, 30),  # wide and short
+                (100, 80),  # narrow and tall
                 (79, 19),
                 (60, 20),
                 (59, 20),
@@ -1780,8 +1846,9 @@ class OfflineTest(OfflineCase):
         """The style the list draws a row in."""
         index = [row.key for row in self.rows.rows].index(key)
         segments = list(self.rows.render_line(index - self.rows.top))
-        # In front of the title: the row number and the selection mark.
-        return segments[2 if self.rows.number_width else 0].style
+        # In front of the title: the row number, the selection mark, the
+        # signal mark and a space.
+        return segments[4 if self.rows.number_width else 0].style
 
     def nothing_was_started(self) -> None:
         self.assertEqual(self.acted(), [])
@@ -2442,7 +2509,7 @@ class ImportOptionsTest(TuiCase):
 
     async def test_a_folder_and_experimental_both(self):
         self.engine.options[FOREIGN] = ImportOptions(False, "no folder", True, True, WARNING)
-        async with self.started() as pilot:
+        async with self.started(size=STACKED) as pilot:
             await settle(pilot)
             await self.ask(pilot, "enter", "foreign_folder")
             self.assertIn("experimental only, into a folder you choose", self.text())
@@ -2546,7 +2613,7 @@ class ImportOptionsTest(TuiCase):
 
     async def test_asking_the_engine_fails_and_is_tried_again(self):
         self.engine.fail["import_options"] = FakeError("the store cannot be read")
-        async with self.started() as pilot:
+        async with self.started(size=STACKED) as pilot:
             await settle(pilot)
             await self.select(pilot, FOREIGN)
             self.assertIn("unknown: the store cannot be read", self.text())
@@ -4200,12 +4267,18 @@ class HostileTest(TuiCase):
             f"L{markup}",
             f"N{markup}",
         )
-        async with self.started(size=(160, 40), engine=FakeEngine([session])) as pilot:
+        # The widest terminal whose data sheet runs the full width under the list.
+        async with self.started(size=(129, 40), engine=FakeEngine([session])) as pilot:
             await settle(pilot)
             await self.select(pilot, session.key)
             text = self.text()
-            for value in (session.id, session.store, session.note):
+            for value in (session.store, session.note):
                 self.assertIn(value, text)
+            # The id gives way to MESSAGES and UPDATED on its line: what it holds
+            # is the whole id, as text, and the screen shows it as far as it fits.
+            shown = str(self.main.query_one("#detail-id").render())
+            self.assertEqual(shown, session.id)
+            self.assertIn(session.id[:20], text)
             self.assertIn(f"L{markup}", text)
             self.assertIn("[b]T[/b]", text)
             self.assertIn("/x/[b]P[red]", text)

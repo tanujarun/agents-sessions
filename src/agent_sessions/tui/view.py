@@ -170,6 +170,8 @@ class Row:
     imported: bool
     haystack: str  # casefolded title, project and cwd, for the filter
     offline: bool = False  # its drive is not mounted
+    started: str | None = None  # when the session began (the lifespan track)
+    messages: int | None = None  # its message count (the meter)
 
 
 def project_name(cwd: str | None) -> str:
@@ -193,6 +195,8 @@ def make_row(session: SessionLike, where: str) -> Row:
         imported=bool(session.imported_as),
         haystack=haystack,
         offline=bool(getattr(session, "offline", False)),
+        started=getattr(session, "started", None),
+        messages=getattr(session, "messages", None),
     )
 
 

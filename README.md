@@ -346,7 +346,7 @@ Environment variables:
 |---|---|
 | `AGENT_SESSIONS_TERMINAL` | the command that opens a terminal window, for example `foot -e`; the tool's command is appended. Without it: `omarchy-launch-tui`, else `xdg-terminal-exec`, else `$TERMINAL`, else the first installed of alacritty, kitty, foot, ghostty, wezterm, gnome-terminal, konsole, xterm |
 | `TERMINAL` | your terminal, used as described above |
-| `AGENT_SESSIONS_MOTION` | `0` stills the browser's transitions (the scan-line wipe, the afterglow of the selection, the flicker of a screen that opens, the marching hazard band); on by default |
+| `AGENT_SESSIONS_MOTION` | `0` stills the browser's cathode-ray motion (the boot log, the raster sweep, the typed-in target, rolling digits, interlaced screens, moving static, the hazard band's beat); on by default |
 | `AGENT_SESSIONS_TRUST_TOOLS` | comma-separated tool commands (`claude,codex`) you vouch for: started even when their script on `PATH` names an installer this program cannot follow |
 | `AGENT_SESSIONS_NOTIFY` | `0` switches the desktop notification of a failed resume off |
 | `AGENT_SESSIONS_HOME` | use this directory as the home: native stores, cache, state and configuration are looked for below it. For tests and trials. `verify` walks the mounted drives only, so with a home outside them (under `/tmp`, which no walk enters) it reports that home's stores and sessions as differences |

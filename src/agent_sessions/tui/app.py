@@ -25,13 +25,16 @@ Rules this module keeps:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import os
+import random
 import re
 import signal
 import threading
 import time
 from bisect import bisect_left, bisect_right
+from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, tzinfo
@@ -40,12 +43,14 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from rich.cells import cell_len
 from rich.segment import Segment
+from rich.style import Style
 from rich.text import Text
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal
 from textual.geometry import Region, Size
+from textual.markup import escape
 from textual.message import Message
 from textual.screen import ModalScreen, Screen
 from textual.scroll_view import ScrollView
@@ -54,7 +59,8 @@ from textual.widget import Widget
 from textual.widgets import Input, Static
 from textual.worker import Worker
 
-from . import eva, view
+from . import crt, eva, view
+from .crt import CrtHorizontal, CrtMixin, CrtStatic, CrtVertical, Raster
 from .engine import Engine
 
 if TYPE_CHECKING:
@@ -79,10 +85,26 @@ CLOCK_INTERVAL = 30.0  # seconds between refreshes of the ages on screen
 PAGER_BATCH = 50  # turns handed to the pager at once
 PAGER_SLICE = 0.01  # seconds of wrapping before the pager yields to input
 PAGER_PAUSE = 0.001  # seconds the keyboard gets between two slices
+STATIC_INTERVAL = 0.4  # seconds between two pictures of a lost signal's static
+DELIBERATION = 0.25  # seconds the MAGI deliberate on a new target (motion)
+PREVIEW_DELAY = 0.3  # seconds a row must stay selected before its transcript is read
+PREVIEW_SECONDS = 1.5  # at most this long reading one transcript for the readout
+PREVIEW_MAX_TURNS = 5000  # and at most this many turns
+PREVIEW_TURNS = 40  # the last things said (no tool turns) kept for the communication log
+PREVIEW_CACHE = 48  # transcripts whose reading is kept
+RELATED_MAX = 5  # other sessions of the same folder listed at most
+BOOT_LIMIT = 2.0  # seconds the boot log waits for the index before it gives way
+_STATIC = random.Random()  # noqa: S311 (the noise of lost signals and rolling digits)
 
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _version() -> str:
+    from .. import __version__
+
+    return __version__
 
 
 class UiCall(Message):
@@ -197,7 +219,7 @@ class SafeInput(Input):
 # --- the session list ---------------------------------------------------------
 
 
-class SessionList(ScrollView, can_focus=True):
+class SessionList(CrtMixin, ScrollView, can_focus=True):
     """The list of sessions, drawn line by line: only the visible rows are
     formatted, so thousands of rows cost the same as twenty."""
 
@@ -214,8 +236,13 @@ class SessionList(ScrollView, can_focus=True):
         "session-list--external",  # ... on another drive, mounted
         "session-list--imported",  # ... on another drive, with a copy here
         "session-list--lost",  # ... on a drive that is not mounted: SIGNAL LOST
-        "session-list--beam",  # the scan line of a wipe (motion)
         "session-list--ghost",  # the afterglow where the selection was (motion)
+        "session-list--track-grid",  # the lifespan track where nothing ran
+        "session-list--track-bar",  # a session's span on it
+        "session-list--track-head",  # its last activity
+        "session-list--meter-on",  # the message meter's lit units
+        "session-list--meter-off",  # and its unlit ones
+        "session-list--meter-count",  # the count after it
     }
 
     class Highlighted(Message):
@@ -232,6 +259,9 @@ class SessionList(ScrollView, can_focus=True):
             super().__init__()
             self.key = key
             self.double = double
+
+    class Scrolled(Message):
+        """The rows moved under the leader line."""
 
     class Fitted(Message):
         """The columns changed; ``header`` is the new header line."""
@@ -255,9 +285,10 @@ class SessionList(ScrollView, can_focus=True):
         self._header: str | None = None
         self._fit_width = -1
         self.motion = False  # set by the screen from the app (``eva.motion_enabled``)
-        self._reveal: int | None = None  # rows a wipe has uncovered so far
-        self._reveal_timer: Timer | None = None
         self._ghost: tuple[int, float] | None = None  # (row, until) of the afterglow
+        self.track = 0  # cells of lifespan track after TITLE; 0: none
+        self.span = eva.track_span([], clock())
+        self.peak = 0  # the most messages among the rows (the meter's scale)
 
     @property
     def number_width(self) -> int:
@@ -287,6 +318,8 @@ class SessionList(ScrollView, can_focus=True):
         still listed and near its old place when it is not (``from_top``:
         at the first row, for a list that is not the one shown before)."""
         self.rows = rows
+        self.span = eva.track_span(rows, self.clock())
+        self.peak = max((row.messages or 0 for row in rows), default=0)
         self.cursor = view.select_index(rows, key, 0 if from_top else self.cursor)
         self.show_provider = show_provider
         self.provider_labels = provider_labels or {}
@@ -303,16 +336,31 @@ class SessionList(ScrollView, can_focus=True):
         self.virtual_size = Size(self.size.width, len(self.rows))
         padding = self.get_component_styles("session-list--cell").padding
         self._pad = (padding.left, padding.right)
-        self.columns = view.fit_columns(
-            self.size.width - self.number_width,
-            self.widths,
-            show_provider=self.show_provider,
-            show_project=self.show_project,
-            cell_pad=padding.left + padding.right,
-        )
-        header = " NO".ljust(self.number_width) * bool(self.number_width) + view.format_header(
-            self.columns, *self._pad
-        )
+
+        def columns(room: int) -> list[view.Column]:
+            return view.fit_columns(
+                room,
+                self.widths,
+                show_provider=self.show_provider,
+                show_project=self.show_project,
+                cell_pad=padding.left + padding.right,
+            )
+
+        room = self.size.width - self.number_width
+        self.columns = columns(room)
+        # A title column with room to spare gives it to the lifespan track and
+        # the message meter (eva.track_cells, eva.meter).
+        title = next((column for column in self.columns if column.name == "title"), None)
+        spare = (title.width if title else 0) - eva.TITLE_ROOM - eva.TRACK_TAIL
+        self.track = spare if spare >= eva.TRACK_MIN and self.number_width else 0
+        if self.track:
+            self.columns = columns(room - self.track - eva.TRACK_TAIL)
+        cells = view.format_header(self.columns, *self._pad)
+        if self.track:
+            cut = sum(self._pad) + self.columns[0].width
+            tail = "  " + "MESSAGES".ljust(eva.METER_UNITS + 5) + " "
+            cells = cells[:cut] + eva.track_ruler(self.span, self.track) + tail + cells[cut:]
+        header = " NO".ljust(self.number_width) * bool(self.number_width) + cells
         if header != self._header:
             self._header = header
             self.post_message(self.Fitted(header))
@@ -332,26 +380,6 @@ class SessionList(ScrollView, can_focus=True):
             self.refresh()
             self._announce()
 
-    def reveal(self) -> None:
-        """Wipe the rows in from the top behind a scan line (motion only; an
-        empty list has nothing to wipe in, and its one line shows at once)."""
-        if not self.motion or not self.rows:
-            return
-        if self._reveal_timer is not None:
-            self._reveal_timer.stop()
-        self._reveal = 0
-        self._reveal_timer = self.set_interval(eva.FRAME, self._reveal_more)
-        self.refresh()
-
-    def _reveal_more(self) -> None:
-        self._reveal = (self._reveal or 0) + eva.reveal_step(self.size.height)
-        if self._reveal > self.size.height:
-            self._reveal = None
-            if self._reveal_timer is not None:
-                self._reveal_timer.stop()
-                self._reveal_timer = None
-        self.refresh()
-
     def move(self, move: str) -> None:
         self.select(view.move_index(self.cursor, len(self.rows), move, page=self.size.height - 1))
 
@@ -368,6 +396,10 @@ class SessionList(ScrollView, can_focus=True):
     def on_resize(self, event: events.Resize) -> None:
         self.fit()
         self._show_cursor()
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        self.post_message(self.Scrolled())
 
     def render_lines(self, crop: Region) -> list[Strip]:
         # The content gets a column narrower when the scrollbar appears, and
@@ -387,11 +419,6 @@ class SessionList(ScrollView, can_focus=True):
 
     def render_line(self, y: int) -> Strip:
         width = self.size.width
-        if self._reveal is not None and y >= self._reveal:
-            if y == self._reveal:
-                beam = self.get_component_rich_style("session-list--beam")
-                return Strip([Segment("━" * width, beam)])
-            return Strip.blank(width, self.rich_style)
         if not self.rows:
             return self._empty_line(y, width)
         index = y + self.top
@@ -413,7 +440,14 @@ class SessionList(ScrollView, can_focus=True):
             number = self.get_component_rich_style(*names, "session-list--number")
             mark = self.get_component_rich_style(*names, "session-list--mark")
             text = eva.gutter_text(index, selected)
-            segments += [Segment(text[:3], style if selected else number), Segment(text[3:], mark)]
+            state = eva.signal(row)
+            sign = self.get_component_rich_style(*names, f"session-list--{state}")
+            segments += [
+                Segment(text[:3], style if selected else number),
+                Segment(text[3:4], mark),
+                Segment(eva.signal_mark(state, _STATIC if self.motion else None), sign),
+                Segment(text[4:], style),
+            ]
         cells = view.row_cells(
             eva.drawn_row(row), self.columns, self.clock(), self.provider_labels, *self._pad
         )
@@ -425,7 +459,32 @@ class SessionList(ScrollView, can_focus=True):
             else:
                 cell = style
             segments.append(Segment(text, cell))
+            if name == "title" and self.track:
+                segments += self._track_segments(row, names, selected, style)
         return Strip(segments).adjust_cell_length(width, style)
+
+    def _track_segments(
+        self, row: view.Row, names: list[str], selected: bool, style: Style
+    ) -> list[Segment]:
+        """The lifespan track and the message meter after a row's title."""
+
+        def look(name: str) -> Style:
+            return style if selected else self.get_component_rich_style(*names, name)
+
+        out = [
+            Segment(text, look(f"session-list--track-{kind}"))
+            for kind, text in eva.track_cells(row, self.span, self.track)
+        ]
+        lit, unlit = eva.meter(row.messages, self.peak)
+        out += [
+            Segment("  ", style),
+            Segment(lit, look("session-list--meter-on")),
+            Segment(unlit, look("session-list--meter-off")),
+            Segment(" ", style),
+            Segment(eva.meter_count(row.messages), look("session-list--meter-count")),
+            Segment(" ", style),
+        ]
+        return out
 
     def _empty_line(self, y: int, width: int) -> Strip:
         """One centred line in the middle of the empty list."""
@@ -439,9 +498,11 @@ class SessionList(ScrollView, can_focus=True):
         ).adjust_cell_length(width, self.rich_style)
 
 
-class MagiPanel(Static):
+class MagiPanel(CrtStatic):
     """The MAGI verdict on the selected session: three units, each voting on
-    one question (``eva.magi_votes``)."""
+    one question (``eva.magi_votes``). Drawn as the screens draw it, three
+    panels round the word MAGI (``eva.magi_shape``), where there is room;
+    one line a unit where there is not."""
 
     COMPONENT_CLASSES: ClassVar[set[str]] = {
         "magi--unit",
@@ -452,11 +513,48 @@ class MagiPanel(Static):
         "magi--pending",
         "magi--conditional",
         "magi--none",
+        "magi--fill-approve",
+        "magi--fill-reject",
+        "magi--fill-pending",
+        "magi--fill-conditional",
+        "magi--fill-none",
+        "magi--name",
+        "magi--label",
+        "magi--word-approve",
+        "magi--word-reject",
+        "magi--word-pending",
+        "magi--word-none",
+        "magi--blank",
     }
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.votes: list[eva.Vote] = []
+        self._until = 0.0
+        self.roomy = False  # set by the screen: room for the three panels
+
+    def deliberate(self) -> None:
+        """A new target: for a moment every unit is still deliberating."""
+        if not getattr(self.app, "motion", False):
+            return
+        self._until = time.monotonic() + DELIBERATION
+        self.set_timer(DELIBERATION, lambda: self.show(self.votes))
+
     def show(self, votes: list[eva.Vote]) -> None:
+        self.votes = votes
+        if time.monotonic() < self._until:
+            votes = [eva.deliberating(vote) for vote in votes]
         width = max(self.size.width, 1)
         text = Text(no_wrap=True, overflow="crop")
+        shaped = (self.roomy and width >= eva.MAGI_SHAPE_WIDTH) and eva.magi_shape(votes, width)
+        if shaped:
+            for number, line in enumerate(shaped):
+                if number:
+                    text.append("\n")
+                for kind, piece in line:
+                    text.append(piece, self.get_component_rich_style(f"magi--{kind}"))
+            self.update(text)
+            return
         for number, vote in enumerate(votes):
             if number:
                 text.append("\n")
@@ -465,15 +563,380 @@ class MagiPanel(Static):
                 text.append(piece, self.get_component_rich_style(f"magi--{kind}"))
         self.update(text)
 
+    def on_resize(self, event: events.Resize) -> None:
+        if self.votes:
+            self.show(self.votes)
 
-class HazardBand(Static):
+
+class StatePlate(CrtStatic):
+    """The target's state, as the 内部 INTERNAL plate beside the screens'
+    clocks: kanji on a filled plate, the English, hazard slashes."""
+
+    COMPONENT_CLASSES: ClassVar[set[str]] = {
+        "plate--internal",
+        "plate--external",
+        "plate--imported",
+        "plate--lost",
+        "plate--none",
+        "plate--word",
+        "plate--slash",
+    }
+
+    state = "none"
+
+    def show(self, state: str) -> None:
+        self.state = state
+        kanji, english, slashes = eva.plate_parts(state, max(self.size.width, 1))
+        text = Text(no_wrap=True, overflow="crop")
+        text.append(kanji, self.get_component_rich_style(f"plate--{state}"))
+        text.append(english, self.get_component_rich_style("plate--word"))
+        text.append(slashes, self.get_component_rich_style("plate--slash"))
+        self.update(text)
+
+    def on_resize(self, event: events.Resize) -> None:
+        self.show(self.state)
+
+
+class SegmentClock(CrtStatic):
+    """Time since the target was last active, in seven-segment numerals
+    (``eva.segments``) under ELAPSED SINCE LAST CONTACT. A new target rolls
+    its digits before they settle; the colons blink with the seconds."""
+
+    COMPONENT_CLASSES: ClassVar[set[str]] = {"clock--digits", "clock--units", "clock--rolling"}
+
+    def __init__(self, clock: Clock = _utc_now, **kwargs: Any) -> None:
+        super().__init__("", **kwargs)
+        self.clock = clock
+        self.stamp: str | None = None
+        self._rolls = 0
+        self._colon = True
+        self._timer: Timer | None = None
+
+    def on_mount(self) -> None:
+        if getattr(self.app, "motion", False):
+            self.set_interval(1.0, self._second)
+        self.draw()
+
+    def show(self, stamp: str | None) -> None:
+        changed = stamp != self.stamp
+        self.stamp = stamp
+        if changed and getattr(self.app, "motion", False) and stamp is not None:
+            self._rolls = 6
+            if self._timer is None:
+                self._timer = self.set_interval(eva.FRAME, self._roll)
+        self.draw()
+
+    def _roll(self) -> None:
+        self._rolls -= 1
+        if self._rolls <= 0 and self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+        self.draw()
+
+    def _second(self) -> None:
+        self._colon = not self._colon
+        self.draw()
+
+    def draw(self) -> None:
+        digits = eva.clock_text(eva.elapsed(self.stamp, self.clock()))
+        rolling = self._rolls > 0
+        if rolling:
+            digits = eva.rolled(digits, _STATIC)
+        if not self._colon:
+            digits = digits.replace(":", " ")
+        style = self.get_component_rich_style("clock--rolling" if rolling else "clock--digits")
+        text = Text(no_wrap=True, overflow="crop")
+        for line in eva.segments(digits):
+            text.append(line + "\n", style)
+        units = "".join(
+            unit.center(width) for unit, width in zip(eva.CLOCK_UNITS, (11, 10, 10), strict=True)
+        )
+        text.append(units, self.get_component_rich_style("clock--units"))
+        self.update(text)
+
+
+class SubjectColumn(CrtMixin, Widget):
+    """The providers as the screens list their subjects: numbered plates,
+    the selected one framed with its number in segments, each over a trace
+    of the days it was active (``eva.subject_lines``). A click selects."""
+
+    COMPONENT_CLASSES: ClassVar[set[str]] = {
+        "subject--frame",
+        "subject--digits",
+        "subject--name",
+        "subject--count",
+        "subject--label",
+        "subject--number",
+        "subject--plate",
+        "subject--trace",
+        "subject--trace-active",
+        "subject--rule",
+        "subject--cursor",
+        "subject--legend",
+        "subject--internal",
+        "subject--external",
+        "subject--lost",
+    }
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.lines: list[eva.SubjectLine] = []
+        self._args: tuple = ((), 0, {})
+
+    def show(self, tabs: list[view.Tab], active: int, traces: dict[str, str]) -> None:
+        self._args = (tabs, active, traces)
+        lines = eva.subject_lines(tabs, active, traces, self.size.width or eva.SUBJECT_WIDTH)
+        grew = len(lines) != len(self.lines)
+        self.lines = lines
+        self.refresh(layout=grew)
+
+    def get_content_height(self, container: Size, viewport: Size, width: int) -> int:
+        return len(self.lines)
+
+    def on_resize(self, event: events.Resize) -> None:
+        self.show(*self._args)
+
+    def render_line(self, y: int) -> Strip:
+        width = self.size.width
+        if not 0 <= y < len(self.lines):
+            return Strip.blank(width, self.rich_style)
+        segments = [
+            Segment(text, self.get_component_rich_style(f"subject--{kind}"))
+            for kind, text in self.lines[y].parts
+        ]
+        return Strip(segments).adjust_cell_length(width, self.rich_style)
+
+    def on_click(self, event: events.Click) -> None:
+        event.stop()
+        offset = event.get_content_offset(self)
+        if offset is None or not 0 <= offset.y < len(self.lines):
+            return
+        tab = self.lines[offset.y].tab
+        if tab >= 0:
+            self.post_message(TabLabel.Pressed(tab))
+
+
+class LinePanel(CrtMixin, Widget):
+    """A panel drawn from ``(kind, text)`` lines made in ``eva``; each kind
+    is the component class ``<PREFIX>--<kind>``. Its height is its lines."""
+
+    PREFIX = ""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.lines: list[list[tuple[str, str]]] = []
+
+    def set_lines(self, lines: list[list[tuple[str, str]]]) -> None:
+        grew = len(lines) != len(self.lines)
+        self.lines = lines
+        self.refresh(layout=grew)
+
+    def get_content_height(self, container: Size, viewport: Size, width: int) -> int:
+        return len(self.lines)
+
+    def render_line(self, y: int) -> Strip:
+        width = self.size.width
+        if not 0 <= y < len(self.lines):
+            return Strip.blank(width, self.rich_style)
+        segments = [
+            Segment(text, self.get_component_rich_style(f"{self.PREFIX}--{kind}"))
+            for kind, text in self.lines[y]
+        ]
+        return Strip(segments).crop(0, width).adjust_cell_length(width, self.rich_style)
+
+
+class ActivityCells(LinePanel):
+    """A cell a day for the selected subject (``eva.activity_lines``)."""
+
+    PREFIX = "activity"
+    COMPONENT_CLASSES: ClassVar[set[str]] = {
+        "activity--title",
+        "activity--note",
+        "activity--cell-0",
+        "activity--cell-1",
+        "activity--cell-2",
+        "activity--cell-3",
+        "activity--cell-4",
+        "activity--cell-x",
+    }
+
+
+class DriveBoard(LinePanel):
+    """A plate a drive (``eva.drive_lines``)."""
+
+    PREFIX = "drives"
+    COMPONENT_CLASSES: ClassVar[set[str]] = {
+        "drives--title",
+        "drives--number",
+        "drives--name",
+        "drives--blank",
+        "drives--online",
+        "drives--standby",
+        "drives--lost",
+        "drives--note",
+        "drives--count",
+    }
+
+
+class RelatedPanel(LinePanel):
+    """Other sessions from the target's folder (``eva.related_lines``)."""
+
+    PREFIX = "related"
+    COMPONENT_CLASSES: ClassVar[set[str]] = {
+        "related--title",
+        "related--note",
+        "related--number",
+        "related--provider",
+        "related--text",
+        "related--age",
+    }
+
+
+class SyncGraph(LinePanel):
+    """The target's turns over its time (``eva.sync_lines``)."""
+
+    PREFIX = "sync"
+    COMPONENT_CLASSES: ClassVar[set[str]] = {
+        "sync--title",
+        "sync--note",
+        "sync--grid",
+        "sync--trace",
+        "sync--user",
+    }
+
+
+class CommLog(LinePanel):
+    """The target's last turns (``eva.comm_lines``); it takes the height it
+    is given, and shows as many as fit."""
+
+    PREFIX = "comm"
+    COMPONENT_CLASSES: ClassVar[set[str]] = {
+        "comm--title",
+        "comm--note",
+        "comm--lost",
+        "comm--blank",
+        "comm--role-user",
+        "comm--role-assistant",
+        "comm--role-tool",
+        "comm--text",
+    }
+
+    def __init__(self, tz: tzinfo | None = None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.tz = tz
+        self.preview: eva.Preview | None = None
+
+    def show(self, preview: eva.Preview | None) -> None:
+        self.preview = preview
+        self.lines = eva.comm_lines(preview, self.size.width, self.size.height, self.tz)
+        self.refresh()
+
+    def get_content_height(self, container: Size, viewport: Size, width: int) -> int:
+        return max(container.height, 1)
+
+    def on_resize(self, event: events.Resize) -> None:
+        self.show(self.preview)
+
+
+class Leader(CrtMixin, Widget):
+    """The leader line from the selected row to the target readout, as the
+    screens tie a label to what it names. It redraws (flashes) when the
+    selection moves."""
+
+    COMPONENT_CLASSES: ClassVar[set[str]] = {"leader--line", "leader--flash"}
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.ends: tuple[int, int] | None = None  # (row, target) in this widget's lines
+        self._flash_until = 0.0
+
+    def point(self, row: int | None, target: int | None, flash: bool = False) -> None:
+        ends = None if row is None or target is None else (row, target)
+        if flash and ends != self.ends and getattr(self.app, "motion", False):
+            self._flash_until = time.monotonic() + eva.FRAME * 3
+            self.set_timer(eva.FRAME * 3, self.refresh)
+        self.ends = ends
+        self.refresh()
+
+    def render_line(self, y: int) -> Strip:
+        width = self.size.width
+        if self.ends is None:
+            return Strip.blank(width, self.rich_style)
+        row, target = self.ends
+        text = eva.leader_cell(y, row, target, width)
+        if not text.strip():
+            return Strip.blank(width, self.rich_style)
+        name = "leader--flash" if time.monotonic() < self._flash_until else "leader--line"
+        return Strip([Segment(text, self.get_component_rich_style(name))]).adjust_cell_length(
+            width, self.rich_style
+        )
+
+
+class BootLog(CrtStatic):
+    """The boot log over the main screen while the index is first read
+    (motion only): lines print one a frame; any key or the end takes it
+    away and the screen is swept in (``eva.boot_lines``)."""
+
+    COMPONENT_CLASSES: ClassVar[set[str]] = {
+        "boot--head",
+        "boot--line",
+        "boot--ok",
+        "boot--wait",
+        "boot--lost",
+        "boot--done",
+    }
+
+    def __init__(self, version: str, **kwargs: Any) -> None:
+        super().__init__("", **kwargs)
+        self.version = version
+        self.facts: eva.BootFacts | None = None
+        self.shown = 0
+        self.finished = False
+        self._timer: Timer | None = None
+        self._ends = 0.0
+
+    def start(self) -> None:
+        self._timer = self.set_interval(eva.FRAME, self._next)
+        self._ends = time.monotonic() + BOOT_LIMIT
+
+    def _next(self) -> None:
+        lines = eva.boot_lines(self.version, self.facts)
+        if self.shown < len(lines):
+            self.shown += 1
+        elif self.facts is not None or time.monotonic() > self._ends:
+            self.finish()
+            return
+        text = Text(no_wrap=True, overflow="crop")
+        for state, line in lines[: self.shown]:
+            text.append(line + "\n", self.get_component_rich_style(f"boot--{state}"))
+        if self.shown < len(lines) or self.facts is None:
+            text.append(crt.CURSOR, self.get_component_rich_style("boot--ok"))
+        self.update(text)
+
+    def finish(self) -> None:
+        if self.finished:
+            return
+        self.finished = True
+        if self._timer is not None:
+            self._timer.stop()
+        screen = self.screen
+        self.remove()
+        raster = getattr(screen, "raster", None)
+        if raster is not None:
+            raster.sweep()
+
+
+class HazardBand(CrtStatic):
     """The band over and under a prompt that cannot be taken back: diagonal
     stripes with 警告 WARNING cut into them (``eva.stripe_parts``)."""
 
     COMPONENT_CLASSES: ClassVar[set[str]] = {"hazard--stripe", "hazard--label"}
 
     def draw(self, width: int, phase: int) -> None:
-        left, label, right = eva.stripe_parts(width, phase, eva.WARNING_LABEL)
+        if phase // 8 % 2:  # every other beat the band goes dark but for its ticks
+            left, label, right = eva.ticks_parts(width, eva.EMERGENCY_LABEL)
+        else:
+            left, label, right = eva.stripe_parts(width, phase, eva.WARNING_LABEL)
         stripe = self.get_component_rich_style("hazard--stripe")
         text = Text(left, stripe, no_wrap=True, overflow="crop")
         text.append(label, self.get_component_rich_style("hazard--label"))
@@ -481,7 +944,7 @@ class HazardBand(Static):
         self.update(text)
 
 
-class KeyHints(Static):
+class KeyHints(CrtStatic):
     """The key hints, each key drawn as a plate; the words are
     ``view.hint_lines``' own."""
 
@@ -498,25 +961,7 @@ class KeyHints(Static):
         self.update(text)
 
 
-FLICKER_CLASSES = ("-flicker-off", "-flicker-dim")  # app.tcss gives them their opacity
-
-
-def flicker(widget: Widget) -> None:
-    """A screen that arrives catches like a cathode tube: it steps through
-    ``eva.flicker_frames`` (off, on, dim, on). Nothing when motion is off."""
-    if not getattr(widget.app, "motion", False):
-        return
-    for step, frame in enumerate(eva.flicker_frames()):
-        widget.set_timer(step * eva.FRAME or 0.001, partial(_flicker_to, widget, frame))
-
-
-def _flicker_to(widget: Widget, frame: str) -> None:
-    if widget.is_attached:
-        for name in FLICKER_CLASSES:
-            widget.set_class(name == f"-flicker-{frame}", name)
-
-
-class TabLabel(Static):
+class TabLabel(CrtStatic):
     """One provider tab."""
 
     class Pressed(Message):
@@ -548,6 +993,7 @@ class Snapshot:
     drives: int = 0
     offline: int = 0  # sessions whose drive is not mounted
     last_scan: str | None = None
+    mounts: list[dict] = field(default_factory=list)  # status()["mounts"]
 
 
 @dataclass
@@ -585,6 +1031,7 @@ def build_snapshot(engine: Engine) -> Snapshot:
         drives=view.drive_count(status.get("mounts")),
         offline=sum(1 for session in sessions if session.offline),
         last_scan=status.get("last_quick"),
+        mounts=[mount for mount in status.get("mounts") or () if isinstance(mount, dict)],
     )
 
 
@@ -592,7 +1039,12 @@ def build_snapshot(engine: Engine) -> Snapshot:
 
 
 class MainScreen(_UiCalls, Screen):
-    """Status line, provider tabs, the list, the detail pane, key hints."""
+    """Central Dogma's session monitor: the status line; the subjects (the
+    providers) in a column, or a strip of plates when the terminal is
+    narrower; the session log; a leader line to the target readout (state
+    plate, clock, data, MAGI); the prompts and the key hints."""
+
+    COMPONENT_CLASSES: ClassVar[set[str]] = set(crt.SCREEN_CLASSES)
 
     def __init__(self, engine: Engine, clock: Clock = _utc_now, tz: tzinfo | None = None) -> None:
         super().__init__(id="main")
@@ -635,6 +1087,15 @@ class MainScreen(_UiCalls, Screen):
         self._verdict_timer: Timer | None = None
         # The exit status, once asked to quit while an import or an undo runs.
         self._leaving: int | None = None
+        self.raster = Raster(self)
+        self._previews: OrderedDict[str, eva.Preview] = OrderedDict()
+        self._preview_wanted: str | None = None
+        self._preview_timer: Timer | None = None
+        self._by_folder: dict[str, list[Session]] = {}
+        self._extras: tuple = ()
+        self._related_limit = RELATED_MAX
+        self._traces: dict[str, str] = {}
+        self._target_key: str | None = None
 
     def _engine_home(self) -> str:
         """The engine's home (``AGENT_SESSIONS_HOME`` can move it); this
@@ -647,45 +1108,70 @@ class MainScreen(_UiCalls, Screen):
     # --- widgets ---------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="statusbar"):
-            yield Static(eva.BRAND, id="brand", markup=False)
-            yield Static(eva.BRAND_SUB, id="brand-sub", markup=False)
-            yield Static(view.APP_TITLE, id="status-message", markup=False)
-            yield Static("", id="status-summary", markup=False)
-        yield Horizontal(id="tabs")
-        with Vertical(id="board"):
-            yield Static("", id="header", markup=False)
-            yield SessionList(clock=self.clock, id="list")
-        with Horizontal(id="lower"):
-            with Vertical(id="detail"):
-                with Horizontal(classes="detail-row", id="detail-row-main"):
-                    for number, name in enumerate(view.DETAIL_FIELDS[:3], 1):
-                        yield Static(
-                            f"{number:02d} {name.upper()}", classes="detail-label", markup=False
-                        )
-                        yield Static(
-                            view.EMPTY, id=f"detail-{name}", classes="detail-value", markup=False
-                        )
-                for number, name in enumerate(view.DETAIL_FIELDS[3:], 4):
-                    with Horizontal(classes="detail-row", id=f"detail-row-{name}"):
-                        yield Static(
-                            f"{number:02d} {name.upper()}", classes="detail-label", markup=False
-                        )
-                        yield Static(
-                            view.EMPTY, id=f"detail-{name}", classes="detail-value", markup=False
-                        )
-            yield MagiPanel("", id="magi", markup=False)
+        with CrtHorizontal(id="statusbar"):
+            yield CrtStatic(eva.BRAND, id="brand", markup=False)
+            yield CrtStatic(eva.BRAND_SUB, id="brand-sub", markup=False)
+            yield CrtStatic(eva.SITE, id="brand-site", markup=False)
+            yield CrtStatic(view.APP_TITLE, id="status-message", markup=False)
+            yield CrtStatic("", id="status-summary", markup=False)
+        yield CrtHorizontal(id="tabs")
+        with Horizontal(id="deck"):
+            with CrtVertical(id="subjects-box"):
+                yield SubjectColumn(id="subjects")
+                yield ActivityCells(id="activity")
+                yield DriveBoard(id="drives")
+            with CrtVertical(id="board"):
+                yield CrtStatic("", id="header", markup=False)
+                yield SessionList(clock=self.clock, id="list")
+            yield Leader(id="leader")
+            with CrtVertical(id="target"):
+                yield StatePlate("", id="target-plate", markup=False)
+                yield CrtStatic(eva.CLOCK_LABEL, id="target-clock-label", markup=False)
+                yield SegmentClock(clock=self.clock, id="target-clock", markup=False)
+                with CrtVertical(id="detail"):
+                    with CrtHorizontal(classes="detail-row", id="detail-row-main"):
+                        for number, name in enumerate(view.DETAIL_FIELDS[:3], 1):
+                            yield CrtStatic(
+                                f"{number:02d} {name.upper()}",
+                                classes="detail-label",
+                                markup=False,
+                            )
+                            yield CrtStatic(
+                                view.EMPTY,
+                                id=f"detail-{name}",
+                                classes="detail-value",
+                                markup=False,
+                            )
+                    for number, name in enumerate(view.DETAIL_FIELDS[3:], 4):
+                        with CrtHorizontal(classes="detail-row", id=f"detail-row-{name}"):
+                            yield CrtStatic(
+                                f"{number:02d} {name.upper()}",
+                                classes="detail-label",
+                                markup=False,
+                            )
+                            yield CrtStatic(
+                                view.EMPTY,
+                                id=f"detail-{name}",
+                                classes="detail-value",
+                                markup=False,
+                            )
+                yield MagiPanel("", id="magi", markup=False)
+                yield RelatedPanel(id="related")
+                yield SyncGraph(id="sync")
+                yield CommLog(tz=self.tz, id="comm")
         yield HazardBand("", id="stripe-top", markup=False)
-        yield Static("", id="prompt", markup=False)
+        yield CrtStatic("", id="prompt", markup=False)
         yield HazardBand("", id="stripe-bottom", markup=False)
-        with Horizontal(id="folderbar"):
-            yield Static("", id="folder-label", markup=False)
+        with CrtHorizontal(id="folderbar"):
+            yield CrtStatic("", id="folder-label", markup=False)
             # The text it opens with is a start to type after, not to replace.
             yield SafeInput(id="folder", select_on_focus=False)
-        with Horizontal(id="filterbar"):
-            yield Static("/", id="filter-label", markup=False)
+        with CrtHorizontal(id="filterbar"):
+            yield CrtStatic("/", id="filter-label", markup=False)
             yield SafeInput(id="filter", placeholder="title, project or folder")
         yield KeyHints("", id="hints", markup=False)
+        if getattr(self.app, "motion", False):
+            yield BootLog(_version(), id="boot", markup=False)
 
     @property
     def session_list(self) -> SessionList:
@@ -703,8 +1189,13 @@ class MainScreen(_UiCalls, Screen):
         self.motion = bool(getattr(self.app, "motion", False))
         self.session_list.motion = self.motion
         self.query_one("#board").border_title = eva.BOARD_TITLE
+        self.query_one("#subjects-box").border_title = eva.SUBJECT_TITLE
+        self.query_one("#target").border_title = eva.TARGET_TITLE
         self.query_one("#detail").border_title = eva.DETAIL_TITLE
         self.query_one("#magi").border_title = eva.MAGI_TITLE
+        boot = self.query("#boot")
+        if boot:
+            boot.first(BootLog).start()
         for name in ("#stripe-top", "#stripe-bottom"):
             self.query_one(name).display = False
         self.query_one("#prompt").display = False
@@ -713,6 +1204,8 @@ class MainScreen(_UiCalls, Screen):
         self.session_list.focus()
         self._apply_layout()
         self.set_interval(CLOCK_INTERVAL, self._tick)
+        if self.motion:
+            self.set_interval(STATIC_INTERVAL, self._static)
         self._set_activity(f"loading{view.ELLIPSIS}")
         self._read(self._load_thread, group="load")
 
@@ -762,8 +1255,16 @@ class MainScreen(_UiCalls, Screen):
         self.app.exit(return_code=self._leaving)
         return True
 
+    def _static(self) -> None:
+        """A lost signal's mark is static, and static moves."""
+        listing = self.session_list
+        shown = listing.rows[listing.top : listing.top + listing.size.height]
+        if any(row.offline for row in shown):
+            listing.refresh()
+
     def _tick(self) -> None:
         self.session_list.refresh()
+        self.query_one("#target-clock", SegmentClock).draw()
         self._render_status()
 
     # --- status line -----------------------------------------------------
@@ -790,7 +1291,10 @@ class MainScreen(_UiCalls, Screen):
             widget.styles.gutter.width + widget.styles.margin.width
             for widget in (left, right, self.query_one("#statusbar"))
         )
-        for name in ("#brand", "#brand-sub"):
+        # The site's name gives its room to anything the line has to say.
+        busy = bool(self._message or self._activity or self._starting)
+        self.query_one("#brand-site").display = self.size.width >= eva.TARGET_MIN_WIDTH and not busy
+        for name in ("#brand", "#brand-sub", "#brand-site"):
             brand = self.query_one(name)
             if brand.display:
                 room -= brand.outer_size.width or (
@@ -840,11 +1344,27 @@ class MainScreen(_UiCalls, Screen):
         layout = view.layout_for(
             self.size.width, self.size.height, hints.styles.gutter.width + hints.styles.margin.width
         )
+        width, height = self.size.width, self.size.height
+        side = layout.show_detail and width >= eva.TARGET_MIN_WIDTH
+        wide = side and width >= eva.SUBJECT_MIN_WIDTH
         self.query_one("#detail").display = layout.show_detail
-        self.query_one("#lower").display = layout.show_detail
-        self.query_one("#magi").display = self.size.width >= eva.MAGI_MIN_WIDTH
-        self.query_one("#brand-sub").display = self.size.width >= eva.MAGI_MIN_WIDTH
-        self.query_one("#brand").display = self.size.width >= 50
+        self.query_one("#target").display = layout.show_detail
+        self.query_one("#leader").display = side
+        self.query_one("#subjects-box").display = wide
+        self.query_one("#tabs").display = not wide
+        self.query_one("#magi").display = width >= eva.MAGI_MIN_WIDTH
+        for name in ("#target-plate", "#target-clock-label", "#target-clock"):
+            self.query_one(name).display = side and (
+                name == "#target-plate" or height >= eva.TARGET_TALL
+            )
+        self.query_one("#brand-sub").display = width >= eva.MAGI_MIN_WIDTH
+        self.query_one("#brand").display = width >= 50
+        self.set_class(side, "-side")
+        if not side:
+            for name in ("#related", "#sync", "#comm"):
+                self.query_one(name).display = False
+        self.set_class(wide, "-wide")
+        self.set_class(layout.show_detail and not side, "-stacked")
         hints.show(layout.hints)
         self.set_class(not layout.show_project, "-narrow")
         self.set_class(not layout.show_detail, "-compact")
@@ -854,6 +1374,8 @@ class MainScreen(_UiCalls, Screen):
         self._render_tabs()
         self._render_status()
         self._render_prompt()
+        self.call_after_refresh(self._point_leader)
+        self.call_after_refresh(self._fit_extras)
 
     @on(SessionList.Fitted)
     def _header_changed(self, message: SessionList.Fitted) -> None:
@@ -877,6 +1399,8 @@ class MainScreen(_UiCalls, Screen):
         for index, (label, text) in enumerate(zip(labels, texts, strict=False)):
             label.update(text)
             label.set_class(index == self.tab_index, "-active")
+        self.query_one("#subjects", SubjectColumn).show(self.tabs, self.tab_index, self._traces)
+        self._render_column()
 
     def select_tab(self, index: int) -> None:
         if not self.tabs:
@@ -885,13 +1409,7 @@ class MainScreen(_UiCalls, Screen):
         self.tab_name = self.tabs[self.tab_index].name
         self._render_tabs()
         self._refresh_rows(from_top=True)
-        if self.motion:
-            labels = list(self.query_one("#tabs").query(TabLabel))
-            if self.tab_index < len(labels):
-                plate = labels[self.tab_index]
-                plate.add_class("-flash")
-                self.set_timer(eva.FRAME * 2, lambda: plate.remove_class("-flash"))
-            self.session_list.reveal()
+        self.raster.sweep()
 
     @on(TabLabel.Pressed)
     def _tab_pressed(self, message: TabLabel.Pressed) -> None:
@@ -908,6 +1426,21 @@ class MainScreen(_UiCalls, Screen):
         self.snapshot = snapshot
         self.loaded = True
         self._verdicts.clear()
+        self._by_folder = {}
+        for session in sorted(
+            snapshot.sessions.values(), key=lambda s: s.updated or s.started or "", reverse=True
+        ):
+            if session.cwd:
+                self._by_folder.setdefault(session.cwd, []).append(session)
+        self._previews.clear()
+        self._traces = {
+            name: eva.trace(
+                eva.activity(
+                    [row.stamp for row in snapshot.rows if row.provider == name], self.clock()
+                )
+            )
+            for name, _label in snapshot.providers
+        }
         self.tabs = view.build_tabs(snapshot.providers, snapshot.rows)
         new_names = [tab.name for tab in self.tabs]
         self.tab_index = new_names.index(self.tab_name) if self.tab_name in new_names else 0
@@ -919,8 +1452,16 @@ class MainScreen(_UiCalls, Screen):
         self._render_tabs()
         self._refresh_rows(select_key)
         self._render_status()
-        if first:
-            self.session_list.reveal()
+        boot = self.query("#boot")
+        if first and boot:
+            boot.first(BootLog).facts = eva.BootFacts(
+                sessions=len(snapshot.rows),
+                drives=snapshot.drives,
+                lost=snapshot.offline,
+                subjects=tuple((tab.label, tab.count) for tab in self.tabs if tab.name != view.ALL),
+            )
+        elif not first and not boot:
+            self.raster.sweep()
 
     def _refresh_rows(self, select_key: str | None = None, from_top: bool = False) -> None:
         """Show the rows of the current tab and filter. The selection goes to
@@ -947,6 +1488,12 @@ class MainScreen(_UiCalls, Screen):
             from_top=from_top,
         )
         self.query_one("#board").border_subtitle = f"{len(rows):03d} ENTRIES"
+        tab = self.tabs[self.tab_index] if self.tabs else None
+        self.query_one("#board").border_title = (
+            f"{eva.BOARD_TITLE} ─ {eva.tab_number(tab)} {escape(tab.label.upper())}"
+            if tab is not None
+            else eva.BOARD_TITLE
+        )
 
     @staticmethod
     def _listed_under(row: view.Row, provider: str) -> bool:
@@ -962,6 +1509,24 @@ class MainScreen(_UiCalls, Screen):
             self._selected[self.tab_name] = message.key
         self._render_detail()
         self._schedule_verdict()
+        self._point_leader(flash=True)
+
+    @on(SessionList.Scrolled)
+    def _list_scrolled(self, message: SessionList.Scrolled) -> None:
+        self._point_leader()
+
+    def _point_leader(self, flash: bool = False) -> None:
+        """Tie the selected row to the target readout."""
+        leader = self.query_one("#leader", Leader)
+        if not leader.display:
+            return
+        listing = self.session_list
+        row = listing.cursor - listing.top
+        target = self.query_one("#target-plate").region.y - leader.region.y
+        if not self.loaded or listing.current is None or not 0 <= row < listing.size.height:
+            leader.point(None, None)
+            return
+        leader.point(listing.region.y - leader.region.y + row, target, flash)
 
     @on(SessionList.Pressed)
     def _row_pressed(self, message: SessionList.Pressed) -> None:
@@ -995,7 +1560,215 @@ class MainScreen(_UiCalls, Screen):
             if session is not None
             else eva.DETAIL_TITLE
         )
+        self.query_one("#target").border_title = (
+            f"{eva.TARGET_TITLE} {eva.row_number(cursor)}"
+            if session is not None
+            else eva.TARGET_TITLE
+        )
+        row = self.session_list.current
+        self.query_one("#target-plate", StatePlate).show(eva.signal(row) if row else "none")
+        self.query_one("#target-clock", SegmentClock).show(row.stamp if row else None)
         self.query_one("#magi", MagiPanel).show(eva.magi_votes(session, verdict))
+        key = session.key if session is not None else None
+        if key != self._target_key:
+            # A new target: the readout prints itself, as the screens' text does.
+            self._target_key = key
+            values = list(self.query("#detail .detail-value"))
+            self._render_related()
+            self._schedule_preview()
+            self.call_after_refresh(self._fit_extras)
+            magi = self.query_one("#magi", MagiPanel)
+            magi.deliberate()
+            magi.show(magi.votes)
+            self.raster.type_in(self.query_one("#target-plate"), *values)
+
+    # --- the panels round the log: activity, drives, related, sync, comm ------
+
+    def _render_column(self) -> None:
+        """The left column under the subjects: the selected subject's days,
+        and the drive board."""
+        if not self.query_one("#subjects-box").display:
+            return
+        tab = self.tabs[self.tab_index] if self.tabs else None
+        name = tab.name if tab else view.ALL
+        cells = self.query_one("#activity", ActivityCells)
+        width = cells.size.width or eva.SUBJECT_WIDTH
+        stamps = [
+            row.stamp for row in self.snapshot.rows if name == view.ALL or row.provider == name
+        ]
+        grid = eva.activity_grid(stamps, self.clock(), max((width - 3) // 2, 1))
+        cells.set_lines(eva.activity_lines(grid, width, (tab.label if tab else "ALL").upper()))
+        self._render_drives()
+
+    def _drives(self) -> list[eva.Drive]:
+        """The drives of the last status report, one a label, with the
+        sessions listed on each."""
+        counts: dict[str, int] = {}
+        for session in self.snapshot.sessions.values():
+            counts[session.mount] = counts.get(session.mount, 0) + 1
+        drives: dict[str, eva.Drive] = {}
+        for mount in self.snapshot.mounts:
+            label = view.clean(str(mount.get("label") or mount.get("path") or "?"))
+            held = counts.get(str(mount.get("path")), 0)
+            known = drives.get(label)
+            if known is not None:
+                drives[label] = dataclasses.replace(known, sessions=known.sessions + held)
+                continue
+            drives[label] = eva.Drive(
+                label=label,
+                fstype=view.clean(str(mount.get("fstype") or "")),
+                device=view.clean(str(mount.get("device") or "")),
+                letter=view.clean(str(mount.get("letter") or "")),
+                state=str(mount.get("state") or ("mounted" if mount.get("mounted") else "absent")),
+                sessions=held,
+            )
+        return list(drives.values())
+
+    def _render_drives(self, room: int | None = None) -> None:
+        board = self.query_one("#drives", DriveBoard)
+        drives = self._drives()
+        if room is not None:
+            drives = drives[: max((room - 1) // 2, 0)]
+        board.set_lines(eva.drive_lines(drives, board.size.width or eva.SUBJECT_WIDTH))
+
+    def _render_related(self) -> None:
+        panel = self.query_one("#related", RelatedPanel)
+        session = self.current_session()
+        if session is None:
+            panel.set_lines([])
+            return
+        digits = {tab.name: eva.tab_number(tab) for tab in self.tabs}
+        labels = dict(self.snapshot.providers)
+        now = self.clock()
+        related = [
+            eva.Related(
+                digits.get(other.provider, "--"),
+                view.clean(labels.get(other.provider, other.provider)),
+                view.shown_title(other.title, other.id),
+                view.age_text(other.updated or other.started, now),
+            )
+            for other in self._by_folder.get(session.cwd or "", [])
+            if other.key != session.key
+        ]
+        folder = view.clean(session.cwd or "")
+        panel.set_lines(
+            eva.related_lines(related, folder, panel.size.width or 44, self._related_limit)
+        )
+
+    def _fit_extras(self) -> None:
+        """Give the space the column and the readout have left to the panels
+        that fit in it, in order: the activity cells, then the drives on the
+        left; the MAGI's shape, the communication log, the sync graph, the
+        related sessions on the right. A panel that does not fit is hidden."""
+        if not self.is_attached:
+            return
+        box = self.query_one("#subjects-box")
+        if box.display:
+            room = box.content_size.height - self.query_one("#subjects").outer_size.height
+            cells = self.query_one("#activity", ActivityCells)
+            show_cells = room >= len(cells.lines) + 1 and bool(cells.lines)
+            room -= (len(cells.lines) + 1) * show_cells
+            drives = len(self._drives())
+            show_drives = room >= 4 and drives > 0
+            self._set_extra(cells, show_cells)
+            self._set_extra(self.query_one("#drives"), show_drives)
+            if show_drives:
+                self._render_drives(room - 1)
+        target = self.query_one("#target")
+        if not (target.display and self.has_class("-side")):
+            return
+        fixed = sum(
+            widget.outer_size.height
+            for widget in target.children
+            if widget.display and widget.id not in ("magi", "related", "sync", "comm")
+        )
+        room = target.content_size.height - fixed
+        magi = self.query_one("#magi", MagiPanel)
+        shaped = room >= eva.MAGI_SHAPE_HEIGHT + 1 + 8
+        room -= (eva.MAGI_SHAPE_HEIGHT if shaped else 3) + 1
+        comm = room >= 7
+        room -= 7 * comm
+        sync = comm and room >= eva.SYNC_ROWS + 3
+        room -= (eva.SYNC_ROWS + 3) * sync
+        related = sync and room >= 4
+        self._related_limit = max(min(room - 2, RELATED_MAX), 1)
+        state = (shaped, comm, sync, related, self._related_limit)
+        if state == self._extras:
+            return
+        self._extras = state
+        magi.roomy = shaped
+        magi.show(magi.votes)
+        self._set_extra(self.query_one("#comm"), comm)
+        self._set_extra(self.query_one("#sync"), sync)
+        self._set_extra(self.query_one("#related"), related)
+        self._render_related()
+        self._schedule_preview()
+
+    @staticmethod
+    def _set_extra(widget: Widget, show: bool) -> None:
+        if widget.display != show:
+            widget.display = show
+
+    def _schedule_preview(self) -> None:
+        """Read the selected session's transcript for the sync graph and the
+        communication log once the selection has settled on it."""
+        if self._preview_timer is not None:
+            self._preview_timer.stop()
+            self._preview_timer = None
+        session = self.current_session()
+        wanted = self.query_one("#comm").display or self.query_one("#sync").display
+        key = session.key if session is not None and wanted else None
+        self._preview_wanted = key
+        preview = self._previews.get(key) if key else None
+        self._show_preview(preview)
+        if key is None or preview is not None:
+            return
+        self._preview_timer = self.set_timer(PREVIEW_DELAY, partial(self._start_preview, key))
+
+    def _start_preview(self, key: str) -> None:
+        self._preview_timer = None
+        session = self.snapshot.sessions.get(key)
+        if session is None or key != self._preview_wanted:
+            return
+        self._read(self._preview_thread, key, session, self.snapshot.index, group="preview")
+
+    def _preview_thread(self, key: str, session: Session, index: Index | None) -> None:
+        turns: deque[tuple[str, str, str | None]] = deque(maxlen=PREVIEW_TURNS)
+        beats: list[tuple[str, str | None]] = []
+        total, capped, error = 0, False, None
+        deadline = time.monotonic() + PREVIEW_SECONDS
+        try:
+            for turn in self.engine.transcript(session.key, index=index):
+                if self._preview_wanted != key:
+                    return  # the selection moved on
+                role, text, ts = (tuple(turn) + (None, None, None))[:3]
+                role = role if role in ("user", "assistant", "tool") else "assistant"
+                stamp = ts if isinstance(ts, str) else None
+                lines = view.clean("" if text is None else str(text)[:400]).strip().splitlines()
+                if role != "tool":  # the log keeps what was said; the graph counts all
+                    turns.append((role, lines[0] if lines else view.EMPTY, stamp))
+                beats.append((role, stamp))
+                total += 1
+                if total >= PREVIEW_MAX_TURNS or time.monotonic() > deadline:
+                    capped = True
+                    break
+        except Exception as exc:
+            error = view.error_text(exc)
+        preview = eva.Preview(tuple(turns), tuple(beats), total, capped, error)
+        self._ui(self._preview_done, key, preview)
+
+    def _preview_done(self, key: str, preview: eva.Preview) -> None:
+        self._previews[key] = preview
+        while len(self._previews) > PREVIEW_CACHE:
+            self._previews.popitem(last=False)
+        if key == self._preview_wanted:
+            self._show_preview(preview)
+            self.raster.type_in(self.query_one("#comm"), stagger=0)
+
+    def _show_preview(self, preview: eva.Preview | None) -> None:
+        sync = self.query_one("#sync", SyncGraph)
+        sync.set_lines(eva.sync_lines(preview, sync.size.width or 44))
+        self.query_one("#comm", CommLog).show(preview)
 
     def _schedule_verdict(self) -> None:
         """Ask the engine what an import of the selected foreign session can
@@ -1088,6 +1861,8 @@ class MainScreen(_UiCalls, Screen):
             event.stop()
             event.prevent_default()
             return
+        for boot in self.query(BootLog):
+            boot.finish()  # a key ends the boot log, and does what it does
         mode = "filter" if self.focused is self.filter_input else self.mode
         action = view.key_action(mode, event.key, event.character)
         if action is None:
@@ -2079,17 +2854,23 @@ class MainScreen(_UiCalls, Screen):
 class HelpScreen(_ClosesOnce, ModalScreen):
     """The key help; ``?``, ``q``, Esc, Enter or a click closes it."""
 
+    COMPONENT_CLASSES: ClassVar[set[str]] = set(crt.SCREEN_CLASSES)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.raster = Raster(self)
+
     def compose(self) -> ComposeResult:
-        with Vertical(id="help"):
-            yield Static("Keys", id="help-title", markup=False)
-            yield Static("", id="help-text", markup=False)
-            yield Static("Esc closes", id="help-hint", markup=False)
+        with CrtVertical(id="help"):
+            yield CrtStatic("Keys", id="help-title", markup=False)
+            yield CrtStatic("", id="help-text", markup=False)
+            yield CrtStatic("Esc closes", id="help-hint", markup=False)
 
     def on_mount(self) -> None:
         box = self.query_one("#help")
         box.border_title = eva.HELP_TITLE
         self._fill()
-        flicker(box)
+        self.raster.interlace()
 
     def on_resize(self, event: events.Resize) -> None:
         self._fill()
@@ -2126,7 +2907,7 @@ class HelpScreen(_ClosesOnce, ModalScreen):
 # --- transcript pager ----------------------------------------------------------------
 
 
-class TranscriptView(ScrollView, can_focus=True):
+class TranscriptView(CrtMixin, ScrollView, can_focus=True):
     """A transcript drawn line by line. Turns arrive in batches and are
     wrapped a slice at a time, each slice from a timer of its own: a key is
     answered between two slices, however long the session is.
@@ -2296,6 +3077,8 @@ class TranscriptView(ScrollView, can_focus=True):
 class TranscriptScreen(_UiCalls, _ClosesOnce):
     """The built-in pager: one session's transcript, read in a thread."""
 
+    COMPONENT_CLASSES: ClassVar[set[str]] = set(crt.SCREEN_CLASSES)
+
     def __init__(
         self,
         engine: Engine,
@@ -2314,13 +3097,14 @@ class TranscriptScreen(_UiCalls, _ClosesOnce):
         self.max_turns = view.PAGER_MAX_TURNS if max_turns is None else max_turns
         self.turn_count = 0
         self.reading = True
+        self.raster = Raster(self)
 
     def compose(self) -> ComposeResult:
-        yield Static(self.session_title, id="pager-title", markup=False)
+        yield CrtStatic(self.session_title, id="pager-title", markup=False)
         yield TranscriptView(tz=self.tz, id="pager-body")
-        with Horizontal(id="pager-footer"):
-            yield Static(view.PAGER_HINTS, id="pager-hints", markup=False)
-            yield Static("", id="pager-status", markup=False)
+        with CrtHorizontal(id="pager-footer"):
+            yield CrtStatic(view.PAGER_HINTS, id="pager-hints", markup=False)
+            yield CrtStatic("", id="pager-status", markup=False)
 
     @property
     def body(self) -> TranscriptView:
@@ -2330,7 +3114,7 @@ class TranscriptScreen(_UiCalls, _ClosesOnce):
         self.body.border_title = eva.PAGER_TITLE
         self.body.focus()
         self._render_status()
-        flicker(self.body)
+        self.raster.interlace()
         read(self, self._load_thread, "transcript")
 
     def on_unmount(self) -> None:

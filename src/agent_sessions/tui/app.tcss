@@ -3,33 +3,41 @@
  * The look is NERV's (Neon Genesis Evangelion), and its rules are the show's:
  * black ground, and colour only where it means something. Orange is the system
  * speaking (frames, labels, the selection); green is nominal or live; red is
- * an alert or a loss; cyan is data from outside (another drive). Frames are
- * hard-edged with a label cut into the top (Pedro Fleming's FUI work); keys
- * are drawn as plates. Palette after lotap's magi-theme. See tui/eva.py.
+ * an alert or a loss; cyan is data from outside (another drive). The screen is
+ * laid out as Central Dogma's monitors are: subjects as numbered plates in a
+ * column, the log in the middle, a leader line out to the target readout
+ * (state plate, seven-segment clock, data, the MAGI as three panels). Palette
+ * after lotap's magi-theme. See tui/eva.py (shapes) and tui/crt.py (motion).
  *
  * The Python side holds no colour and reads the spacing it needs for fitting
  * (cell padding, tab padding, gutters) back from these rules.
  *
  * Widget tree:
- *   MainScreen#main                (.-narrow below 80 columns, .-compact when
- *                                   the detail pane is dropped)
- *     #statusbar > #brand, #brand-sub, #status-message (.-info | .-error),
- *                  #status-summary (.-busy, .-blink while a job runs)
- *     #tabs > TabLabel.tab#tab-<provider> (.-active, .-flash), #tab-all
- *     #board > #header (column headings), SessionList#list (classes below)
- *     #lower > #detail > .detail-row > .detail-label, .detail-value#detail-<field>
- *              MagiPanel#magi      the three MAGI votes (magi--* classes)
+ *   MainScreen#main                (.-wide: the subject column; .-side: the
+ *                                   target readout right of the log;
+ *                                   .-stacked: the readout under it; .-narrow
+ *                                   below 80 columns; .-compact without it)
+ *     #statusbar > #brand, #brand-sub, #brand-site, #status-message (.-info |
+ *                  .-error), #status-summary (.-busy, .-blink while a job runs)
+ *     #tabs > TabLabel.tab#tab-<provider> (.-active), #tab-all
+ *     #deck > #subjects-box > SubjectColumn#subjects (subject--* classes)
+ *             #board > #header (column headings), SessionList#list
+ *             Leader#leader        the line from the selected row to the target
+ *             #target > StatePlate#target-plate (plate--*), #target-clock-label,
+ *                       SegmentClock#target-clock (clock--*),
+ *                       #detail > .detail-row > .detail-label, .detail-value#detail-<field>
+ *                       MagiPanel#magi  the three MAGI votes (magi--* classes)
  *     #stripe-top, #stripe-bottom  the hazard band of a prompt that is .-danger
  *     #prompt (.-caution | .-danger, .-flash as it arrives)
- *                                  the prompts: one line, or two to four (a
- *                                  reason, a warning) over the choices
  *     #folderbar > #folder-label, Input#folder
- *                                  a folder to type, in the prompt's place
  *     #filterbar > #filter-label, Input#filter
  *     KeyHints#hints               hints--key (a plate), hints--action
+ *     BootLog#boot                 the boot log, on its own layer (motion only)
  *   HelpScreen > #help > #help-title, #help-text, #help-hint
  *   TranscriptScreen#pager > #pager-title, TranscriptView#pager-body,
  *                            #pager-footer > #pager-hints, #pager-status (.-error)
+ * Every screen styles crt--noise (the raster band), crt--bloom (a line just
+ * painted) and crt--old (the picture the band has not reached).
  */
 
 $void: #000000;
@@ -44,6 +52,8 @@ $grid: #484848;        /* rules, the inactive */
 $ink: #e8e8e8;         /* text */
 $dim: #8a8a8a;         /* secondary text */
 $ember: #2a1300;       /* the dark of an orange plate */
+$phosphor: #ffffff;    /* a line the raster has just painted */
+$ember-lit: #7a3a10;   /* the first step of a lit cell */
 
 Screen {
     background: $void;
@@ -51,8 +61,35 @@ Screen {
 }
 
 /* --- status line --------------------------------------------------------- */
+Screen > .crt--noise {
+    color: $nominal;
+}
+Screen > .crt--bloom {
+    color: $phosphor;
+    text-style: bold;
+}
+Screen > .crt--old {
+    text-style: dim;
+}
+MainScreen {
+    layers: base boot;
+}
+
 #statusbar {
     height: 1;
+}
+/* With the subjects in a column there is no strip of plates under the
+ * status line: a rule takes its place. */
+#main.-wide #statusbar {
+    height: 2;
+    border-bottom: heavy $nerv;
+}
+#brand-site {
+    width: auto;
+    height: 1;
+    padding: 0 1;
+    color: $nerv;
+    text-style: bold;
 }
 #brand {
     width: auto;
@@ -117,15 +154,71 @@ Screen {
     color: $void;
     text-style: bold;
 }
-.tab.-flash {
-    background: $ink;
-    color: $void;
-}
 
-/* --- the board: header and list in one frame -------------------------------- */
-#board {
+/* --- the deck: subjects, the log, the leader, the target ---------------------- */
+#deck {
     height: 1fr;
-    border: heavy $nerv;
+}
+#main.-stacked #deck {
+    layout: vertical;
+}
+#subjects-box {
+    width: 26;
+    height: 1fr;
+    border: solid $nerv;
+    border-title-color: $amber;
+    border-title-style: bold;
+}
+#subjects {
+    height: auto;
+}
+#activity, #drives {
+    height: auto;
+    margin: 1 0 0 0;
+}
+#activity > .activity--title { color: $nerv; text-style: bold; }
+#activity > .activity--note { color: $dim; }
+#activity > .activity--cell-0 { color: $grid; }
+#activity > .activity--cell-1 { color: $ember-lit; }
+#activity > .activity--cell-2 { color: $nerv; }
+#activity > .activity--cell-3 { color: $amber; }
+#activity > .activity--cell-4 { color: $phosphor; text-style: bold; }
+#activity > .activity--cell-x { color: $void; }
+#drives > .drives--title { color: $nerv; text-style: bold; }
+#drives > .drives--number { color: $nerv; }
+#drives > .drives--name { color: $ink; text-style: bold; }
+#drives > .drives--online { background: $nominal; color: $void; text-style: bold; }
+#drives > .drives--standby { background: $amber; color: $void; text-style: bold; }
+#drives > .drives--lost { background: $alert; color: $ink; text-style: bold; }
+#drives > .drives--note { color: $dim; }
+#drives > .drives--count { color: $mint; }
+#subjects > .subject--frame { color: $nerv; }
+#subjects > .subject--digits { color: $alert; text-style: bold; }
+#subjects > .subject--name { color: $amber; text-style: bold; }
+#subjects > .subject--count { color: $mint; }
+#subjects > .subject--label { color: $dim; }
+#subjects > .subject--number { color: $nerv; text-style: bold; }
+#subjects > .subject--plate { color: $ink; }
+#subjects > .subject--trace { color: $nominal; }
+#subjects > .subject--trace-active { color: $nerv; }
+#subjects > .subject--rule { color: $grid; }
+#subjects > .subject--cursor { background: $nerv; color: $void; text-style: bold; }
+#subjects > .subject--legend { color: $dim; }
+#subjects > .subject--internal { color: $nominal; }
+#subjects > .subject--external { color: $external; }
+#subjects > .subject--lost { color: $alert; }
+
+#leader {
+    width: 3;
+    height: 1fr;
+}
+#leader > .leader--line { color: $nerv; text-style: bold; }
+#leader > .leader--flash { color: $phosphor; text-style: bold; }
+
+#board {
+    width: 1fr;
+    height: 1fr;
+    border: solid $nerv;
     border-title-color: $amber;
     border-title-style: bold;
     border-subtitle-color: $mint;
@@ -190,18 +283,85 @@ Screen {
     color: $ink;
     text-style: bold;
 }
-#list > .session-list--beam {
-    color: $nerv;
-    text-style: bold;
-}
+#list > .session-list--track-grid { color: $grid; }
+#list > .session-list--track-bar { color: $nerv; }
+#list > .session-list--track-head { color: $amber; text-style: bold; }
+#list > .session-list--meter-on { color: $nominal; }
+#list > .session-list--meter-off { color: $grid; }
+#list > .session-list--meter-count { color: $mint; }
 #list > .session-list--empty {
     color: $alert;
     text-style: bold;
 }
 
-/* --- the lower deck: data sheet and MAGI ----------------------------------------- */
-#lower {
+/* --- the target readout: plate, clock, data sheet, MAGI ---------------------------- */
+#target {
+    width: 48;
+    height: 1fr;
+    padding: 0 1;
+    border: solid $nerv;
+    border-title-color: $amber;
+    border-title-style: bold;
+}
+#main.-stacked #target {
+    width: 100%;
     height: auto;
+    padding: 0;
+    layout: horizontal;
+    border: none;
+}
+#target-plate {
+    height: 1;
+    text-wrap: nowrap;
+}
+#target-plate > .plate--internal { background: $nominal; color: $void; text-style: bold; }
+#target-plate > .plate--external { background: $external; color: $void; text-style: bold; }
+#target-plate > .plate--imported { background: $external; color: $void; text-style: bold; }
+#target-plate > .plate--lost { background: $alert; color: $ink; text-style: bold; }
+#target-plate > .plate--none { background: $grid; color: $void; text-style: bold; }
+#target-plate > .plate--word { color: $amber; text-style: bold; }
+#target-plate > .plate--slash { color: $alert; }
+#target-clock-label {
+    height: 1;
+    margin: 1 0 0 0;
+    color: $nerv;
+    text-wrap: nowrap;
+}
+#target-clock {
+    height: 4;
+    text-wrap: nowrap;
+}
+#target-clock > .clock--digits { color: $alert; text-style: bold; }
+#target-clock > .clock--rolling { color: $amber; }
+#target-clock > .clock--units { color: $dim; }
+#main.-side #detail {
+    margin: 1 0 0 0;
+    border: none;
+    border-top: solid $nerv;
+}
+#main.-side #detail-row-main {
+    layout: grid;
+    grid-size: 2;
+    grid-columns: 13 1fr;
+    height: 3;
+}
+#main.-side #detail-row-main > .detail-value {
+    width: 1fr;
+    padding: 0;
+}
+#main.-side #detail-row-note, #main.-side #detail-row-import {
+    height: auto;
+}
+#main.-side #detail-note, #main.-side #detail-import {
+    height: auto;
+    text-wrap: wrap;
+}
+#main.-side #magi {
+    width: 100%;
+    height: auto;
+    padding: 0;
+    border: none;
+    border-top: solid $nerv;
 }
 #detail {
     width: 1fr;
@@ -280,6 +440,59 @@ Screen {
 #magi > .magi--none {
     color: $grid;
 }
+#magi > .magi--fill-approve { background: $nominal; color: $void; text-style: bold; }
+#magi > .magi--fill-reject { background: $alert; color: $ink; text-style: bold; }
+#magi > .magi--fill-pending { background: $amber; color: $void; text-style: bold; }
+#magi > .magi--fill-conditional { background: $ember; color: $amber; text-style: bold; }
+#magi > .magi--fill-none { color: $grid; }
+#magi > .magi--name { color: $nerv; text-style: bold; }
+#magi > .magi--label { color: $nerv; }
+#magi > .magi--word-approve { background: $nominal; color: $void; text-style: bold; }
+#magi > .magi--word-reject { background: $alert; color: $ink; text-style: bold; }
+#magi > .magi--word-pending { background: $amber; color: $void; text-style: bold; }
+#magi > .magi--word-none { color: $grid; }
+
+#related, #sync {
+    height: auto;
+    margin: 1 0 0 0;
+}
+#comm {
+    height: 1fr;
+    margin: 1 0 0 0;
+}
+#related > .related--title, #sync > .sync--title, #comm > .comm--title {
+    color: $nerv;
+    text-style: bold;
+}
+#related > .related--note, #sync > .sync--note, #comm > .comm--note { color: $dim; }
+#related > .related--number { color: $nerv; text-style: bold; }
+#related > .related--provider { color: $amber; }
+#related > .related--text { color: $ink; }
+#related > .related--age { color: $mint; }
+#sync > .sync--grid { color: $grid; }
+#sync > .sync--trace { color: $nominal; }
+#sync > .sync--user { color: $amber; text-style: bold; }
+#comm > .comm--lost { background: $alert; color: $ink; text-style: bold; }
+#comm > .comm--role-user { background: $amber; color: $void; text-style: bold; }
+#comm > .comm--role-assistant { color: $nominal; text-style: bold; }
+#comm > .comm--role-tool { color: $grid; }
+#comm > .comm--text { color: $ink; }
+
+/* --- the boot log -------------------------------------------------------------------- */
+#boot {
+    layer: boot;
+    width: 100%;
+    height: 100%;
+    padding: 1 2;
+    background: $void;
+    text-wrap: nowrap;
+}
+#boot > .boot--head { color: $alert; text-style: bold; }
+#boot > .boot--line { color: $nerv; }
+#boot > .boot--ok { color: $nerv; text-style: bold; }
+#boot > .boot--wait { color: $amber; }
+#boot > .boot--lost { color: $alert; text-style: bold; }
+#boot > .boot--done { color: $nominal; text-style: bold; }
 
 /* --- prompts: caution in orange, danger under a hazard band ------------------------ */
 #stripe-top, #stripe-bottom {
@@ -360,13 +573,6 @@ Screen {
     border-top: none;
 }
 
-/* A screen arriving flickers (motion): off, on, dim, on. */
-.-flicker-off {
-    opacity: 0%;
-}
-.-flicker-dim {
-    opacity: 35%;
-}
 
 /* --- help overlay ------------------------------------------------------------------ */
 HelpScreen {

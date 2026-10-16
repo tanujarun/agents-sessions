@@ -23,9 +23,28 @@ next release gets is the owner's decision. The program still says 0.2.0.
   framed panels, a LOCATION that reads SIGNAL LOST for a drive that is not mounted, a MAGI panel that
   votes on resume, import and drive for the selected session, key hints drawn as plates, and a hazard
   band over any question that cannot be taken back or sends a message to a model.
-- Transitions in the same spirit: a scan line wipes the list in on a tab switch and at start, the row
-  the selection leaves glows for a moment, a screen that opens flickers in, a danger band marches, a job
-  under way blinks. `AGENT_SESSIONS_MOTION=0` stills them.
+- The browser is laid out as Central Dogma's monitors are, not as a table with a detail pane. From 160
+  columns the providers are SUBJECT plates in a column (the selected one framed, its number in
+  seven-segment numerals, each with a trace of the last 18 days' sessions); from 135 a leader line runs
+  from the selected row to a TARGET readout beside the log: a 内部 INTERNAL / 外部 EXTERNAL / 信号途絶
+  SIGNAL LOST plate, the time since the session was last active as a seven-segment clock, the data, and
+  the MAGI drawn as their three panels with the resolution (決議 可決 / 否決) between them. Every row
+  carries a signal mark; a lost one is moving static. Narrower terminals keep the readout under the log.
+- The space round the log carries information, fitted to the window: a panel that has no room is left
+  out, so short, tall, wide and narrow terminals each show what fits. Where TITLE can spare the width,
+  each row draws its lifespan (start to last activity) on a log scale of age (2MO … 1H, NOW) and a
+  message meter in identical units with the count. Under the subjects: a cell a day for the selected
+  subject over the last ten weeks, and a drive board (D-01 …: name, ONLINE / STANDBY / 信号途絶,
+  filesystem, letter, sessions held). Under the MAGI: the other sessions of the same folder in any tool,
+  a sync graph of the selected session's turns over its time, and its communication log (the last
+  things said by the user and the agent). The transcript is read, bounded in turns and time, once the
+  selection settles, and kept for the sessions read last.
+- The screen redraws as a cathode-ray tube (`tui/crt.py`): a boot log prints the drives and subjects as
+  the index is read; a provider change, a rescan and the end of the boot sweep a raster band over the
+  whole screen, the old picture showing below it; a new target types itself in behind a block cursor
+  while its clock's digits roll and the MAGI deliberate (審議中); help and the transcript come in
+  interlaced; a danger band alternates its stripes with a dark 非常事態 EMERGENCY beat; a job under way
+  blinks. `AGENT_SESSIONS_MOTION=0` stills it all.
 
 ### Security
 
