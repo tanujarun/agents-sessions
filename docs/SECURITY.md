@@ -156,7 +156,9 @@ value itself stays what was typed. No name that `clean` would change is put into
 suggested folder with such a name is not offered (the input starts at `~/` and says why) and
 Tab leaves such names out of its completions and counts them (audit A-12). Every field of a
 session and every engine answer the TUI shows is drawn cleaned, at several screen sizes
-(audit A-15).
+(audit A-15). A search's snippets are cleaned where they are cut (`search._hit`), and the text
+the search keeps never leaves the process: it is held in memory, read through `transcript`
+and its bounds, and written nowhere.
 
 - Implemented: `textsafe.py`; `cli.py` (output helpers, `_write`); `tui/view.py` (`clean`,
   `complete_folder`); `tui/app.py` (`SafeInput`, `MainScreen._open_folder`); `logs.py`
@@ -167,7 +169,8 @@ session and every engine answer the TUI shows is drawn cleaned, at several scree
   locales, the rule that only the helpers write, the notification), `tests/test_logs.py`,
   `tests/test_tui_view.py` (the `Hostile*` classes: every row, detail and prompt value),
   `tests/test_tui_app.py` (`HostileTest`: hostile text in every `Session` field and every
-  engine answer, asserted on what the screen draws, the folder and filter inputs included).
+  engine answer, asserted on what the screen draws, the folder and filter inputs included;
+  `SearchTest`: a hostile message in the search results), `tests/test_search.py` (snippets).
 - Closes REVIEW R-03 and R-09, audit A-03, A-12, A-15, A-27.
 
 ### 7. Reads are bounded and never wait

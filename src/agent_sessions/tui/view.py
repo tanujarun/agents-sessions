@@ -14,11 +14,11 @@ import os
 import re
 import unicodedata
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, tzinfo
 from typing import Any, Protocol
 
-from .. import fmt, textsafe
+from .. import fmt, search, textsafe
 
 APP_TITLE = "agent-sessions"
 ELLIPSIS = "…"
@@ -172,6 +172,25 @@ class Row:
     offline: bool = False  # its drive is not mounted
     started: str | None = None  # when the session began (the lifespan track)
     messages: int | None = None  # its message count (the meter)
+    # While a search is shown: "hit" is a message that has the text in it (its
+    # session's row, with ``hit`` and the message's time as ``stamp``) and
+    # "section" a heading over the sessions or the messages (``title``).
+    kind: str = "session"
+    hit: Any = None  # the search.Hit of a "hit" row
+
+
+def row_ident(row: Row) -> str:
+    """What the selection holds on to across a new list: the session's key,
+    and for a message also its place in the transcript, after a ``#`` (no
+    session key has one: ``model.make_key``, ``Provider.id_pattern``)."""
+    if row.kind == "hit" and row.hit is not None:
+        return f"{row.key}#{row.hit.turn}"
+    return row.key
+
+
+def selectable(row: Row) -> bool:
+    """A heading is not a row to select."""
+    return row.kind != "section"
 
 
 def project_name(cwd: str | None) -> str:
@@ -218,12 +237,17 @@ def matches(row: Row, needle: str) -> bool:
     return not needle or needle in row.haystack
 
 
-def empty_text(loaded: bool, needle: str) -> str:
-    """The one line in the middle of a list with no rows."""
+def empty_text(loaded: bool, needle: str, messages: bool = False) -> str:
+    """The one line in the middle of a list with no rows; ``messages`` when
+    what was said was searched too."""
     if not loaded:
         return ""
     needle = clean(needle).strip()
-    return f'No sessions match "{needle}"' if needle else "No sessions found"
+    if not needle:
+        return "No sessions found"
+    return (
+        f'No sessions or messages match "{needle}"' if messages else f'No sessions match "{needle}"'
+    )
 
 
 def filter_rows(rows: Iterable[Row], provider: str | None = None, needle: str = "") -> list[Row]:
@@ -233,17 +257,153 @@ def filter_rows(rows: Iterable[Row], provider: str | None = None, needle: str = 
     return [row for row in rows if (everyone or row.provider == provider) and matches(row, needle)]
 
 
+# --- search: sessions by name, and the messages that say it --------------------
+
+
+@dataclass(frozen=True)
+class Reading:
+    """How far the reading of what was said is (the engine's
+    ``search.Progress``), as the MESSAGES heading tells it."""
+
+    done: int = 0
+    total: int = 0
+    failed: int = 0
+    full: bool = False
+    finished: bool = False
+
+
+def section_row(title: str) -> Row:
+    return Row(
+        key="",
+        provider="",
+        title=clean(title),
+        project="",
+        stamp=None,
+        where="",
+        foreign=False,
+        imported=False,
+        haystack="",
+        kind="section",
+    )
+
+
+def messages_heading(found: Any, shown: int, reading: Reading | None) -> str:
+    """The heading over the messages: how many say it, in how many
+    sessions; how many are listed when not all; how far the reading is."""
+    total = found.total if found is not None else 0
+    parts = [
+        f"MESSAGES {ELLIPSIS}" if total == 0 and reading and not reading.finished else "MESSAGES"
+    ]
+    if total:
+        parts.append(f"{total:,} IN {plural(found.sessions, 'SESSION').upper()}")
+        if shown < total:
+            parts.append(f"{shown:,} SHOWN")
+    elif reading is None or reading.finished:
+        parts.append("NONE")
+    if reading is not None and not reading.finished:
+        parts.append(f"READING {reading.done}/{reading.total}")
+    elif reading is not None and reading.full:
+        parts.append("NOT ALL READ: TOO MUCH TEXT")
+    if reading is not None and reading.failed:
+        parts.append(f"{reading.failed} UNREADABLE")
+    return " · ".join(parts)
+
+
+def search_rows(
+    named: Sequence[Row],
+    rows_by_key: Mapping[str, Row],
+    found: Any,
+    reading: Reading | None,
+) -> list[Row]:
+    """The list while a search is shown, as WhatsApp lists chats and then
+    messages: the sessions whose name, project or folder has the text
+    (``named``) under a SESSIONS heading, then every message that says it
+    (``found``, the engine's ``search.Found``) under MESSAGES, each as its
+    session's row. Messages of sessions not in ``rows_by_key`` (another
+    tab) are left out. No rows at all when nothing matches and nothing is
+    being read."""
+    hits = [
+        replace(
+            rows_by_key[hit.key], kind="hit", hit=hit, stamp=hit.ts or rows_by_key[hit.key].stamp
+        )
+        for hit in (found.hits if found is not None else ())
+        if hit.key in rows_by_key
+    ]
+    reading_on = reading is not None and not reading.finished
+    if not named and not hits and not reading_on:
+        return []
+    out: list[Row] = []
+    if named:
+        out.append(section_row(f"SESSIONS · {len(named):,}"))
+        out.extend(named)
+    out.append(section_row(messages_heading(found, len(hits), reading)))
+    out.extend(hits)
+    return out
+
+
+SEARCH_MIN = search.MIN_NEEDLE
+"""From this many characters on, what was said is searched too."""
+
+SPEAKERS = {"user": "USER", "assistant": "AI"}
+
+
+def hit_pieces(hit: Any, width: int) -> list[tuple[str, str]]:
+    """A message's snippet in ``width`` cells as ``(kind, text)`` pieces:
+    the speaker plate (``role-user``/``role-assistant``), the text before
+    the match (``text``), the ``match``, the text after (``text``). The
+    match stays in view: what comes before it gives way first, cut from
+    the left."""
+    if width <= 0:
+        return []
+    role = hit.role if hit.role in SPEAKERS else "assistant"
+    plate = f"▐{SPEAKERS[role]:<4}▌ "
+    if text_width(plate) + 8 > width:
+        plate = ""
+    room = width - text_width(plate)
+    match = clip(hit.match, room)
+    room -= text_width(match)
+    after_width = text_width(hit.after)
+    before_room = max(room - min(after_width, max(room // 2, 1)), min(room, 12))
+    before = hit.before
+    if text_width(before) > before_room:
+        kept = _take(before[::-1], max(before_room - 1, 0))[::-1]
+        before = (ELLIPSIS + kept) if before_room > 0 else ""
+    room -= text_width(before)
+    after = pad(hit.after, max(room, 0))
+    pieces = [(f"role-{role}", plate)] if plate else []
+    return pieces + [("text", before), ("match", match), ("text", after)]
+
+
 def select_index(rows: Sequence[Row], key: str | None, previous: int = 0) -> int:
-    """Index of the row with ``key``. When it is gone, the row now at the old
-    position (clamped), so the selection stays where the eye was. ``-1`` for
-    an empty list."""
+    """Index of the row ``key`` names (``row_ident``; else the first row of
+    that session). When it is gone, the row now at the old position
+    (clamped), so the selection stays where the eye was; never a heading.
+    ``-1`` for an empty list, or one of headings only."""
     if not rows:
         return -1
     if key is not None:
         for index, row in enumerate(rows):
-            if row.key == key:
+            if row_ident(row) == key:
                 return index
-    return min(max(previous, 0), len(rows) - 1)
+        session = key.partition("#")[0]
+        for index, row in enumerate(rows):
+            if row.key == session and selectable(row):
+                return index
+    return nearest_selectable(rows, min(max(previous, 0), len(rows) - 1))
+
+
+def nearest_selectable(rows: Sequence[Row], index: int, step: int = 1) -> int:
+    """``index``, or when that is a heading the next row past it in the
+    direction of ``step``, else the nearest the other way. ``-1`` when there
+    is none."""
+    step = 1 if step >= 0 else -1
+    for direction in (step, -step):
+        probe = index
+        while 0 <= probe < len(rows):
+            if selectable(rows[probe]):
+                return probe
+            probe += direction
+    return -1
 
 
 def move_index(index: int, count: int, move: str, page: int = 1) -> int:
@@ -489,16 +649,16 @@ class Layout:
 HINTS_FULL = (
     "↑↓ move  ←→ provider  Enter resume  o resume, keep open  i import  t import into folder"
     "  v view",
-    "c continue  u undo import  m mount  / filter  r rescan  R full rescan  ? help  q quit",
+    "c continue  u undo import  m mount  / search  r rescan  R full rescan  ? help  q quit",
 )
 HINTS_MEDIUM = (  # the same keys in the 80 columns of a standard terminal
     "↑↓ move  ←→ provider  Enter resume  o keep open  i import  t into folder",
-    "v view  c continue  u undo  m mount  / filter  r R rescan  ? help  q quit",
+    "v view  c continue  u undo  m mount  / search  r R rescan  ? help  q quit",
 )
 HINTS_SHORT = (
-    "Enter resume  i import  c continue  v view  / filter  ? help  q quit",
-    "Enter resume  i import  v view  / filter  ? help  q quit",
-    "Enter resume  / filter  ? help  q quit",
+    "Enter resume  i import  c continue  v view  / search  ? help  q quit",
+    "Enter resume  i import  v view  / search  ? help  q quit",
+    "Enter resume  / search  ? help  q quit",
     "Enter resume  ? help  q quit",
     "? help  q quit",
 )
@@ -1260,7 +1420,7 @@ KEYMAPS = {
     # While the filter box has the keyboard it takes every printable key.
     "filter": {
         "escape": "filter_clear",
-        "enter": "filter_accept",
+        "enter": "filter_enter",
         "tab": "filter_accept",
         "up": "cursor_up",
         "down": "cursor_down",
@@ -1293,6 +1453,8 @@ KEYMAPS = {
         "g": "home",
         "end": "end",
         "G": "end",
+        "n": "next_match",
+        "N": "previous_match",
     },
 }
 
@@ -1337,7 +1499,14 @@ HELP = (
     ("u", "undo an import: remove the imported copy (asks y/n)"),
     ("m", "mount the drive of an offline session (the desktop asks for the password)"),
     ("v", "view the transcript (q or Esc returns)"),
-    ("/", "filter by title, project and folder; Esc clears"),
+    (
+        "/",
+        "search: sessions by title, project or folder, then the messages that say it; Esc clears",
+    ),
+    (
+        "Enter on a message",
+        "open the transcript at that message; n N go to the next and previous match",
+    ),
     ("r", "rescan the known stores"),
     ("R", "rescan every drive; Esc cancels"),
     ("?", "this help"),
@@ -1480,3 +1649,32 @@ def pager_status(turns: int, loading: bool, capped: bool, error: str | None = No
 
 
 PAGER_HINTS = "↑↓ PgUp PgDn Home End scroll  q back"
+PAGER_SEARCH_HINTS = "↑↓ PgUp PgDn scroll  n next match  N previous  q back"
+
+
+def match_status(place: int | None, count: int) -> str:
+    """Where in the pager's matches the view is: ``match 3 of 12``."""
+    if not count:
+        return "no match"
+    if place is not None:
+        return f"match {place + 1} of {count:,}"
+    return "1 match" if count == 1 else f"{count:,} matches"
+
+
+def match_pieces(text: str, needle: str) -> list[tuple[bool, str]]:
+    """``text`` as pieces, ``True`` for each place that is ``needle`` (case
+    ignored). One piece when there is none, or when lower case would move
+    the places (it changes the length of the text)."""
+    folded, wanted = text.lower(), needle.strip().lower()
+    if not wanted or wanted not in folded or len(folded) != len(text):
+        return [(False, text)]
+    pieces: list[tuple[bool, str]] = []
+    start = 0
+    while (found := folded.find(wanted, start)) >= 0:
+        if found > start:
+            pieces.append((False, text[start:found]))
+        pieces.append((True, text[found : found + len(wanted)]))
+        start = found + len(wanted)
+    if start < len(text):
+        pieces.append((False, text[start:]))
+    return pieces

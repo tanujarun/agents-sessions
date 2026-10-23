@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from ..launch import ContinuePlan, LaunchPlan
     from ..model import Session
     from ..providers.base import Turn
+    from ..search import Corpus
 
 
 class EngineError(Exception):
@@ -88,6 +89,15 @@ class Engine:
 
     def transcript(self, ref: Session | str, index: Index | None = None) -> Iterator[Turn]:
         return self._call("transcript", ref, index=index)
+
+    def corpus(self) -> Corpus:
+        """An empty ``search.Corpus``: the sessions' text, kept to find a
+        session by what was said in it."""
+        try:
+            search = importlib.import_module("agent_sessions.search")
+        except ImportError as exc:
+            raise EngineError(f"the engine could not be loaded: {exc}") from exc
+        return search.Corpus()
 
     def _fsutil(self) -> Any:
         try:

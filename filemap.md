@@ -68,6 +68,9 @@
 - `src/agent_sessions/fmt.py` — small values as a listing shows them, one copy for both front ends: `age`,
   `size` (bytes), `project` (the last segment of a folder), `local_time`, `parse_stamp`; each gives `-` for
   what it cannot place and never raises; and `utc_now`, the clock the engine stamps its files with
+- `src/agent_sessions/search.py` — `Corpus`: the sessions' text kept in memory to find a session by what
+  was said in it (`read` the stale sessions through a `transcript` function, `search` with snippets,
+  newest first, bounded), `Hit`, `Found`, `Progress`, `signature`, `fold`; stdlib only, writes nothing
 - `src/agent_sessions/textsafe.py` — the one sanitiser for text from a store: `clean` (control and
   bidirectional characters become spaces; `multiline` keeps line feed and tab), `json_escape` (the same
   characters as `\uXXXX` in `--json` output), the set `UNSAFE`. Used by the CLI's output helpers, `clean_title`,
@@ -217,6 +220,8 @@
 - `tests/test_session_ids.py` — the session id grammar (`Provider.id_pattern`) in its three places: the
   index (fresh parses and cached entries), `launch.plan` (the id, and every argument that came from session
   data), `importer.check`
+- `tests/test_search.py` — `search.Corpus`: what it reads and rereads, failures, the bounds, what a
+  search finds and in which order, snippets (safe, the match kept), searching while it reads
 - `tests/test_textsafe.py` — `textsafe`, the JSON round trip, every CLI command on stores full of escape
   sequences, the rule that only the CLI's output helpers write to a stream, id-fallback titles, the
   notification text
@@ -318,10 +323,11 @@
   Textual is missing
 - `src/agent_sessions/tui/engine.py` — `Engine`: the object the app calls the engine through (forwards to
   `agent_sessions.api`, looked up at call time; `list_folder`: a directory's entries for the folder input,
-  through `fsutil.listdir_ro`), `EngineError`; tests pass a fake in its place
+  through `fsutil.listdir_ro`; `corpus`: an empty `search.Corpus`), `EngineError`; tests pass a fake in its place
 - `src/agent_sessions/tui/view.py` — pure view logic, no Textual: rows, ages (`age_text`, `local_time`,
   `bytes_text`, `parse_stamp`: names of `fmt`'s functions), `clean` (`textsafe.clean`), display width and clipping,
-  column fitting, filter, tabs, selection by key, small-terminal layout and key hints, status texts, the
+  column fitting, filter, the search's rows (`search_rows`, `hit_pieces`, headings skipped by the
+  selection), tabs, selection by key, small-terminal layout and key hints, status texts, the
   import verdict (`Verdict`, from `import_options`), every prompt's wording at every width (foreign row,
   mount, warning, tool, start, undo), the folder a user types (`expand_folder`, `complete_folder`), which
   refusal of an undo it is (`undo_refusal`), one key table per mode (`KEYMAPS`), help, transcript wrapping

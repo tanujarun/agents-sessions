@@ -150,7 +150,8 @@ class TuiCase(unittest.IsolatedAsyncioTestCase):
         return self.text().splitlines()[0]
 
     def titles(self) -> list:
-        return [row.title for row in self.rows.rows]
+        """The sessions listed (a search's headings and messages left out)."""
+        return [row.title for row in self.rows.rows if row.kind == "session"]
 
     def opened(self) -> list:
         return self.engine.called("open_session")
@@ -295,7 +296,7 @@ class StartTest(TuiCase):
             for label in ("ID", "MESSAGES", "UPDATED", "CWD", "LOCAL", "STORE", "NOTE", "IMPORT"):
                 self.assertRegex(text, rf"(?m)^\s*{label}\s|\s{label}\s")
             self.assertIn("↑↓ move  ←→ provider  Enter resume", lines[-2])
-            self.assertIn("/ filter  r rescan  R full rescan  ? help  q quit", lines[-1])
+            self.assertIn("/ search  r rescan  R full rescan  ? help  q quit", lines[-1])
             # First tab, first row, list focused.
             self.assertEqual(self.main.tab_name, "claude")
             self.assertEqual(self.rows.cursor, 0)
@@ -622,7 +623,7 @@ class FilterTest(TuiCase):
             await pilot.pause()
             self.assertEqual(self.main.needle, "sessionqoir")
             self.assertEqual(self.titles(), [])
-            self.assertIn('No sessions match "sessionqoir"', self.text())
+            self.assertIn('No sessions or messages match "sessionqoir"', self.text())
             self.assertEqual(self.opened() + self.imported(), [])
             self.assertFalse(self.exited())
             await pilot.press("escape")
@@ -650,8 +651,12 @@ class FilterTest(TuiCase):
             self.assertEqual(len(self.rows.rows), 21)
             await pilot.press("slash", *"session")
             await pilot.pause()
-            await pilot.press("down", "down")  # arrows still move
+            # The selected session is not listed: the search starts at its
+            # first row, under the SESSIONS heading.
+            self.assertEqual((self.rows.rows[0].kind, self.rows.cursor), ("section", 1))
+            await pilot.press("down")  # arrows still move
             key = self.selected()
+            self.assertEqual(key, "claude:aaaaaaaa:cln-0001")
             await pilot.press(*" 1")
             await pilot.pause()
             self.assertIn(key, [row.key for row in self.rows.rows])
@@ -1013,6 +1018,194 @@ class ImportKeyTest(TuiCase):
             self.assertEqual(self.imported(), [])
 
 
+class SearchTest(TuiCase):
+    """Search as a chat app has it: the sessions by name, then every message
+    that says the text; Enter on a message opens the transcript there."""
+
+    size = (160, 40)
+    KIWI = "claude:aaaaaaaa:cln-0003"  # "claude session 3"
+    CODEX = "codex:aaaaaaaa:con-0001"
+
+    def setUp(self):
+        super().setUp()
+        filler = [Turn("assistant", f"filler turn {n}", None) for n in range(75)]
+        self.engine.turns[self.KIWI] = [
+            Turn("user", "Can we talk about the kiwi crate?", support.stamp(minutes=40)),
+            *filler,
+            Turn("tool", "kiwi", None),  # a tool's name is not what was said
+            Turn("assistant", "The KIWI crate is\nfixed now.", support.stamp(minutes=39)),
+            *filler,
+        ]
+        self.engine.turns[self.CODEX] = [Turn("user", "kiwi on codex", support.stamp(minutes=30))]
+
+    async def search(self, pilot, text):
+        """Type into the search box (opened first if need be) and wait for
+        the answer to what it then says."""
+        if self.app.focused is not self.main.filter_input:
+            await pilot.press("slash")
+        await pilot.press(*text)
+        needle = self.main.needle.strip()
+        await until(
+            lambda: (
+                self.main._reading is not None
+                and self.main._reading.finished
+                and self.main._shown_for == (needle, self.main.tab_name)
+            ),
+            what="the search",
+        )
+        await settle(pilot)
+
+    def kinds(self):
+        return [row.kind for row in self.rows.rows]
+
+    async def test_messages_are_listed_under_the_sessions_newest_first(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.search(pilot, "kiwi")
+            # Claude's tab: no title says it; two messages of one session do.
+            self.assertEqual(self.kinds(), ["section", "hit", "hit"])
+            self.assertEqual([row.hit.turn for row in self.rows.rows[1:]], [77, 0])
+            text = self.text()
+            self.assertIn("MESSAGES · 2 IN 1 SESSION ", text)
+            self.assertIn("The KIWI crate is", text)
+            self.assertIn("▐USER▌", text)
+            self.assertIn("about the kiwi crate?", text)
+            self.assertEqual(self.rows.cursor, 1)  # the first message, not the heading
+            self.assertIn("001▶", text)  # numbered as the first row
+            # The readout is about the session of the selected message.
+            self.assertEqual(self.main.current_session().key, self.KIWI)
+            await pilot.press("tab", "0")  # to the list, then All: the Codex message too
+            await settle(pilot)
+            await until(lambda: self.main._shown_for == ("kiwi", view.ALL), what="All")
+            await settle(pilot)
+            self.assertEqual(
+                next(row.key for row in self.rows.rows if row.kind == "hit"), self.CODEX
+            )
+            await pilot.press("slash", "backspace", "backspace", "backspace", "backspace")
+            await self.search(pilot, "session 3")
+            self.assertEqual(
+                self.titles(), ["claude session 3", "codex session 3", "grok session 3"]
+            )
+            self.assertEqual(self.kinds(), ["section", *["session"] * 3, "section"])
+            self.assertIn("SESSIONS · 3", self.text())
+            self.assertIn("MESSAGES · NONE", self.text())
+
+    async def test_reading_the_text_reads_every_session_once_in_a_thread(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await pilot.press("slash", "k")
+            await settle(pilot)
+            self.assertEqual(self.engine.called("corpus"), [])  # one letter: names only
+            await self.search(pilot, "iwi")  # "kiwi"
+            readable = {s.key for s in self.engine.sessions if not s.offline}
+            # (The selected row's own transcript is read for the readout too.)
+            self.assertEqual(set(self.engine.called("transcript")), readable)
+            self.assertIsNot(self.engine.threads["transcript"], threading.main_thread())
+            before = len(self.engine.called("transcript"))
+            await pilot.press("escape")
+            await self.search(pilot, "crate")
+            again = self.engine.called("transcript")[before:]
+            self.assertLessEqual(set(again), {self.KIWI})  # the readout's, not the corpus
+            self.assertEqual(len(self.engine.called("corpus")), 1)
+
+    async def test_enter_on_a_message_opens_the_transcript_there_and_n_goes_round(self):
+        async with self.started(size=(100, 30)) as pilot:
+            await settle(pilot)
+            await self.search(pilot, "kiwi")
+            await pilot.press("enter")  # from the search box: the first message
+            await settle(pilot)
+            pager = self.app.screen
+            self.assertIsInstance(pager, TranscriptScreen)
+            await until(lambda: pager.body.settled and pager.body._anchor is None, what="jump")
+            await settle(pilot)
+            body = pager.body
+            self.assertEqual(body._top_turn(), 77)
+            lines = self.text().splitlines()
+            self.assertIn("The KIWI crate is", self.text())
+            self.assertIn("match 2 of 2", lines[-1])
+            self.assertIn("n next match", lines[-1])
+            await pilot.press("n")  # past the last: round to the first
+            await settle(pilot)
+            self.assertEqual(body._top_turn(), 0)
+            self.assertIn("match 1 of 2", self.text().splitlines()[-1])
+            await pilot.press("N")
+            await settle(pilot)
+            self.assertEqual(body._top_turn(), 77)
+            # The match is lit where it is drawn.
+            y = next(y for y in range(body.size.height) if "KIWI" in body.render_line(y).text)
+            lit = body.get_component_rich_style("transcript--match")
+            drawn = [(segment.text, segment.style) for segment in body.render_line(y)]
+            self.assertIn(("KIWI", lit), drawn)
+            self.assertNotIn(("is", lit), drawn)
+            await pilot.press("q")
+            await settle(pilot)
+            self.assertIs(self.app.screen, self.main)
+            self.assertEqual(self.main.needle, "kiwi")  # the search is still there
+            self.assertEqual(self.opened(), [])
+
+    async def test_enter_in_the_list_and_v_open_a_message_and_escape_keeps_its_session(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.search(pilot, "kiwi")
+            await pilot.press("tab", "down")  # the list, then the older message
+            self.assertEqual(self.rows.current.hit.turn, 0)
+            await pilot.press("v")
+            await settle(pilot)
+            self.assertEqual(self.app.screen.start_turn, 0)
+            await pilot.press("q")
+            await settle(pilot)
+            await pilot.press("enter")
+            await settle(pilot)
+            self.assertIsInstance(self.app.screen, TranscriptScreen)
+            await pilot.press("q")
+            await settle(pilot)
+            self.assertEqual(self.opened(), [])  # Enter on a message is not "resume"
+            await pilot.press("escape")
+            await settle(pilot)
+            self.assertEqual(self.main.needle, "")
+            self.assertEqual(self.kinds(), ["session"] * len(self.rows.rows))
+            self.assertEqual(self.selected(), self.KIWI)
+
+    async def test_arrows_and_clicks_pass_over_the_headings(self):
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.search(pilot, "session 1")
+            # SESSIONS, its rows, MESSAGES · NONE
+            self.assertEqual(self.kinds()[0], "section")
+            await pilot.press("home")
+            self.assertEqual(self.rows.cursor, 1)
+            await pilot.press("up")
+            self.assertEqual(self.rows.cursor, 1)
+            await pilot.press("end")
+            self.assertEqual(self.kinds()[self.rows.cursor], "session")
+            await pilot.press("escape")
+            await self.search(pilot, "kiwi")
+            await pilot.click(SessionList, offset=(10, 0))  # the heading
+            await settle(pilot)
+            self.assertEqual(self.rows.cursor, 1)
+            self.assertEqual(self.opened(), [])
+
+    async def test_what_a_message_says_is_drawn_safe(self):
+        self.engine.turns[self.KIWI] = [
+            Turn("user", f"kiwi {support.HOSTILE}", support.stamp(minutes=40))
+        ]
+        async with self.started() as pilot:
+            await settle(pilot)
+            await self.search(pilot, "kiwi")
+            self.assertIn("kiwi", self.text())
+            self.assertEqual(support.unsafe_on_screen(self.app), [])
+
+    async def test_an_engine_without_search_keeps_the_name_filter(self):
+        self.engine.fail["corpus"] = support.FakeError("this build of the engine has no search")
+        async with self.started() as pilot:
+            await settle(pilot)
+            await pilot.press("slash", *"session 3")
+            await settle(pilot)
+            self.assertEqual(self.titles(), ["claude session 3"])
+            self.assertEqual(self.kinds(), ["session"])
+            self.assertIn("this build of the engine has no search", self.status())
+
+
 class PagerTest(TuiCase):
     size = (80, 24)
 
@@ -1225,8 +1418,8 @@ class ScanTest(TuiCase):
             self.assertTrue(self.main._scan["deep"])
             cancel = self.main._scan["cancel"]
             self.assertFalse(cancel.is_set())
-            await pilot.press("j")  # still responsive
-            self.assertEqual(self.rows.cursor, 1)
+            await pilot.press("j")  # still responsive (row 0 is the SESSIONS heading)
+            self.assertEqual(self.rows.cursor, 2)
             await pilot.press("escape")
             self.assertTrue(cancel.is_set())  # the scan, not the filter
             self.assertEqual(self.main.needle, "session")
@@ -2011,7 +2204,8 @@ class OfflineTest(OfflineCase):
             self.assertIn(OFFLINE, [row.key for row in self.rows.rows])
             await pilot.press("slash", *"offline one", "enter")
             await settle(pilot)
-            self.assertEqual([row.key for row in self.rows.rows], [OFFLINE])
+            listed = [row.key for row in self.rows.rows if row.kind == "session"]
+            self.assertEqual(listed, [OFFLINE])
 
 
 class MountTest(OfflineCase):

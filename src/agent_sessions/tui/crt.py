@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 from rich.segment import Segment
 from rich.style import Style
 from textual.containers import Horizontal, Vertical
+from textual.dom import NoScreen
 from textual.geometry import Region
 from textual.strip import Strip
 from textual.timer import Timer
@@ -178,7 +179,11 @@ class CrtMixin:
     def render_lines(self, crop: Region) -> list[Strip]:
         strips: list[Strip] = super().render_lines(crop)  # type: ignore[misc]
         widget: Any = self
-        raster: Raster | None = getattr(widget.screen, "raster", None)
+        try:
+            screen = widget.screen
+        except NoScreen:  # taken off its screen while a repaint was on its way: drawn plain
+            return strips
+        raster: Raster | None = getattr(screen, "raster", None)
         if raster is None or not raster.enabled:
             return strips
         seen = self.__dict__.setdefault("_crt_seen", {})

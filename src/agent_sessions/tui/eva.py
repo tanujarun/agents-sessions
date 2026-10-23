@@ -978,7 +978,7 @@ def hint_spans(line: str) -> list[tuple[str, str]]:
     """A key-hint line as ``(kind, text)`` pieces, ``kind`` being ``key``,
     ``action`` or ``gap``: hints are separated by two spaces, and the first
     word of each is its key. The text is unchanged; only its parts are
-    named, so the key can be drawn as a plate."""
+    named, so the key can be drawn apart."""
     spans: list[tuple[str, str]] = []
     for number, item in enumerate(line.split("  ")):
         if not item:

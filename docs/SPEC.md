@@ -382,7 +382,7 @@ selection bar and the dimming are colours and do not show here):
  import   possible
 ────────────────────────────────────────────────────────────────────────────────
  ↑↓ move  ←→ provider  Enter resume  o keep open  i import  t into folder
- v view  c continue  u undo  m mount  / filter  r R rescan  ? help  q quit
+ v view  c continue  u undo  m mount  / search  r R rescan  ? help  q quit
 ```
 
 (The phase 1 mock-up that stood here had no PROVIDER column, no `note` and
@@ -413,7 +413,8 @@ Keys:
 | `u` | undo the import of the selected row, the native copy or the session it came from (asks `y/n` with what would be removed) |
 | `m` | a row whose drive is not mounted: mount the drive; one mount at a time |
 | `v` | view the transcript in a built-in scrolling pager (`q`/Esc returns) |
-| `/` | filter the current list by substring over title, project and cwd; Esc clears |
+| `/` | search: the current list by substring over title, project and cwd, then (two characters or more) every message of the tab's sessions that has the text, under SESSIONS and MESSAGES headings; Esc clears. See "Search" below |
+| Enter / `v` on a message | the pager at that message, every match lit; `n`/`N` next and previous match (round past the ends) |
 | `r` | quick rescan (known stores); `R` full rescan of every drive |
 | `?` | key help overlay |
 | `q`, Ctrl-C | quit |
@@ -439,6 +440,32 @@ Behaviour:
 - Errors (cwd gone, tool not installed, import refused) appear in the status
   line in plain words; the TUI never exits on an error.
 - The terminal is always restored on exit, including on an exception.
+
+### Search
+
+Asked for on 2026-10-24: "look up a session by typing its session name or some of the
+contents, much like how whatsapp or discord allows to search chats and contacts".
+
+`/` opens the search box. With one character it filters by title, project and folder only, as
+before. From two characters (`search.MIN_NEEDLE`) the list becomes two sections: SESSIONS
+(the name matches) and MESSAGES (every user or assistant message that contains the text,
+ignoring case, newest first; at most 25 per session and 400 in all, the heading counts them
+all). A message row is its session's row with the session title, a speaker plate, a snippet
+of the line around the match (the match lit and kept in view) and the message's age; the
+readout follows the selected row's session. Tool turns are not searched (their text is the
+tool's name), and a turn is searched as far as the pager shows it (20,000 characters).
+
+The text is read by `search.Corpus` in a daemon thread the first time a search needs it, through
+`transcript` (so with its bounds), newest sessions first; the MESSAGES heading says how far
+it is, and results come in as it goes. It is kept in memory only, for the life of the
+process, at most 200 million characters, and only changed sessions are read again after a
+rescan. Sessions whose drive is not mounted are not read. On this machine (370 readable
+sessions, 20 MB of text) the first reading takes about 5 s and a search about 11 ms; a search
+runs in a thread after the typing pauses for 80 ms, and an answer to an older text is dropped.
+
+Enter (in the box or the list) or `v` on a message opens the pager at it; Enter on a session
+row still resumes. Esc clears the search and keeps the selection on the session of the
+row that was selected.
 
 The TUI holds no logic of its own: lists, filters, import and launch are
 engine calls, so another front end can replace it. All colours, borders and

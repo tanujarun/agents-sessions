@@ -32,7 +32,7 @@ Python standard library only.
  import   possible
 ────────────────────────────────────────────────────────────────────────────────────────────────────
  ↑↓ move  ←→ provider  Enter resume  o resume, keep open  i import  t import into folder  v view
- c continue  u undo import  m mount  / filter  r rescan  R full rescan  ? help  q quit
+ c continue  u undo import  m mount  / search  r rescan  R full rescan  ? help  q quit
 ```
 
 The screen above is the real program at 100 by 24 characters, drawn by Textual's headless
@@ -217,7 +217,8 @@ stderr: without one it prints one line and exits 2.
 | `u` | undo the import of the selected session (asks, with what would be removed) |
 | `m` | mount the drive of the selected session |
 | `v` | read the transcript in a pager (`q` or Esc returns) |
-| `/` | filter the list by title, project and folder; Esc clears the filter |
+| `/` | search: the sessions whose title, project or folder has the text, then every message that says it (from two characters on), as a chat app lists chats and then messages; Esc clears the search |
+| Enter on a message | open the transcript at that message, the text lit wherever it is; `n` and `N` go to the next and previous message that says it |
 | `r`, `R` | rescan the known stores; rescan every drive completely (Esc cancels) |
 | `?` | the key help |
 | `q`, Ctrl-C | quit |

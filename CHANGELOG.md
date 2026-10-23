@@ -47,6 +47,11 @@ next release gets is the owner's decision. The program still says 0.2.0.
   while its clock's digits roll and the MAGI deliberate (審議中); help and the transcript come in
   interlaced; a danger band alternates its stripes with a dark 非常事態 EMERGENCY beat; a job under way
   blinks. `AGENT_SESSIONS_MOTION=0` stills it all.
+- Search, as a chat app has it: `/` now finds the sessions whose title, project or folder has the
+  text and, from two characters on, every message that says it, under SESSIONS and MESSAGES
+  headings with a snippet of each, newest first. Enter or `v` on a message opens the transcript at
+  it with every match lit; `n` and `N` go to the next and previous one. The sessions' text is read
+  once in the background (newest first; the heading shows how far) and kept in memory only.
 
 ### Security
 

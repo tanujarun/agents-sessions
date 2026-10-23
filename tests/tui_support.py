@@ -325,6 +325,14 @@ class FakeEngine:
         with os.scandir(directory) as entries:
             return [(entry.name, entry.is_dir()) for entry in entries]
 
+    def corpus(self):
+        """The engine's own ``search.Corpus``, which reads nothing itself:
+        the screen hands it this engine's ``transcript``."""
+        from agent_sessions.search import Corpus
+
+        self._record("corpus")
+        return Corpus()
+
     def transcript(self, ref, index=None):
         self._record("transcript", ref)
         if self.by_key(ref).offline:  # at the call, as the engine does

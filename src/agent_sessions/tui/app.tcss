@@ -21,7 +21,9 @@
  *                  .-error), #status-summary (.-busy, .-blink while a job runs)
  *     #tabs > TabLabel.tab#tab-<provider> (.-active), #tab-all
  *     #deck > #subjects-box > SubjectColumn#subjects (subject--* classes)
- *             #board > #header (column headings), SessionList#list
+ *             #board > #header (column headings), SessionList#list (while a
+ *                       search is shown: headings and messages, session-list--section
+ *                       and session-list--hit-*)
  *             Leader#leader        the line from the selected row to the target
  *             #target > StatePlate#target-plate (plate--*), #target-clock-label,
  *                       SegmentClock#target-clock (clock--*),
@@ -31,7 +33,7 @@
  *     #prompt (.-caution | .-danger, .-flash as it arrives)
  *     #folderbar > #folder-label, Input#folder
  *     #filterbar > #filter-label, Input#filter
- *     KeyHints#hints               hints--key (a plate), hints--action
+ *     KeyHints#hints               hints--key (orange), hints--action
  *     BootLog#boot                 the boot log, on its own layer (motion only)
  *   HelpScreen > #help > #help-title, #help-text, #help-hint
  *   TranscriptScreen#pager > #pager-title, TranscriptView#pager-body,
@@ -289,6 +291,19 @@ MainScreen {
 #list > .session-list--meter-on { color: $nominal; }
 #list > .session-list--meter-off { color: $grid; }
 #list > .session-list--meter-count { color: $mint; }
+#list > .session-list--section {
+    color: $nerv;
+    text-style: bold;
+}
+#list > .session-list--hit-title { color: $dim; }
+#list > .session-list--hit-text { color: $ink; }
+#list > .session-list--hit-match {
+    background: $amber;
+    color: $void;
+    text-style: bold;
+}
+#list > .session-list--hit-role-user { color: $amber; text-style: bold; }
+#list > .session-list--hit-role-assistant { color: $nominal; text-style: bold; }
 #list > .session-list--empty {
     color: $alert;
     text-style: bold;
@@ -557,8 +572,7 @@ MainScreen {
     border-top: solid $grid;
 }
 #hints > .hints--key {
-    background: $nerv;
-    color: $void;
+    color: $nerv;
     text-style: bold;
 }
 #hints > .hints--action {
@@ -659,6 +673,11 @@ HelpScreen {
 }
 #pager-body > .transcript--text {
     color: $ink;
+}
+#pager-body > .transcript--match {
+    background: $amber;
+    color: $void;
+    text-style: bold;
 }
 #pager-footer {
     height: 1;

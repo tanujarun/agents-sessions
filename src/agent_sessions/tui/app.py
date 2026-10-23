@@ -39,6 +39,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, tzinfo
 from functools import partial
+from itertools import accumulate
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from rich.cells import cell_len
@@ -69,6 +70,7 @@ if TYPE_CHECKING:
 
     from ..index import Index
     from ..model import Session
+    from ..search import Corpus, Found, Progress
 
 Clock = Callable[[], datetime]
 
@@ -92,6 +94,8 @@ PREVIEW_SECONDS = 1.5  # at most this long reading one transcript for the readou
 PREVIEW_MAX_TURNS = 5000  # and at most this many turns
 PREVIEW_TURNS = 40  # the last things said (no tool turns) kept for the communication log
 PREVIEW_CACHE = 48  # transcripts whose reading is kept
+SEARCH_DELAY = 0.08  # seconds the typing must pause before what was said is searched
+SEARCH_PROGRESS = 0.4  # seconds between two searches while the text is still being read
 RELATED_MAX = 5  # other sessions of the same folder listed at most
 BOOT_LIMIT = 2.0  # seconds the boot log waits for the index before it gives way
 _STATIC = random.Random()  # noqa: S311 (the noise of lost signals and rolling digits)
@@ -243,6 +247,12 @@ class SessionList(CrtMixin, ScrollView, can_focus=True):
         "session-list--meter-on",  # the message meter's lit units
         "session-list--meter-off",  # and its unlit ones
         "session-list--meter-count",  # the count after it
+        "session-list--section",  # a heading of a search: SESSIONS, MESSAGES
+        "session-list--hit-title",  # a message's session, in front of its snippet
+        "session-list--hit-text",  # the snippet
+        "session-list--hit-match",  # the text searched for in it
+        "session-list--hit-role-user",  # the speaker plate
+        "session-list--hit-role-assistant",
     }
 
     class Highlighted(Message):
@@ -274,6 +284,7 @@ class SessionList(CrtMixin, ScrollView, can_focus=True):
         super().__init__(**kwargs)
         self.clock = clock
         self.rows: list[view.Row] = []
+        self._numbers: list[int] = []  # rows up to and with each, headings not counted
         self.cursor = -1
         self.columns: list[view.Column] = []
         self.widths: dict[str, int] = {}
@@ -299,6 +310,10 @@ class SessionList(CrtMixin, ScrollView, can_focus=True):
     def current(self) -> view.Row | None:
         return self.rows[self.cursor] if 0 <= self.cursor < len(self.rows) else None
 
+    def number(self, index: int) -> int:
+        """A row's place among the rows, headings not counted, from 0."""
+        return self._numbers[index] - 1 if 0 <= index < len(self._numbers) else index
+
     @property
     def top(self) -> int:
         return int(self.scroll_offset.y)
@@ -318,6 +333,7 @@ class SessionList(CrtMixin, ScrollView, can_focus=True):
         still listed and near its old place when it is not (``from_top``:
         at the first row, for a list that is not the one shown before)."""
         self.rows = rows
+        self._numbers = list(accumulate(view.selectable(row) for row in rows))
         self.span = eva.track_span(rows, self.clock())
         self.peak = max((row.messages or 0 for row in rows), default=0)
         self.cursor = view.select_index(rows, key, 0 if from_top else self.cursor)
@@ -366,11 +382,13 @@ class SessionList(CrtMixin, ScrollView, can_focus=True):
             self.post_message(self.Fitted(header))
         self.refresh()
 
-    def select(self, index: int) -> None:
+    def select(self, index: int, step: int = 1) -> None:
+        """Select a row; a heading passes the selection on in the direction
+        of ``step``."""
         if not self.rows:
             return
-        index = min(max(index, 0), len(self.rows) - 1)
-        if index != self.cursor:
+        index = view.nearest_selectable(self.rows, min(max(index, 0), len(self.rows) - 1), step)
+        if index >= 0 and index != self.cursor:
             if self.motion and 0 <= self.cursor < len(self.rows):
                 # The row it leaves glows for a moment, as a phosphor does.
                 self._ghost = (self.cursor, time.monotonic() + eva.FRAME * 3)
@@ -381,7 +399,9 @@ class SessionList(CrtMixin, ScrollView, can_focus=True):
             self._announce()
 
     def move(self, move: str) -> None:
-        self.select(view.move_index(self.cursor, len(self.rows), move, page=self.size.height - 1))
+        target = view.move_index(self.cursor, len(self.rows), move, page=self.size.height - 1)
+        step = -1 if move in ("up", "pageup", "end") else 1
+        self.select(target, step)
 
     def _announce(self) -> None:
         row = self.current
@@ -412,7 +432,7 @@ class SessionList(CrtMixin, ScrollView, can_focus=True):
         event.stop()
         offset = event.get_content_offset(self)
         index = -1 if offset is None else offset.y + self.top
-        if not 0 <= index < len(self.rows):
+        if not 0 <= index < len(self.rows) or not view.selectable(self.rows[index]):
             return
         self.select(index)
         self.post_message(self.Pressed(self.rows[index].key, event.chain == 2))
@@ -425,6 +445,8 @@ class SessionList(CrtMixin, ScrollView, can_focus=True):
         if not 0 <= index < len(self.rows):
             return Strip.blank(width, self.rich_style)
         row = self.rows[index]
+        if row.kind == "section":
+            return self._section_line(row, width)
         names = ["session-list--foreign" if row.foreign else "session-list--row"]
         selected = index == self.cursor
         if selected:
@@ -439,7 +461,7 @@ class SessionList(CrtMixin, ScrollView, can_focus=True):
         if self.number_width:
             number = self.get_component_rich_style(*names, "session-list--number")
             mark = self.get_component_rich_style(*names, "session-list--mark")
-            text = eva.gutter_text(index, selected)
+            text = eva.gutter_text(self.number(index), selected)
             state = eva.signal(row)
             sign = self.get_component_rich_style(*names, f"session-list--{state}")
             segments += [
@@ -451,6 +473,9 @@ class SessionList(CrtMixin, ScrollView, can_focus=True):
         cells = view.row_cells(
             eva.drawn_row(row), self.columns, self.clock(), self.provider_labels, *self._pad
         )
+        if row.kind == "hit":
+            segments += self._hit_segments(row, cells, names, selected, style)
+            return Strip(segments).adjust_cell_length(width, style)
         for name, text in cells:
             if name == "where" and not selected:
                 cell = self.get_component_rich_style(*names, f"session-list--{eva.signal(row)}")
@@ -462,6 +487,66 @@ class SessionList(CrtMixin, ScrollView, can_focus=True):
             if name == "title" and self.track:
                 segments += self._track_segments(row, names, selected, style)
         return Strip(segments).adjust_cell_length(width, style)
+
+    def _section_line(self, row: view.Row, width: int) -> Strip:
+        """A heading of a search, ruled to the edge."""
+        style = self.get_component_rich_style("session-list--section")
+        text = view.clip(f"{'─' * 2} {row.title} ", width)
+        text += "─" * max(width - view.text_width(text), 0)
+        return Strip([Segment(text, style)]).adjust_cell_length(width, self.rich_style)
+
+    def _hit_segments(
+        self,
+        row: view.Row,
+        cells: list[tuple[str, str]],
+        names: list[str],
+        selected: bool,
+        style: Style,
+    ) -> list[Segment]:
+        """A message: its session's title, then the snippet over the
+        columns up to AGE (and the lifespan track), then AGE (the message's)
+        and the columns after it."""
+
+        def look(name: str) -> Style:
+            return style if selected else self.get_component_rich_style(*names, name)
+
+        names_order = [name for name, _ in cells]
+        age_at = names_order.index("age") if "age" in names_order else len(cells)
+        title_at = names_order.index("title") if "title" in names_order else -1
+        out: list[Segment] = []
+        pad_left, pad_right = self._pad
+        span = sum(
+            view.text_width(text) for at, (_, text) in enumerate(cells) if title_at < at < age_at
+        )
+        if self.track:
+            span += self.track + eva.TRACK_TAIL
+        if title_at >= 0:
+            # The snippet is what a message row is for: the title gives it room.
+            title = view.text_width(cells[title_at][1]) - pad_left - pad_right
+            kept = min(title, max(view.MIN_TITLE_WIDTH, (title + span) // 3))
+            span += title - kept
+            text = " " * pad_left + view.pad(row.title, kept) + " " * pad_right
+            out.append(Segment(text, look("session-list--hit-title")))
+        room = span - pad_left - pad_right
+        used = min(pad_left, span)
+        out.append(Segment(" " * used, style))
+        match = self.get_component_rich_style(*names, "session-list--hit-match")
+        for kind, text in view.hit_pieces(row.hit, room):
+            out.append(
+                Segment(text, match if kind == "match" else look(f"session-list--hit-{kind}"))
+            )
+            used += view.text_width(text)
+        out.append(Segment(" " * max(span - used, 0), style))
+        for at in range(age_at, len(cells)):
+            name, text = cells[at]
+            if name == "where" and not selected:
+                cell = self.get_component_rich_style(*names, f"session-list--{eva.signal(row)}")
+            elif name == "age" and not selected:
+                cell = self.get_component_rich_style(*names, "session-list--age")
+            else:
+                cell = style
+            out.append(Segment(text, cell))
+        return out
 
     def _track_segments(
         self, row: view.Row, names: list[str], selected: bool, style: Style
@@ -945,7 +1030,7 @@ class HazardBand(CrtStatic):
 
 
 class KeyHints(CrtStatic):
-    """The key hints, each key drawn as a plate; the words are
+    """The key hints, each key in the system's orange; the words are
     ``view.hint_lines``' own."""
 
     COMPONENT_CLASSES: ClassVar[set[str]] = {"hints--key", "hints--action"}
@@ -1096,6 +1181,20 @@ class MainScreen(_UiCalls, Screen):
         self._related_limit = RELATED_MAX
         self._traces: dict[str, str] = {}
         self._target_key: str | None = None
+        # Search: the sessions' text (read in a thread once a search wants
+        # it), how far that reading is, and the last answer, with the
+        # (text, tab) it answers.
+        self._corpus: Corpus | None = None
+        self._corpus_failed = False
+        self._corpus_busy = False
+        self._corpus_again = False
+        self._corpus_stop = threading.Event()
+        self._reading: view.Reading | None = None
+        self._found: Found | None = None
+        self._found_for: tuple[str, str] | None = None
+        self._shown_for: tuple[str, str] | None = None  # what the rows on screen answer
+        self._search_timer: Timer | None = None
+        self._search_asked = 0
 
     def _engine_home(self) -> str:
         """The engine's home (``AGENT_SESSIONS_HOME`` can move it); this
@@ -1168,7 +1267,9 @@ class MainScreen(_UiCalls, Screen):
             yield SafeInput(id="folder", select_on_focus=False)
         with CrtHorizontal(id="filterbar"):
             yield CrtStatic("/", id="filter-label", markup=False)
-            yield SafeInput(id="filter", placeholder="title, project or folder")
+            yield SafeInput(
+                id="filter", placeholder="session name, project, folder, or words said in it"
+            )
         yield KeyHints("", id="hints", markup=False)
         if getattr(self.app, "motion", False):
             yield BootLog(_version(), id="boot", markup=False)
@@ -1219,6 +1320,7 @@ class MainScreen(_UiCalls, Screen):
         for job in (self._scan, self._mount):
             if job is not None:
                 job["cancel"].set()
+        self._corpus_stop.set()
 
     def _read(self, function: Callable[..., object], *args: object, group: str) -> None:
         """Start an engine call that only reads (``Reader``)."""
@@ -1450,6 +1552,8 @@ class MainScreen(_UiCalls, Screen):
         if self._question is not None and self._question.key not in snapshot.sessions:
             self._close_prompt()
         self._render_tabs()
+        if self._corpus is not None:
+            self._start_corpus()  # what changed since it was read
         self._refresh_rows(select_key)
         self._render_status()
         boot = self.query("#boot")
@@ -1463,19 +1567,31 @@ class MainScreen(_UiCalls, Screen):
         elif not first and not boot:
             self.raster.sweep()
 
-    def _refresh_rows(self, select_key: str | None = None, from_top: bool = False) -> None:
+    def _refresh_rows(
+        self, select_key: str | None = None, from_top: bool = False, reset: bool = False
+    ) -> None:
         """Show the rows of the current tab and filter. The selection goes to
         ``select_key``, else stays on its session, else returns to the one
         this tab had; ``from_top`` (a tab switch) starts at the first row
-        when none of those is listed."""
+        when none of those is listed. ``reset`` (a new search): the same row
+        when it is still listed, else the first one; never another row of
+        the selected session, which may be far down among the messages."""
         provider = self.tab_name or view.ALL
         rows = view.filter_rows(self.snapshot.rows, provider, self.needle)
+        searching = self._searching()
+        if searching:
+            listed = {row.key: row for row in view.filter_rows(self.snapshot.rows, provider)}
+            rows = view.search_rows(rows, listed, self._found, self._reading)
+            if self._found_for != (self.needle.strip(), provider):
+                self._schedule_search()
         current = self.session_list.current
         key = select_key or (
-            current.key
-            if current and self._listed_under(current, provider)
+            view.row_ident(current)
+            if current and current.kind != "section" and self._listed_under(current, provider)
             else self._selected.get(provider)
         )
+        if reset and not any(view.row_ident(row) == key for row in rows):
+            key, from_top = None, True
         self.session_list.set_rows(
             rows,
             key,
@@ -1484,10 +1600,11 @@ class MainScreen(_UiCalls, Screen):
             widths=view.column_widths(
                 [eva.drawn_row(row) for row in rows], dict(self.snapshot.providers)
             ),
-            empty_text=view.empty_text(self.loaded, self.needle),
+            empty_text=view.empty_text(self.loaded, self.needle, messages=searching),
             from_top=from_top,
         )
-        self.query_one("#board").border_subtitle = f"{len(rows):03d} ENTRIES"
+        entries = sum(1 for row in rows if view.selectable(row))
+        self.query_one("#board").border_subtitle = f"{entries:03d} ENTRIES"
         tab = self.tabs[self.tab_index] if self.tabs else None
         self.query_one("#board").border_title = (
             f"{eva.BOARD_TITLE} ─ {eva.tab_number(tab)} {escape(tab.label.upper())}"
@@ -1556,12 +1673,12 @@ class MainScreen(_UiCalls, Screen):
             self.query_one(f"#detail-{name}", Static).update(value)
         cursor = self.session_list.cursor
         self.query_one("#detail").border_title = (
-            f"{eva.DETAIL_TITLE} ─ SESSION {eva.row_number(cursor)}"
+            f"{eva.DETAIL_TITLE} ─ SESSION {eva.row_number(self.session_list.number(cursor))}"
             if session is not None
             else eva.DETAIL_TITLE
         )
         self.query_one("#target").border_title = (
-            f"{eva.TARGET_TITLE} {eva.row_number(cursor)}"
+            f"{eva.TARGET_TITLE} {eva.row_number(self.session_list.number(cursor))}"
             if session is not None
             else eva.TARGET_TITLE
         )
@@ -1968,7 +2085,124 @@ class MainScreen(_UiCalls, Screen):
     def _set_needle(self, needle: str) -> None:
         if needle != self.needle:
             self.needle = needle
+            if len(needle.strip()) >= view.SEARCH_MIN:
+                self._start_corpus()
+            self._refresh_rows(reset=self._searching())
+
+    def do_filter_enter(self, event: events.Key | None = None) -> None:
+        """Enter in the search box: a message opens at its place, as a
+        search result does in a chat app; anything else leaves the box for
+        the list."""
+        row = self.session_list.current
+        self.do_filter_accept()
+        if row is not None and row.kind == "hit":
+            self._view_hit(row)
+
+    # --- search: what was said ------------------------------------------
+
+    def _searching(self) -> bool:
+        """Whether the list shows what was said as well as the names."""
+        return self._corpus is not None and len(self.needle.strip()) >= view.SEARCH_MIN
+
+    def _start_corpus(self) -> None:
+        """Have the sessions' text read, for a search: all of it the first
+        time, after that what changed."""
+        if self._corpus is None:
+            if self._corpus_failed:
+                return
+            try:
+                self._corpus = self.engine.corpus()
+            except Exception as exc:
+                self._corpus_failed = True
+                self.set_message(view.error_text(exc), error=True)
+                return
+            self._reading = view.Reading()
+        if not self.loaded:
+            return  # the first snapshot starts it
+        if self._corpus_busy:
+            self._corpus_again = True
+            return
+        self._corpus_busy = True
+        self._corpus_again = False
+        sessions = list(self.snapshot.sessions.values())
+        self._corpus.keep(self.snapshot.sessions.keys())
+        self._read(self._corpus_thread, self._corpus, sessions, self.snapshot.index, group="corpus")
+
+    def _corpus_thread(self, corpus: Corpus, sessions: list[Session], index: Index | None) -> None:
+        last = 0.0
+
+        def progress(state: Progress) -> None:
+            nonlocal last
+            now = time.monotonic()
+            if now - last >= SEARCH_PROGRESS:
+                last = now
+                self._ui(self._corpus_progress, state, False)
+
+        state = corpus.read(
+            sessions,
+            partial(self.engine.transcript, index=index),
+            progress,
+            stop=self._corpus_stop.is_set,
+        )
+        self._ui(self._corpus_progress, state, True)
+
+    def _corpus_progress(self, state: Progress, finished: bool) -> None:
+        if not finished and state.total == 0:
+            return
+        self._reading = view.Reading(state.done, state.total, state.failed, state.full, finished)
+        if finished:
+            self._corpus_busy = False
+            if self._corpus_again:
+                self._start_corpus()
+        if self._searching():
+            self._found_for = None  # more text to search: ask again
             self._refresh_rows()
+
+    def _schedule_search(self) -> None:
+        """Search what was said once the typing pauses."""
+        if self._search_timer is not None:
+            self._search_timer.stop()
+        self._search_timer = self.set_timer(SEARCH_DELAY, self._start_search)
+
+    def _start_search(self) -> None:
+        self._search_timer = None
+        if not self._searching() or self._corpus is None:
+            return
+        provider = self.tab_name or view.ALL
+        keys = (
+            None
+            if provider == view.ALL
+            else {row.key for row in self.snapshot.rows if row.provider == provider}
+        )
+        self._search_asked += 1
+        needle = self.needle.strip()
+        self._read(
+            self._search_thread,
+            self._corpus,
+            needle,
+            provider,
+            keys,
+            self._search_asked,
+            group="search",
+        )
+
+    def _search_thread(
+        self, corpus: Corpus, needle: str, provider: str, keys: set[str] | None, asked: int
+    ) -> None:
+        def stale() -> bool:
+            return asked != self._search_asked
+
+        found = corpus.search(needle, keys, stop=stale)
+        if not stale():
+            self._ui(self._search_done, needle, provider, found, asked)
+
+    def _search_done(self, needle: str, provider: str, found: Found, asked: int) -> None:
+        if asked != self._search_asked or not self._searching():
+            return
+        new = self._shown_for != (needle, provider)
+        self._found, self._found_for = found, (needle, provider)
+        self._shown_for = (needle, provider)
+        self._refresh_rows(reset=new)  # a new search starts at its first result
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         if event.widget is self.filter_input:
@@ -2260,7 +2494,12 @@ class MainScreen(_UiCalls, Screen):
     def do_resume(self, event: events.Key | None = None, stay: bool = False) -> None:
         """Enter: a native session resumes; a foreign one resumes its native
         copy when it has one, else asks what to do: about its drive when
-        that is not mounted, else about the import."""
+        that is not mounted, else about the import. A message found by a
+        search opens the transcript at its place instead."""
+        row = self.session_list.current
+        if row is not None and row.kind == "hit":
+            self._view_hit(row)
+            return
         session = self.current_session()
         if session is None:
             return
@@ -2762,11 +3001,19 @@ class MainScreen(_UiCalls, Screen):
     # --- view ------------------------------------------------------------
 
     def do_view(self, event: events.Key | None = None) -> None:
+        row = self.session_list.current
+        if row is not None and row.kind == "hit":
+            self._view_hit(row)
+            return
         session = self.current_session()
         if session is not None:
             self._view(session.key)
 
-    def _view(self, key: str | None) -> None:
+    def _view_hit(self, row: view.Row) -> None:
+        """The transcript, at the message a search found, its matches lit."""
+        self._view(row.key, row.hit.turn, self.needle.strip())
+
+    def _view(self, key: str | None, turn: int | None = None, needle: str = "") -> None:
         session = self.snapshot.sessions.get(key) if key is not None else None
         if key is None or session is None:
             return
@@ -2774,7 +3021,18 @@ class MainScreen(_UiCalls, Screen):
             self._start_refusal(session, "view")
             return
         title = view.shown_title(session.title, key)
-        self._show(TranscriptScreen(self.engine, key, title, self.snapshot.index, tz=self.tz))
+        self._show(
+            TranscriptScreen(
+                self.engine,
+                key,
+                title,
+                self.snapshot.index,
+                tz=self.tz,
+                max_turns=None if turn is None else max(view.PAGER_MAX_TURNS, turn + 1),
+                anchor=turn,
+                needle=needle,
+            )
+        )
 
     # --- load and scan -----------------------------------------------------
 
@@ -2924,11 +3182,17 @@ class TranscriptView(CrtMixin, ScrollView, can_focus=True):
         "transcript--text",
         "transcript--note",
         "transcript--blank",
+        "transcript--match",  # the text a search was for
     }
 
-    def __init__(self, tz: tzinfo | None = None, **kwargs: Any) -> None:
+    def __init__(self, tz: tzinfo | None = None, needle: str = "", **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.tz = tz
+        self.needle = needle.strip()
+        self._folded = self.needle.lower()
+        self.matches: list[int] = []  # the turns that say ``needle``
+        self.place: int | None = None  # the one of them the view went to last
+        self._anchor: int | None = None  # a turn to bring to the top once it is wrapped
         self.turns: list[tuple] = []
         self.pending = 0  # turns not wrapped for the current width yet
         self._blocks: list[list[tuple[str, str]]] = []  # the lines of every turn
@@ -2958,12 +3222,77 @@ class TranscriptView(CrtMixin, ScrollView, can_focus=True):
         before = len(self.turns)
         self.turns.extend(turns)
         added = len(self.turns) - before
+        if self._folded:
+            self.matches += [
+                index
+                for index in range(before, len(self.turns))
+                if self.turns[index][0] != "tool"
+                and self._folded
+                in str(self.turns[index][1] or "")[: view.PAGER_MAX_TURN_CHARS].lower()
+            ]
         self._blocks.extend([] for _ in range(added))
         self._wrapped_for.extend([0] * added)
         self._starts.extend([self._height] * added)
         self.pending += added
+        if self._anchor is not None and before <= self._anchor < len(self.turns):
+            self._aim(self._anchor)  # it has arrived: wrap from there
+            if self._anchor in self.matches:
+                self.place = self.matches.index(self._anchor)
         if self._timer is None:
             self._wrap_some()
+
+    def go_to_turn(self, index: int) -> None:
+        """Bring a turn to the top of the view: now when it is wrapped, else
+        as soon as it is (it is wrapped first, and then what follows it)."""
+        self._anchor = index
+        if index in self.matches:
+            self.place = self.matches.index(index)
+        if index < len(self.turns):
+            self._aim(index)
+            self._jump()
+            if self._timer is None:
+                self._wrap_some()
+
+    def drop_anchor(self) -> None:
+        """The reader scrolled: the view stays where they put it."""
+        self._anchor = None
+
+    def step_match(self, step: int) -> int | None:
+        """Go to the next (``step`` 1) or previous (-1) turn that says the
+        needle, from the last one gone to or from the top of the view; past
+        the last, round to the first. The turn, or None when none says it."""
+        if not self.matches:
+            return None
+        here = self.matches[self.place] if self.place is not None else self._top_turn()
+        if step > 0:
+            at = bisect_right(self.matches, here)
+            if self.place is None and here in self.matches:
+                at -= 1  # the top turn itself is the first one forward
+        else:
+            at = bisect_left(self.matches, here) - 1
+        at %= len(self.matches)
+        self.go_to_turn(self.matches[at])
+        return self.matches[at]
+
+    def _aim(self, index: int) -> None:
+        """Wrap from ``index`` down first, then up and down in turn."""
+        self._down, self._up, self._ahead, self._upward = index, index - 1, 0, False
+
+    def _jump(self) -> None:
+        """Scroll to the anchor once it, and a screenful after it (or all
+        there is), is wrapped for this width."""
+        anchor, width = self._anchor, self._width
+        if anchor is None or width <= 0 or anchor >= len(self.turns):
+            return
+        lines, index = 0, anchor
+        while index < len(self.turns) and lines < self.size.height:
+            if self._wrapped_for[index] != width:
+                return
+            lines += len(self._blocks[index])
+            index += 1
+        self._anchor = None
+        self.scroll_to(y=self._starts[anchor], animate=False, force=True, immediate=True)
+        self.refresh()
 
     def stop(self) -> None:
         """No more wrapping: the pager is closing."""
@@ -3002,8 +3331,11 @@ class TranscriptView(CrtMixin, ScrollView, can_focus=True):
             return
         self._width = width
         self.pending = sum(1 for wrapped_for in self._wrapped_for if wrapped_for != width)
-        top = max(self._top_turn(), 0)
-        self._down, self._up, self._ahead, self._upward = top, top - 1, 0, False
+        anchor = self._anchor
+        top = (
+            anchor if anchor is not None and anchor < len(self.turns) else max(self._top_turn(), 0)
+        )
+        self._aim(top)
         if self._timer is None:
             self._wrap_some()
 
@@ -3060,6 +3392,7 @@ class TranscriptView(CrtMixin, ScrollView, can_focus=True):
             if target != y:
                 self.scroll_to(y=target, animate=False, force=True)
         self.refresh()
+        self._jump()
         if self.pending:
             self._timer = self.set_timer(PAGER_PAUSE, self._wrap_some)
 
@@ -3071,7 +3404,14 @@ class TranscriptView(CrtMixin, ScrollView, can_focus=True):
         turn = bisect_right(self._starts, index) - 1
         kind, text = self._blocks[turn][index - self._starts[turn]]
         style = self.get_component_rich_style(f"transcript--{kind}")
-        return Strip([Segment(text, style)]).adjust_cell_length(width, self.rich_style)
+        if kind != "text" or not self._folded or self._folded not in text.lower():
+            return Strip([Segment(text, style)]).adjust_cell_length(width, self.rich_style)
+        lit = self.get_component_rich_style("transcript--match")
+        segments = [
+            Segment(part, lit if hit else style)
+            for hit, part in view.match_pieces(text, self.needle)
+        ]
+        return Strip(segments).adjust_cell_length(width, self.rich_style)
 
 
 class TranscriptScreen(_UiCalls, _ClosesOnce):
@@ -3087,7 +3427,11 @@ class TranscriptScreen(_UiCalls, _ClosesOnce):
         index: Index | None = None,
         tz: tzinfo | None = None,
         max_turns: int | None = None,
+        anchor: int | None = None,
+        needle: str = "",
     ) -> None:
+        """``anchor``: the turn to open at (a message a search found);
+        ``needle``: the text the search was for, lit wherever it is."""
         super().__init__(id="pager")
         self.engine = engine
         self.key = key
@@ -3097,13 +3441,18 @@ class TranscriptScreen(_UiCalls, _ClosesOnce):
         self.max_turns = view.PAGER_MAX_TURNS if max_turns is None else max_turns
         self.turn_count = 0
         self.reading = True
+        self.start_turn = anchor
+        self.needle = needle.strip()
+        self._capped = False
+        self._error: str | None = None
         self.raster = Raster(self)
 
     def compose(self) -> ComposeResult:
         yield CrtStatic(self.session_title, id="pager-title", markup=False)
-        yield TranscriptView(tz=self.tz, id="pager-body")
+        yield TranscriptView(tz=self.tz, needle=self.needle, id="pager-body")
         with CrtHorizontal(id="pager-footer"):
-            yield CrtStatic(view.PAGER_HINTS, id="pager-hints", markup=False)
+            hints = view.PAGER_SEARCH_HINTS if self.needle else view.PAGER_HINTS
+            yield CrtStatic(hints, id="pager-hints", markup=False)
             yield CrtStatic("", id="pager-status", markup=False)
 
     @property
@@ -3113,6 +3462,8 @@ class TranscriptScreen(_UiCalls, _ClosesOnce):
     def on_mount(self) -> None:
         self.body.border_title = eva.PAGER_TITLE
         self.body.focus()
+        if self.start_turn is not None:
+            self.body.go_to_turn(self.start_turn)
         self._render_status()
         self.raster.interlace()
         read(self, self._load_thread, "transcript")
@@ -3120,10 +3471,16 @@ class TranscriptScreen(_UiCalls, _ClosesOnce):
     def on_unmount(self) -> None:
         self._gone = True  # the reader stops at its next turn
 
-    def _render_status(self, capped: bool = False, error: str | None = None) -> None:
+    def _render_status(self, capped: bool | None = None, error: str | None = None) -> None:
+        if capped is not None:
+            self._capped, self._error = capped, error
         status = self.query_one("#pager-status", Static)
-        status.update(view.pager_status(self.turn_count, self.reading, capped, error))
-        status.set_class(bool(error), "-error")
+        text = view.pager_status(self.turn_count, self.reading, self._capped, self._error)
+        if self.needle:
+            body = self.body
+            text = f"{view.match_status(body.place, len(body.matches))} · {text}"
+        status.update(text)
+        status.set_class(bool(self._error), "-error")
 
     def _load_thread(self) -> None:
         batch: list[tuple] = []
@@ -3165,6 +3522,11 @@ class TranscriptScreen(_UiCalls, _ClosesOnce):
         event.stop()
         event.prevent_default()
         body = self.body
+        if action in ("next_match", "previous_match"):
+            body.step_match(1 if action == "next_match" else -1)
+            self._render_status()
+            return
+        body.drop_anchor()
         if action == "close":
             body.stop()
             self.close()

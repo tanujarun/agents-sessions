@@ -434,6 +434,101 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(view.scroll_for(-1, 3, 10, 0), 0)
 
 
+class SearchViewTest(unittest.TestCase):
+    """The list while a search is shown: the sessions by name, then the
+    messages that say it, under their headings."""
+
+    def setUp(self):
+        from agent_sessions.search import Corpus
+
+        self.sessions = [support.make_session("claude", n) for n in (1, 2, 3)]
+        self.rows = rows_of(self.sessions)
+        self.by_key = {row.key: row for row in self.rows}
+        corpus = Corpus()
+        for n, session in enumerate(self.sessions):
+            said = [("user", f"talk about kiwi number {n}", ago(minutes=50 - n))]
+            corpus.add(session.key, (), said if n else [])
+        self.found = corpus.search("kiwi")
+
+    def test_sessions_then_messages_each_under_a_heading(self):
+        named = self.rows[:1]
+        rows = view.search_rows(named, self.by_key, self.found, view.Reading(finished=True))
+        self.assertEqual(
+            [row.kind for row in rows], ["section", "session", "section", "hit", "hit"]
+        )
+        self.assertEqual(rows[0].title, "SESSIONS · 1")
+        self.assertEqual(rows[2].title, "MESSAGES · 2 IN 2 SESSIONS")
+        self.assertEqual([row.key for row in rows[3:]], [s.key for s in self.sessions[2:0:-1]])
+        self.assertEqual(rows[3].stamp, self.found.hits[0].ts)  # AGE is the message's
+        self.assertEqual(view.row_ident(rows[3]), f"{rows[3].key}#0")
+
+    def test_no_sessions_heading_without_names_and_nothing_at_all_without_either(self):
+        rows = view.search_rows([], self.by_key, self.found, None)
+        self.assertEqual([row.kind for row in rows], ["section", "hit", "hit"])
+        self.assertEqual(view.search_rows([], self.by_key, None, view.Reading(finished=True)), [])
+
+    def test_messages_of_another_tab_are_left_out(self):
+        only = {self.rows[1].key: self.rows[1]}
+        rows = view.search_rows([], only, self.found, None)
+        self.assertEqual([row.key for row in rows if row.kind == "hit"], [self.rows[1].key])
+
+    def test_the_messages_heading_while_reading_and_after(self):
+        heading = view.messages_heading
+        self.assertEqual(heading(None, 0, view.Reading(3, 40)), "MESSAGES … · READING 3/40")
+        self.assertEqual(
+            heading(self.found, 1, view.Reading(3, 40)),
+            ("MESSAGES · 2 IN 2 SESSIONS · 1 SHOWN · READING 3/40"),
+        )
+        done = view.Reading(40, 40, failed=2, full=True, finished=True)
+        self.assertEqual(
+            heading(None, 0, done), "MESSAGES · NONE · NOT ALL READ: TOO MUCH TEXT · 2 UNREADABLE"
+        )
+        rows = view.search_rows([], self.by_key, None, view.Reading(0, 9))
+        self.assertEqual([row.kind for row in rows], ["section"])
+
+    def test_the_selection_skips_headings(self):
+        rows = view.search_rows(self.rows[:1], self.by_key, self.found, None)
+        self.assertEqual(view.select_index(rows, None, 0), 1)
+        self.assertEqual(view.select_index(rows, None, 2), 3)  # a heading at the old place
+        self.assertEqual(view.select_index(rows, view.row_ident(rows[4]), 0), 4)
+        # A message gone: the first row of its session.
+        self.assertEqual(view.select_index(rows, f"{rows[1].key}#9", 0), 1)
+        self.assertEqual(view.nearest_selectable(rows, 2, -1), 1)
+        self.assertEqual(view.nearest_selectable([view.section_row("X")], 0), -1)
+        self.assertEqual(view.select_index([view.section_row("X")], None, 0), -1)
+
+    def test_a_snippet_keeps_the_match_in_view(self):
+        hit = self.found.hits[0]
+        for width in (12, 20, 31, 60, 200):
+            pieces = view.hit_pieces(hit, width)
+            self.assertEqual(sum(view.text_width(text) for _, text in pieces), width, width)
+            self.assertIn(("match", "kiwi"), pieces)
+        long = type(hit)(hit.key, 0, "assistant", None, "x" * 80, "kiwi", "y" * 80, 1)
+        pieces = {kind: text for kind, text in view.hit_pieces(long, 40) if kind != "text"}
+        self.assertEqual(pieces["role-assistant"], "▐AI  ▌ ")
+        before = view.hit_pieces(long, 40)[1][1]
+        self.assertTrue(before.startswith(view.ELLIPSIS))
+        self.assertEqual(view.hit_pieces(hit, 0), [])
+        self.assertEqual(view.hit_pieces(hit, 9)[0][0], "text")  # too narrow for the plate
+
+    def test_match_pieces_and_status(self):
+        self.assertEqual(
+            view.match_pieces("Kiwi and kiwi!", "KIWI"),
+            [(True, "Kiwi"), (False, " and "), (True, "kiwi"), (False, "!")],
+        )
+        self.assertEqual(view.match_pieces("nothing", "kiwi"), [(False, "nothing")])
+        self.assertEqual(view.match_pieces("İkiwi", "kiwi"), [(False, "İkiwi")])
+        self.assertEqual(view.match_status(None, 0), "no match")
+        self.assertEqual(view.match_status(None, 3), "3 matches")
+        self.assertEqual(view.match_status(1, 1200), "match 2 of 1,200")
+
+    def test_empty_text_says_what_was_searched(self):
+        self.assertEqual(
+            view.empty_text(True, "kiwi", messages=True), 'No sessions or messages match "kiwi"'
+        )
+        self.assertEqual(view.empty_text(True, "k"), 'No sessions match "k"')
+
+
 class TabTest(unittest.TestCase):
     def setUp(self):
         self.rows = rows_of(support.default_sessions())
@@ -633,7 +728,7 @@ class LayoutTest(unittest.TestCase):
         self.assertTrue(narrow.show_detail)
         tiny = view.layout_for(40, 10, hint_gutter=2)
         self.assertFalse(tiny.show_project or tiny.show_detail)  # then the detail pane
-        self.assertEqual(tiny.hints, ("Enter resume  / filter  ? help  q quit",))
+        self.assertEqual(tiny.hints, ("Enter resume  / search  ? help  q quit",))
 
     def test_detail_pane_thresholds(self):
         self.assertTrue(view.layout_for(60, 20).show_detail)
@@ -1563,7 +1658,7 @@ class PromptAndKeyTest(unittest.TestCase):
 
     def test_filter_pager_and_unknown_modes(self):
         self.assertEqual(view.key_action("filter", "escape"), "filter_clear")
-        self.assertEqual(view.key_action("filter", "enter", "\r"), "filter_accept")
+        self.assertEqual(view.key_action("filter", "enter", "\r"), "filter_enter")
         self.assertEqual(view.key_action("filter", "down"), "cursor_down")
         self.assertIsNone(view.key_action("filter", "q", "q"))  # typed into the box
         self.assertIsNone(view.key_action("filter", "j", "j"))
